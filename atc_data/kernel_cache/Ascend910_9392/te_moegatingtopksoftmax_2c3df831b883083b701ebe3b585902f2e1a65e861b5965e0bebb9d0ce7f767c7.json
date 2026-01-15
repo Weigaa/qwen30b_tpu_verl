@@ -1,0 +1,32 @@
+{
+  "binFileName": "te_moegatingtopksoftmax_2c3df831b883083b701ebe3b585902f2e1a65e861b5965e0bebb9d0ce7f767c7",
+  "binFileSuffix": ".o",
+  "blockDim": 8,
+  "coreType": "VectorCore",
+  "core_type": "AIV",
+  "intercoreSync": 0,
+  "kernelName": "te_moegatingtopksoftmax_2c3df831b883083b701ebe3b585902f2e1a65e861b5965e0bebb9d0ce7f767c7__kernel0",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+  "memoryStamping": [],
+  "opParaSize": 80,
+  "parameters": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "sha256": "d6e5cfbbfd93557ce77dd4b8ef04b6b596f7e7a9d37964377324a51abe5b42ff",
+  "workspace": {
+    "num": 1,
+    "size": [
+      0
+    ],
+    "type": [
+      0
+    ]
+  },
+  "supportSuperKernel": 1,
+  "localMemorySize": 0
+}

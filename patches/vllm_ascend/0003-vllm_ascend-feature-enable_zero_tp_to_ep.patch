@@ -1,0 +1,292 @@
+From fa3a51973bb2a5ab4df1a39650c15600599dc050 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Tue, 11 Nov 2025 11:32:26 +0800
+Subject: [PATCH] Update vllm_ascend: qwen3 moe communication
+Implement a zero-redundancy TP-to-EP communication schedume: replace AllReduce in o_proj with ReduceScatter
+to make MoE layer only receive data necessary for local computation.
+
+---
+ llm_rl/qwen3/vllm_ascend/ascend_config.py   |   6 +
+ .../vllm_ascend/torchair/models/qwen3_moe.py  | 117 ++++++++++++++++--
+ 2 files changed, 112 insertions(+), 11 deletions(-)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/ascend_config.py b/llm_rl/qwen3/vllm_ascend/ascend_config.py
+index 65ea3ea..e0f9b68 100644
+--- a/llm_rl/qwen3/vllm_ascend/ascend_config.py
++++ b/llm_rl/qwen3/vllm_ascend/ascend_config.py
+@@ -114,6 +114,8 @@ class TorchairGraphConfig:
+             "graph_batch_sizes_init", False)
+         self.enable_multistream_mla = torchair_graph_config.get(
+             "enable_multistream_mla", False)
++        self.enable_zero_tp_to_ep = torchair_graph_config.get(
++            "enable_zero_tp_to_ep", False)
+         self.enable_view_optimize = torchair_graph_config.get(
+             "enable_view_optimize", True)
+         self.enable_frozen_parameter = torchair_graph_config.get(
+@@ -150,6 +152,10 @@ class TorchairGraphConfig:
+                 raise RuntimeError(
+                     "enable_multistream_mla is valid only when Torchair graph mode is enabled"
+                 )
++            if self.enable_zero_tp_to_ep:
++                raise RuntimeError(
++                    "enable_zero_tp_to_ep is valid only when Torchair graph mode is enabled"
++                )
+             if self.enable_kv_nz:
+                 raise RuntimeError(
+                     "enable_kv_nz is valid only when Torchair graph mode is enabled"
+diff --git a/llm_rl/qwen3/vllm_ascend/torchair/models/qwen3_moe.py b/llm_rl/qwen3/vllm_ascend/torchair/models/qwen3_moe.py
+index c6aad6a..1fc08f5 100644
+--- a/llm_rl/qwen3/vllm_ascend/torchair/models/qwen3_moe.py
++++ b/llm_rl/qwen3/vllm_ascend/torchair/models/qwen3_moe.py
+@@ -25,7 +25,14 @@ from transformers import PretrainedConfig
+ from vllm.attention import Attention, AttentionMetadata
+ from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import CacheConfig, CompilationLevel, VllmConfig
+-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
++from vllm.distributed import (get_pp_group, 
++                              get_tensor_model_parallel_rank, 
++                              get_tensor_model_parallel_world_size,
++                              get_tp_group, 
++                              split_tensor_along_last_dim,
++                              tensor_model_parallel_all_gather,
++                              tensor_model_parallel_all_reduce,
++                              tensor_model_parallel_reduce_scatter)
+ from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
+                                              get_tp_group)
+ from vllm.forward_context import get_forward_context
+@@ -53,12 +60,53 @@ from vllm.sequence import IntermediateTensors
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+-from vllm_ascend.ops.fused_moe import AscendFusedMoE
++from vllm_ascend.torchair.ops.torchair_fused_moe import TorchairAscendFusedMoE
+ from vllm_ascend.torchair.ops.sequence_parallel import (MetadataForPadding,
+                                                         init_metadata_for_sp)
+ from vllm_ascend.utils import vllm_version_is
+ 
+ 
++class RowParallelLinearReplaceAllreduce(RowParallelLinear):
++
++    def forward(
++        self,
++        input_
++    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[nn.Parameter]]]:
++        is_prefill = get_forward_context().with_prefill
++        if self.input_is_parallel:
++            input_parallel = input_
++        else:
++            tp_rank = get_tensor_model_parallel_rank()
++            splitted_input = split_tensor_along_last_dim(
++                input_, num_partitions=self.tp_size
++            )
++            input_parallel = splitted_input[tp_rank].contiguous()
++
++        # Matrix multiply.
++        assert self.quant_method is not None
++        # Only fuse bias add into GEMM for rank 0 (this ensures that
++        # bias will not get added more than once in TP>1 case)
++        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
++        output_parallel = self.quant_method.apply(self,
++                                                  input_parallel,
++                                                  bias=bias_)
++        if self.reduce_results and self.tp_size > 1:
++            # Use reduce-scatter for decoding phase when batch size is divisible by tp_size
++            if not is_prefill and output_parallel.shape[0] % self.tp_size == 0:
++                output = tensor_model_parallel_reduce_scatter(output_parallel,
++                                                              dim=0)
++            else:
++                # Use all-reduce for prefill phase or when batch size not divisible 
++                output = tensor_model_parallel_all_reduce(output_parallel)
++        else:
++            output = output_parallel
++        
++        output_bias = self.bias if self.skip_bias_add else None
++
++        if not self.return_bias:
++            return output
++        return output, output_bias
++
+ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
+ 
+     def __init__(
+@@ -82,7 +130,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
+             prefix=f"{prefix}.gate",
+         )
+ 
+-        self.experts = AscendFusedMoE(
++        self.experts = TorchairAscendFusedMoE(
+             num_experts=config.num_experts,
+             top_k=config.num_experts_per_tok,
+             hidden_size=config.hidden_size,
+@@ -108,6 +156,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
+         hidden_states,
+         attn_metadata=None,
+         _metadata_for_padding: Optional[MetadataForPadding] = None,
++        replace_allreduce: bool = False
+     ):
+         if attn_metadata is None:
+             attn_metadata = get_forward_context().attn_metadata
+@@ -127,6 +176,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
+             enable_force_load_balance=enable_force_load_balance,
+             shared_experts=None,
+             _metadata_for_padding=_metadata_for_padding,
++            replace_allreduce=replace_allreduce
+         )
+ 
+         return hidden_states
+@@ -171,6 +221,7 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
+         self.scaling = self.head_dim**-0.5
+         self.rope_theta = rope_theta
+         self.max_position_embeddings = max_position_embeddings
++        ascend_config = get_ascend_config()
+ 
+         self.qkv_proj = QKVParallelLinear(hidden_size,
+                                           self.head_dim,
+@@ -180,11 +231,22 @@ class CustomQwen3MoeAttention(Qwen3MoeAttention):
+                                           quant_config=quant_config,
+                                           prefix=f"{prefix}.qkv_proj")
+ 
+-        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
+-                                        hidden_size,
+-                                        bias=False,
+-                                        quant_config=quant_config,
+-                                        prefix=f"{prefix}.o_proj")
++        if ascend_config.torchair_graph_config.enable_zero_tp_to_ep:
++            self.o_proj = RowParallelLinearReplaceAllreduce(
++                self.total_num_heads * self.head_dim,
++                self.hidden_size,
++                bias=False,
++                quant_config=quant_config,
++                prefix=f"{prefix}.o_proj"
++            )
++        else:
++            self.o_proj = RowParallelLinear(
++                self.total_num_heads * self.head_dim,
++                self.hidden_size,
++                bias=False,
++                quant_config=quant_config,
++                prefix=f"{prefix}.o_proj"
++            )
+ 
+         self.rotary_emb = get_rope(
+             self.head_dim,
+@@ -280,6 +342,12 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
+         rope_scaling = getattr(config, "rope_scaling", None)
+         max_position_embeddings = getattr(config, "max_position_embeddings",
+                                           8192)
++        layer_idx = int(prefix.split(sep='.')[-1])
++        self.layer_idx = layer_idx
++        self.layers = config.num_hidden_layers
++        self.tp_size = get_tensor_model_parallel_world_size()
++        self.tp_rank = get_tp_group().rank_in_group
++
+         self.self_attn = CustomQwen3MoeAttention(
+             hidden_size=self.hidden_size,
+             num_heads=config.num_attention_heads,
+@@ -320,12 +388,16 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
+                 else:
+                     self.mlp = Qwen3MoeSparseMoeBlock(vllm_config=vllm_config,
+                                                       prefix=f"{prefix}.mlp")
++            ascend_config = get_ascend_config()
++            self.moe_communication = ascend_config.torchair_graph_config.enable_zero_tp_to_ep and envs.VLLM_USE_V1 and self.tp_size > 1
++
+         else:
+             self.mlp = Qwen3MoeMLP(hidden_size=config.hidden_size,
+                                    intermediate_size=config.intermediate_size,
+                                    hidden_act=config.hidden_act,
+                                    quant_config=quant_config,
+                                    prefix=f"{prefix}.mlp")
++            self.moe_communication = False
+         self.input_layernorm = RMSNorm(config.hidden_size,
+                                        eps=config.rms_norm_eps)
+         self.post_attention_layernorm = RMSNorm(config.hidden_size,
+@@ -343,6 +415,7 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
+         kv_cache: Optional[torch.Tensor] = None,
+         attn_metadata: Optional[AttentionMetadata] = None,
+         _metadata_for_padding: Optional[MetadataForPadding] = None,
++        replace_allreduce: bool = False
+     ) -> torch.Tensor:
+ 
+         # To prevent precision issues during the decoder phase when only prefilling enables SP
+@@ -351,6 +424,11 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
+         else:
+             self.self_attn.o_proj.reduce_results = not _metadata_for_padding.not_dummy_and_is_prefill if _metadata_for_padding is not None else True
+ 
++        if attn_metadata is not None and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
++            enable_optimization = self.moe_communication and replace_allreduce
++        else:
++            enable_optimization = False
++
+         # Self Attention
+         if residual is None:
+             residual = hidden_states
+@@ -366,6 +444,10 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
+                 hidden_states = _metadata_for_padding.allgather_unpadding_aligned(
+                     hidden_states)
+ 
++        if enable_optimization and positions.shape[0] != hidden_states.shape[0]:
++            hidden_states = tensor_model_parallel_all_gather(hidden_states,
++                                                             dim=0)
++
+         hidden_states = self.self_attn(
+             positions=positions,
+             hidden_states=hidden_states,
+@@ -376,17 +458,27 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
+         if _metadata_for_padding and _metadata_for_padding.not_dummy_and_is_prefill:
+             hidden_states = _metadata_for_padding.padding_aligned_reduce_scatter(
+                 hidden_states)
++        
++        if residual.shape[0] != hidden_states.shape[0]:
++            chunk_residual = torch.tensor_split(residual, self.tp_size, dim=0)
++            residual = chunk_residual[self.tp_rank]
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(
+             hidden_states, residual)
+ 
+-        if not self.use_aclgraph:
++        if not self.use_aclgraph and isinstance(self.mlp, CustomSparseMoeBlock):
+             hidden_states = self.mlp(
+-                hidden_states, _metadata_for_padding=_metadata_for_padding)
++                hidden_states, 
++                _metadata_for_padding=_metadata_for_padding,
++                replace_allreduce=enable_optimization)
+         else:
+             hidden_states = self.mlp(hidden_states)
+ 
++        if enable_optimization and self.layer_idx == self.layers - 1:
++            hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
++            residual = tensor_model_parallel_all_gather(residual, dim=0)
++
+         return hidden_states, residual
+ 
+ 
+@@ -404,6 +496,7 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
+         self.num_redundant_experts = eplb_config.num_redundant_experts
+         self.padding_idx = config.pad_token_id
+         self.vocab_size = config.vocab_size
++        self.tp_size = get_tensor_model_parallel_world_size()
+         self.config = config
+         self.embed_tokens = VocabParallelEmbedding(
+             config.vocab_size,
+@@ -444,6 +537,7 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
+             assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
++        replace_allreduce = hidden_states.shape[0] % self.tp_size == 0
+         for i in range(self.start_layer, self.end_layer):
+             layer = self.layers[i]
+             hidden_states, residual = layer(
+@@ -453,7 +547,8 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
+                 kv_caches[i -
+                           self.start_layer] if kv_caches is not None else None,
+                 attn_metadata,
+-                _metadata_for_padding=_metadata_for_padding)
++                _metadata_for_padding=_metadata_for_padding,
++                replace_allreduce=replace_allreduce)
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors({
+                 "hidden_states": hidden_states,
+-- 
+2.50.1.windows.1
+

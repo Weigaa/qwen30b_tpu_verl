@@ -1,0 +1,38 @@
+{
+  "binFileName": "te_groupedmatmul_31e176652884c73a7d58e3f64cc8316496042b25dd4a0803c8f72119819e2a8b",
+  "binFileSuffix": ".o",
+  "blockDim": 24,
+  "coreType": "MIX",
+  "intercoreSync": 1,
+  "kernelName": "te_groupedmatmul_31e176652884c73a7d58e3f64cc8316496042b25dd4a0803c8f72119819e2a8b",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF",
+  "memoryStamping": [],
+  "opParaSize": 2016,
+  "parameters": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "sha256": "1a240ceb6587132a3ade902f0547104b7b2eab8bc383d02a46e7e1f9e1bfb230",
+  "workspace": {
+    "num": 1,
+    "size": [
+      16777216
+    ],
+    "type": [
+      0
+    ]
+  },
+  "taskRation": "1:0",
+  "supportSuperKernel": 1,
+  "localMemorySize": 0,
+  "dynamicParamMode": "folded_with_desc"
+}

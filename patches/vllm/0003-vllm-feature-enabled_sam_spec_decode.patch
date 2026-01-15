@@ -1,0 +1,64 @@
+From 2b128ac7d0e183e2e371930e33a9fe8347fd795e Mon Sep 17 00:00:00 2001
+From: mystri <mystri@noreply.gitcode.com>
+Date: Tue, 2 Dec 2025 00:30:24 +0800
+Subject: [PATCH] Integrated SAM spec decoding into vllm
+
+---
+ qwen3/vllm/config/speculative.py    | 11 +++++++----
+ qwen3/vllm/v1/engine/core_client.py |  4 +++-
+ 2 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/llm_rl/qwen3/vllm/config/speculative.py b/llm_rl/qwen3/vllm/config/speculative.py
+index d5c6d1d..1031963 100644
+--- a/llm_rl/qwen3/vllm/config/speculative.py
++++ b/llm_rl/qwen3/vllm/config/speculative.py
+@@ -29,7 +29,7 @@ else:
+ 
+ logger = init_logger(__name__)
+ 
+-SpeculativeMethod = Literal["ngram", "eagle", "eagle3", "medusa",
++SpeculativeMethod = Literal["ngram", "sam", "eagle", "eagle3", "medusa",
+                             "mlp_speculator", "draft_model", "deepseek_mtp",
+                             "ernie_mtp", "qwen3_next_mtp", "mimo_mtp",
+                             "longcat_flash_mtp", "mtp"]
+@@ -233,6 +233,8 @@ class SpeculativeConfig:
+                     self.quantization = self.target_model_config.quantization
+             elif self.method in ("ngram", "[ngram]"):
+                 self.model = "ngram"
++            elif self.method == "sam":
++                self.model = "sam"
+             else:
+                 raise ValueError(
+                     "num_speculative_tokens was provided but without "
+@@ -244,9 +246,10 @@ class SpeculativeConfig:
+                                     and self.model in ("ngram", "[ngram]")):
+             self.method = "ngram"
+ 
+-        if self.method in ("ngram", "[ngram]"):
+-            # Unified to "ngram" internally
+-            self.method = "ngram"
++        if self.method in ("ngram", "[ngram]", "sam"):
++            if self.method in ("ngram", "[ngram]"):
++                # Unified to "ngram" internally
++                self.method = "ngram"
+             # Set default values if not provided
+             if (self.prompt_lookup_min is None
+                     and self.prompt_lookup_max is None):
+diff --git a/llm_rl/qwen3/vllm/v1/engine/core_client.py b/llm_rl/qwen3/vllm/v1/engine/core_client.py
+index a84b0e5..aebe677 100644
+--- a/llm_rl/qwen3/vllm/v1/engine/core_client.py
++++ b/llm_rl/qwen3/vllm/v1/engine/core_client.py
+@@ -245,7 +245,9 @@ class InprocClient(EngineCoreClient):
+         self.engine_core = EngineCore(*args, **kwargs)
+ 
+     def get_output(self) -> EngineCoreOutputs:
+-        outputs, _ = self.engine_core.step_fn()
++        # Copied from https://github.com/vllm-project/vllm/issues/27287.
++        outputs, model_executed = self.engine_core.step_fn()
++        self.engine_core.post_step(model_executed)
+         return outputs and outputs.get(0) or EngineCoreOutputs()
+ 
+     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+-- 
+2.28.0.windows.1
+

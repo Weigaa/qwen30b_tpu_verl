@@ -1,0 +1,19 @@
+{
+    "binFileName":"te_tensormove_d3883396d3284b372767dbd0079b7ae84ebe873d25bda88f5cf8a4437efd4e0d",
+    "binFileSuffix":".o",
+    "blockDim":32,
+    "coreType":"VectorCore",
+    "deterministic":"ignore",
+    "intercoreSync":0,
+    "kernelName":"te_tensormove_d3883396d3284b372767dbd0079b7ae84ebe873d25bda88f5cf8a4437efd4e0d__kernel0",
+    "magic":"RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+    "memoryStamping":[
+        -1
+    ],
+    "opParaSize":32,
+    "parameters":[
+        null,
+        null
+    ],
+    "sha256":"d42fa2eb222b31a1661e548dcdc755a62c43953704e39846c20ff87e87ce9491"
+}

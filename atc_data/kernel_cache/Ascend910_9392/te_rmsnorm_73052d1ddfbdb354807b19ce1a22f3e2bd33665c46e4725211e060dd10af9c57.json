@@ -1,0 +1,31 @@
+{
+  "binFileName": "te_rmsnorm_73052d1ddfbdb354807b19ce1a22f3e2bd33665c46e4725211e060dd10af9c57",
+  "binFileSuffix": ".o",
+  "blockDim": 32,
+  "coreType": "VectorCore",
+  "core_type": "AIV",
+  "intercoreSync": 0,
+  "kernelName": "te_rmsnorm_73052d1ddfbdb354807b19ce1a22f3e2bd33665c46e4725211e060dd10af9c57__kernel0",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+  "memoryStamping": [],
+  "opParaSize": 96,
+  "parameters": [
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "sha256": "81776306496c729affd53ee97d72ea8d618aa74824610d4a83e4bcc2ac7e5038",
+  "workspace": {
+    "num": 1,
+    "size": [
+      16777472
+    ],
+    "type": [
+      0
+    ]
+  },
+  "supportSuperKernel": 1,
+  "localMemorySize": 0
+}

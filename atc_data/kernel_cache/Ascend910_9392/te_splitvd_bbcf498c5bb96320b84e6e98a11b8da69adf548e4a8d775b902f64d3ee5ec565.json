@@ -1,0 +1,19 @@
+{
+    "binFileName":"te_splitvd_bbcf498c5bb96320b84e6e98a11b8da69adf548e4a8d775b902f64d3ee5ec565",
+    "binFileSuffix":".o",
+    "blockDim":1,
+    "coreType":"VectorCore",
+    "deterministic":"ignore",
+    "intercoreSync":0,
+    "kernelName":"te_splitvd_bbcf498c5bb96320b84e6e98a11b8da69adf548e4a8d775b902f64d3ee5ec565__kernel0",
+    "magic":"RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+    "memoryStamping":[],
+    "opParaSize":0,
+    "parameters":[
+        null,
+        null,
+        null,
+        null
+    ],
+    "sha256":"36ef8d2064761dfe963c2878a371452a00c698ca2c79c1f657e34a87b904721c"
+}

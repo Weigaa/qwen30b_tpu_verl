@@ -1,0 +1,30 @@
+ninja_required_version = 1.3
+cxx = c++
+
+cflags = -DTORCH_EXTENSION_NAME=npu_rotary_position_embedding -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_TYPE=\"_gcc\" -DPYBIND11_STDLIB=\"_libstdcpp\" -DPYBIND11_BUILD_ABI=\"_cxxabi1016\" -I/usr/local/python3.11.13/lib/python3.11/site-packages/torch_npu/include -I/usr/local/python3.11.13/lib/python3.11/site-packages/torch_npu/include/third_party/hccl/inc -I/usr/local/python3.11.13/lib/python3.11/site-packages/torch_npu/include/third_party/acl/inc -I/usr/local/Ascend/ascend-toolkit/latest/include -I/workspace/cann-recipes-train/llm_rl/qwen3/mindspeed/ops/csrc/cann/inc -isystem /usr/local/python3.11.13/lib/python3.11/site-packages/torch/include -isystem /usr/local/python3.11.13/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/python3.11.13/include/python3.11 -D_GLIBCXX_USE_CXX11_ABI=1 -fPIC -std=c++17 -fstack-protector-all -Wl,-z,relro,-z,now,-z,noexecstack -fPIC -pie -s -fvisibility=hidden -D_FORTIFY_SOURCE=2 -O2 -include cstring -Wno-sign-compare -Wno-deprecated-declarations -Wno-return-type -D__FILENAME__='"$$(notdir $$(abspath $$<))"'
+post_cflags = 
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = -shared -L/usr/local/Ascend/ascend-toolkit/latest/lib64 -lascendcl -L/usr/local/python3.11.13/lib/python3.11/site-packages/torch_npu/lib -ltorch_npu -L/usr/local/python3.11.13/lib/python3.11/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+
+
+
+
+rule link
+  command = $cxx $in $ldflags -o $out
+
+build npu_rotary_position_embedding.o: compile /workspace/cann-recipes-train/llm_rl/qwen3/mindspeed/ops/csrc/cann/npu_rotary_position_embedding.cpp
+
+
+
+
+
+build npu_rotary_position_embedding.so: link npu_rotary_position_embedding.o
+
+default npu_rotary_position_embedding.so

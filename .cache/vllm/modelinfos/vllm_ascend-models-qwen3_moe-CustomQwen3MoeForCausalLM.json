@@ -1,0 +1,21 @@
+{
+  "hash": "39ce5d23c41ca5f19e107fb56915bd81",
+  "modelinfo": {
+    "architecture": "CustomQwen3MoeForCausalLM",
+    "is_text_generation_model": true,
+    "is_pooling_model": false,
+    "default_pooling_type": "LAST",
+    "supports_cross_encoding": false,
+    "supports_multimodal": false,
+    "supports_multimodal_raw_input_only": false,
+    "supports_multimodal_encoder_tp_data": false,
+    "supports_pp": true,
+    "has_inner_state": false,
+    "is_attention_free": false,
+    "is_hybrid": false,
+    "has_noops": false,
+    "supports_transcription": false,
+    "supports_transcription_only": false,
+    "supports_v0_only": false
+  }
+}

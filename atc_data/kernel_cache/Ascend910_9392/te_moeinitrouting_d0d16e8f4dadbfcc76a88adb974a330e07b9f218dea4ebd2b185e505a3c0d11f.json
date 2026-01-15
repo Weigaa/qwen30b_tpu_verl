@@ -1,0 +1,33 @@
+{
+  "binFileName": "te_moeinitrouting_d0d16e8f4dadbfcc76a88adb974a330e07b9f218dea4ebd2b185e505a3c0d11f",
+  "binFileSuffix": ".o",
+  "blockDim": 48,
+  "coreType": "MIX",
+  "intercoreSync": 1,
+  "kernelName": "te_moeinitrouting_d0d16e8f4dadbfcc76a88adb974a330e07b9f218dea4ebd2b185e505a3c0d11f",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF",
+  "memoryStamping": [],
+  "opParaSize": 392,
+  "parameters": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "sha256": "c847ed74277792b9a3222ec160cc583911a1dd1a6184fedb0cce669be122df8d",
+  "workspace": {
+    "num": 1,
+    "size": [
+      16808960
+    ],
+    "type": [
+      0
+    ]
+  },
+  "taskRation": "0:1",
+  "supportSuperKernel": 1,
+  "localMemorySize": 196352
+}

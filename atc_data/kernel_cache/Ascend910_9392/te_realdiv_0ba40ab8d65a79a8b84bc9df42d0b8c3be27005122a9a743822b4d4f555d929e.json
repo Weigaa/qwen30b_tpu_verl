@@ -1,0 +1,19 @@
+{
+    "KBHit":false,
+    "binFileName":"te_realdiv_0ba40ab8d65a79a8b84bc9df42d0b8c3be27005122a9a743822b4d4f555d929e",
+    "binFileSuffix":".o",
+    "blockDim":32,
+    "coreType":"VectorCore",
+    "deterministic":"ignore",
+    "intercoreSync":0,
+    "kernelName":"te_realdiv_0ba40ab8d65a79a8b84bc9df42d0b8c3be27005122a9a743822b4d4f555d929e__kernel0",
+    "magic":"RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+    "memoryStamping":[],
+    "opParaSize":0,
+    "parameters":[
+        null,
+        null,
+        null
+    ],
+    "sha256":"c441fc5e625064da40be59e046ad94fdc7fb64fd0a38b31451be132a7056b5c2"
+}

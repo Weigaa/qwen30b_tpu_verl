@@ -1,0 +1,35 @@
+{
+  "binFileName": "te_moefinalizeroutingv2_7fbb33faac1b7d8a51643a097a080fd3a522bc56bac20925d49a34cb4b08f0fe",
+  "binFileSuffix": ".o",
+  "blockDim": 47,
+  "coreType": "VectorCore",
+  "core_type": "AIV",
+  "intercoreSync": 0,
+  "kernelName": "te_moefinalizeroutingv2_7fbb33faac1b7d8a51643a097a080fd3a522bc56bac20925d49a34cb4b08f0fe__kernel0",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+  "memoryStamping": [],
+  "opParaSize": 208,
+  "parameters": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "sha256": "706d435416536d05c169886fcd7e0d10311b07cf13ccc7c2ed5e96acdcdccc7b",
+  "workspace": {
+    "num": 1,
+    "size": [
+      16777216
+    ],
+    "type": [
+      0
+    ]
+  },
+  "supportSuperKernel": 1,
+  "localMemorySize": 0
+}

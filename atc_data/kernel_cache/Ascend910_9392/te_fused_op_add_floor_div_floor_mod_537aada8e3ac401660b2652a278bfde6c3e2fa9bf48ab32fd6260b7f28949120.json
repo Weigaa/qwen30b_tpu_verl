@@ -1,0 +1,22 @@
+{
+    "KBHit":false,
+    "binFileName":"te_fused_op_add_floor_div_floor_mod_537aada8e3ac401660b2652a278bfde6c3e2fa9bf48ab32fd6260b7f28949120",
+    "binFileSuffix":".o",
+    "blockDim":1,
+    "coreType":"VectorCore",
+    "deterministic":"ignore",
+    "intercoreSync":0,
+    "kernelName":"te_fused_op_add_floor_div_floor_mod_537aada8e3ac401660b2652a278bfde6c3e2fa9bf48ab32fd6260b7f28949120__kernel0",
+    "magic":"RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+    "memoryStamping":[],
+    "opParaSize":0,
+    "parameters":[
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+    ],
+    "sha256":"7ad2d531fae44feb2fea3c827b359ce3fbb8437bc8c1866a87ac4bc98f18b9b9"
+}

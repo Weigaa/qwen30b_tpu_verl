@@ -1,0 +1,28 @@
+From c5ad10aa0ccd7454f9448062e926a34b3b1f5365 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi2@huawei.com>
+Date: Fri, 28 Nov 2025 15:12:58 +0800
+Subject: [PATCH] enable rollout rebalance
+
+Enable rollout rebalance via `ROLLOUT_REBALANCE_ENABLE`. It dynamically migrates requests across ranks in real time,
+leverages multi-level compiled graphs, and greatly improves global throughput and resource utilization in long-sequence workloads.
+---
+ rl_train/qwen3/verl/workers/megatron_workers.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/llm_rl/qwen3/verl/workers/megatron_workers.py b/llm_rl/qwen3/verl/workers/megatron_workers.py
+index 6cb8086..fe892b3 100644
+--- a/llm_rl/qwen3/verl/workers/megatron_workers.py
++++ b/llm_rl/qwen3/verl/workers/megatron_workers.py
+@@ -77,6 +77,9 @@ from verl.workers.critic.megatron_critic import MegatronPPOCritic
+ from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
+ from verl.workers.rollout import get_rollout_class
+ 
++from patches.verl.features.rollout_optimize import init_rollout_rebalance
++init_rollout_rebalance()
++
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+-- 
+2.50.1.windows.1
+

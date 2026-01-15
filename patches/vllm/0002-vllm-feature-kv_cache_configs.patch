@@ -1,0 +1,37 @@
+From dc8e024b47ed2bb91fe950f190f4abb985c935d9 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Wed, 12 Nov 2025 15:24:26 +0800
+Subject: [PATCH 12/18] Update vllm: kv_cache_configs
+KV cache requires multiple initializations during training to achieve offloading.
+This patch makes the `kv_cache_configs` retrievable, ensuring that every reinitialization uses
+the exact config from the initial allocation, thereby guaranteeing memory layout consistency.
+---
+ llm_rl/qwen3/vllm/v1/engine/core.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/llm_rl/qwen3/vllm/v1/engine/core.py b/llm_rl/qwen3/vllm/v1/engine/core.py
+index a43042a..47361ae 100644
+--- a/llm_rl/qwen3/vllm/v1/engine/core.py
++++ b/llm_rl/qwen3/vllm/v1/engine/core.py
+@@ -196,15 +196,15 @@ class EngineCore:
+ 
+         assert len(kv_cache_specs) == len(available_gpu_memory)
+ 
+-        kv_cache_configs = get_kv_cache_configs(vllm_config, kv_cache_specs,
++        self.kv_cache_configs = get_kv_cache_configs(vllm_config, kv_cache_specs,
+                                                 available_gpu_memory)
+         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(
+-            kv_cache_configs)
++            self.kv_cache_configs)
+         num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+         num_cpu_blocks = 0
+ 
+         # Initialize kv cache and warmup the execution
+-        self.model_executor.initialize_from_config(kv_cache_configs)
++        self.model_executor.initialize_from_config(self.kv_cache_configs)
+ 
+         elapsed = time.time() - start
+         logger.info(("init engine (profile, create kv cache, "
+-- 
+2.50.1.windows.1
+

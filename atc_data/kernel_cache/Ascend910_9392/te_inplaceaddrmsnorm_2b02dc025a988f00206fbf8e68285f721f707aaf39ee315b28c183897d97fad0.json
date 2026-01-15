@@ -1,0 +1,33 @@
+{
+  "binFileName": "te_inplaceaddrmsnorm_2b02dc025a988f00206fbf8e68285f721f707aaf39ee315b28c183897d97fad0",
+  "binFileSuffix": ".o",
+  "blockDim": 16,
+  "coreType": "VectorCore",
+  "core_type": "AIV",
+  "intercoreSync": 0,
+  "kernelName": "te_inplaceaddrmsnorm_2b02dc025a988f00206fbf8e68285f721f707aaf39ee315b28c183897d97fad0__kernel0",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+  "memoryStamping": [],
+  "opParaSize": 40,
+  "parameters": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "sha256": "65a36acd98508288799a491d688d76d3186954523952079076e0241bde51dba6",
+  "workspace": {
+    "num": 1,
+    "size": [
+      16777472
+    ],
+    "type": [
+      0
+    ]
+  },
+  "supportSuperKernel": 1,
+  "localMemorySize": 0
+}

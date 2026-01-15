@@ -1,0 +1,98 @@
+From 7d5b4651adaf1cda8527ba0fc66980c36050a719 Mon Sep 17 00:00:00 2001
+From: mystri <mystri@noreply.gitcode.com>
+Date: Tue, 2 Dec 2025 00:18:21 +0800
+Subject: [PATCH] Switched back to PagedAttention by replacing
+ CANN-8.3-specific workarounds with environment variable
+
+---
+ qwen3/vllm_ascend/attention/attention_mask.py | 6 ++++--
+ qwen3/vllm_ascend/attention/attention_v1.py   | 5 +++--
+ qwen3/vllm_ascend/worker/model_runner_v1.py   | 4 ++--
+ 3 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/attention/attention_mask.py b/llm_rl/qwen3/vllm_ascend/attention/attention_mask.py
+index 225d4b9..57107c2 100644
+--- a/llm_rl/qwen3/vllm_ascend/attention/attention_mask.py
++++ b/llm_rl/qwen3/vllm_ascend/attention/attention_mask.py
+@@ -12,6 +12,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++import os
++
+ import torch
+ 
+ 
+@@ -50,7 +52,7 @@ class AttentionMaskBuilder:
+         self._seq_len_cached = attn_mask.shape[0]
+         self.attn_mask_cache = attn_mask
+         self.device = device
+-        if torch.version.cann.startswith("8.3"):
++        if int(os.environ.get("USE_FIA_FOR_SPEC_DECODING", "0")):
+             assigned_mask_dim = 2048
+             self.chunked_prefill_attn_mask = torch.triu(
+                 torch.ones(assigned_mask_dim, assigned_mask_dim),
+@@ -82,7 +84,7 @@ class AttentionMaskBuilder:
+         dtype: torch.dtype = None,
+         device: torch.device = None,
+     ) -> torch.Tensor:
+-        if torch.version.cann.startswith("8.3"):
++        if int(os.environ.get("USE_FIA_FOR_SPEC_DECODING", "0")):
+             return self.chunked_prefill_attn_mask
+         else:
+             if dtype not in [torch.float16, torch.bfloat16]:
+diff --git a/llm_rl/qwen3/vllm_ascend/attention/attention_v1.py b/llm_rl/qwen3/vllm_ascend/attention/attention_v1.py
+index d289bb4..0f89a0d 100644
+--- a/llm_rl/qwen3/vllm_ascend/attention/attention_v1.py
++++ b/llm_rl/qwen3/vllm_ascend/attention/attention_v1.py
+@@ -17,6 +17,7 @@
+ 
+ from dataclasses import dataclass
+ from enum import Enum
++import os
+ from typing import ClassVar, List, Optional, Tuple, Type
+ 
+ import torch
+@@ -476,7 +477,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             attn_metadata.seq_lens = \
+                 attn_metadata.seq_lens.to(device=query.device)
+ 
+-        if torch.version.cann.startswith("8.3"):
++        if int(os.environ.get("USE_FIA_FOR_SPEC_DECODING", "0")):
+             # TODO:The npu_fused_infer_attention_score op is planned to
+             # be utilized in a wider range in upcoming versions.
+             num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
+@@ -606,7 +607,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+                                                    output)
+             # Normal V1 situation.
+             else:
+-                if torch.version.cann.startswith("8.3"):
++                if int(os.environ.get("USE_FIA_FOR_SPEC_DECODING", "0")):
+                     # npu_fused_infer_attention_score does not support cases
+                     # where query.shape[0] != attn_metadata.query_start_loc[-1].
+                     # Thus we need unpad it here.
+diff --git a/llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py b/llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py
+index 561e2ad..b0774fd 100644
+--- a/llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py
++++ b/llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py
+@@ -325,7 +325,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
+                 self.block_size,
+                 use_mla=self.model_config.use_mla,
+                 use_sfa=self.ascend_config.use_sfa)
+-        if torch.version.cann.startswith("8.3"):
++        if int(os.environ.get("USE_FIA_FOR_SPEC_DECODING", "0")):
+             self.attn_mask_builder = AttentionMaskBuilder(
+                 self.scheduler_config.max_num_batched_tokens, self.dtype,
+                 self.device)
+@@ -892,7 +892,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
+                              attn_state) -> torch.Tensor:
+         # Chunk Prefill situation.
+         if attn_state == AscendAttentionState.ChunkedPrefill and not self.vllm_config.model_config.use_mla and not self.ascend_config.use_sfa:
+-            if torch.version.cann.startswith("8.3"):
++            if int(os.environ.get("USE_FIA_FOR_SPEC_DECODING", "0")):
+                 return self.attn_mask_builder.get_splitfuse_attn_mask()
+             else:
+                 return self.attn_mask_builder.get_splitfuse_attn_mask(
+-- 
+2.28.0.windows.1
+

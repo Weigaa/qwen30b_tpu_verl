@@ -1,0 +1,98 @@
+From ac46c5d461f6f23c7a06e11cca5509839e471613 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Mon, 17 Nov 2025 16:24:30 +0800
+Subject: [PATCH] Update vllm_ascend: chunk moe
+For MoE computation scenarios, implement chunk processing optimization to address excessive peak memory
+in prefill phase.
+
+---
+ .../torchair/ops/torchair_fused_moe.py        | 52 +++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/torchair/ops/torchair_fused_moe.py b/llm_rl/qwen3/vllm_ascend/torchair/ops/torchair_fused_moe.py
+index 5514ce1..e1cf384 100644
+--- a/llm_rl/qwen3/vllm_ascend/torchair/ops/torchair_fused_moe.py
++++ b/llm_rl/qwen3/vllm_ascend/torchair/ops/torchair_fused_moe.py
+@@ -54,6 +54,55 @@ from vllm_ascend.utils import (AscendSocVersion, dispose_tensor,
+                                vllm_version_is)
+ 
+ 
++def chunk_moe_decorator(fused_experts_func):
++    chunk_moe_size = int(os.environ.get('VLLM_CHUNK_MOE_SIZE', 512))
++
++    def wrapper(hidden_states, topk_weights, topk_ids, *args, **kwargs):
++        final_hidden_states = torch.zeros_like(hidden_states)
++        chunk_start_index = 0
++        ctx = get_forward_context()
++        from vllm.distributed import get_tensor_model_parallel_world_size
++        tp_size = get_tensor_model_parallel_world_size()
++        max_tokens = (ctx.max_tokens_across_dp + tp_size - 1) // tp_size
++
++        if max_tokens < chunk_moe_size:
++            mlp_hidden_states = fused_experts_func(
++                hidden_states=hidden_states,
++                topk_weights=topk_weights,
++                topk_ids=topk_ids,
++                *args,
++                **kwargs
++            )
++            return mlp_hidden_states
++            
++        num_tokens = hidden_states.size(0)
++        for chunk_start in range(0, max_tokens, chunk_moe_size):
++            chunk_end = min(chunk_start + chunk_moe_size, max_tokens)
++            chunk_start = min(chunk_start, num_tokens - 1)
++            chunk_end = min(chunk_end, num_tokens)
++            chunk_hidden_states = hidden_states[chunk_start:chunk_end]
++            chunk_topk_ids = topk_ids[chunk_start:chunk_end]
++            chunk_topk_weights = topk_weights[chunk_start:chunk_end]
++            update_kwargs = dict(**kwargs)
++            if update_kwargs.get('shared_experts'):
++                update_kwargs['shared_experts'] = update_kwargs['shared_experts'][chunk_start:chunk_end]
++            
++            mlp_hidden_states = fused_experts_func(
++                hidden_states=chunk_hidden_states,
++                topk_weights=chunk_topk_weights,
++                topk_ids=chunk_topk_ids,
++                *args,
++                **update_kwargs
++            )
++
++            chunk_end_idx = chunk_start_index + mlp_hidden_states.shape[0]
++            final_hidden_states[chunk_start_index: chunk_end_idx, :] = mlp_hidden_states
++            chunk_start_index = chunk_end_idx
++        return final_hidden_states
++
++    return wrapper
++
++
+ def torchair_fused_experts_with_mc2(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,
+@@ -259,6 +308,7 @@ def torchair_apply_mlp(
+ 
+ # currently expert parallelism implemented with all2all
+ # is under-optimized.
++@chunk_moe_decorator
+ def torchair_fused_experts_with_all2all(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,
+@@ -390,6 +440,7 @@ def torchair_fused_experts_with_all2all(
+     return final_hidden_states
+ 
+ 
++@chunk_moe_decorator
+ def torchair_fused_experts_moge(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,
+@@ -481,6 +532,7 @@ def torchair_fused_experts_moge(
+     return final_hidden_states
+ 
+ 
++@chunk_moe_decorator
+ def torchair_fused_experts(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,
+-- 
+2.50.1.windows.1
+

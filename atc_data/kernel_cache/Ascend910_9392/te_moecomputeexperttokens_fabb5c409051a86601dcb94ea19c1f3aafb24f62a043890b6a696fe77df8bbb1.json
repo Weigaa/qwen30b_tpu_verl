@@ -1,0 +1,29 @@
+{
+  "binFileName": "te_moecomputeexperttokens_fabb5c409051a86601dcb94ea19c1f3aafb24f62a043890b6a696fe77df8bbb1",
+  "binFileSuffix": ".o",
+  "blockDim": 48,
+  "coreType": "MIX",
+  "intercoreSync": 1,
+  "kernelName": "te_moecomputeexperttokens_fabb5c409051a86601dcb94ea19c1f3aafb24f62a043890b6a696fe77df8bbb1",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF",
+  "memoryStamping": [],
+  "opParaSize": 320,
+  "parameters": [
+    null,
+    null,
+    null
+  ],
+  "sha256": "e10703e9d258a594ecd89437562eb07669abf624a816825eee9b66dc5da0cba3",
+  "workspace": {
+    "num": 1,
+    "size": [
+      16801792
+    ],
+    "type": [
+      0
+    ]
+  },
+  "taskRation": "0:1",
+  "supportSuperKernel": 1,
+  "localMemorySize": 0
+}

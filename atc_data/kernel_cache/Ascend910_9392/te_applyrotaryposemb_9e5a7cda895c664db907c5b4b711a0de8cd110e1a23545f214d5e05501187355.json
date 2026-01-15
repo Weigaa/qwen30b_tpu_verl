@@ -1,0 +1,33 @@
+{
+  "binFileName": "te_applyrotaryposemb_9e5a7cda895c664db907c5b4b711a0de8cd110e1a23545f214d5e05501187355",
+  "binFileSuffix": ".o",
+  "blockDim": 16,
+  "coreType": "VectorCore",
+  "core_type": "AIV",
+  "intercoreSync": 0,
+  "kernelName": "te_applyrotaryposemb_9e5a7cda895c664db907c5b4b711a0de8cd110e1a23545f214d5e05501187355__kernel0",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+  "memoryStamping": [],
+  "opParaSize": 272,
+  "parameters": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "sha256": "48f7ab7af83a2531f9c1b767f6849627ccb08e0323d5222803f21e0891ae94aa",
+  "workspace": {
+    "num": 1,
+    "size": [
+      16777216
+    ],
+    "type": [
+      0
+    ]
+  },
+  "supportSuperKernel": 1,
+  "localMemorySize": 0
+}

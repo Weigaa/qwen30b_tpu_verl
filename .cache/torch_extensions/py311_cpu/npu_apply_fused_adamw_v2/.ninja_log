@@ -1,0 +1,3 @@
+# ninja log v7
+0	22555	1766379634873301590	npu_apply_fused_adamw_v2.o	7c70604b55adf14
+22555	22970	1766379657429398111	npu_apply_fused_adamw_v2.so	47c97d830c999ccc

@@ -1,0 +1,3 @@
+# ninja log v7
+0	27878	1766379473432610768	npu_rotary_position_embedding.o	85ba239ace614e8f
+27878	28286	1766379501312730069	npu_rotary_position_embedding.so	6a094b6d93984fa6

@@ -1,0 +1,29 @@
+{
+  "binFileName": "te_swiglu_d5418d658223ba9b5e2918e51b4a1ce369e0bd829ecdc5297da086894ecf60a1",
+  "binFileSuffix": ".o",
+  "blockDim": 48,
+  "coreType": "VectorCore",
+  "core_type": "AIV",
+  "intercoreSync": 0,
+  "kernelName": "te_swiglu_d5418d658223ba9b5e2918e51b4a1ce369e0bd829ecdc5297da086894ecf60a1__kernel0",
+  "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+  "memoryStamping": [],
+  "opParaSize": 88,
+  "parameters": [
+    null,
+    null,
+    null
+  ],
+  "sha256": "1a7dddcc4e7a8a11339b29d82839b131d31ab0151c8deaccd990f3d5c2b55602",
+  "workspace": {
+    "num": 1,
+    "size": [
+      16777216
+    ],
+    "type": [
+      0
+    ]
+  },
+  "supportSuperKernel": 1,
+  "localMemorySize": 0
+}
