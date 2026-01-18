@@ -534,6 +534,7 @@ class Qwen3MoeModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
+        print("vllm moe expert_params_mapping is", expert_params_mapping)
         for name, loaded_weight in weights:
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -602,6 +603,11 @@ class Qwen3MoeModel(nn.Module):
                     # available replicas.
                     weight_loader = typing.cast(Callable[..., bool],
                                                 param.weight_loader)
+                    #print("moe weight_loader is", weight_loader)
+                    self.ep_group = get_ep_group().device_group
+                    if self.ep_group.rank() == 0:
+                        print("name is", name, "param_name is", param_name)
+                        print("ep_rank is ", self.ep_group.rank(), "load_weight is", loaded_weight, "name_mapped", name_mapped, "shard_id", shard_id, "expert_id", expert_id)
                     success = weight_loader(param,
                                             loaded_weight,
                                             name_mapped,

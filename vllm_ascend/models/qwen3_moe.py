@@ -67,6 +67,8 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
     ):
         nn.Module.__init__(self)
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.prefix = prefix
+        self.layer_idx = extract_layer_index(prefix) 
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -89,6 +91,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            layer_idx=self.layer_idx
         )
 
         self.top_k = config.num_experts_per_tok

@@ -1,1462 +1,642 @@
 [
     [
-        188098,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_272990259689515809"
+        1360778,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3915932124972445800"
     ],
     [
-        188099,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1567533944458273035"
+        1360889,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18121373851232734502"
     ],
     [
-        188100,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12019227661829513526"
+        1360927,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7356127557938526073"
     ],
     [
-        188101,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15310657039066933462"
+        1360928,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14993170181929903163"
     ],
     [
-        188102,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8466028326964990687"
+        1360929,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14795262022320059807"
     ],
     [
-        188103,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10599865163533448580"
+        1360930,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14263784647894939265"
     ],
     [
-        188104,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4536449438095816428"
+        1360931,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9025813102841834613"
     ],
     [
-        188105,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4545072622036177841"
+        1360932,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17212972755528178657"
     ],
     [
-        188106,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11274085853039431644"
+        1360933,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11142946480106083601"
     ],
     [
-        188108,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11532599502381623775"
+        1360934,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6303469098025360851"
     ],
     [
-        188110,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14497124962239678361"
+        1360935,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10212110246210064505"
     ],
     [
-        188111,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16318605274242117400"
+        1360936,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7315310922408755169"
     ],
     [
-        188119,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6453089277917025000"
+        1360937,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_387749710508938678"
     ],
     [
-        188120,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15053607801218430845"
+        1360938,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11087899784141325583"
     ],
     [
-        188124,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9790258183854030494"
+        1361016,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3723420371660192593"
     ],
     [
-        188125,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10164582148365166051"
+        1361020,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2461752587826032692"
     ],
     [
-        356796,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13461722638261860654"
+        1550109,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4618352663368372209"
     ],
     [
-        356797,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7459678621551711827"
+        1550110,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4051382182617777111"
     ],
     [
-        356798,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11551725888910550151"
+        1550111,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1466711685003230525"
     ],
     [
-        356799,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3926624412365231548"
+        1550112,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2119346068317687867"
     ],
     [
-        356800,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8428199263920301753"
+        1550113,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18343452157581379702"
     ],
     [
-        356801,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7135873813571137593"
+        1550114,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5855320331727437680"
     ],
     [
-        356802,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13526173415300306212"
+        1550115,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10614569971893033982"
     ],
     [
-        356803,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9451094462210943635"
+        1550120,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16934396051824220747"
     ],
     [
-        356804,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6635281186808150310"
+        1550121,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11119746430583259934"
     ],
     [
-        356805,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17086150716955125702"
+        1550122,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13183110423808662121"
     ],
     [
-        356806,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6079613984264783458"
+        1550123,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16086533407245683782"
     ],
     [
-        356807,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7634150688079516436"
+        1550124,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10734574725084274612"
     ],
     [
-        356808,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10353755963116822369"
+        1550128,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15394743031184935762"
     ],
     [
-        356809,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9491634291401929773"
+        1550132,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14779461043485025265"
     ],
     [
-        356810,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8437015278771511154"
+        1550136,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16704375365032210805"
     ],
     [
-        456318,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10397676416790947795"
+        1550143,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5104455636246886190"
     ],
     [
-        456319,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15373798952877255319"
+        1895539,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11710314170440219276"
     ],
     [
-        456320,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6786491562562683920"
+        1895540,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16622638031200014963"
     ],
     [
-        456321,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13088549227644055598"
+        1895541,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1728727066378562611"
     ],
     [
-        456322,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15829095250982874855"
+        1895543,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8359755672521657974"
     ],
     [
-        456323,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12579761675484753328"
+        1895547,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12018898345910262315"
     ],
     [
-        456324,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6372718464398535232"
+        1895548,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8273805127112209684"
     ],
     [
-        456325,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12656892220499425329"
+        1895552,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15162034778297191825"
     ],
     [
-        456326,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6842756248576246767"
+        1895553,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15537813111186928269"
     ],
     [
-        456327,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8367214074491209025"
+        1895554,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2852721951058122267"
     ],
     [
-        456328,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_99464227725376387"
+        1895555,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10943433949900474550"
     ],
     [
-        456329,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5210996369906969536"
+        1895556,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14466281218164483440"
     ],
     [
-        456330,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9389545571671083574"
+        1895557,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9033922310882174118"
     ],
     [
-        456331,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12254734450736061"
+        1895561,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_521309671513709611"
     ],
     [
-        456332,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17932513652851767105"
+        1895571,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7998877703654694758"
     ],
     [
-        456333,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14090594176964564234"
+        1895576,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16894841587145618548"
     ],
     [
-        495216,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17626236844903762461"
+        1895577,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16064163209964111654"
     ],
     [
-        495221,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11583765045477340066"
+        2118189,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2700240408248335427"
     ],
     [
-        495224,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_495302576960739691"
+        2118190,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17677322638971121434"
     ],
     [
-        495225,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8508411714553750380"
+        2118191,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14890029869956155927"
     ],
     [
-        495226,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1722681046036312428"
+        2118192,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14155414097798881865"
     ],
     [
-        495227,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17952367553337471877"
+        2118193,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4200533826641164441"
     ],
     [
-        495228,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8070026399629536705"
+        2118194,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9578493748715564157"
     ],
     [
-        495230,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7796760132435908210"
+        2118195,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8776687103324297252"
     ],
     [
-        495231,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12045500048195906014"
+        2118196,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4544576444749706814"
     ],
     [
-        495232,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3407306170060729420"
+        2118197,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15364866002614514574"
     ],
     [
-        495233,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16444435232113149695"
+        2118198,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14355753415630592164"
     ],
     [
-        495236,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11115140804174492101"
+        2118199,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14154579014666301065"
     ],
     [
-        495238,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16575312707081264808"
+        2118203,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13789170960555013263"
     ],
     [
-        495239,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7708088984570072629"
+        2118210,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12864456039140271766"
     ],
     [
-        495244,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15098912859142936427"
+        2118214,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9391376276648630013"
     ],
     [
-        495246,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5740423107391032854"
+        2118218,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17300976149447878878"
     ],
     [
-        589392,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_235088948364010666"
+        2118225,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6219917286821889693"
     ],
     [
-        589393,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16667541016666412654"
+        2303704,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2578869877365477771"
     ],
     [
-        589394,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_951868981246499520"
+        2303708,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10350961909267152588"
     ],
     [
-        589395,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5472195743392789560"
+        2303712,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_598328691904439720"
     ],
     [
-        589396,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13124987193652639819"
+        2303713,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15887710233650642293"
     ],
     [
-        589397,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12943786958868442120"
+        2303714,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4803676881882713320"
     ],
     [
-        589398,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16617244706037638033"
+        2303715,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9691076256180138016"
     ],
     [
-        589402,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3571491964890156508"
+        2303716,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1044678947148819684"
     ],
     [
-        589403,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7137185988032368071"
+        2303717,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5614403437761849676"
     ],
     [
-        589404,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8720001743696232842"
+        2303718,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4664023905950654393"
     ],
     [
-        589405,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1422328019004333504"
+        2303719,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5937224180401056820"
     ],
     [
-        589406,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18263975167383985277"
+        2303720,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9973972771249064757"
     ],
     [
-        589407,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11418257189821602586"
+        2303721,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3370276951572823586"
     ],
     [
-        589408,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13329214291869005405"
+        2303722,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2436636962666481581"
     ],
     [
-        589409,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8152074586674290079"
+        2303723,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1237716088313651577"
     ],
     [
-        589410,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4608976924218050272"
+        2303724,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9299271327529863568"
     ],
     [
-        688449,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17749239766260549225"
+        2303725,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10471304795282304145"
     ],
     [
-        688450,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13275772969826070505"
+        2360635,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4291121013414454234"
     ],
     [
-        688451,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1464339058300515964"
+        2360636,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1588750387849673508"
     ],
     [
-        688452,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4384981293254365371"
+        2360637,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5366906808383606127"
     ],
     [
-        688453,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11500977648132842438"
+        2360638,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_250070954949090318"
     ],
     [
-        688454,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1862571982293933091"
+        2360639,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7707286902726357706"
     ],
     [
-        688455,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9836192723369082602"
+        2360640,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4742384504792211751"
     ],
     [
-        688456,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14665384319634083339"
+        2360641,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4904030475562702207"
     ],
     [
-        688457,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16130687278507751966"
+        2360642,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9497311609922542708"
     ],
     [
-        688458,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17029796646851096472"
+        2360643,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17467505209755485291"
     ],
     [
-        688459,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12473846709334781163"
+        2360644,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6770073020681578982"
     ],
     [
-        688460,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4503056398406138890"
+        2360645,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13819383555719945284"
     ],
     [
-        688461,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2118321232201350973"
+        2360646,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11414503270297476174"
     ],
     [
-        688462,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14883329497815624574"
+        2360647,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16643006773960610038"
     ],
     [
-        688463,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2293917037907662176"
+        2360648,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1579983409267364904"
     ],
     [
-        688464,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2716617556968969707"
+        2360649,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2028672837767454147"
     ],
     [
-        949165,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_422366804694234074"
+        2360650,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2336599989399404076"
     ],
     [
-        949166,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7367774656170757747"
+        2492468,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5385068828090705986"
     ],
     [
-        949167,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8025452927560304541"
+        2492473,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7292001872635007061"
     ],
     [
-        949168,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_189521719214768436"
+        2492474,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17736710217260981851"
     ],
     [
-        949169,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8727972527915948732"
+        2492475,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14154669064835307357"
     ],
     [
-        949170,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17239144387418532854"
+        2492476,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14109816733988775985"
     ],
     [
-        949171,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16803485094352781059"
+        2492478,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6237864864932172558"
     ],
     [
-        949172,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13664815847615128808"
+        2492479,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12529961251128796908"
     ],
     [
-        949173,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16774778324592931941"
+        2492480,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16724900193890402729"
     ],
     [
-        949174,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1363208276011168004"
+        2492481,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16268486864360227254"
     ],
     [
-        949175,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6267539729502221283"
+        2492483,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9917340808200511023"
     ],
     [
-        949179,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14278020258245693835"
+        2492484,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3363181873140679883"
     ],
     [
-        949180,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13945466732304876021"
+        2492485,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12060058296732669742"
     ],
     [
-        949181,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6951564173768266239"
+        2492486,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16405333996580953888"
     ],
     [
-        949182,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18407853836042108666"
+        2492487,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9340752769026174395"
     ],
     [
-        949183,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11044146055010480853"
+        2492488,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1686098351705532540"
     ],
     [
-        1150690,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16786525984878181839"
+        2492489,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9500972609733720513"
     ],
     [
-        1150691,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17251987995827307804"
+        2575105,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18346751326509068074"
     ],
     [
-        1150692,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12109832616230468911"
+        2575106,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14698254802481840471"
     ],
     [
-        1150693,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14051916416928921410"
+        2575107,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12656587557675523131"
     ],
     [
-        1150694,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14982607998861410749"
+        2575108,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_272252259313835893"
     ],
     [
-        1150695,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8459971471051860885"
+        2575109,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16207043325263337216"
     ],
     [
-        1150696,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17661512851061971564"
+        2575110,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16748042772643966083"
     ],
     [
-        1150697,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5213405469976606649"
+        2575111,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18145777929171853350"
     ],
     [
-        1150698,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8687350060559555271"
+        2575112,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14609533872448536305"
     ],
     [
-        1150699,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_878538900565279205"
+        2575113,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16515704959928590977"
     ],
     [
-        1150701,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_492187739584835163"
+        2575114,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14580348462803730767"
     ],
     [
-        1150702,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15220520854776354456"
+        2575115,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6740189340760049989"
     ],
     [
-        1150703,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7694382260031365593"
+        2575116,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15848987930492575883"
     ],
     [
-        1150704,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16020656266011934226"
+        2575117,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8143275094754965033"
     ],
     [
-        1150705,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7676223887448189134"
+        2575118,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5939650387026606284"
     ],
     [
-        1150706,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6993530728428722683"
+        2575119,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16261883006737918239"
     ],
     [
-        1293018,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1875103619316439479"
+        2575123,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2008587479637634408"
     ],
     [
-        1293019,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6395694373670069513"
+        3037229,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17737480427890123125"
     ],
     [
-        1293020,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13727941365915014642"
+        3037274,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16028358876934758329"
     ],
     [
-        1293021,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13953874702432259218"
+        3037296,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1320958950830206509"
     ],
     [
-        1293022,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7796160150951260620"
+        3037315,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8666389687770878864"
     ],
     [
-        1293023,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11401010705217937416"
+        3037333,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_422227064011388793"
     ],
     [
-        1293024,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16801344568355757321"
+        3037334,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6448491546359599693"
     ],
     [
-        1293025,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6811205975976934855"
+        3037335,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12320023686183522885"
     ],
     [
-        1293026,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3546883272084021352"
+        3037336,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9000455967904928097"
     ],
     [
-        1293027,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9439433361191815341"
+        3037337,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10489069723706088872"
     ],
     [
-        1293028,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8593185732958408953"
+        3037338,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11861189830250119956"
     ],
     [
-        1293029,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13568655196358074816"
+        3037339,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7249713998067653469"
     ],
     [
-        1293030,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13972311440772850889"
+        3037340,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5092676201006416914"
     ],
     [
-        1293031,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14565715084748674374"
+        3037341,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5476550161852416490"
     ],
     [
-        1293035,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12873703882221126572"
+        3037348,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12008861150427251984"
     ],
     [
-        1293036,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14006342295653941951"
+        3037352,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3155641679530740510"
     ],
     [
-        1351599,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15074602165644051896"
+        3037359,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15091054634047992606"
     ],
     [
-        1351600,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8546533508741812508"
+        4036531,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1642483827487563143"
     ],
     [
-        1351604,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5356465778366678120"
+        4036532,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2574938135033366130"
     ],
     [
-        1351607,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8631865865211785263"
+        4036533,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1771340443921916468"
     ],
     [
-        1351608,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7309480276290979121"
+        4036534,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13375033939091976546"
     ],
     [
-        1351609,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14701246007951320190"
+        4036535,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15245516441314452853"
     ],
     [
-        1351610,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13703788012623683756"
+        4036536,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17808264439708216057"
     ],
     [
-        1351614,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2352075269734734223"
+        4036537,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1114891929732803720"
     ],
     [
-        1351616,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9216748231094584806"
+        4036538,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10521718911684944757"
     ],
     [
-        1351617,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2904398514208580671"
+        4036542,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12943294171690031320"
     ],
     [
-        1351618,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7080511503495659388"
+        4036543,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5860138386478300048"
     ],
     [
-        1351619,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17480147324193122844"
+        4036544,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12739749125090759625"
     ],
     [
-        1351620,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10713303060690530122"
+        4036545,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10228272311581415980"
     ],
     [
-        1351621,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10750039813838157137"
+        4036546,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8120005904899110724"
     ],
     [
-        1351623,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17449607582291771216"
+        4036547,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6159837765836239080"
     ],
     [
-        1351626,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18432613638514451373"
+        4036548,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3261219151105670958"
     ],
     [
-        1590870,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9925276427384206477"
-    ],
-    [
-        1590871,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4620926482865639538"
-    ],
-    [
-        1590873,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13358316155130461456"
-    ],
-    [
-        1590874,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2903767267195601944"
-    ],
-    [
-        1590880,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18198418161267924297"
-    ],
-    [
-        1590882,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18410428981264618583"
-    ],
-    [
-        1590883,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10276571084158675695"
-    ],
-    [
-        1590887,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1590686928815967876"
-    ],
-    [
-        1590888,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8596047717007688737"
-    ],
-    [
-        1590889,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3576513118683676363"
-    ],
-    [
-        1590890,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13687755941865737343"
-    ],
-    [
-        1590891,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4588084878329987641"
-    ],
-    [
-        1590892,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9625546826695673365"
-    ],
-    [
-        1830820,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8526804018770535626"
-    ],
-    [
-        1830821,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_757005163549060371"
-    ],
-    [
-        1830826,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9296797224003670121"
-    ],
-    [
-        1830828,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2896098930234504728"
-    ],
-    [
-        1830829,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9105718338226736700"
-    ],
-    [
-        1830830,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1769169435605659403"
-    ],
-    [
-        1830831,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10188482637566781628"
-    ],
-    [
-        1830832,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11021282964861812689"
-    ],
-    [
-        1830833,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_842020380192491367"
-    ],
-    [
-        1830834,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17816247788262642040"
-    ],
-    [
-        1830835,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14207044109994714705"
-    ],
-    [
-        1830836,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_243358943421227551"
-    ],
-    [
-        1830840,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9279593159990517714"
-    ],
-    [
-        1830843,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12926548861057611585"
-    ],
-    [
-        1830845,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4144476226357900693"
-    ],
-    [
-        2054138,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11756791474868583590"
-    ],
-    [
-        2054142,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8908639824414784227"
-    ],
-    [
-        2054143,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_264046166155564591"
-    ],
-    [
-        2054144,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1056367648679600789"
-    ],
-    [
-        2054145,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6683490351896304624"
-    ],
-    [
-        2054146,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3544713860187192115"
-    ],
-    [
-        2054148,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4172669876686395765"
-    ],
-    [
-        2054149,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13839352417108910386"
-    ],
-    [
-        2054150,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18225007863123961697"
-    ],
-    [
-        2054151,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3591803757438362370"
-    ],
-    [
-        2054152,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9356606598448177007"
-    ],
-    [
-        2054153,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4270697654239705099"
-    ],
-    [
-        2054154,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11433597856257352748"
-    ],
-    [
-        2054155,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2083022235806188941"
-    ],
-    [
-        2054156,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15442773278037366488"
-    ],
-    [
-        2054157,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3429025954000431177"
-    ],
-    [
-        2361621,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6222191904392861109"
-    ],
-    [
-        2361622,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1466130417143170033"
-    ],
-    [
-        2361623,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17819359155177819906"
-    ],
-    [
-        2361624,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1714984675135185127"
-    ],
-    [
-        2361625,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3134511812096025699"
-    ],
-    [
-        2361626,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7834293205853064694"
-    ],
-    [
-        2361627,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6357947412570702640"
-    ],
-    [
-        2361628,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_476777804991244580"
-    ],
-    [
-        2361629,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16282639128252588934"
-    ],
-    [
-        2361630,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3073065388350803399"
-    ],
-    [
-        2361631,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17253055137556338759"
-    ],
-    [
-        2361632,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17350423668316816932"
-    ],
-    [
-        2361633,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9279952019437263613"
-    ],
-    [
-        2361634,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12021822526414247845"
-    ],
-    [
-        2361639,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4127238000045298456"
-    ],
-    [
-        2361642,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3410203216841197166"
-    ],
-    [
-        2424919,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2888825068508520927"
-    ],
-    [
-        2424920,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9517124497371541518"
-    ],
-    [
-        2424923,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11154744980577051308"
-    ],
-    [
-        2424924,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17027245836328461586"
-    ],
-    [
-        2424925,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13568108951245342881"
-    ],
-    [
-        2424928,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4179598900598302354"
-    ],
-    [
-        2424932,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11848865337859194973"
-    ],
-    [
-        2424933,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18231546567020736069"
-    ],
-    [
-        2424936,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2356667578409697731"
-    ],
-    [
-        2424937,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4522670700343273167"
-    ],
-    [
-        2424938,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14574573524996405503"
-    ],
-    [
-        2424939,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15531532662548747062"
-    ],
-    [
-        2424940,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7420177374256012499"
-    ],
-    [
-        2424942,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10755491907770229898"
-    ],
-    [
-        2424943,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12314441894500828974"
-    ],
-    [
-        2424950,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4495525306396755711"
-    ],
-    [
-        2515010,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12649827057363634593"
-    ],
-    [
-        2515011,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16458923052679689117"
-    ],
-    [
-        2515012,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15510839684273876208"
-    ],
-    [
-        2515013,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3231783917259668375"
-    ],
-    [
-        2515014,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10204075309487467921"
-    ],
-    [
-        2515015,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4225758131562146647"
-    ],
-    [
-        2515016,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4116017636283626088"
-    ],
-    [
-        2515017,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17573210625407099237"
-    ],
-    [
-        2515018,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_483448897891101039"
-    ],
-    [
-        2515019,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5490797944274151468"
-    ],
-    [
-        2515020,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10892883821470714555"
-    ],
-    [
-        2515021,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2480658531648992500"
-    ],
-    [
-        2515022,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2022881704747260500"
-    ],
-    [
-        2515023,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7270525598152071891"
-    ],
-    [
-        2515024,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14330384202470171681"
-    ],
-    [
-        2515025,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16170061244790241747"
-    ],
-    [
-        2665266,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6084340606291353780"
-    ],
-    [
-        2665267,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8973148673623724442"
-    ],
-    [
-        2665268,
-        "/worpace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8973148673623724442"
-    ],
-    [
-        2665268,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10611920715323850785"
-    ],
-    [
-        2665272,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1658150782001343993"
-    ],
-    [
-        2665273,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2429794267119402438"
-    ],
-    [
-        2665280,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9357804093203873820"
-    ],
-    [
-        2665281,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10960363050881637789"
-    ],
-    [
-        2665282,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3799481006505384338"
-    ],
-    [
-        2665283,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13856332336184126149"
-    ],
-    [
-        2665284,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_165674049149868062"
-    ],
-    [
-        2665285,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5360042981715574661"
-    ],
-    [
-        2665286,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1941460554554904805"
-    ],
-    [
-        2665287,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3327765753509018855"
-    ],
-    [
-        2665288,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8504647272381972646"
-    ],
-    [
-        2665289,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11774142829201517848"
-    ],
-    [
-        2665293,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_40304565133606873"
-    ],
-    [
-        2797659,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12982750929161252962"
-    ],
-    [
-        2797661,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17513259304362650024"
-    ],
-    [
-        2797662,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6425781255083093786"
-    ],
-    [
-        2797663,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9737854269795264979"
-    ],
-    [
-        2797664,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6140269875655887859"
-    ],
-    [
-        2797665,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4461096780475847487"
-    ],
-    [
-        2797666,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12843866856067135280"
-    ],
-    [
-        2797691,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1907115018005242895"
-    ],
-    [
-        2797692,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12045316992246703804"
-    ],
-    [
-        2797693,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18243409642065896977"
-    ],
-    [
-        2797694,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11604048714523581832"
-    ],
-    [
-        2797695,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17076373483966452525"
-    ],
-    [
-        2797696,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_219694660753188105"
-    ],
-    [
-        2797700,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10044979658869281423"
-    ],
-    [
-        2797701,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1276123169376710174"
-    ],
-    [
-        2797705,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2951164984010953395"
-    ],
-    [
-        3006238,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10722456772958466658"
-    ],
-    [
-        3006239,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1689084152984046973"
-    ],
-    [
-        3006240,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4921791569331021864"
-    ],
-    [
-        3006241,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7294820189304625405"
-    ],
-    [
-        3006243,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5966839630544113435"
-    ],
-    [
-        3006244,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12449574902137852563"
-    ],
-    [
-        3006245,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18392253317336535068"
-    ],
-    [
-        3006246,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14597450942953649129"
-    ],
-    [
-        3006247,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4514422697302720770"
-    ],
-    [
-        3006248,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4705665131390936798"
-    ],
-    [
-        3006250,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18240186146838946007"
-    ],
-    [
-        3006251,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11866027921559596633"
-    ],
-    [
-        3006252,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3580622529817323654"
-    ],
-    [
-        3006253,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_441496627624169770"
-    ],
-    [
-        3006258,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16214804374962438142"
-    ],
-    [
-        3006261,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8107913401376371236"
-    ],
-    [
-        3341661,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_808148611891202731"
-    ],
-    [
-        3341662,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_987000060868325455"
-    ],
-    [
-        3341663,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13469036117766997460"
-    ],
-    [
-        3341664,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11393244133368370650"
-    ],
-    [
-        3341665,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3865717063003728390"
-    ],
-    [
-        3341666,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17920697377991039839"
-    ],
-    [
-        3341667,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8800921247718614048"
-    ],
-    [
-        3341668,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12137388106006031579"
-    ],
-    [
-        3341669,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3528600662388576535"
-    ],
-    [
-        3341670,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17133621807414469877"
-    ],
-    [
-        3341671,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2800620804925461455"
-    ],
-    [
-        3341675,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2925300655663625244"
-    ],
-    [
-        3341676,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16826701047093005698"
-    ],
-    [
-        3341677,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14283536057860274317"
-    ],
-    [
-        3341681,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14670338665889338759"
-    ],
-    [
-        3341682,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6594921498058009611"
-    ],
-    [
-        3627729,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8411722513560216422"
-    ],
-    [
-        3627730,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14704080781666576048"
-    ],
-    [
-        3627731,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17758475443120008835"
-    ],
-    [
-        3627732,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15341514494008540119"
-    ],
-    [
-        3627733,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_2625533917070071616"
-    ],
-    [
-        3627734,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_11946205947725617270"
-    ],
-    [
-        3627735,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7360628822320577017"
-    ],
-    [
-        3627736,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4915137595881747034"
-    ],
-    [
-        3627737,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17631145198037493173"
-    ],
-    [
-        3627738,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6022888699417347057"
-    ],
-    [
-        3627739,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8488571697896531650"
-    ],
-    [
-        3627744,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_463438028198693385"
-    ],
-    [
-        3627745,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15801960081652719914"
-    ],
-    [
-        3627746,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3225042823891540323"
-    ],
-    [
-        3627750,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4680438245494612956"
-    ],
-    [
-        3627751,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3974332387399397394"
-    ],
-    [
-        3885295,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3443266761228490066"
-    ],
-    [
-        3885296,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_14028036200181786644"
-    ],
-    [
-        3885297,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10110395949096162738"
-    ],
-    [
-        3885298,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7662742521125675228"
-    ],
-    [
-        3885298,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7662742521125675226"
-    ],
-    [
-        3885299,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_13669180859895098652"
-    ],
-    [
-        3885300,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1453473425457119099"
-    ],
-    [
-        3885301,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_6315138861459359962"
-    ],
-    [
-        3885302,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18347376044156709243"
-    ],
-    [
-        3885303,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8240498618450686659"
-    ],
-    [
-        3885304,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12982020876340215150"
-    ],
-    [
-        3885305,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_347099242318038676"
-    ],
-    [
-        3885306,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_1703931571923055065"
-    ],
-    [
-        3885307,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18379002455264152719"
-    ],
-    [
-        3885308,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16072572405094441357"
-    ],
-    [
-        3885312,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3227366173465573105"
-    ],
-    [
-        3885316,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4495353982499246042"
-    ],
-    [
-        4134517,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8500312990878077029"
-    ],
-    [
-        4134518,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_18415529581077806379"
-    ],
-    [
-        4134539,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_7989524009931000315"
-    ],
-    [
-        4134563,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4425260598189046596"
-    ],
-    [
-        4134585,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_8760051199035079461"
-    ],
-    [
-        4134608,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_9035573277236931850"
-    ],
-    [
-        4134631,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_15367402124037601299"
-    ],
-    [
-        4134654,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_10551213031251202355"
-    ],
-    [
-        4134675,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_16518980147064246246"
-    ],
-    [
-        4134698,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3854942592559585043"
-    ],
-    [
-        4134721,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_3863411204262193121"
-    ],
-    [
-        4134745,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5170005094974902421"
-    ],
-    [
-        4134772,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4492582707834259368"
-    ],
-    [
-        4134795,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_5857345968051384776"
-    ],
-    [
-        4134818,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_17506162480053884391"
-    ],
-    [
-        4134843,
-        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_12046931810006243843"
+        4036552,
+        "/workspace/cann-recipes-train/llm_rl/qwen3/kernel_meta/kernel_meta_4709772314930714745"
     ]
 ]

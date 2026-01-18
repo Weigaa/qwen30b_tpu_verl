@@ -27,7 +27,7 @@
             },
             "CastRemoveFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "ConcatTileFusionPass": {
                 "effect_times": "0",
@@ -67,7 +67,7 @@
             },
             "ForceFp16CastFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "FusedInferAttentionScoreQuantDeployPass": {
                 "effect_times": "0",
@@ -76,6 +76,10 @@
             "GroupedMatmulTransFusionPass": {
                 "effect_times": "96",
                 "match_times": "96"
+            },
+            "IndexByTensorStaticFusionPass": {
+                "effect_times": "48",
+                "match_times": "48"
             },
             "InplaceAddRmsNormFusionPass": {
                 "effect_times": "96",
@@ -107,7 +111,7 @@
             },
             "RemoveCastFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "SplitConvConcatFusionPass": {
                 "effect_times": "0",
@@ -190,7 +194,7 @@
             },
             "CastRemoveFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "ConcatTileFusionPass": {
                 "effect_times": "0",
@@ -230,7 +234,7 @@
             },
             "ForceFp16CastFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "FusedInferAttentionScoreQuantDeployPass": {
                 "effect_times": "0",
@@ -239,6 +243,10 @@
             "GroupedMatmulTransFusionPass": {
                 "effect_times": "96",
                 "match_times": "96"
+            },
+            "IndexByTensorStaticFusionPass": {
+                "effect_times": "48",
+                "match_times": "48"
             },
             "InplaceAddRmsNormFusionPass": {
                 "effect_times": "96",
@@ -270,7 +278,7 @@
             },
             "RemoveCastFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "SplitConvConcatFusionPass": {
                 "effect_times": "0",
@@ -353,7 +361,7 @@
             },
             "CastRemoveFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "ConcatTileFusionPass": {
                 "effect_times": "0",
@@ -393,7 +401,7 @@
             },
             "ForceFp16CastFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "FusedInferAttentionScoreQuantDeployPass": {
                 "effect_times": "0",
@@ -402,6 +410,10 @@
             "GroupedMatmulTransFusionPass": {
                 "effect_times": "96",
                 "match_times": "96"
+            },
+            "IndexByTensorStaticFusionPass": {
+                "effect_times": "48",
+                "match_times": "48"
             },
             "InplaceAddRmsNormFusionPass": {
                 "effect_times": "96",
@@ -433,7 +445,7 @@
             },
             "RemoveCastFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "SplitConvConcatFusionPass": {
                 "effect_times": "0",
@@ -516,7 +528,7 @@
             },
             "CastRemoveFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "ConcatTileFusionPass": {
                 "effect_times": "0",
@@ -556,7 +568,7 @@
             },
             "ForceFp16CastFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "FusedInferAttentionScoreQuantDeployPass": {
                 "effect_times": "0",
@@ -565,6 +577,10 @@
             "GroupedMatmulTransFusionPass": {
                 "effect_times": "96",
                 "match_times": "96"
+            },
+            "IndexByTensorStaticFusionPass": {
+                "effect_times": "48",
+                "match_times": "48"
             },
             "InplaceAddRmsNormFusionPass": {
                 "effect_times": "96",
@@ -596,7 +612,7 @@
             },
             "RemoveCastFusionPass": {
                 "effect_times": "0",
-                "match_times": "49"
+                "match_times": "97"
             },
             "SplitConvConcatFusionPass": {
                 "effect_times": "0",

@@ -1,0 +1,19 @@
+{
+    "binFileName":"te_scatterndupdate_818d82c5a52b2a067aa989e6499aaa8112cd4b3c608cee3a4c096acb05ecd625",
+    "binFileSuffix":".o",
+    "blockDim":48,
+    "coreType":"VectorCore",
+    "deterministic":"ignore",
+    "intercoreSync":0,
+    "kernelName":"te_scatterndupdate_818d82c5a52b2a067aa989e6499aaa8112cd4b3c608cee3a4c096acb05ecd625__kernel0",
+    "magic":"RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+    "memoryStamping":[],
+    "opParaSize":0,
+    "parameters":[
+        null,
+        null,
+        null,
+        null
+    ],
+    "sha256":"688811c59169fb78c48b65c028b15d4cc0875daba24b50b26f212eead03c5d44"
+}

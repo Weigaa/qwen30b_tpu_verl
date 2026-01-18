@@ -140,4 +140,4 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> wjnewqwen30b-a3b-record.txt 
+    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> wjqwen30b-a3b-record.txt 

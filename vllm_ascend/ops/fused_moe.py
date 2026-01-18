@@ -171,6 +171,7 @@ class AscendFusedMoE(FusedMoE):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
+        layer_idx: Optional[int] = -1,
     ):
         # TODO: This could not initialize FusedMoE baseclass,
         # fixme and make __init__() of AscendFusedMoE more clear
@@ -195,9 +196,11 @@ class AscendFusedMoE(FusedMoE):
             e_score_correction_bias=e_score_correction_bias,
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
         )
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
+        self.layer_idx = layer_idx
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -257,8 +260,9 @@ class AscendFusedMoE(FusedMoE):
                 self.expert_load_balancer.get_global_redundant_expert_num())
         else:
             # init moe.
+            print("use code in vllm_ascend_ops_fused_moe to init expert_map")
             self.local_num_experts, self.expert_map = determine_expert_map(
-                self.ep_size, self.ep_rank, self.global_num_experts)
+                self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
                 self.global_redundant_expert_num = ascend_config.init_redundancy_expert

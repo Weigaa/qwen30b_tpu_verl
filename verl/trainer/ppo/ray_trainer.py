@@ -1136,9 +1136,9 @@ class RayPPOTrainer:
                     end_gen_time = time.time()
                     batch_time = end_gen_time - beginning_gen_time
                     print("global_token_num: ", batch.meta_info["global_token_num"])
-                    print("batch_time: ", batch_time)
+                    print("batch_time:", batch_time)
                     print("rollouts speed tokens/s: ", sum(batch.meta_info["global_token_num"])/batch_time)
-                    continue
+                    # continue
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
