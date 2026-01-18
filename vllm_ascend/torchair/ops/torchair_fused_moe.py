@@ -944,7 +944,6 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
 
         if log2phy is not None:
-            print("layer", layer.layer_idx, "use log2phy mapping", log2phy)
             topk_ids = log2phy[topk_ids]
         # # #在我修改了专家分布之后强行使用专家映射
         # logical_to_physical_map = [
@@ -1028,7 +1027,6 @@ class TorchairAscendFusedMoE(FusedMoE):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = -1,
-        custom_expert: bool = True,
     ):
         # TODO: This could not initialize FusedMoE baseclass,
         # fixme and make __init__() of AscendFusedMoE more clear
@@ -1117,12 +1115,8 @@ class TorchairAscendFusedMoE(FusedMoE):
         else:
             # init moe.
             print("use code in torchair_fused_moe to init expert_map")
-            if custom_expert:
-                self.local_num_experts, self.expert_map, self.log2phy = determine_expert_map(
-                    self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
-            else:
-                self.local_num_experts, self.expert_map = determine_expert_map(
-                    self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
+            self.local_num_experts, self.expert_map, self.log2phy = determine_expert_map(
+                self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
                 self.global_redundant_expert_num = ascend_config.init_redundancy_expert

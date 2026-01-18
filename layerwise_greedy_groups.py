@@ -119,34 +119,35 @@ def main():
 
     data = load_json(data_path)
 
-    # 顶层 list，取第 1 个元素（索引 0）
+    # 顶层 list
     if not isinstance(data, list) or len(data) < 1:
         raise ValueError("顶层应为长度>=1的 list。")
-    first = data[0]
-    if not isinstance(first, dict):
-        raise ValueError("第 1 个元素应为字典：{seq_id -> {layer_id -> [E个数]}}。")
 
     # 汇总每层（跨 seq）得到 vec(E)；允许不同层有不同 E，但同一层必须一致
     sums_by_layer: Dict[str, List[float]] = {}
     layer_len: Dict[str, int] = {}
     layer_keys_set = set()
 
-    for seq_id, layer_dict in first.items():
-        if not isinstance(layer_dict, dict):
-            raise ValueError(f"seq_id={seq_id} 的值应为字典。")
-        for lid, vec in layer_dict.items():
-            ensure_vec(vec)
-            E = len(vec)
-            layer_keys_set.add(lid)
-            if lid not in sums_by_layer:
-                sums_by_layer[lid] = [0.0] * E
-                layer_len[lid] = E
-            else:
-                if len(sums_by_layer[lid]) != E:
-                    raise ValueError(f"层 {lid} 的专家数不一致：之前为 {layer_len[lid]}，现在是 {E}。")
-            acc = sums_by_layer[lid]
-            for i in range(E):
-                acc[i] += float(vec[i])
+    # 汇总每层（跨顶层 list 的 16 个元素）得到 vec(E)
+    for item in data:  # item: depth2 dict, has 2 keys
+        if not isinstance(item, dict):
+            continue
+        for seq_id, layer_dict in item.items():  # seq_id 这里其实是 depth2 的 key（2个分支）
+            if not isinstance(layer_dict, dict):
+                continue
+            for lid, vec in layer_dict.items():  # lid: 48 layers
+                ensure_vec(vec)
+                E = len(vec)
+                layer_keys_set.add(lid)
+                if lid not in sums_by_layer:
+                    sums_by_layer[lid] = [0.0] * E
+                    layer_len[lid] = E
+                else:
+                    if len(sums_by_layer[lid]) != E:
+                        raise ValueError(f"层 {lid} 的专家数不一致：之前为 {layer_len[lid]}，现在是 {E}。")
+                acc = sums_by_layer[lid]
+                for i in range(E):
+                    acc[i] += float(vec[i])
 
     # 层顺序（尽量按数字层号）
     try:
