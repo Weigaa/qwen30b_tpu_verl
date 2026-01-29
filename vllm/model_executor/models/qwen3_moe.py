@@ -239,16 +239,17 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        #graph和eager模式NPU都没有走到这个方法
         # add record
         topk_ids = self.compute_topk(router_logits)
         self.layer_idx = extract_layer_index(self.prefix)
+        # moe_stats.record_layer_topk(self.layer_idx, topk_ids)
         # self._ep_same_input_guard(topk_ids, self.layer_idx, note=f"(run={getattr(self,'total_run',-1)})")
-        #NPU并没有走到这个方法
-        moe_stats.record(
-            layer_idx=extract_layer_index(self.prefix),
-            topk_ids=topk_ids,
-            num_experts=128,
-        )
+        # moe_stats.record(
+        #     layer_idx=extract_layer_index(self.prefix),
+        #     topk_ids=topk_ids,
+        #     num_experts=128,
+        # )
         final_hidden_states = self.experts(hidden_states=hidden_states,
                                            router_logits=router_logits)
 
@@ -424,23 +425,39 @@ class Qwen3MoeDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
+        is_dummy: Optional[bool] = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        if is_dummy:
+            # print("doing dummy eagle train here to overlap self attn")
+            if residual is None:
+                residual = hidden_states
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-
+            # if hidden_states.shape[0] == 32:
+            #     self._attn_start.record()
+            # Self Attention
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        # if hidden_states.shape[0] == 32:
+        #     self._attn_end.record()
+        hidden_states = self.mlp(hidden_states, is_dummy)
+        # if hidden_states.shape[0] == 32:
+        #     self._attn_end_moe.record()
+        #     self._attn_end_moe.synchronize()
+        #     attn_ms = self._attn_start.elapsed_time(self._attn_end)
+        #     moe_ms = self._attn_end.elapsed_time(self._attn_end_moe)
+        #     print("rank", self.ep_group.rank(), "layer_idx", self.layer_idx, "self attn ms:", attn_ms, "moe ms:", moe_ms)
+
         return hidden_states, residual
 
 
@@ -484,6 +501,7 @@ class Qwen3MoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        is_dummy: Optional[bool] = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -496,7 +514,7 @@ class Qwen3MoeModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(positions, hidden_states, residual, is_dummy=is_dummy)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
@@ -534,7 +552,7 @@ class Qwen3MoeModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
-        print("vllm moe expert_params_mapping is", expert_params_mapping)
+        # print("vllm moe expert_params_mapping is", expert_params_mapping)
         for name, loaded_weight in weights:
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -604,10 +622,10 @@ class Qwen3MoeModel(nn.Module):
                     weight_loader = typing.cast(Callable[..., bool],
                                                 param.weight_loader)
                     #print("moe weight_loader is", weight_loader)
-                    self.ep_group = get_ep_group().device_group
-                    if self.ep_group.rank() == 0:
-                        print("name is", name, "param_name is", param_name)
-                        print("ep_rank is ", self.ep_group.rank(), "load_weight is", loaded_weight, "name_mapped", name_mapped, "shard_id", shard_id, "expert_id", expert_id)
+                    # self.ep_group = get_ep_group().device_group
+                    # if self.ep_group.rank() == 0:
+                    #     print("name is", name, "param_name is", param_name)
+                    #     print("ep_rank is ", self.ep_group.rank(), "load_weight is", loaded_weight, "name_mapped", name_mapped, "shard_id", shard_id, "expert_id", expert_id)
                     success = weight_loader(param,
                                             loaded_weight,
                                             name_mapped,
@@ -755,9 +773,10 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        is_dummy: Optional[bool] = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
-                                   inputs_embeds)
+                                   inputs_embeds, is_dummy=is_dummy)
         return hidden_states
 
     def compute_logits(

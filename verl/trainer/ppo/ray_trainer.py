@@ -1363,7 +1363,7 @@ class RayPPOTrainer:
             end_epoch_time = time.time()
             epoch_duration = end_epoch_time - beginning_epoch_time
             print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")
-            # ... 一轮生成/训练（该轮内统计已自动累计）...
+            # # ... 一轮生成/训练（该轮内统计已自动累计）...
             # epoch_stats = self.actor_rollout_wg.get_record()  # 得到 {prompt_id: {layer_idx: [per-expert prob sums]}}
             # with open(f"moe_step_{epoch}.json", "w") as f:
             #     json.dump(epoch_stats, f)

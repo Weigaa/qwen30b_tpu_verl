@@ -1,0 +1,5 @@
+Name,Input Shapes,Call Stack,Host Self Duration(us),Host Total Duration(us),Device Self Duration(us),Device Total Duration(us),Device Self Duration With AICore(us),Device Total Duration With AICore(us)
+npu::npu_grouped_matmul,,,6894.79,6931.86,0,9.14,0,0
+empty_tensor,,,19.25,19.25,0,0,0,0
+npu::get_npu_format,,,6.37,6.37,0,0,0,0
+aclnnGroupedMatmulV5,,,11.45,11.45,9.14,9.14,0,0

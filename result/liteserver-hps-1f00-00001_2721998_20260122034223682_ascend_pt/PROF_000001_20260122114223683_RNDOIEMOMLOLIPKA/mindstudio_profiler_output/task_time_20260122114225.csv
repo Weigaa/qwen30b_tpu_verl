@@ -1,0 +1,2 @@
+Device_id,kernel_name,kernel_type,stream_id,task_id,task_time(us),task_start(us),task_stop(us)
+0,aclnnGroupedMatmulV5_GroupedMatmul_GroupedMatmul,KERNEL_MIX_AIC,2,13,12.340,1769053343748007.996	,1769053343748020.336	

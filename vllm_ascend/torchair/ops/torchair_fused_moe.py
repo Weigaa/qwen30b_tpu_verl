@@ -168,6 +168,7 @@ def torchair_fused_experts_with_mc2(
     # comm_stream.wait_stream(torch.npu.current_stream())
     expand_x, dynamic_scale, assist_info_for_combine, expert_token_nums, ep_recv_counts = output[
         0:5]
+    print("ep_rank", ep_rank_id, "expert_token_nums", expert_token_nums, "expand_x.shape[0]", expand_x.shape[0], "ep_recv_counts", ep_recv_counts)
 
     if shared_experts is not None:
         with npu_stream_switch("moe_secondary", 0):
@@ -352,6 +353,7 @@ def torchair_fused_experts_with_all2all(
                                                   -1).sum(-1)
 
         gather_sizes = torch.empty_like(scatter_sizes)
+        #第一次通信获取每个进程需要发送和接收的元数据
         dist.all_to_all_single(gather_sizes,
                                scatter_sizes,
                                group=ep_group.device_group)
@@ -359,9 +361,11 @@ def torchair_fused_experts_with_all2all(
         gather_size_list = gather_sizes.cpu().tolist()
 
         expanded_expert_idx = expanded_expert_idx % local_num_experts
+        #第二次通信发送和接收数据
         hidden_states = ep_group.all_to_all(hidden_states, 0, 0,
                                             scatter_size_list,
                                             gather_size_list)
+        #第三次通信发送和接收所用专家信息
         local_expert_idx = ep_group.all_to_all(expanded_expert_idx, 0, 0,
                                                scatter_size_list,
                                                gather_size_list)
@@ -414,6 +418,7 @@ def torchair_fused_experts_with_all2all(
     if expert_map is not None:
         resorted_idx = torch.argsort(sorted_idx)
         hidden_states = hidden_states[resorted_idx]
+        #第四次通信发送和接收每个专家处理完的参数
         hidden_states = ep_group.all_to_all(hidden_states, 0, 0,
                                             gather_size_list,
                                             scatter_size_list)
@@ -945,19 +950,6 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         if log2phy is not None:
             topk_ids = log2phy[topk_ids]
-        # # #在我修改了专家分布之后强行使用专家映射
-        # logical_to_physical_map = [
-        #                             85, 59, 73, 109, 42, 46, 62, 108, 58, 91, 53, 64, 17, 94, 37, 98,
-        #                             105, 114, 80, 106, 44, 81, 112, 101, 21, 15, 23, 120, 89, 22, 113, 116,
-        #                             13, 71, 66, 69, 82, 121, 26, 100, 7, 20, 51, 52, 123, 104, 40, 28,
-        #                             56, 11, 47, 93, 32, 67, 78, 84, 99, 27, 3, 5, 65, 110, 95, 41,
-        #                             29, 57, 4, 61, 127, 54, 39, 49, 103, 74, 124, 77, 25, 19, 86, 75,
-        #                             1, 107, 79, 48, 125, 60, 63, 68, 8, 12, 33, 55, 38, 31, 70, 16,
-        #                             111, 87, 118, 10, 76, 24, 6, 88, 92, 35, 30, 96, 50, 115, 117, 9,
-        #                             90, 14, 34, 102, 126, 45, 72, 122, 119, 36, 83, 97, 43, 2, 18, 0
-        #                             ]
-        # topk_ids = torch.tensor(logical_to_physical_map, device=topk_ids.device, dtype=torch.int32)[topk_ids]
-        ###########
         fused_moe_state = get_forward_context().fused_moe_state
         if self.enable_shared_expert_dp and fused_moe_state == FusedMoEState.MC2:
             fused_moe_state = FusedMoEState.All2All
@@ -1114,7 +1106,7 @@ class TorchairAscendFusedMoE(FusedMoE):
                 self.expert_load_balancer.get_global_redundant_expert_num())
         else:
             # init moe.
-            print("use code in torchair_fused_moe to init expert_map")
+            # print("use code in torchair_fused_moe to init expert_map")
             self.local_num_experts, self.expert_map, self.log2phy = determine_expert_map(
                 self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
             # dynamic eplb initializing with not expert_map_path

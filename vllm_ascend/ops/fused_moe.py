@@ -45,6 +45,7 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ,
                                get_all_reduce_merge_state,
                                get_rm_router_logits_state, is_310p,
                                vllm_version_is)
+from vllm.utils.moe_stats import moe_stats
 
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -63,6 +64,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             device_group = get_mc2_group().device_group
             # TODO: Try local_rank = ep_group.rank_in_group
             local_rank = torch.distributed.get_rank(group=device_group)
+            self.ep_rank = local_rank 
             backend = device_group._get_backend(torch.device("npu"))
             self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
                 local_rank)
@@ -120,15 +122,28 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             global_num_experts=global_num_experts)
 
         topk_weights = topk_weights.to(x.dtype)
+        layer_idx = kwargs.get("layer_idx", getattr(layer, "layer_idx", -1))
+        is_dummy = kwargs.get("is_dummy", False)
+        if log2phy is not None:
+            old_topk_ids = topk_ids
+        topk_ids = log2phy[topk_ids]
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
-        if enable_force_load_balance and not self.use_aclgraph:
-            topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
+        # if enable_force_load_balance and not self.use_aclgraph:
+        #     topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
+        # 考虑在dummy_run场景下也打开？
+        if (enable_force_load_balance and not self.use_aclgraph) or is_dummy:
+            topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
+            # if is_dummy:
+            #     print("dummy run enable force load balance, layer_idx:", layer_idx)
 
-        if log2phy is not None:
-            topk_ids = log2phy[topk_ids]
         moe_comm_method = get_forward_context().moe_comm_method
+        # #记录topk_ids用于统计
+        # if topk_ids.shape[0] == 32:
+        #     moe_stats.record_topk_ids(self.ep_rank, layer_idx, old_topk_ids, topk_ids)
+        # mc = get_forward_context().moe_comm_method
+        # print("moe_comm_method:", type(mc), getattr(mc, "comm_type", None), getattr(mc, "__dict__", None))
         return moe_comm_method.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -261,7 +276,7 @@ class AscendFusedMoE(FusedMoE):
         else:
             # init moe.
             print("use code in vllm_ascend_ops_fused_moe to init expert_map")
-            self.local_num_experts, self.expert_map = determine_expert_map(
+            self.local_num_experts, self.expert_map, self.log2phy = determine_expert_map(
                 self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
@@ -366,7 +381,8 @@ class AscendFusedMoE(FusedMoE):
                 top_k: Optional[int] = None,
                 shared_experts: Optional[Any] = None,
                 gate=None,
-                replace_allreduce: bool = False):
+                replace_allreduce: bool = False,
+                is_dummy: bool = False):
 
         assert self.quant_method is not None
 
@@ -394,7 +410,8 @@ class AscendFusedMoE(FusedMoE):
             rm_router_logits=self.rm_router_logits,
             replace_allreduce=replace_allreduce,
             gate=gate)
-
+        
+        # print("is_dummy in ascendfusedmoe is:", is_dummy)
         # Matrix multiply.
         e_hidden_states = self.quant_method.apply(
             layer=self,
@@ -418,6 +435,8 @@ class AscendFusedMoE(FusedMoE):
             mc2_mask=mc2_mask,
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,
+            layer_idx=self.layer_idx,
+            is_dummy=is_dummy
         )
 
         group_list_type = None

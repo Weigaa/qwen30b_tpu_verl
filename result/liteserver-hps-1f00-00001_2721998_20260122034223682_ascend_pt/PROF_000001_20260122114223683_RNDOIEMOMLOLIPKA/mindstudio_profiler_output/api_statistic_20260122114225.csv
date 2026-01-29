@@ -1,0 +1,6 @@
+Device_id,Level,API Name,Time(us),Count,Avg(us),Min(us),Max(us),Variance
+host,acl,GroupedMatmul_Tiling,198.5,2,99.25,0.69,197.81,9714.074
+host,acl,aclnnGroupedMatmulV5,643.88,1,643.88,643.88,643.88,0
+host,acl,aclnnGroupedMatmulV5GetWorkspaceSize,6606.17,1,6606.17,6606.17,6606.17,0
+host,acl,aclrtSynchronizeDeviceWithTimeout,88.54,1,88.54,88.54,88.54,0
+host,node,launch,497.08,1,497.08,497.08,497.08,0

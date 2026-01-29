@@ -108,6 +108,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
     def forward(
         self,
         hidden_states,
+        is_dummy: bool = False,
         attn_metadata=None,
     ):
         if attn_metadata is None:
@@ -121,6 +122,9 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         router_logits, _ = self.gate(hidden_states)
         #NPU并没有走到这个方法,eager会走到，图模式不会
         # add record
+        # topk_ids = torch.topk(router_logits, k=self.top_k, dim=-1).indices
+        # moe_stats.record_layer_topk(self.layer_idx, topk_ids)
+        # add record
         # topk_ids = self.compute_topk(router_logits)
         # self.layer_idx = extract_layer_index(self.prefix)
         # self._ep_same_input_guard(topk_ids, self.layer_idx, note=f"(run={getattr(self,'total_run',-1)})")
@@ -130,6 +134,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         #     num_experts=128,
         # )
         # print("do record in vllm_ascend")
+        # print("is_dummy in customsparsemoeblock:", is_dummy)
 
         hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -138,6 +143,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             top_k=self.top_k,
             enable_force_load_balance=enable_force_load_balance,
             shared_experts=None,
+            is_dummy=is_dummy,
         )
 
         return hidden_states
@@ -177,6 +183,7 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = layer_idx
         mlp_only_layers = ([] if not hasattr(config, "mlp_only_layers") else
                            config.mlp_only_layers)
         self.use_aclgraph = (vllm_config is not None
@@ -210,6 +217,11 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        ###新增参数
+        self._attn_start = torch.npu.Event(enable_timing=True)
+        self._attn_end   = torch.npu.Event(enable_timing=True)
+        self._attn_end_moe   = torch.npu.Event(enable_timing=True)
+        self.ep_group = get_ep_group().device_group
 
 
 @support_torch_compile

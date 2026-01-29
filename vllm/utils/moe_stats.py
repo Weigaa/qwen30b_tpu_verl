@@ -29,6 +29,9 @@ class MoEStats:
         self.top_k_count = 0
         self.step_layer_topk: Optional[List[Optional[torch.Tensor]]] = None
         self.reset_epoch()
+        #统计每一步的各个rank在moe层最终处理的token数
+        self.rank_token_count = defaultdict(int)
+        self.step_count = 0
     
     @torch.no_grad()
     def record_layer_topk(self, layer_id: int, topk_ids: torch.Tensor):
@@ -107,6 +110,36 @@ class MoEStats:
         # print(f"MoEStats recorded layer {layer_idx} for {len(idxs)} tokens.")
         # print("current result:", self.per_prompt)
 
+    @torch.no_grad()
+    def record_no_seqid(self,
+               layer_idx: int,
+               topk_ids: torch.Tensor,
+               num_experts: int,  # 移除 topk_weights 参数
+               token_types: Optional[torch.Tensor] = None):
+        if not self.enabled:
+            return
+        # 统一到 CPU，避免 graph/compile 干扰
+        seq_ids = self.current_batch_seq_ids
+        
+        #确认schedule和topk_ids匹配
+        self.top_k_count += 1
+
+        if seq_ids is None:
+            #print("MoEStats: current_batch_seq_ids is None, cannot record stats.") 
+            #igonre dummy stats
+            return
+
+        topk_ids = topk_ids.detach().to("cpu")
+        idxs = torch.arange(topk_ids.shape[0], device=seq_ids.device).tolist()
+        seq_ids = 0
+        for i in idxs:
+            pid = int(seq_ids)
+            self._ensure_vec(pid, layer_idx, num_experts)
+            ids = topk_ids[i].tolist()
+            # 移除权重处理，直接每个选中专家+1
+            for e in ids:
+                self.per_prompt[pid][layer_idx][int(e)] += 1.0
+
     def snapshot(self):
         # 转成纯 Python dict（便于 json.dump）
         out = {}
@@ -115,6 +148,38 @@ class MoEStats:
         print("current result:", out)
         print("current result size:", len(out))
         return out
+
+    def record_topk_ids(self, ep_rank, layer_id, old_topk_ids, new_topk_ids,
+                        dump_every=1000, dump_dir="./moe_stats"):
+        # 1) 记录：key=step_count, value=[layer_id, old_topk_ids, new_topk_ids]
+        #    尽量不做 device->host，同步只在 dump 时发生
+        self.rank_token_count[self.step_count] = [
+            int(layer_id),
+            old_topk_ids.detach().clone() if hasattr(old_topk_ids, "detach") else old_topk_ids,
+            new_topk_ids.detach().clone() if hasattr(new_topk_ids, "detach") else new_topk_ids,
+        ]
+
+        # 2) 满足条件就落盘（文件名按 ep_rank 区分）
+        if self.step_count == dump_every:
+            os.makedirs(dump_dir, exist_ok=True)
+            out = {}
+            for step, rec in self.rank_token_count.items():
+                # rec = [layer_id, old, new]
+                old_x, new_x = rec[1], rec[2]
+                out[str(step)] = [
+                    rec[0],
+                    old_x.detach().cpu().tolist() if hasattr(old_x, "detach") else old_x,
+                    new_x.detach().cpu().tolist() if hasattr(new_x, "detach") else new_x,
+                ]
+            path = os.path.join(dump_dir, f"moe_topk_ids_ep{int(ep_rank)}.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+            # 可选：落盘后清空，避免继续增长占内存（不需要就删掉下一行）
+            # self.rank_token_count.clear()
+
+        # 3) step + 1
+        self.step_count += 1
+
 
 # 全局实例
 moe_stats = MoEStats()

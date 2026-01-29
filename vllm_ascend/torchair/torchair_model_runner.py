@@ -195,13 +195,14 @@ class NPUTorchairModelRunner(NPUModelRunner):
                 **model_kwargs,
             )
             #also record in dummy_run ranks
-            # print("moe_stats dummy_run current_batch_seq_ids are", moe_stats.current_batch_seq_ids.size())
-            # print("dummy_run the shape of hidden_states are", hidden_states.size())
-            # print("dummy_run the length of moe_stats.step_layer_topk are", len(moe_stats.step_layer_topk) if moe_stats.step_layer_topk is not None else "None")
-            # print("dummy_run the inner shape of record topk_ids are", moe_stats.step_layer_topk[0].size() if moe_stats.step_layer_topk is not None and moe_stats.step_layer_topk[0] is not None else "None")
-            #record this step topk ids for moe stats
-            # for layer_idx, topk_ids in enumerate(moe_stats.step_layer_topk):
-            #     moe_stats.record(layer_idx, topk_ids, 128)  #num_experts is 128 for qwen3
+            # if moe_stats.current_batch_seq_ids is not None:
+            #     print("moe_stats dummy_run current_batch_seq_ids are", moe_stats.current_batch_seq_ids.size())
+            #     print("dummy_run the shape of hidden_states are", hidden_states.size())
+            #     print("dummy_run the length of moe_stats.step_layer_topk are", len(moe_stats.step_layer_topk) if moe_stats.step_layer_topk is not None else "None")
+            #     print("dummy_run the inner shape of record topk_ids are", moe_stats.step_layer_topk[0].size() if moe_stats.step_layer_topk is not None and moe_stats.step_layer_topk[0] is not None else "None")
+            #     #record this step topk ids for moe stats
+            #     for layer_idx, topk_ids in enumerate(moe_stats.step_layer_topk):
+            #         moe_stats.record_no_seqid(layer_idx, topk_ids, 128)  #num_experts is 128 for qwen3
             
         return hidden_states
 
@@ -342,13 +343,14 @@ class NPUTorchairModelRunner(NPUModelRunner):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            # #非dummy_run期间的seq_ids数量和hidden_states在第一维度是对齐的，padding时除外
             # print("moe_stats current_batch_seq_ids are", moe_stats.current_batch_seq_ids.size())
             # print("the shape of hidden_states are", hidden_states.size())
             # print("the length of moe_stats.step_layer_topk are", len(moe_stats.step_layer_topk) if moe_stats.step_layer_topk is not None else "None")
             # print("the inner shape of record topk_ids are", moe_stats.step_layer_topk[0].size() if moe_stats.step_layer_topk is not None and moe_stats.step_layer_topk[0] is not None else "None")
-            #record this step topk ids for moe stats
+            # #record this step topk ids for moe stats
             # for layer_idx, topk_ids in enumerate(moe_stats.step_layer_topk):
-            #     moe_stats.record(layer_idx, topk_ids, 128)  #num_experts is 128 for qwen3
+            #     moe_stats.record_no_seqid(layer_idx, topk_ids, 128)  #num_experts is 128 for qwen3
         else:
             assert self.model is not None
             if is_310p():

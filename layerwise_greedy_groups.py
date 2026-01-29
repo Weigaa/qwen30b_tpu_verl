@@ -148,7 +148,8 @@ def main():
                 acc = sums_by_layer[lid]
                 for i in range(E):
                     acc[i] += float(vec[i])
-
+    
+    print("每层专家分布情况为:",sums_by_layer)
     # 层顺序（尽量按数字层号）
     try:
         layer_keys_sorted = sorted(layer_keys_set, key=lambda x: int(x))
@@ -194,7 +195,7 @@ def main():
 
     # === 最终输出（n 个 list；贪心分配） ===
     for gi, lst in enumerate(groups_by_layer_lists):
-        print(f"group{gi}_by_layer =", lst)
+        print(f"rank{gi} =", lst)
 
 if __name__ == "__main__":
     main()

@@ -196,6 +196,7 @@ def unquant_apply_mlp(hidden_states: torch.Tensor,
         group_type=0,
         group_list=group_list,
     )[0]
+    # print("size of w1 is", w1.size(), "size of gate_up_out is", gate_up_out.size())
     if is_310p():
         gate_up_out = torch_npu.npu_swiglu(gate_up_out.to(torch.float32)).to(
             torch.float16)

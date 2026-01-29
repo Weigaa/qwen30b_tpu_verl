@@ -150,6 +150,8 @@ if not vllm_version_is("0.10.2"):
 else:
     from vllm.sequence import PoolerOutput
     UniformTypeKVCacheSpecs = None
+#wj新增
+from vllm.utils.moe_stats import moe_stats
 
 
 @dataclass
@@ -1333,7 +1335,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         else:
             maybe_padded_num_tokens = 16
             num_tokens_across_dp = torch.tensor([16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16])
-
+        print("rank", self.dp_rank, "maybe_padded_num_tokens:", maybe_padded_num_tokens)
         # TODO: Now that num_input_tokens is basically identical with maybe_padded_num_tokens
         # We should consider removing maybe_padded_num_tokens later
         num_input_tokens = maybe_padded_num_tokens
@@ -1633,6 +1635,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             pad_size = get_forward_context().pad_size
             if pad_size > 0:
                 hidden_states = hidden_states[:-pad_size, :]
+        # # #非dummy_run期间的seq_ids数量和hidden_states在第一维度是对齐的，padding时除外
+        # print("model_runner_v1 moe_stats current_batch_seq_ids are", moe_stats.current_batch_seq_ids.size())
+        # print("model_runner_v1 the shape of hidden_states are", hidden_states.size())
+         # #record this step topk ids for moe stats,仅统计decode
+        # print("model_runner_v1 the length of moe_stats.step_layer_topk are", len(moe_stats.step_layer_topk) if moe_stats.step_layer_topk is not None else "None")
+        # print("model_runner_v1 the inner shape of record topk_ids are", moe_stats.step_layer_topk[0].size() if moe_stats.step_layer_topk is not None and moe_stats.step_layer_topk[0] is not None else "None")
+        # if moe_stats.current_batch_seq_ids.numel() < 33:
+        #     for layer_idx, topk_ids in enumerate(moe_stats.step_layer_topk):
+        #         moe_stats.record_no_seqid(layer_idx, topk_ids, 128)  #num_experts is 128 for qwen3
         return hidden_states
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens,
@@ -1933,6 +1944,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             moe_comm_type = (MoECommType.MC2
                              if num_tokens <= self.mc2_tokens_capacity else
                              MoECommType.ALLTOALL)
+            # #强制走Alltoall
+            # moe_comm_type = MoECommType.ALLTOALL
         else:
             raise ValueError(f"Unsupported soc_version: {soc_version}")
 
@@ -2363,16 +2376,26 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def _generate_dummy_run_hidden_states(self, with_prefill,
                                           is_torchair_compile, input_ids,
                                           positions, attn_metadata, num_tokens,
-                                          intermediate_tensors, inputs_embeds):
+                                          intermediate_tensors, inputs_embeds, is_long_tail):
         #print("dummy forward in model_runner_v1.py")
         hidden_states = self.model(input_ids=input_ids,
                                    positions=positions,
                                    intermediate_tensors=intermediate_tensors,
-                                   inputs_embeds=inputs_embeds)
+                                   inputs_embeds=inputs_embeds,
+                                   is_dummy=is_long_tail)
         if self.drafter and self.drafter.name == SpecDcodeType.EAGLE3:
             hidden_states, _ = hidden_states
         else:
             hidden_states = hidden_states
+        # ###also record in dummy_run ranks
+        # if moe_stats.current_batch_seq_ids is not None:
+        #     print("model_runner_v1 moe_stats dummy_run current_batch_seq_ids are", moe_stats.current_batch_seq_ids.size())
+        #     print("model_runner_v1 dummy_run the shape of hidden_states are", hidden_states.size())
+        #     print("model_runner_v1 dummy_run the length of moe_stats.step_layer_topk are", len(moe_stats.step_layer_topk) if moe_stats.step_layer_topk is not None else "None")
+        #     print("model_runner_v1 dummy_run the inner shape of record topk_ids are", moe_stats.step_layer_topk[0].size() if moe_stats.step_layer_topk is not None and moe_stats.step_layer_topk[0] is not None else "None")
+        #     #record this step topk ids for moe stats
+        #     for layer_idx, topk_ids in enumerate(moe_stats.step_layer_topk):
+        #         moe_stats.record_no_seqid(layer_idx, topk_ids, 128)  #num_experts is 128 for qwen3
         return hidden_states
 
     @torch.inference_mode()
@@ -2391,7 +2414,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         }
         before_num_tokens = num_tokens
         #单独处理长尾阶段的dummy_run
+        is_long_tail = False
         if num_tokens == 1:
+            is_long_tail = True
             #only dummy_run in decode stage num_tokens == 1
             print("rank", self.dp_rank, "Using dummy run in vllm_ascend model_runner_v1.py")
         #     print("num_tokens:", num_tokens,"uniform_decode:", uniform_decode,
@@ -2550,7 +2575,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     with_prefill, is_torchair_compile, input_ids, positions,
                     attn_metadata, num_tokens, intermediate_tensors,
-                    inputs_embeds)
+                    inputs_embeds, is_long_tail)
                 if need_dummy_logits:
                     dummy_compute_logits(hidden_states)
 

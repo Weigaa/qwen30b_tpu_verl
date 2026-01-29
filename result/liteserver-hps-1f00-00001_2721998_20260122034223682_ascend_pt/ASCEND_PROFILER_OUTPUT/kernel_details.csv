@@ -1,0 +1,2 @@
+Step Id,Device_id,Name,Type,Accelerator Core,Start Time(us),Duration(us),Wait Time(us),Block Dim
+0,0,aclnnGroupedMatmulV5_GroupedMatmul_GroupedMatmul,N/A,N/A,1769053343748009.976	,9.140,0,0

@@ -1,0 +1,220 @@
+2026-01-22 11:42:25 [INFO] [2722654] [2722654] [export_manager.cpp:119] Start to load data!
+2026-01-22 11:42:25 [INFO] [2722654] [2722654] [data_processor.cpp:27] HASH_INIT Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722654] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/ge_logic_stream_info.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722654] [hash_init_processor.cpp:55] Init Hash data, dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722654] [data_processor.cpp:54] Check /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/ge_hash.db and GeHashInfo success.
+2026-01-22 11:42:25 [INFO] [2722654] [2722654] [db_runner.h:75] Start query data
+2026-01-22 11:42:25 [INFO] [2722654] [2722654] [db_runner.h:86] Query data success: SELECT hash_key, hash_value FROM GeHashInfo
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.cpp:27] ACC_PMU Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.cpp:27] AICORE_FREQ Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [data_processor.cpp:27] API Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.cpp:27] COMMUNICATION Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.cpp:27] COMMUNICATION_STATISTIC Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [data_processor.cpp:27] COMPUTE_TASK_INFO Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722662] [data_processor.cpp:27] CPU_USAGE Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/hccl_single_device.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722662] [host_usage_processor.cpp:23] Start process CPU_USAGE.
+2026-01-22 11:42:25 [INFO] [2722654] [2722663] [data_processor.cpp:27] DDR Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.h:72] Save COMMUNICATION_STATISTIC data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/acc_pmu.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722664] [data_processor.cpp:27] DEVICE_MSTX Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.h:74] COMMUNICATION_STATISTIC no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.h:72] Save ACC_PMU data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [data_processor.cpp:27] DISK_USAGE Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.h:74] ACC_PMU no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.cpp:27] FUSION_OP Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [host_usage_processor.cpp:23] Start process DISK_USAGE.
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.cpp:27] HBM Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/ge_model_info.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.cpp:27] HCCS Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722661] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/hccl_single_device.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722661] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/hccl_single_device.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [data_processor.cpp:54] Check /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/api_event.db and ApiData success.
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:61] There are 0 records before COMMUNICATION_TASK_INFO data filtering, filterTime is 1769053343737654000.
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/host_cpu_usage.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:65] There are 0 records after COMMUNICATION_TASK_INFO data filtering.
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [db_runner.h:75] Start query data
+2026-01-22 11:42:25 [INFO] [2722654] [2722662] [data_processor.cpp:27] KFC_COMM Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:61] There are 0 records before COMMUNICATION_TASK_INFO data filtering, filterTime is 1769053343737654000.
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [data_processor.cpp:54] Check /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/ge_info.db and TaskInfo success.
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:65] There are 0 records after COMMUNICATION_TASK_INFO data filtering.
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [db_runner.h:75] Start query data
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:72] Save COMMUNICATION_TASK_INFO data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722661] [data_processor.h:74] COMMUNICATION_TASK_INFO no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:72] Save COMMUNICATION_OP data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/hbm.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722657] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/host_disk_usage.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.h:72] Save HBM data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722661] [data_processor.h:74] COMMUNICATION_OP no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.h:74] HBM no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [data_processor.cpp:27] KFC_TASK Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.h:72] Save HBM data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.cpp:27] LLC Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.h:74] HBM no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [db_runner.h:86] Query data success: SELECT struct_type, id, level, thread_id, item_id, start, end, connection_id FROM ApiData
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/hccs.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.cpp:27] MC2_COMM_INFO Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.h:72] Save HCCS data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/mc2_comm_info.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.h:74] HCCS no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.cpp:27] MEMCPY_INFO Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.h:72] Save HCCS data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.h:74] HCCS no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.cpp:27] MEM_USAGE Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [host_usage_processor.cpp:23] Start process MEM_USAGE.
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [db_runner.h:86] Query data success: SELECT hashid, model_id, op_name, stream_id, task_id, block_dim, mix_block_dim, task_type, op_type, op_flag, batch_id, IFNULL(input_formats, 'NULL'), IFNULL(input_data_types, 'NULL'), IFNULL(input_shapes, 'NULL'), IFNULL(output_formats, 'NULL'), IFNULL(output_data_types, 'NULL'), IFNULL(output_shapes, 'NULL'), device_id, context_id, (case when op_state is 'N/A' then 'N/A' when op_state is '1' then 'dynamic' when op_state is '0' then 'static' end) FROM TaskInfo
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/hccl_single_device.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/hccl_single_device.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/freq.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722662] [data_processor.h:72] Save KFC_COMM data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722664] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/step_trace.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.h:74] KFC_COMM no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [aicore_freq_processor.cpp:90] Original data is empty. DBPath is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/freq.db
+2026-01-22 11:42:25 [INFO] [2722654] [2722664] [data_processor.h:72] Save TASK data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [data_processor.h:72] Save COMPUTE_TASK_INFO data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722662] [data_processor.h:72] Save KFC_COMM data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [aicore_freq_processor.cpp:116] AicoreFreqProcessor FormatData.
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [data_processor.cpp:27] MODEL_NAME Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.h:74] KFC_COMM no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722664] [data_processor.h:74] TASK no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722659] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/ge_model_info.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722662] [data_processor.cpp:27] MSTX Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722664] [data_processor.cpp:27] NETDEV_STATS Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [data_processor.cpp:27] NETWORK_USAGE Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [host_usage_processor.cpp:23] Start process NETWORK_USAGE.
+2026-01-22 11:42:25 [WARN] [2722654] [2722663] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/ddr.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/host_mem_usage.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [connection.cpp:68] sqlite3_exec return 1, Failed to check: no such table: MemcpyInfo
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.cpp:27] NIC Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722663] [data_processor.h:72] Save DDR data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722663] [data_processor.h:74] DDR no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.cpp:50] Check MemcpyInfo not exists
+2026-01-22 11:42:25 [INFO] [2722654] [2722663] [data_processor.cpp:27] NPU_MEM Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.cpp:27] NPU_MODULE_MEM Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [aicore_freq_processor.cpp:123] freq original data is empty, it will use default freq.
+2026-01-22 11:42:25 [WARN] [2722654] [2722657] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/kfc_info.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:72] Save AICORE_FREQ data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722661] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/llc.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722657] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/kfc_info.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:72] Save LLC data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [data_processor.h:72] Save KFC_TASK data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722661] [data_processor.h:74] LLC no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722657] [data_processor.h:74] KFC_TASK no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:72] Save LLC data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.cpp:27] NPU_OP_MEM Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722661] [data_processor.h:74] LLC no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722659] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/host_network_usage.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/task_memory.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [api_processor.cpp:35] There are 6 records before API data filtering, filterTime is 1769053343737726000.
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [data_processor.cpp:27] PCIE Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.cpp:27] PMU Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [data_processor.cpp:27] OP_STATISTIC Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.cpp:27] OSRT_API Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [api_processor.cpp:49] There are 6 records after API data filtering.
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [host_usage_processor.cpp:23] Start process OSRT_API.
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/nic.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [data_processor.h:72] Save API data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722664] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/netdev_stats.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [pcie_processor.cpp:47] PCIeProcessor Process, dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [data_processor.cpp:27] QOS Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722664] [data_processor.h:72] Save NETDEV_STATS data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/msproftx.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722664] [data_processor.h:74] NETDEV_STATS no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/nic.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722664] [data_processor.cpp:27] ROCE Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/msproftx.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.cpp:27] SIO Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [msproftx_host_processor.cpp:79] msprofTx in /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA is not exists, return
+2026-01-22 11:42:25 [INFO] [2722654] [2722662] [data_processor.cpp:27] SOC Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [metric_processor.cpp:73] Metric mode is not task_based, the metric summary will not processed.
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/npu_module_mem.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.cpp:27] STEP_TRACE Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722661] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/host/sqlite/host_runtime_api.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.h:72] Save NPU_MODULE_MEM data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.cpp:27] TASK Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.h:74] NPU_MODULE_MEM no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [data_processor.cpp:54] Check /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/op_counter.db and op_report success.
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [data_processor.cpp:27] UNIFIED_PMU Run. Dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [db_runner.h:75] Start query data
+2026-01-22 11:42:25 [WARN] [2722654] [2722663] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/npu_mem.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722663] [data_processor.h:72] Save NPU_MEM data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722656] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/qos.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722663] [data_processor.h:74] NPU_MEM no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722656] [data_processor.h:72] Save QOS data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/sio.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/soc_profiler.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722660] [data_processor.h:72] Save SIO data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722662] [data_processor.h:72] Save SOC data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722660] [data_processor.h:74] SIO no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722662] [data_processor.h:74] SOC no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722664] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/roce.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722656] [data_processor.h:74] QOS no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722664] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/roce.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [unified_pmu_processor.cpp:262] SampleBasedProcess, dir is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/ai_vector_core.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [db_runner.h:86] Query data success: SELECT op_type, core_type, occurrences,  round(total_time/1000.0, 3), round(min/1000.0, 3), round(avg/1000.0, 3), round(max/1000.0, 3), round(ratio, 3) FROM op_report WHERE op_type != 'N/A' and core_type not in ('WRITE_BACK', 'INVALID')
+2026-01-22 11:42:25 [WARN] [2722654] [2722655] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/aicore.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722655] [unified_pmu_processor.cpp:296] There is no db to export, prof path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA.
+2026-01-22 11:42:25 [WARN] [2722654] [2722657] [op_statistic_processor.cpp:86] Op Statistics original data has no valid type data. DBPath is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/op_counter.db
+2026-01-22 11:42:25 [INFO] [2722654] [2722657] [data_processor.h:72] Save OP_STATISTIC data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.cpp:54] Check /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/ascend_task.db and AscendTask success.
+2026-01-22 11:42:25 [WARN] [2722654] [2722657] [data_processor.h:74] OP_STATISTIC no data to inject to dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722659] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/pcie.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/trace.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722659] [data_processor.h:72] Save PCIE data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:61] There are 0 records before STEP_TRACE data filtering, filterTime is 1769053343737654000.
+2026-01-22 11:42:25 [WARN] [2722654] [2722659] [data_processor.h:74] PCIE no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:65] There are 0 records after STEP_TRACE data filtering.
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [db_runner.h:75] Start query data
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/trace.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [db_runner.h:86] Query data success: SELECT a.start_time, a.duration, a.model_id, a.index_id, a.stream_id, a.task_id, a.context_id,a.batch_id, a.connection_id, a.host_task_type, a.device_task_type FROM AscendTask a WHERE a.device_task_type != 'UNKNOWN'
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:61] There are 0 records before STEP_TRACE data filtering, filterTime is 1769053343737654000.
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:65] There are 0 records after STEP_TRACE data filtering.
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [data_processor.cpp:38] Can't find the db, the path is /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/device_0/sqlite/trace.db.
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:61] There are 0 records before STEP_TRACE data filtering, filterTime is 1769053343737654000.
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:65] There are 0 records after STEP_TRACE data filtering.
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:72] Save STEP_TRACE data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [data_processor.h:74] STEP_TRACE no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:72] Save STEP_TRACE data into dataInventory
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [data_processor.h:74] STEP_TRACE no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:61] There are 2 records before TASK data filtering, filterTime is 1769053343737654000.
+2026-01-22 11:42:25 [INFO] [2722654] [2722658] [data_processor.h:72] Save STEP_TRACE data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:65] There are 2 records after TASK data filtering.
+2026-01-22 11:42:25 [WARN] [2722654] [2722658] [data_processor.h:74] STEP_TRACE no data to inject to dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722661] [data_processor.h:72] Save TASK data into dataInventory
+2026-01-22 11:42:25 [INFO] [2722654] [2722665] [summary_manager.cpp:53] Start exporting summary!
+2026-01-22 11:42:25 [INFO] [2722654] [2722666] [db_assembler.cpp:1231] Start exporting db!
+2026-01-22 11:42:25 [INFO] [2722654] [2722672] [summary_assembler.h:33] Begin to Assemble OP_SUMMARY data
+2026-01-22 11:42:25 [INFO] [2722654] [2722670] [summary_assembler.h:33] Begin to Assemble OP_STATISTIC data
+2026-01-22 11:42:25 [INFO] [2722654] [2722669] [summary_assembler.h:33] Begin to Assemble NPU_MEM data
+2026-01-22 11:42:25 [INFO] [2722654] [2722668] [summary_assembler.h:33] Begin to Assemble COMMUNICATION_STATISTIC data
+2026-01-22 11:42:25 [INFO] [2722654] [2722671] [summary_assembler.h:33] Begin to Assemble NPU_MODULE_MEM data
+2026-01-22 11:42:25 [INFO] [2722654] [2722666] [db_assembler.cpp:1164] Find completed msprof db, /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/msprof_20260122114224.db.
+2026-01-22 11:42:25 [WARN] [2722654] [2722671] [npu_module_mem_assembler.cpp:41] No data to export npu module memory summary
+2026-01-22 11:42:25 [WARN] [2722654] [2722669] [npu_memory_assembler.cpp:32] No data to export npu memory summary
+2026-01-22 11:42:25 [WARN] [2722654] [2722671] [summary_assembler.h:39] No need to Export NPU_MODULE_MEM data
+2026-01-22 11:42:25 [WARN] [2722654] [2722669] [summary_assembler.h:39] No need to Export NPU_MEM data
+2026-01-22 11:42:25 [INFO] [2722654] [2722671] [summary_assembler.h:33] Begin to Assemble API data
+2026-01-22 11:42:25 [INFO] [2722654] [2722669] [summary_assembler.h:33] Begin to Assemble FUSION_OP data
+2026-01-22 11:42:25 [WARN] [2722654] [2722669] [fusion_op_assembler.cpp:69] fusion op data not exist.
+2026-01-22 11:42:25 [WARN] [2722654] [2722669] [summary_assembler.h:39] No need to Export FUSION_OP data
+2026-01-22 11:42:25 [INFO] [2722654] [2722669] [summary_assembler.h:33] Begin to Assemble TASK_TIME_SUMMARY data
+2026-01-22 11:42:25 [INFO] [2722654] [2722669] [csv_writer.cpp:77] Start dump /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/task_time.csv, timestamp is 20260122114225.
+2026-01-22 11:42:25 [INFO] [2722654] [2722671] [csv_writer.cpp:77] Start dump /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/api_statistic.csv, timestamp is 20260122114225.
+2026-01-22 11:42:25 [INFO] [2722654] [2722669] [file.cpp:395] The file not exists: /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/task_time_20260122114225.csv.
+2026-01-22 11:42:25 [INFO] [2722654] [2722671] [file.cpp:395] The file not exists: /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/api_statistic_20260122114225.csv.
+2026-01-22 11:42:25 [WARN] [2722654] [2722670] [op_statistic_assembler.cpp:56] Op Statistic data not exist.
+2026-01-22 11:42:25 [WARN] [2722654] [2722668] [comm_statistic_assembler.cpp:56] Communication Statistic data not exist.
+2026-01-22 11:42:25 [WARN] [2722654] [2722670] [summary_assembler.h:39] No need to Export OP_STATISTIC data
+2026-01-22 11:42:25 [WARN] [2722654] [2722668] [summary_assembler.h:39] No need to Export COMMUNICATION_STATISTIC data
+2026-01-22 11:42:25 [INFO] [2722654] [2722672] [csv_writer.cpp:77] Start dump /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/op_summary.csv, timestamp is 20260122114225.
+2026-01-22 11:42:25 [INFO] [2722654] [2722669] [csv_writer.cpp:84] Generate /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/task_time.csv finished, timestamp is 20260122114225.
+2026-01-22 11:42:25 [INFO] [2722654] [2722670] [summary_assembler.h:33] Begin to Assemble STEP_TRACE data
+2026-01-22 11:42:25 [INFO] [2722654] [2722671] [csv_writer.cpp:84] Generate /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/api_statistic.csv finished, timestamp is 20260122114225.
+2026-01-22 11:42:25 [INFO] [2722654] [2722672] [file.cpp:395] The file not exists: /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/op_summary_20260122114225.csv.
+2026-01-22 11:42:25 [INFO] [2722654] [2722671] [summary_assembler.h:36] Assemble and export API data success
+2026-01-22 11:42:25 [WARN] [2722654] [2722670] [summary_step_trace_assembler.cpp:59] trainTraceData not exists, can't export step trace data.
+2026-01-22 11:42:25 [INFO] [2722654] [2722669] [summary_assembler.h:36] Assemble and export TASK_TIME_SUMMARY data success
+2026-01-22 11:42:25 [WARN] [2722654] [2722670] [summary_assembler.h:39] No need to Export STEP_TRACE data
+2026-01-22 11:42:25 [INFO] [2722654] [2722672] [csv_writer.cpp:84] Generate /workspace/cann-recipes-train/llm_rl/qwen3/result/liteserver-hps-1f00-00001_2721998_20260122034223682_ascend_pt/PROF_000001_20260122114223683_RNDOIEMOMLOLIPKA/mindstudio_profiler_output/op_summary.csv finished, timestamp is 20260122114225.
+2026-01-22 11:42:25 [INFO] [2722654] [2722672] [summary_assembler.h:36] Assemble and export OP_SUMMARY data success

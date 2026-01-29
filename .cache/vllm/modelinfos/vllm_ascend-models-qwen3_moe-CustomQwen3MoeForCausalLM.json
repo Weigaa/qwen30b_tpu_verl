@@ -1,5 +1,5 @@
 {
-  "hash": "2f186936e82fb7ad675316fce63149b3",
+  "hash": "0d6d11ef7a72bc3d3467c82c68ca1b84",
   "modelinfo": {
     "architecture": "CustomQwen3MoeForCausalLM",
     "is_text_generation_model": true,

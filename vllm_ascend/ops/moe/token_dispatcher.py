@@ -188,6 +188,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         # comm_stream.wait_stream(torch.npu.current_stream())
         expand_x, dynamic_scale, self.assist_info_for_combine, \
             expert_token_nums, self.ep_recv_counts = self.output[0:5]
+        # if expand_x.shape[0] == 4096 and self.ep_rank_id == 0:
+        #     torch.set_printoptions(profile="full")
+        #     print("assist_info_for_combine in dispatch is", self.assist_info_for_combine, "size is", self.assist_info_for_combine.size())
+        #     torch.set_printoptions(profile="default")
 
         if self.with_quant:
             if shared_experts is not None:
