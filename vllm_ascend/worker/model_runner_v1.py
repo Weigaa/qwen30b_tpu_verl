@@ -811,7 +811,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # even if we are running in eager mode, which harms performance.
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
-        #print("sync happend in model_runner_v1.py")
         if self.dp_size == 1:
             return num_tokens, None, with_prefill, enable_dbo
 
@@ -833,6 +832,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[:-2]
+        # print("real num_tokens_across_dp is", num_tokens_across_dp)
         synced_flags = packed_tensor[-2:]
 
         max_tokens_across_dp = torch.max(num_tokens_across_dp).item()
@@ -1277,6 +1277,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         ],
                                     dtype=np.int32)
 
+        # print("current step num_reqs", num_reqs, "num_scheduled_tokens", num_scheduled_tokens, "num_valid_tokens", num_valid_tokens)
         # Get the attention state.
         attn_state = self._build_attn_state(num_reqs, num_scheduled_tokens,
                                             num_valid_tokens)
@@ -1326,6 +1327,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # NOTE: maybe_padded_num_tokens is only used when using TorchAir with DP,
         # Otherwise, it's just max_tokens_across_dp_cpu
         # print("rank", self.dp_rank, "prepare need_allreduce:", self.need_allreduce)
+        # print("rank", self.dp_rank, "with_prefill is: ", with_prefill, "current attn_state is", attn_state)
         if self.need_allreduce:
             (maybe_padded_num_tokens, num_tokens_across_dp, with_prefill,
             enable_dbo) = self._sync_metadata_across_dp(num_input_tokens,
@@ -1335,7 +1337,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         else:
             maybe_padded_num_tokens = 16
             num_tokens_across_dp = torch.tensor([16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16])
-        print("rank", self.dp_rank, "maybe_padded_num_tokens:", maybe_padded_num_tokens)
+        # print("rank", self.dp_rank, "input_tokens is",num_input_tokens, "maybe_padded_num_tokens:", maybe_padded_num_tokens, "with_prefill is", with_prefill, "after sync num_tokens_across_dp is", num_tokens_across_dp.tolist(), "enable_dbo is", enable_dbo)
         # TODO: Now that num_input_tokens is basically identical with maybe_padded_num_tokens
         # We should consider removing maybe_padded_num_tokens later
         num_input_tokens = maybe_padded_num_tokens
@@ -2418,7 +2420,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if num_tokens == 1:
             is_long_tail = True
             #only dummy_run in decode stage num_tokens == 1
-            print("rank", self.dp_rank, "Using dummy run in vllm_ascend model_runner_v1.py")
+            # print("rank", self.dp_rank, "Using dummy run in vllm_ascend model_runner_v1.py")
         #     print("num_tokens:", num_tokens,"uniform_decode:", uniform_decode,
         #         "with_prefill:", with_prefill,
         #         "aclgraph_runtime_mode:", aclgraph_runtime_mode,

@@ -166,7 +166,8 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         hidden_states,
         attn_metadata=None,
         _metadata_for_padding: Optional[MetadataForPadding] = None,
-        replace_allreduce: bool = False
+        replace_allreduce: bool = False,
+        is_dummy: bool = False,
     ):
         if attn_metadata is None:
             attn_metadata = get_forward_context().attn_metadata
@@ -188,7 +189,8 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             enable_force_load_balance=enable_force_load_balance,
             shared_experts=None,
             _metadata_for_padding=_metadata_for_padding,
-            replace_allreduce=replace_allreduce
+            replace_allreduce=replace_allreduce,
+            is_dummy=is_dummy
         )
 
         return hidden_states
@@ -427,7 +429,8 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         kv_cache: Optional[torch.Tensor] = None,
         attn_metadata: Optional[AttentionMetadata] = None,
         _metadata_for_padding: Optional[MetadataForPadding] = None,
-        replace_allreduce: bool = False
+        replace_allreduce: bool = False,
+        is_dummy: bool = False,
     ) -> torch.Tensor:
 
         # To prevent precision issues during the decoder phase when only prefilling enables SP
@@ -483,9 +486,10 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
             hidden_states = self.mlp(
                 hidden_states, 
                 _metadata_for_padding=_metadata_for_padding,
-                replace_allreduce=enable_optimization)
+                replace_allreduce=enable_optimization,
+                is_dummy=is_dummy)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, is_dummy=is_dummy)
 
         if enable_optimization and self.layer_idx == self.layers - 1:
             hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=0)
@@ -538,6 +542,7 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         _metadata_for_padding: Optional[MetadataForPadding] = None,
+        is_dummy: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -560,7 +565,8 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
                           self.start_layer] if kv_caches is not None else None,
                 attn_metadata,
                 _metadata_for_padding=_metadata_for_padding,
-                replace_allreduce=replace_allreduce)
+                replace_allreduce=replace_allreduce,
+                is_dummy=is_dummy)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
@@ -642,10 +648,11 @@ class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
         attn_metadata: Optional[AttentionMetadata] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        is_dummy: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         _metadata_for_padding = init_metadata_for_sp(
             input_ids, self.enable_sequence_parallelism)
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, intermediate_tensors,
-                                   inputs_embeds, _metadata_for_padding)
+                                   inputs_embeds, _metadata_for_padding, is_dummy)
         return hidden_states

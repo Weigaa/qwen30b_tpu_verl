@@ -1,0 +1,33 @@
+{
+    "graph_id": 4,
+    "op": [
+        {
+            "error_type": "infer_shape_error",
+            "input0": {
+                "data_type": "DT_BFLOAT16",
+                "layout": "ND",
+                "shape": [
+                    -1,
+                    0
+                ]
+            },
+            "input1": {
+                "data_type": "DT_BFLOAT16",
+                "layout": "ND",
+                "shape": [
+                    2048,
+                    5120
+                ]
+            },
+            "name": "MatMul_578",
+            "output0": {
+                "data_type": "DT_BFLOAT16",
+                "layout": "ND",
+                "shape": []
+            },
+            "reason": "InferShapeFailed!",
+            "type": "MatMul"
+        }
+    ],
+    "session_id": 0
+}

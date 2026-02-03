@@ -168,7 +168,7 @@ def torchair_fused_experts_with_mc2(
     # comm_stream.wait_stream(torch.npu.current_stream())
     expand_x, dynamic_scale, assist_info_for_combine, expert_token_nums, ep_recv_counts = output[
         0:5]
-    print("ep_rank", ep_rank_id, "expert_token_nums", expert_token_nums, "expand_x.shape[0]", expand_x.shape[0], "ep_recv_counts", ep_recv_counts)
+    # print("ep_rank", ep_rank_id, "expert_token_nums", expert_token_nums, "expand_x.shape[0]", expand_x.shape[0], "ep_recv_counts", ep_recv_counts)
 
     if shared_experts is not None:
         with npu_stream_switch("moe_secondary", 0):
@@ -942,14 +942,13 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
 
         topk_weights = topk_weights.to(x.dtype)
+        if log2phy is not None:
+            topk_ids = log2phy[topk_ids]
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
         if enable_force_load_balance and not self.use_aclgraph:
             topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
-
-        if log2phy is not None:
-            topk_ids = log2phy[topk_ids]
         fused_moe_state = get_forward_context().fused_moe_state
         if self.enable_shared_expert_dp and fused_moe_state == FusedMoEState.MC2:
             fused_moe_state = FusedMoEState.All2All
@@ -1215,7 +1214,9 @@ class TorchairAscendFusedMoE(FusedMoE):
                 shared_experts: Optional[Any] = None,
                 gate=None,
                 replace_allreduce: bool = False,
-                _metadata_for_padding: Optional[MetadataForPadding] = None):
+                _metadata_for_padding: Optional[MetadataForPadding] = None,
+                is_dummy: bool = False,
+                ):
 
         assert self.quant_method is not None
 

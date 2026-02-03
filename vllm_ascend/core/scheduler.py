@@ -70,6 +70,7 @@ class AscendScheduler(Scheduler):
                                                decode_max_num_seqs)
 
     def schedule(self) -> SchedulerOutput:
+        # print("self.phase is", self.phase, "len(self.running) is", len(self.running),"len(self.waiting) is", len(self.waiting),"len(self.finished_prefill_reqs) is", len(self.finished_prefill_reqs),"token_budget is", self.max_num_scheduled_tokens,"decode_max_num_running_reqs is", self.decode_max_num_running_reqs,"max_num_running_reqs is", self.max_num_running_reqs)
         if self.scheduler_config.chunked_prefill_enabled:
             return super().schedule()
         scheduled_new_reqs: list[Request] = []
@@ -388,6 +389,8 @@ class AscendScheduler(Scheduler):
                                 scheduled_timestamp)
                         self.waiting.appendleft(preempted_req)
                         preempted_reqs.append(preempted_req)
+                        print("Preempting request", preempted_req.request_id,
+                              "for request", request.request_id)
                         if preempted_req == request:
                             # No more request to preempt.
                             can_schedule = False
@@ -515,91 +518,93 @@ class AscendScheduler(Scheduler):
         from collections.abc import Iterable as _Iterable  # 避免与typing冲突
         from collections import defaultdict
 
-        ##wj 新增内容
-        def tokens_sha256_hex(tokens: Iterable[int]) -> str:
-            """将一串 token id 计算为稳定的 SHA-256 十六进制串。"""
-            h = hashlib.sha256()
-            for t in tokens:
-                # 8 字节小端、不带符号，避免字符串拼接歧义
-                h.update(int(t).to_bytes(8, byteorder="little", signed=False))
-            return h.hexdigest()
+        # #######
+        # ##wj 新增内容
+        # def tokens_sha256_hex(tokens: Iterable[int]) -> str:
+        #     """将一串 token id 计算为稳定的 SHA-256 十六进制串。"""
+        #     h = hashlib.sha256()
+        #     for t in tokens:
+        #         # 8 字节小端、不带符号，避免字符串拼接歧义
+        #         h.update(int(t).to_bytes(8, byteorder="little", signed=False))
+        #     return h.hexdigest()
 
-        def build_seqid_to_hash(scheduler_output: Any, *, return_delta: bool = True) -> Dict[SeqId, str]:
-            """
-            仅对 scheduler_output.scheduled_new_reqs 里的请求计算哈希，并将“新加入”的
-            {seq_id/req_id: prompt_hash} 追加到全局 PROMPT_HASH_DB 中。
+        # def build_seqid_to_hash(scheduler_output: Any, *, return_delta: bool = True) -> Dict[SeqId, str]:
+        #     """
+        #     仅对 scheduler_output.scheduled_new_reqs 里的请求计算哈希，并将“新加入”的
+        #     {seq_id/req_id: prompt_hash} 追加到全局 PROMPT_HASH_DB 中。
 
-            - 不修改任何 vLLM 请求对象（避免把 prompt_token_ids 变成字符串）。
-            - 兼容 seq_id/req_id 既可能为 int 也可能为 str。
-            - 若同一个 seq_id 已存在于全局库，默认不覆盖（保持稳定性）。
-            - return_delta=True 时返回“本次新增”的条目；否则返回全量副本。
-            """
-            delta: Dict[SeqId, str] = {}
+        #     - 不修改任何 vLLM 请求对象（避免把 prompt_token_ids 变成字符串）。
+        #     - 兼容 seq_id/req_id 既可能为 int 也可能为 str。
+        #     - 若同一个 seq_id 已存在于全局库，默认不覆盖（保持稳定性）。
+        #     - return_delta=True 时返回“本次新增”的条目；否则返回全量副本。
+        #     """
+        #     delta: Dict[SeqId, str] = {}
 
-            # 只处理 new requests（它们携带完整的 prompt_token_ids）
-            new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None)
-            if isinstance(new_reqs, _Iterable) and not isinstance(new_reqs, (str, bytes)):
-                for req in new_reqs:
-                    # 优先 seq_id，其次 req_id（vLLM 常见是 req_id）
-                    seq_id = getattr(req, "seq_id", None)
-                    if seq_id is None:
-                        seq_id = getattr(req, "req_id", None)
+        #     # 只处理 new requests（它们携带完整的 prompt_token_ids）
+        #     new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None)
+        #     if isinstance(new_reqs, _Iterable) and not isinstance(new_reqs, (str, bytes)):
+        #         for req in new_reqs:
+        #             # 优先 seq_id，其次 req_id（vLLM 常见是 req_id）
+        #             seq_id = getattr(req, "seq_id", None)
+        #             if seq_id is None:
+        #                 seq_id = getattr(req, "req_id", None)
 
-                    tokens = getattr(req, "prompt_token_ids", None)
-                    if seq_id is None or tokens is None:
-                        continue
+        #             tokens = getattr(req, "prompt_token_ids", None)
+        #             if seq_id is None or tokens is None:
+        #                 continue
 
-                    # 如果 tokens 已被外部误改为字符串/字节串，则跳过，避免再次污染
-                    if isinstance(tokens, (str, bytes)):
-                        continue
+        #             # 如果 tokens 已被外部误改为字符串/字节串，则跳过，避免再次污染
+        #             if isinstance(tokens, (str, bytes)):
+        #                 continue
 
-                    # 计算哈希（尽量稳健地把张量/ndarray转为列表）
-                    try:
-                        h = tokens_sha256_hex(tokens)
-                    except Exception:
-                        if hasattr(tokens, "tolist"):
-                            h = tokens_sha256_hex(tokens.tolist())
-                        else:
-                            continue
+        #             # 计算哈希（尽量稳健地把张量/ndarray转为列表）
+        #             try:
+        #                 h = tokens_sha256_hex(tokens)
+        #             except Exception:
+        #                 if hasattr(tokens, "tolist"):
+        #                     h = tokens_sha256_hex(tokens.tolist())
+        #                 else:
+        #                     continue
 
-                    # 新条目才写入全局库；已存在则保持原值不覆盖
-                    if seq_id not in PROMPT_HASH_DB:
-                        PROMPT_HASH_DB[seq_id] = h
-                        delta[seq_id] = h
-                    # 如果想发现“同 seq_id 但 hash 不一致”的情况，可在此处打印告警：
-                    # elif PROMPT_HASH_DB[seq_id] != h:
-                    #     print(f"[build_seqid_to_hash] WARNING: seq_id={seq_id} hash changed; keep the first-seen value.")
+        #             # 新条目才写入全局库；已存在则保持原值不覆盖
+        #             if seq_id not in PROMPT_HASH_DB:
+        #                 PROMPT_HASH_DB[seq_id] = h
+        #                 delta[seq_id] = h
+        #             # 如果想发现“同 seq_id 但 hash 不一致”的情况，可在此处打印告警：
+        #             # elif PROMPT_HASH_DB[seq_id] != h:
+        #             #     print(f"[build_seqid_to_hash] WARNING: seq_id={seq_id} hash changed; keep the first-seen value.")
 
-            # 不用考虑 running_reqs（你说它总是空），也不去遍历 cached_reqs（它是对象而非列表）
-            # cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)  # 仅供调试时查看其 .req_ids
+        #     # 不用考虑 running_reqs（你说它总是空），也不去遍历 cached_reqs（它是对象而非列表）
+        #     # cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)  # 仅供调试时查看其 .req_ids
 
-            return delta if return_delta else dict(PROMPT_HASH_DB)
+        #     return delta if return_delta else dict(PROMPT_HASH_DB)
         
-        #计算得到每一个{req_id,prompt_tokens哈希值}的映射
-        hash_result = build_seqid_to_hash(scheduler_output, return_delta=True)
-        # ep_group = get_ep_group().device_group
-        # ep_rank = ep_group.rank()
-        # print(f"the ep_rank is {ep_rank}, hash_result is {hash_result}")
+        # #计算得到每一个{req_id,prompt_tokens哈希值}的映射
+        # hash_result = build_seqid_to_hash(scheduler_output, return_delta=True)
+        # # ep_group = get_ep_group().device_group
+        # # ep_rank = ep_group.rank()
+        # # print(f"the ep_rank is {ep_rank}, hash_result is {hash_result}")
 
-        # print("after hash update the result is", len(hash_result))
-        req_ids = defaultdict(int)
-        for key , value in scheduler_output.num_scheduled_tokens.items():
-            new_key = PROMPT_HASH_DB[key]
-            req_ids[new_key] += int(value)
-        schedule_total = sum(scheduler_output.num_scheduled_tokens.values())
-        seq_total = sum(req_ids.values())
-        if schedule_total != seq_total:
-            print("schedule_total:", schedule_total)
-            print("seq_total:", seq_total)
-            print("warning: the num_scheduled_tokens is not equal to the req_ids")
-            print("the number of req_ids ias", len(req_ids))
-            print("the number of scheduler_output.num_scheduled_tokens is", len(scheduler_output.num_scheduled_tokens))
-            print("the scheduler_output.num_scheduled_tokens is", scheduler_output.num_scheduled_tokens)
-            print("the req_ids is", req_ids)
-        # print("after trans the result is", req_ids)
-        #update current batch seq_ids
-        moe_stats.get_current_batch_seq_ids(req_ids)
-        # print("this time scheduled tokens are", scheduler_output.num_scheduled_tokens)
+        # # print("after hash update the result is", len(hash_result))
+        # req_ids = defaultdict(int)
+        # for key , value in scheduler_output.num_scheduled_tokens.items():
+        #     new_key = PROMPT_HASH_DB[key]
+        #     req_ids[new_key] += int(value)
+        # schedule_total = sum(scheduler_output.num_scheduled_tokens.values())
+        # seq_total = sum(req_ids.values())
+        # if schedule_total != seq_total:
+        #     print("schedule_total:", schedule_total)
+        #     print("seq_total:", seq_total)
+        #     print("warning: the num_scheduled_tokens is not equal to the req_ids")
+        #     print("the number of req_ids ias", len(req_ids))
+        #     print("the number of scheduler_output.num_scheduled_tokens is", len(scheduler_output.num_scheduled_tokens))
+        #     print("the scheduler_output.num_scheduled_tokens is", scheduler_output.num_scheduled_tokens)
+        #     print("the req_ids is", req_ids)
+        # # print("after trans the result is", req_ids)
+        # #update current batch seq_ids
+        # moe_stats.get_current_batch_seq_ids(req_ids)
+        # # print("this time scheduled tokens are", scheduler_output.num_scheduled_tokens)
+        # ################
 
         return scheduler_output
 

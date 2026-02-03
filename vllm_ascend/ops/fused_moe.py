@@ -126,17 +126,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         is_dummy = kwargs.get("is_dummy", False)
         if log2phy is not None:
             old_topk_ids = topk_ids
-        topk_ids = log2phy[topk_ids]
+            topk_ids = log2phy[topk_ids]
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
-        # if enable_force_load_balance and not self.use_aclgraph:
-        #     topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
-        # 考虑在dummy_run场景下也打开？
-        if (enable_force_load_balance and not self.use_aclgraph) or is_dummy:
+        if enable_force_load_balance and not self.use_aclgraph:
             topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
-            # if is_dummy:
-            #     print("dummy run enable force load balance, layer_idx:", layer_idx)
+        # 考虑在dummy_run场景下也打开？
+        # if (enable_force_load_balance and not self.use_aclgraph) or is_dummy:
+        #     topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
+        #     # if is_dummy:
+        #     #     print("dummy run enable force load balance, layer_idx:", layer_idx)
 
         moe_comm_method = get_forward_context().moe_comm_method
         # #记录topk_ids用于统计

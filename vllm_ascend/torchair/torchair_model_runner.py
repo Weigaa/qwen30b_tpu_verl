@@ -153,7 +153,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
     def _generate_dummy_run_hidden_states(self, with_prefill,
                                           is_torchair_compile, input_ids,
                                           positions, attn_metadata, num_tokens,
-                                          intermediate_tensors, inputs_embeds):
+                                          intermediate_tensors, inputs_embeds, is_long_tail):
         #Decode run dummy forward here
         #print("dummy forward in torchair_model_runner.py")
         if with_prefill or self.enable_shared_expert_dp:
@@ -161,7 +161,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
                 converting_weight_acl_format(self.model, ACL_FORMAT_FRACTAL_ND)
             hidden_states = super()._generate_dummy_run_hidden_states(
                 with_prefill, is_torchair_compile, input_ids, positions,
-                attn_metadata, num_tokens, intermediate_tensors, inputs_embeds)
+                attn_metadata, num_tokens, intermediate_tensors, inputs_embeds, is_long_tail)
         else:
             # Only mark static while compiling
             if is_torchair_compile:
@@ -192,6 +192,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
                 positions=positions,
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=None,
+                is_dummy=is_long_tail,
                 **model_kwargs,
             )
             #also record in dummy_run ranks

@@ -862,7 +862,6 @@ def determine_expert_map(
     #     idx = torch.tensor(rank3[layer_idx], dtype=torch.int32)
     #     expert_map[idx] = torch.arange(16, dtype=torch.int32)
     
-    '''
     #use customed expert map 16 ranks
     rank0 = [[98, 30, 112, 87, 124, 68, 105, 55], [102, 111, 87, 121, 78, 74, 46, 110], [37, 73, 61, 42, 109, 121, 96, 106], [126, 99, 6, 87, 37, 120, 33, 15], [48, 2, 64, 65, 33, 12, 6, 68], [44, 72, 123, 111, 56, 26, 120, 11], [2, 120, 101, 34, 84, 7, 113, 81], [80, 61, 123, 19, 59, 7, 114, 20], [71, 64, 43, 51, 115, 120, 38, 34], [18, 17, 1, 55, 3, 93, 20, 109], [46, 116, 126, 121, 48, 118, 69, 77], [123, 29, 21, 81, 34, 121, 57, 38], [48, 64, 16, 120, 85, 112, 72, 70], [73, 44, 89, 127, 102, 19, 101, 9], [127, 97, 94, 123, 22, 42, 50, 103], [124, 60, 102, 76, 114, 96, 73, 68], [95, 1, 73, 68, 51, 16, 19, 86], [74, 19, 26, 112, 77, 84, 120, 24], [2, 71, 72, 50, 85, 67, 103, 36], [37, 67, 10, 76, 20, 6, 63, 121], [71, 21, 66, 43, 67, 63, 94, 22], [18, 84, 2, 112, 97, 3, 121, 20], [46, 103, 5, 109, 70, 38, 104, 17], [123, 54, 119, 51, 126, 2, 57, 83], [48, 0, 47, 113, 1, 65, 31, 86], [69, 47, 117, 89, 41, 46, 62, 3], [127, 16, 34, 81, 41, 114, 103, 77], [124, 50, 56, 127, 70, 123, 113, 43], [95, 106, 103, 10, 125, 93, 32, 86], [74, 88, 94, 78, 31, 98, 47, 71], [2, 71, 72, 125, 69, 81, 121, 100], [80, 27, 70, 125, 86, 23, 73, 25], [12, 113, 20, 93, 5, 14, 4, 0], [18, 26, 13, 33, 70, 111, 46, 109], [46, 57, 107, 44, 73, 58, 30, 106], [123, 72, 97, 92, 112, 74, 96, 83], [48, 115, 54, 41, 85, 29, 70, 14], [88, 86, 109, 102, 119, 26, 100, 17], [126, 79, 71, 97, 100, 109, 103, 99], [124, 95, 17, 3, 54, 7, 6, 99], [95, 108, 99, 100, 37, 25, 52, 88], [74, 63, 17, 123, 100, 93, 71, 24], [104, 92, 93, 115, 110, 40, 10, 97], [118, 72, 55, 52, 70, 110, 44, 104], [109, 121, 82, 61, 116, 12, 117, 83], [21, 97, 41, 79, 31, 40, 57, 120], [28, 18, 29, 106, 107, 110, 87, 22], [92, 105, 65, 6, 114, 57, 68, 97]]
     rank1 = [[100, 61, 97, 41, 125, 18, 95, 56], [119, 108, 82, 9, 101, 35, 109, 118], [32, 103, 29, 69, 39, 119, 26, 28], [45, 72, 118, 111, 106, 34, 95, 83], [103, 11, 89, 29, 32, 71, 69, 17], [29, 14, 103, 1, 33, 35, 94, 60], [73, 17, 108, 53, 82, 64, 48, 36], [65, 108, 119, 72, 17, 6, 121, 102], [12, 126, 101, 42, 66, 86, 94, 80], [19, 124, 23, 125, 105, 78, 77, 36], [100, 34, 65, 42, 111, 76, 41, 89], [127, 14, 47, 87, 53, 82, 101, 20], [89, 114, 110, 50, 8, 126, 17, 46], [114, 22, 57, 42, 124, 14, 70, 37], [73, 14, 7, 90, 17, 31, 65, 15], [22, 36, 101, 56, 7, 91, 89, 99], [112, 64, 116, 43, 120, 89, 38, 88], [122, 53, 90, 64, 78, 59, 71, 27], [73, 15, 77, 115, 70, 127, 33, 45], [80, 61, 72, 94, 22, 93, 62, 102], [12, 121, 118, 42, 3, 4, 75, 58], [19, 115, 32, 12, 87, 7, 35, 36], [100, 6, 19, 37, 102, 49, 71, 21], [127, 89, 75, 100, 87, 77, 74, 106], [13, 77, 10, 21, 56, 45, 90, 72], [114, 97, 75, 66, 122, 12, 101, 116], [43, 91, 97, 56, 47, 44, 50, 23], [22, 42, 5, 69, 102, 74, 58, 68], [36, 34, 81, 79, 123, 68, 94, 56], [119, 109, 18, 29, 22, 95, 58, 87], [73, 98, 44, 20, 124, 92, 85, 36], [37, 35, 76, 10, 108, 7, 71, 102], [52, 77, 61, 66, 2, 23, 33, 104], [88, 51, 67, 66, 96, 3, 72, 121], [100, 4, 16, 120, 38, 96, 9, 91], [127, 56, 125, 89, 17, 60, 7, 38], [83, 15, 0, 113, 73, 50, 1, 61], [114, 118, 57, 91, 122, 126, 54, 116], [127, 113, 89, 36, 117, 41, 40, 54], [105, 122, 10, 24, 106, 109, 96, 43], [2, 74, 65, 33, 62, 105, 21, 56], [119, 42, 18, 37, 68, 31, 102, 70], [91, 49, 70, 113, 0, 45, 4, 44], [117, 53, 43, 91, 75, 63, 73, 127], [43, 103, 39, 37, 78, 44, 89, 74], [49, 112, 98, 126, 55, 28, 84, 33], [27, 67, 81, 6, 115, 99, 61, 72], [9, 15, 77, 36, 19, 1, 64, 17]]
@@ -902,7 +901,6 @@ def determine_expert_map(
     print("expert_map:", expert_map.size(), expert_map)
     print("l2p:", l2p.size(), l2p)
     return (local_num_experts, expert_map, l2p)
-    '''
 
     '''
     #所有层共享的版本
@@ -1021,32 +1019,32 @@ def determine_expert_map(
     '''
 
     
-    # ############ Original expert placement logic ############
-    # # Create an expert map for the local experts
-    if expert_placement_strategy == "linear":
-        start_idx = ep_rank * base_experts + min(ep_rank, remainder)
-        expert_map[start_idx:start_idx + local_num_experts] = torch.arange(
-            0, local_num_experts, dtype=torch.int32)
-    elif expert_placement_strategy == "round_robin":
-        local_log_experts = torch.arange(ep_rank,
-                                         global_num_experts,
-                                         ep_size,
-                                         dtype=torch.int32)
+    # # ############ Original expert placement logic ############
+    # # # Create an expert map for the local experts
+    # if expert_placement_strategy == "linear":
+    #     start_idx = ep_rank * base_experts + min(ep_rank, remainder)
+    #     expert_map[start_idx:start_idx + local_num_experts] = torch.arange(
+    #         0, local_num_experts, dtype=torch.int32)
+    # elif expert_placement_strategy == "round_robin":
+    #     local_log_experts = torch.arange(ep_rank,
+    #                                      global_num_experts,
+    #                                      ep_size,
+    #                                      dtype=torch.int32)
 
-        expert_map[local_log_experts] = torch.arange(0,
-                                                     local_num_experts,
-                                                     dtype=torch.int32)
-    else:
-        raise ValueError("Unsupported expert placement strategy "
-                         f"'{expert_placement_strategy}', expected one of "
-                         f"{get_args(ExpertPlacementStrategy)}")
-    # print("use original expert placement for ep_rank", ep_rank, "layer_idx", layer_idx)
-    print("original local num_experts:", local_num_experts)
-    print("use original expert placement for ep_rank", ep_rank, "original expert_map:", expert_map.size(), expert_map)
-    #l2p = None
-    l2p = torch.arange(128, dtype=torch.int32)
-    print("l2p is:", l2p.size(), l2p)
-    return (local_num_experts, expert_map, l2p)
+    #     expert_map[local_log_experts] = torch.arange(0,
+    #                                                  local_num_experts,
+    #                                                  dtype=torch.int32)
+    # else:
+    #     raise ValueError("Unsupported expert placement strategy "
+    #                      f"'{expert_placement_strategy}', expected one of "
+    #                      f"{get_args(ExpertPlacementStrategy)}")
+    # # print("use original expert placement for ep_rank", ep_rank, "layer_idx", layer_idx)
+    # print("original local num_experts:", local_num_experts)
+    # print("use original expert placement for ep_rank", ep_rank, "original expert_map:", expert_map.size(), expert_map)
+    # #l2p = None
+    # l2p = torch.arange(128, dtype=torch.int32)
+    # print("l2p is:", l2p.size(), l2p)
+    # return (local_num_experts, expert_map, l2p)
     
 
 def get_compressed_expert_map(expert_map: torch.Tensor) -> str:

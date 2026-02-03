@@ -33,6 +33,8 @@ export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ENABLE_MC2=1                     # 910C开启
 export VLLM_DP_SIZE=16                        # world_size // rollout.tp_size
 export HCCL_BUFFSIZE=800
+#debug用
+# export ASCEND_LAUNCH_BLOCKING=1
 
 export TASK_QUEUE_ENABLE=2
 
@@ -74,7 +76,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \
-    +data.dataset_fraction=0.001\
+    +data.dataset_fraction=0.002\
     custom_reward_function.path=deepscaler.py \
     custom_reward_function.name=compute_score  \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
@@ -138,4 +140,4 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> wjeagerqwen30b-a3b-eager_record_bsz32_dummy_bal.txt 
+    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> wjeagerqwen30b-a3b-eager_record_bsz32_profile.txt 

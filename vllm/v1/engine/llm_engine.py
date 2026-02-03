@@ -273,14 +273,14 @@ class LLMEngine:
             self.should_execute_dummy_batch = False
             #do something replace execute dummy batch
             #record dummy_run time
-            print("rank", torch.distributed.get_rank(group=self.dp_group), "executed dummy batch")
-            begin_time = time.time()
+            # print("rank", torch.distributed.get_rank(group=self.dp_group), "executed dummy batch")
+            # begin_time = time.time()
             self.engine_core.execute_dummy_batch()
-            end=time.time()
-            self.dummy_times += 1
-            print("rank", torch.distributed.get_rank(group=self.dp_group), "dummy_times:", self.dummy_times)
-            print("rank", torch.distributed.get_rank(group=self.dp_group), "total_step_times:", self.total_step_times)
-            print("rank", torch.distributed.get_rank(group=self.dp_group), "dummy batch time:", end-begin_time)
+            # end=time.time()
+            # self.dummy_times += 1
+            # print("rank", torch.distributed.get_rank(group=self.dp_group), "dummy_times:", self.dummy_times)
+            # print("rank", torch.distributed.get_rank(group=self.dp_group), "total_step_times:", self.total_step_times)
+            # print("rank", torch.distributed.get_rank(group=self.dp_group), "dummy batch time:", end-begin_time)
             return []
 
         # 1) Get EngineCoreOutput from the EngineCore.

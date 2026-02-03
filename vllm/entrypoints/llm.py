@@ -1605,6 +1605,7 @@ class LLM:
         while self.llm_engine.has_unfinished_requests():
             original_threshold = gc.get_threshold()
             gc.set_threshold(0)
+            ##profiling here
             step_outputs = self.llm_engine.step()
             gc.set_threshold(*original_threshold)
             for output in step_outputs:
@@ -1629,11 +1630,13 @@ class LLM:
                             pbar.update(1)
                         if pbar.n == num_requests:
                             pbar.refresh()
+        #############
         #update worker config
         self.llm_engine.engine_core.collective_rpc(
             "set_need_allreduce",
             args=(True,),
         )
+        #############
         if use_tqdm:
             pbar.close()
         # Sort the outputs by request ID.
