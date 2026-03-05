@@ -17,7 +17,6 @@ export ASCEND_SLOG_PRINT_TO_STDOUT=0
 export ASCEND_GLOBAL_LOG_LEVEL=3           
 
 export HCCL_CONNECT_TIMEOUT=360   
-export HCCL_EXEC_TIMEOUT=7200
 export HCCL_IF_BASE_PORT=64021
 export HCCL_EXEC_TIMEOUT=360
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -50,6 +49,67 @@ export VLLM_ENABLE_EPLB=0                   # 0: disable eplb, 1: enable eplb
 export USE_HDP=0                            # 0: disable hdp, 1: enable hdp
 export ROLLOUT_REBALANCE_ENABLE=0          # 0: disable rollout rebalance, 1: enable rollout rebalance
 
+#关闭看门狗
+export HCCL_ASYNC_ERROR_HANDLING=1
+
+#Train Drafter开关
+export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=1
+export VLLM_ASCEND_DRAFT_WARMUP_ON_INIT=1
+export VLLM_ASCEND_DRAFT_LR=1e-4
+export VLLM_ASCEND_DRAFT_REUSE_TARGET_EMB_LM=1
+export VLLM_ASCEND_DRAFT_VOCAB_SIZE=4096
+export VLLM_ASCEND_DRAFT_QUEUE_SIZE=4
+export VLLM_ASCEND_DRAFT_MAX_SEQ_LEN=16384
+export VLLM_ASCEND_DRAFT_TRAIN_DTYPE=bf16
+export VLLM_ASCEND_DRAFT_ATTN_IMPL=sdpa
+export VLLM_ASCEND_DRAFT_ATTN_CHUNK_SIZE=1024
+export VLLM_ASCEND_DRAFT_LORA_ENABLE=0
+export VLLM_ASCEND_DRAFT_LORA_BACKEND=custom
+export VLLM_ASCEND_DRAFT_LORA_RANK=8
+export VLLM_ASCEND_DRAFT_LORA_ALPHA=16
+export VLLM_ASCEND_DRAFT_LORA_DROPOUT=0.0
+export VLLM_ASCEND_DRAFT_LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,fc
+export VLLM_ASCEND_DRAFT_SPARSE_KL_ENABLE=1
+export VLLM_ASCEND_DRAFT_SPARSE_KL_TOPK=64
+export VLLM_ASCEND_DRAFT_COMPUTE_ACCURACY=0
+# micro-step training: one dummy window only runs a seq chunk, then accumulate across windows
+export VLLM_ASCEND_DRAFT_MICRO_SEQ_LEN=1
+export VLLM_ASCEND_DRAFT_GRAD_ACCUM_STEPS=4096
+
+# Draft profile mode:
+#   breakdown   -> 正常训练中打印 draft 分段耗时（默认）
+#   profile_only -> 只跑 draft profile step 后退出进程
+export DRAFT_PROFILE_MODE=${DRAFT_PROFILE_MODE:-breakdown}
+
+# 默认：在正常训练里看 draft 的分段耗时
+export VLLM_ASCEND_DRAFT_PROFILE_ONLY=0
+export VLLM_ASCEND_DRAFT_NPU_PROFILE=0
+# export VLLM_ASCEND_DRAFT_NPU_PROFILE_STEPS=10
+# export VLLM_ASCEND_DRAFT_NPU_PROFILE_WAIT=0
+# export VLLM_ASCEND_DRAFT_NPU_PROFILE_WARMUP=2
+# export VLLM_ASCEND_DRAFT_NPU_PROFILE_ACTIVE=4
+# export VLLM_ASCEND_DRAFT_NPU_PROFILE_REPEAT=1
+export VLLM_ASCEND_DRAFT_NPU_PROFILE_DIR=./result/profiler/draft_${DRAFT_PROFILE_MODE}
+export VLLM_ASCEND_DRAFT_STARTUP_WARMUP_STEPS=5
+export VLLM_ASCEND_DRAFT_WARMUP_STEPS=5
+export VLLM_ASCEND_DRAFT_PROFILE_BREAKDOWN=1
+export VLLM_ASCEND_DRAFT_PROFILE_SYNC=0
+export VLLM_ASCEND_DRAFT_ASYNC_TRAIN=0
+
+if [ "${DRAFT_PROFILE_MODE}" = "profile_only" ]; then
+    # 只关注 draft train 的耗时拆分，不进入整套 RL 训练
+    export VLLM_ASCEND_DRAFT_PROFILE_ONLY=1
+    export VLLM_ASCEND_DRAFT_PROFILE_ONLY_WARMUP_STEPS=2
+    export VLLM_ASCEND_DRAFT_PROFILE_ONLY_STEPS=10
+    export VLLM_ASCEND_DRAFT_NPU_PROFILE_STEPS=10
+    export VLLM_ASCEND_DRAFT_STARTUP_WARMUP_STEPS=0
+    export VLLM_ASCEND_DRAFT_WARMUP_STEPS=0
+fi
+
+#超时配置
+export ACL_MDL_STREAM_SYNC_TIMEOUT=-1
+export ACL_MDL_EVENT_SYNC_TIMEOUT=-1
+
 HOME=$(pwd)
 MODEL_PATH=${MODEL_PATH:-"/home/data/Qwen3-30B-A3B"}
 CONFIG_DIR=${CONFIG_DIR:-"${HOME}/verl/trainer/config"}
@@ -59,7 +119,7 @@ TEST_FILE=${TEST_FILE:-"/workspace/data/deepscaler/test.parquet"}
     
 
 time=$(date +%Y%m%d%H%M%S)
-logfile=qwen30B_${time}.log
+logfile=wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}.txt
 
 set -x
 
@@ -128,7 +188,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=1 \
     +trainer.rollout_data_dir=/workspace/data/dump_qwen30b \
     +trainer.rollout_length_dir=/workspace/data/dump_qwen30b \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
@@ -140,4 +200,4 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> wjeagerqwen30b-a3b-record.txt 
+    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> "${logfile}" 

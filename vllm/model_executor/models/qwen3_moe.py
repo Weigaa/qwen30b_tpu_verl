@@ -427,6 +427,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         is_dummy: Optional[bool] = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # is_dummy = False # 强制关闭
         if is_dummy:
             # print("doing dummy eagle train here to overlap self attn")
             if residual is None:
@@ -445,9 +446,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+        # Fully Connected
         # if hidden_states.shape[0] == 32:
         #     self._attn_end.record()
         hidden_states = self.mlp(hidden_states, is_dummy)

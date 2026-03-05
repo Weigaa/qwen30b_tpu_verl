@@ -347,12 +347,22 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
+        self.rollout_early_stop_enable = os.getenv("VLLM_ROLLOUT_EARLY_STOP_ENABLE", "1").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self.rollout_early_stop_factor = float(os.getenv("VLLM_ROLLOUT_EARLY_STOP_FACTOR", "2.0"))
+        self.rollout_early_stop_min_tokens = int(os.getenv("VLLM_ROLLOUT_EARLY_STOP_MIN_TOKENS", "10000"))
+
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+        from torch.utils.data import Subset
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(
@@ -362,6 +372,19 @@ class RayPPOTrainer:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
+
+        # Keep a fixed prompt set per epoch: floor train samples to batch-size multiple.
+        batch_size = int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size))
+        aligned_size = (len(train_dataset) // batch_size) * batch_size
+        if aligned_size <= 0:
+            raise ValueError(f"Train dataset too small after alignment: len={len(train_dataset)}, batch_size={batch_size}")
+        if aligned_size < len(train_dataset):
+            print(f"[DataAlign] floor train dataset to batch multiple: {len(train_dataset)} -> {aligned_size}")
+            train_dataset = Subset(train_dataset, range(aligned_size))
+            # main_ppo may pass in a sampler created from the unaligned dataset.
+            # Reset it so we rebuild a sampler that matches the trimmed dataset.
+            train_sampler = None
+
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:
@@ -466,11 +489,19 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
-                    "request_id",
-                    batch.non_tensor_batch["request_id"].tolist(),
-                )
+            for field in ("request_id", "rollout_rank"):
+                if field in batch.non_tensor_batch:
+                    values = batch.non_tensor_batch[field]
+                    if hasattr(values, "tolist"):
+                        values = values.tolist()
+                    reward_extra_infos_to_dump.setdefault(field, values)
+            # Keep token-level fields for offline draft training reconstruction.
+            for field in ("prompts", "responses", "response_mask"):
+                if field in batch.batch:
+                    values = batch.batch[field]
+                    if isinstance(values, torch.Tensor):
+                        values = values.detach().cpu().tolist()
+                    reward_extra_infos_to_dump.setdefault(field, values)
 
             self._dump_generations(
                 inputs=inputs,
@@ -540,6 +571,41 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _maybe_compute_rollout_response_cap(self, batch: DataProto) -> Optional[int]:
+        if not self.rollout_early_stop_enable:
+            return None
+        if not isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+            return None
+
+        sampler = self.train_dataloader.sampler
+        length_est = getattr(sampler, "_length_estimate", None)
+        if length_est is None:
+            return None
+
+        sample_ids = None
+        for key in ("dataset_item_idx", "index"):
+            if key in batch.non_tensor_batch:
+                sample_ids = batch.non_tensor_batch[key]
+                break
+        if sample_ids is None:
+            return None
+
+        sample_ids = np.asarray(sample_ids, dtype=np.int64)
+        if sample_ids.size == 0:
+            return None
+
+        valid = (sample_ids >= 0) & (sample_ids < len(length_est))
+        if not np.any(valid):
+            return None
+
+        expected_len = float(np.mean(length_est[sample_ids[valid]]))
+        raw_cap = max(self.rollout_early_stop_min_tokens, int(self.rollout_early_stop_factor * expected_len))
+        hard_cap = int(self.config.actor_rollout_ref.rollout.response_length)
+        cap = max(1, min(raw_cap, hard_cap))
+        if cap >= hard_cap:
+            return None
+        return cap
 
     def _validate(self):
         data_source_lst = []
@@ -1042,8 +1108,8 @@ class RayPPOTrainer:
 
         for epoch in range(self.config.trainer.total_epochs):
             beginning_epoch_time = time.time()
-            #正式训练前，清空记录
-            self.actor_rollout_wg.flush_record()
+            #正式训练前，清空记录moe_stats
+            # self.actor_rollout_wg.flush_record()
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1061,6 +1127,7 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                response_cap = self._maybe_compute_rollout_response_cap(batch)
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
@@ -1072,6 +1139,9 @@ class RayPPOTrainer:
                 data_rebalance = False
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n,
                                              interleave=not data_rebalance)
+                if response_cap is not None:
+                    gen_batch.meta_info["response_max_tokens_cap"] = int(response_cap)
+                    metrics["rollout/response_max_tokens_cap"] = int(response_cap)
                 if data_rebalance:
                     interleave_indices = torch.arange(gen_batch.batch.batch_size[0]).view(
                         -1, batch.batch.batch_size[0]).transpose(1, 0).reshape(-1)
@@ -1363,6 +1433,18 @@ class RayPPOTrainer:
             end_epoch_time = time.time()
             epoch_duration = end_epoch_time - beginning_epoch_time
             print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")
+            save_epoch_freq = int(self.config.trainer.get("save_epoch_freq", 0))
+            if save_epoch_freq > 0 and (epoch + 1) % save_epoch_freq == 0:
+                # global_steps has already advanced to the next step id.
+                save_step = max(1, self.global_steps - 1)
+                origin_step = self.global_steps
+                self.global_steps = save_step
+                print(
+                    "Saving epoch checkpoint: "
+                    f"epoch={epoch + 1}, step={save_step}"
+                )
+                self._save_checkpoint()
+                self.global_steps = origin_step
             # # ... 一轮生成/训练（该轮内统计已自动累计）...
             # epoch_stats = self.actor_rollout_wg.get_record()  # 得到 {prompt_id: {layer_idx: [per-expert prob sums]}}
             # with open(f"moe_step_{epoch}.json", "w") as f:

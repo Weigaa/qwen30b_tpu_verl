@@ -14,12 +14,8 @@ export RAY_DEDUP_LOGS=0
 
 export ASCEND_GLOBAL_EVENT_ENABLE=0         
 export ASCEND_SLOG_PRINT_TO_STDOUT=0       
-export ASCEND_GLOBAL_LOG_LEVEL=3           
-
-export HCCL_CONNECT_TIMEOUT=360   
-export HCCL_EXEC_TIMEOUT=7200
+export ASCEND_GLOBAL_LOG_LEVEL=3             
 export HCCL_IF_BASE_PORT=64021
-export HCCL_EXEC_TIMEOUT=360
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 export MASTER_PORT=23300    # vllm port error
@@ -32,7 +28,7 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ENABLE_MC2=1                     # 910C开启
 export VLLM_DP_SIZE=16                        # world_size // rollout.tp_size
-export HCCL_BUFFSIZE=350
+export HCCL_BUFFSIZE=800
 
 export TASK_QUEUE_ENABLE=2
 
@@ -49,6 +45,63 @@ export USE_ALLTOALL_OVERLAP=1               # Enable to overlap communication in
 export VLLM_ENABLE_EPLB=0                   # 0: disable eplb, 1: enable eplb
 export USE_HDP=0                            # 0: disable hdp, 1: enable hdp
 export ROLLOUT_REBALANCE_ENABLE=0          # 0: disable rollout rebalance, 1: enable rollout rebalance
+#关闭看门狗,并控制超时时间
+export HCCL_ASYNC_ERROR_HANDLING=0
+export HCCL_EXEC_TIMEOUT=7200
+export HCCL_CONNECT_TIMEOUT=7200
+
+# Unified output root for checkpoints / rollout dumps / draft dumps / logs.
+OUTPUT_ROOT=${OUTPUT_ROOT:-/workspace/cann-recipes-train/llm_rl/qwen3}
+OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-save4eagle3}
+OUTPUT_DIR="${OUTPUT_ROOT}/${OUTPUT_SUBDIR}"
+ROLL_OUT_DIR="${OUTPUT_DIR}/rollout_data"
+ROLL_LEN_DIR="${OUTPUT_DIR}/rollout_length"
+DRAFT_DUMP_DIR="${OUTPUT_DIR}/draft_hidden"
+CKPT_DIR="${OUTPUT_DIR}/checkpoints/qwen3moe_for_eagle3"
+TB_DIR="${OUTPUT_DIR}/tensorboard"
+LOG_DIR="${OUTPUT_DIR}/logs"
+
+# Toggle switches:
+#   SAVE_CKPT_ENABLE=1        -> save checkpoints
+#   SAVE_DRAFT_HIDDEN_ENABLE=1 -> dump draft hidden states
+SAVE_CKPT_ENABLE=${SAVE_CKPT_ENABLE:-0}
+SAVE_DRAFT_HIDDEN_ENABLE=${SAVE_DRAFT_HIDDEN_ENABLE:-0}
+
+mkdir -p "${ROLL_OUT_DIR}" "${ROLL_LEN_DIR}" "${TB_DIR}" "${LOG_DIR}"
+if [ "${SAVE_DRAFT_HIDDEN_ENABLE}" = "1" ]; then
+    mkdir -p "${DRAFT_DUMP_DIR}"
+fi
+if [ "${SAVE_CKPT_ENABLE}" = "1" ]; then
+    mkdir -p "${CKPT_DIR}"
+fi
+
+# Draft data collection for offline Eagle3 training
+export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=${VLLM_ASCEND_ENABLE_DRAFT_TRAIN:-0}
+export VLLM_ASCEND_DRAFT_DUMP_ENABLE=${VLLM_ASCEND_DRAFT_DUMP_ENABLE:-${SAVE_DRAFT_HIDDEN_ENABLE}}
+export VLLM_ASCEND_DRAFT_DUMP_DIR=${VLLM_ASCEND_DRAFT_DUMP_DIR:-${DRAFT_DUMP_DIR}}
+export VLLM_ASCEND_DRAFT_DUMP_EVERY=${VLLM_ASCEND_DRAFT_DUMP_EVERY:-1}
+export VLLM_ASCEND_DRAFT_DUMP_HIDDEN_DTYPE=${VLLM_ASCEND_DRAFT_DUMP_HIDDEN_DTYPE:-bf16}
+# Larger queue reduces drop risk when collecting offline draft dataset.
+export VLLM_ASCEND_DRAFT_QUEUE_SIZE=${VLLM_ASCEND_DRAFT_QUEUE_SIZE:-4096}
+export TENSORBOARD_DIR=${TENSORBOARD_DIR:-${TB_DIR}}
+
+# Keep disk usage bounded for per-step save.
+# 1) only save model weights in checkpoints (no optimizer/extra),
+# 2) keep only the latest checkpoint(s).
+ACTOR_CKPT_SAVE_CONTENTS=${ACTOR_CKPT_SAVE_CONTENTS:-[model]}
+ACTOR_CKPT_LOAD_CONTENTS=${ACTOR_CKPT_LOAD_CONTENTS:-[model]}
+CRITIC_CKPT_SAVE_CONTENTS=${CRITIC_CKPT_SAVE_CONTENTS:-[model]}
+CRITIC_CKPT_LOAD_CONTENTS=${CRITIC_CKPT_LOAD_CONTENTS:-[model]}
+MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-3}
+MAX_CRITIC_CKPT_TO_KEEP=${MAX_CRITIC_CKPT_TO_KEEP:-1}
+
+if [ "${SAVE_CKPT_ENABLE}" = "1" ]; then
+    TRAINER_SAVE_FREQ=1
+    TRAINER_DEFAULT_LOCAL_DIR="${CKPT_DIR}"
+else
+    TRAINER_SAVE_FREQ=-1
+    TRAINER_DEFAULT_LOCAL_DIR="${OUTPUT_DIR}"
+fi
 
 HOME=$(pwd)
 MODEL_PATH=${MODEL_PATH:-"/home/data/Qwen3-30B-A3B"}
@@ -59,7 +112,7 @@ TEST_FILE=${TEST_FILE:-"/workspace/data/deepscaler/test.parquet"}
     
 
 time=$(date +%Y%m%d%H%M%S)
-logfile=qwen30B_${time}.log
+logfile="${LOG_DIR}/wjqwen30b-a3b-record_graph_save4eagle3_${time}.txt"
 
 set -x
 
@@ -74,7 +127,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \
-    +data.dataset_fraction=0.002\
+    +data.dataset_fraction=0.003\
     custom_reward_function.path=deepscaler.py \
     custom_reward_function.name=compute_score  \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
@@ -126,11 +179,19 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     trainer.experiment_name='qwen3_30_verl_mindspeedllm_vllm' \
     trainer.n_gpus_per_node=16 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=${TRAINER_SAVE_FREQ} \
+    trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT_TO_KEEP} \
+    trainer.max_critic_ckpt_to_keep=${MAX_CRITIC_CKPT_TO_KEEP} \
+    actor_rollout_ref.actor.checkpoint.save_contents="${ACTOR_CKPT_SAVE_CONTENTS}" \
+    actor_rollout_ref.actor.checkpoint.load_contents="${ACTOR_CKPT_LOAD_CONTENTS}" \
+    critic.checkpoint.save_contents="${CRITIC_CKPT_SAVE_CONTENTS}" \
+    critic.checkpoint.load_contents="${CRITIC_CKPT_LOAD_CONTENTS}" \
+    +trainer.save_epoch_freq=0 \
+    trainer.default_local_dir="${TRAINER_DEFAULT_LOCAL_DIR}" \
     trainer.test_freq=-1 \
     trainer.total_epochs=3 \
-    +trainer.rollout_data_dir=/workspace/data/dump_qwen30b \
-    +trainer.rollout_length_dir=/workspace/data/dump_qwen30b \
+    +trainer.rollout_data_dir="${ROLL_OUT_DIR}" \
+    +trainer.rollout_length_dir="${ROLL_LEN_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_num_transformer_layers=[[11],[13],[13],[11]] \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type='alltoall' \
@@ -140,4 +201,4 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> wjqwen30b-a3b-record_graph_baseline.txt 
+    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> "${logfile}" 

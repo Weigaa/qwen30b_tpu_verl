@@ -913,49 +913,52 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # 如果是 dummy 且开启了负载均衡，直接生成，跳过计算
         # 注意：这里假设 is_dummy 为 True 时，我们需要的是纯粹的负载均衡数据
         if ((enable_force_load_balance and not self.use_aclgraph) or is_dummy):
-            # =======================================================
-             # 路径 A: "计算衍生法" (Data Dependency Construction)
-             # =======================================================
-             # 核心思想：不要 create tensor，而是 compute tensor
-             # 只有计算出来的 tensor，编译器才承认它继承了输入的 shape 符号
+            import torch._dynamo
+            torch._dynamo.prints(f"topk_ids shape in graph mode: {topk_ids.shape}")
+            torch._dynamo.prints(f"topk_weights shape in graph mode: {topk_weights.shape}")
+            # # =======================================================
+            #  # 路径 A: "计算衍生法" (Data Dependency Construction)
+            #  # =======================================================
+            #  # 核心思想：不要 create tensor，而是 compute tensor
+            #  # 只有计算出来的 tensor，编译器才承认它继承了输入的 shape 符号
              
-             # 1. 拿 x 做"种马"，生成全 0 的 Tensor
-             # 选取前 top_k 列，此时 shape 为 [N, top_k] (符号为 S0)
-             # 乘以 0 确保数值为 0，但图连接关系保留了！
-             # .to(int32) 这一步 Cast 操作也会保留符号传播
-             topk_ids = (x[:, :top_k] * 0).to(torch.int32)
+            #  # 1. 拿 x 做"种马"，生成全 0 的 Tensor
+            #  # 选取前 top_k 列，此时 shape 为 [N, top_k] (符号为 S0)
+            #  # 乘以 0 确保数值为 0，但图连接关系保留了！
+            #  # .to(int32) 这一步 Cast 操作也会保留符号传播
+            #  topk_ids = (x[:, :top_k] * 0).to(torch.int32)
              
-             # 同理生成 weights (保持 dtype)
-             topk_weights = (x[:, :top_k] * 0)
+            #  # 同理生成 weights (保持 dtype)
+            #  topk_weights = (x[:, :top_k] * 0)
 
-             # 2. 构造 Pattern (这部分是纯静态的，或者是基于 arange 的)
-             # 这里的计算必须非常小心，不能破坏动态维度
+            #  # 2. 构造 Pattern (这部分是纯静态的，或者是基于 arange 的)
+            #  # 这里的计算必须非常小心，不能破坏动态维度
              
-             # 2.1 构造行偏移： [0, top_k, 2*top_k ...]
-             # 利用 topk_ids 的第0列来生成 range，确保长度一致
-             # (N, 1)
-             num_tokens_tensor = torch.ones_like(topk_ids[:, 0]).cumsum(0) - 1
-             row_offsets = (num_tokens_tensor * top_k).unsqueeze(1).to(torch.int32)
+            #  # 2.1 构造行偏移： [0, top_k, 2*top_k ...]
+            #  # 利用 topk_ids 的第0列来生成 range，确保长度一致
+            #  # (N, 1)
+            #  num_tokens_tensor = torch.ones_like(topk_ids[:, 0]).cumsum(0) - 1
+            #  row_offsets = (num_tokens_tensor * top_k).unsqueeze(1).to(torch.int32)
              
-             # 2.2 构造列基础: [0, 1, ... top_k-1]
-             base_col = torch.arange(top_k, device=x.device, dtype=torch.int32).unsqueeze(0)
+            #  # 2.2 构造列基础: [0, 1, ... top_k-1]
+            #  base_col = torch.arange(top_k, device=x.device, dtype=torch.int32).unsqueeze(0)
              
-             # 2.3 计算 Pattern
-             # 假设 global_num_experts 是 64
-             g_experts = global_num_experts if global_num_experts > 0 else 64
-             pattern = (row_offsets + base_col) % g_experts
+            #  # 2.3 计算 Pattern
+            #  # 假设 global_num_experts 是 64
+            #  g_experts = global_num_experts if global_num_experts > 0 else 64
+            #  pattern = (row_offsets + base_col) % g_experts
              
-             # 3. 【注入灵魂的一步】
-             # 将 Pattern 加到那个"带有血缘关系"的 topk_ids 上
-             # 在图上：topk_ids = (x * 0) + pattern
-             # 编译器看到这个加法，必然承认结果的 shape 等于 x 的 shape
-             topk_ids = topk_ids + pattern
+            #  # 3. 【注入灵魂的一步】
+            #  # 将 Pattern 加到那个"带有血缘关系"的 topk_ids 上
+            #  # 在图上：topk_ids = (x * 0) + pattern
+            #  # 编译器看到这个加法，必然承认结果的 shape 等于 x 的 shape
+            #  topk_ids = topk_ids + pattern
              
-             # weights 同理，全0 + 均值
-             topk_weights = topk_weights + (1.0 / top_k)
+            #  # weights 同理，全0 + 均值
+            #  topk_weights = topk_weights + (1.0 / top_k)
              
-             # 4. 确保连续
-             topk_ids = topk_ids.contiguous()
+            #  # 4. 确保连续
+            #  topk_ids = topk_ids.contiguous()
              topk_weights = topk_weights.contiguous()
         else:
             # ==========================================

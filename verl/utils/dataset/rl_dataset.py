@@ -407,6 +407,9 @@ class RLHFDataset(Dataset):
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
+        # Stable per-row id for curriculum samplers that need to aggregate
+        # rollout stats back to dataset rows across epochs.
+        row_dict["dataset_item_idx"] = item
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
         return row_dict

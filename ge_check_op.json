@@ -8,25 +8,62 @@
                 "layout": "ND",
                 "shape": [
                     -1,
-                    0
+                    2048
                 ]
             },
             "input1": {
-                "data_type": "DT_BFLOAT16",
+                "data_type": "DT_INT32",
                 "layout": "ND",
                 "shape": [
-                    2048,
-                    5120
+                    -1,
+                    8
                 ]
             },
-            "name": "MatMul_578",
+            "input2": {
+                "data_type": "DT_BOOL",
+                "layout": "ND",
+                "shape": [
+                    -1
+                ]
+            },
+            "name": "MoeDistributeDispatchV2_192",
             "output0": {
                 "data_type": "DT_BFLOAT16",
                 "layout": "ND",
                 "shape": []
             },
+            "output1": {
+                "data_type": "DT_FLOAT",
+                "layout": "ND",
+                "shape": []
+            },
+            "output2": {
+                "data_type": "DT_INT32",
+                "layout": "ND",
+                "shape": []
+            },
+            "output3": {
+                "data_type": "DT_INT64",
+                "layout": "ND",
+                "shape": []
+            },
+            "output4": {
+                "data_type": "DT_INT32",
+                "layout": "ND",
+                "shape": []
+            },
+            "output5": {
+                "data_type": "DT_INT32",
+                "layout": "ND",
+                "shape": []
+            },
+            "output6": {
+                "data_type": "DT_FLOAT",
+                "layout": "ND",
+                "shape": []
+            },
             "reason": "InferShapeFailed!",
-            "type": "MatMul"
+            "type": "MoeDistributeDispatchV2"
         }
     ],
     "session_id": 0

@@ -486,6 +486,17 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
+        response_cap = prompts.meta_info.get("response_max_tokens_cap", None)
+        if response_cap is not None:
+            try:
+                response_cap = int(response_cap)
+                max_resp_len = int(self.config.response_length)
+                current_max = kwargs.get("max_tokens", getattr(self.sampling_params, "max_tokens", max_resp_len))
+                current_max = int(current_max) if current_max is not None else max_resp_len
+                kwargs["max_tokens"] = max(1, min(response_cap, current_max, max_resp_len))
+            except Exception:
+                logger.warning("Ignore invalid response_max_tokens_cap=%s", response_cap)
+
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -510,10 +521,18 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
+            request_ids = []
+            rollout_ranks = []
+            local_rank = -1
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                local_rank = int(torch.distributed.get_rank())
             for output in outputs:
+                req_id = str(getattr(output, "request_id", ""))
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
+                    request_ids.append(req_id)
+                    rollout_ranks.append(local_rank)
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
@@ -530,6 +549,17 @@ class vLLMRollout(BaseRollout):
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             seq = torch.cat([idx, response], dim=-1)
+            num_responses = int(response.shape[0])
+            if len(request_ids) == num_responses:
+                non_tensor_batch["request_id"] = np.array(request_ids, dtype=object)
+                non_tensor_batch["rollout_rank"] = np.array(rollout_ranks, dtype=np.int64)
+            else:
+                logger.warning(
+                    "Skip attaching request_id/rollout_rank due to length mismatch: "
+                    "request_ids=%d, responses=%d",
+                    len(request_ids),
+                    num_responses,
+                )
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)

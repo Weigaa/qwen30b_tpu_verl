@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import random
-from collections.abc import Callable
 from dataclasses import asdict
 
 import numpy as np
@@ -26,6 +25,12 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.transformer.enums import AttnBackend
 from transformers import GenerationConfig
+try:
+    from omegaconf import DictConfig, ListConfig, OmegaConf
+except Exception:  # pragma: no cover
+    DictConfig = None  # type: ignore[assignment]
+    ListConfig = None  # type: ignore[assignment]
+    OmegaConf = None  # type: ignore[assignment]
 
 from verl.models.weight_loader_registry import get_weight_saver
 from verl.utils.device import get_device_name, get_torch_device
@@ -43,6 +48,34 @@ from .checkpoint_manager import BaseCheckpointManager
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _to_json_safe(value):
+    if ListConfig is not None and DictConfig is not None and OmegaConf is not None:
+        if isinstance(value, (ListConfig, DictConfig)):
+            value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if callable(item):
+                continue
+            out[str(key)] = _to_json_safe(item)
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(item) for item in value if not callable(item)]
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if isinstance(value, AttnBackend):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 class MegatronCheckpointManager(BaseCheckpointManager):
@@ -461,18 +494,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 # Save transformer config
                 print(self.transformer_config)
                 transformer_config_dict = asdict(self.transformer_config)
-                to_convert_types = {torch.dtype: str, AttnBackend: str}
-                ignore_types = [Callable]
-                pop_keys = []
-                for key, value in transformer_config_dict.items():
-                    if type(value) in to_convert_types:
-                        transformer_config_dict[key] = to_convert_types[type(value)](value)
-                    if type(value) in ignore_types:
-                        pop_keys.append(key)
-                    if callable(value):
-                        pop_keys.append(key)
-                for key in pop_keys:
-                    transformer_config_dict.pop(key)
+                transformer_config_dict = _to_json_safe(transformer_config_dict)
                 transformer_config_path = get_transformer_config_checkpoint_path(local_path)
                 with open(transformer_config_path, "w") as f:
                     json.dump(transformer_config_dict, f, indent=2)

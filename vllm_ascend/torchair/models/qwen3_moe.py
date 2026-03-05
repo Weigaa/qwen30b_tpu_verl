@@ -60,6 +60,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.draft.draft_trainer import DraftTrainer, build_draft_trainer
 from vllm_ascend.torchair.ops.torchair_fused_moe import TorchairAscendFusedMoE
 from vllm_ascend.torchair.ops.sequence_parallel import (MetadataForPadding,
                                                         init_metadata_for_sp)
@@ -420,6 +421,10 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         self.enable_sequence_parallelism = (
             vllm_config.compilation_config.pass_config.
             enable_sequence_parallelism if vllm_config is not None else False)
+        self.draft_trainer: Optional[DraftTrainer] = None
+
+    def set_draft_trainer(self, draft_trainer: Optional[DraftTrainer]) -> None:
+        self.draft_trainer = draft_trainer
 
     def forward(
         self,
@@ -432,6 +437,12 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         replace_allreduce: bool = False,
         is_dummy: bool = False,
     ) -> torch.Tensor:
+        if is_dummy and self.draft_trainer is not None:
+            self.draft_trainer.maybe_train_step(
+                layer_idx=self.layer_idx,
+                hidden_states=hidden_states,
+                positions=positions,
+            )
 
         # To prevent precision issues during the decoder phase when only prefilling enables SP
         if not self.enable_sequence_parallelism:
@@ -528,6 +539,10 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
                 prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        self.draft_trainer = build_draft_trainer(self)
+        for layer in self.layers:
+            if isinstance(layer, CustomQwen3MoeDecoderLayer):
+                layer.set_draft_trainer(self.draft_trainer)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
@@ -614,6 +629,11 @@ class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
                                       prefix=maybe_prefix(prefix, "lm_head"))
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        if getattr(self.model, "draft_trainer", None) is not None:
+            self.model.draft_trainer.bind_target_layers(
+                embed_tokens=self.model.embed_tokens,
+                lm_head=self.lm_head,
+            )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)

@@ -17,7 +17,7 @@
 # Adapted from vllm/model_executor/models/qwen3_moe.py
 # This file is a part of the vllm-ascend project.
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -47,6 +47,7 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
 
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
+from vllm_ascend.draft.draft_trainer import DraftTrainer, build_draft_trainer
 from vllm_ascend.utils import vllm_version_is
 #新增
 from vllm.forward_context import get_forward_context
@@ -222,6 +223,25 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
         self._attn_end   = torch.npu.Event(enable_timing=True)
         self._attn_end_moe   = torch.npu.Event(enable_timing=True)
         self.ep_group = get_ep_group().device_group
+        self.draft_trainer: Optional[DraftTrainer] = None
+
+    def set_draft_trainer(self, draft_trainer: Optional[DraftTrainer]) -> None:
+        self.draft_trainer = draft_trainer
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        is_dummy: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if is_dummy and self.draft_trainer is not None:
+            self.draft_trainer.maybe_train_step(
+                layer_idx=self.layer_idx,
+                hidden_states=hidden_states,
+                positions=positions,
+            )
+        return super().forward(positions, hidden_states, residual, is_dummy)
 
 
 @support_torch_compile
@@ -253,6 +273,11 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
                 prefix=prefix),
             prefix=f"{prefix}.layers",
         )
+        # Initialize once at model build time to avoid first-use latency.
+        self.draft_trainer = build_draft_trainer(self)
+        for layer in self.layers:
+            if isinstance(layer, CustomQwen3MoeDecoderLayer):
+                layer.set_draft_trainer(self.draft_trainer)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
@@ -278,6 +303,11 @@ class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
                                       prefix=maybe_prefix(prefix, "lm_head"))
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        if getattr(self.model, "draft_trainer", None) is not None:
+            self.model.draft_trainer.bind_target_layers(
+                embed_tokens=self.model.embed_tokens,
+                lm_head=self.lm_head,
+            )
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)

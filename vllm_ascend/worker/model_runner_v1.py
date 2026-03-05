@@ -561,6 +561,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.level == CompilationLevel.PIECEWISE and not self.model_config.enforce_eager
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+        draft_trainer = getattr(self.model, "draft_trainer", None)
+        if draft_trainer is None:
+            inner_model = getattr(self.model, "model", None)
+            draft_trainer = getattr(inner_model, "draft_trainer", None)
+        if draft_trainer is not None and scheduler_output.finished_req_ids:
+            draft_trainer.finalize_requests(
+                list(scheduler_output.finished_req_ids))
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1637,6 +1644,58 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             pad_size = get_forward_context().pad_size
             if pad_size > 0:
                 hidden_states = hidden_states[:-pad_size, :]
+        if get_pp_group().is_last_rank:
+            draft_hidden_states = hidden_states
+            if isinstance(draft_hidden_states, tuple):
+                draft_hidden_states = draft_hidden_states[0]
+            draft_trainer = getattr(self.model, "draft_trainer", None)
+            if draft_trainer is None:
+                inner_model = getattr(self.model, "model", None)
+                draft_trainer = getattr(inner_model, "draft_trainer", None)
+            # print(type(self.model), getattr(self.model, "__module__", None))
+            # print("has draft_trainer:", hasattr(self.model, "draft_trainer"))
+            # print("has inner model:", hasattr(self.model, "model"))
+            # print("inner has draft_trainer:", hasattr(getattr(self.model, "model", None), "draft_trainer"))
+            # print("model_runner_v1 draft_trainer is", draft_trainer, "input_ids is", input_ids, "input_batch num_reqs is", self.input_batch.num_reqs)
+            if (draft_trainer is not None and input_ids is not None
+                    and self.input_batch.num_reqs > 0):
+                num_reqs = self.input_batch.num_reqs
+                query_start_loc_cpu = self.query_start_loc_cpu[:num_reqs + 1]
+                total_tokens = int(query_start_loc_cpu[num_reqs].item())
+                if total_tokens > 0:
+                    # Mark where completion tokens start in each per-request slice
+                    # so draft loss can be restricted to response tokens only.
+                    response_start_locs_cpu = torch.zeros(num_reqs,
+                                                          dtype=torch.int32)
+                    prompt_lens = getattr(self.input_batch, "num_prompt_tokens",
+                                          None)
+                    for i, req_id in enumerate(self.input_batch.req_ids):
+                        seg_start = int(query_start_loc_cpu[i].item())
+                        seg_end = int(query_start_loc_cpu[i + 1].item())
+                        seg_len = max(0, seg_end - seg_start)
+                        if seg_len <= 0:
+                            continue
+                        num_computed = int(
+                            self.input_batch.num_computed_tokens_cpu[i])
+                        if prompt_lens is not None:
+                            num_prompt = int(prompt_lens[i])
+                        else:
+                            req_state = self.requests.get(req_id)
+                            if req_state is not None and req_state.prompt_token_ids is not None:
+                                num_prompt = len(req_state.prompt_token_ids)
+                            else:
+                                num_prompt = num_computed
+                        prompt_part_len = max(0, num_prompt - num_computed)
+                        prompt_part_len = min(prompt_part_len, seg_len)
+                        response_start_locs_cpu[i] = prompt_part_len
+                    draft_trainer.record_step_batch(
+                        req_ids=self.input_batch.req_ids,
+                        query_start_loc_cpu=query_start_loc_cpu,
+                        input_ids_cpu=self.input_ids_cpu[:total_tokens],
+                        positions_cpu=self.positions_cpu[:total_tokens],
+                        hidden_states=draft_hidden_states,
+                        response_start_locs_cpu=response_start_locs_cpu,
+                    )
         # # #非dummy_run期间的seq_ids数量和hidden_states在第一维度是对齐的，padding时除外
         # print("model_runner_v1 moe_stats current_batch_seq_ids are", moe_stats.current_batch_seq_ids.size())
         # print("model_runner_v1 the shape of hidden_states are", hidden_states.size())

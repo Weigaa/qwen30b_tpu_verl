@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
+from contextlib import nullcontext
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
 
@@ -62,6 +64,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _R = TypeVar("_R", default=Any)
+
+###新增
+import torch_npu
+import torch
 
 
 class LLM:
@@ -1602,34 +1608,79 @@ class LLM:
         #     "set_need_allreduce",
         #     args=(False,),
         # )
-        while self.llm_engine.has_unfinished_requests():
-            original_threshold = gc.get_threshold()
-            gc.set_threshold(0)
-            ##profiling here
-            step_outputs = self.llm_engine.step()
-            gc.set_threshold(*original_threshold)
-            for output in step_outputs:
-                if output.finished:
-                    outputs.append(output)
-                    if use_tqdm:
-                        if isinstance(output, RequestOutput):
-                            # Calculate tokens only for RequestOutput
-                            n = len(output.outputs)
-                            assert output.prompt_token_ids is not None
-                            total_in_toks += len(output.prompt_token_ids) * n
-                            in_spd = total_in_toks / pbar.format_dict["elapsed"]
-                            total_out_toks += sum(
-                                len(stp.token_ids) for stp in output.outputs)
-                            out_spd = (total_out_toks /
-                                       pbar.format_dict["elapsed"])
-                            pbar.postfix = (
-                                f"est. speed input: {in_spd:.2f} toks/s, "
-                                f"output: {out_spd:.2f} toks/s")
-                            pbar.update(n)
-                        else:
-                            pbar.update(1)
-                        if pbar.n == num_requests:
-                            pbar.refresh()
+        profile_enabled = os.getenv("VLLM_ASCEND_LLM_PROFILE_ENABLE",
+                                    "0").lower() in ("1", "true", "yes", "on")
+        profile_ctx = nullcontext()
+        if profile_enabled:
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                export_type=[torch_npu.profiler.ExportType.Text],
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                msprof_tx=False,
+                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+                l2_cache=False,
+                op_attr=False,
+                data_simplification=False,
+                record_op_args=False,
+                gc_detect_threshold=None,
+            )
+            rank = torch.distributed.get_rank()
+            profile_ctx = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                schedule=torch_npu.profiler.schedule(wait=5000,
+                                                     warmup=0,
+                                                     active=1,
+                                                     repeat=3),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    f"./result/profiler/llm_rank_{rank}"),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+                with_modules=False,
+                with_flops=False,
+                experimental_config=experimental_config,
+            )
+        with profile_ctx as prof:
+            while self.llm_engine.has_unfinished_requests():
+                original_threshold = gc.get_threshold()
+                gc.set_threshold(0)
+                step_outputs = self.llm_engine.step()
+                # # 只打印被捕获的那一步（第101步）
+                # if step_idx == 10000:
+                #     print(f"[PROFILED STEP] step_idx={step_idx}")
+                #     print("rank ", rank,"step_outputs =", step_outputs)  # 直接打印对象
+                #     print("len(step_outputs) =", len(step_outputs))
+                #     # 或者更结构化一点：只打印 finished 的
+                #     for out in step_outputs:
+                #         print("  finished=", out.finished,
+                #             "request_id=", getattr(out, "request_id", None))
+                if prof is not None:
+                    prof.step()
+                gc.set_threshold(*original_threshold)
+                for output in step_outputs:
+                    if output.finished:
+                        outputs.append(output)
+                        if use_tqdm:
+                            if isinstance(output, RequestOutput):
+                                # Calculate tokens only for RequestOutput
+                                n = len(output.outputs)
+                                assert output.prompt_token_ids is not None
+                                total_in_toks += len(output.prompt_token_ids) * n
+                                in_spd = total_in_toks / pbar.format_dict["elapsed"]
+                                total_out_toks += sum(
+                                    len(stp.token_ids) for stp in output.outputs)
+                                out_spd = (total_out_toks /
+                                        pbar.format_dict["elapsed"])
+                                pbar.postfix = (
+                                    f"est. speed input: {in_spd:.2f} toks/s, "
+                                    f"output: {out_spd:.2f} toks/s")
+                                pbar.update(n)
+                            else:
+                                pbar.update(1)
+                            if pbar.n == num_requests:
+                                pbar.refresh()
         #############
         #update worker config
         self.llm_engine.engine_core.collective_rpc(
