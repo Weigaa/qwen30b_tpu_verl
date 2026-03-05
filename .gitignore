@@ -13,3 +13,9 @@ __pycache__/
 
 # Lock files
 Ascend/latest/.lock/
+
+# ATC kernel cache
+atc_data/
+
+# IDE settings
+.vscode/
