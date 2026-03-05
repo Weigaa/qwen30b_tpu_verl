@@ -2,3 +2,14 @@
 # large experiment logs
 wjeagerqwen30b-a3b-eager_*.txt
 *.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# HuggingFace and vllm cache
+.cache/
+
+# Lock files
+Ascend/latest/.lock/
