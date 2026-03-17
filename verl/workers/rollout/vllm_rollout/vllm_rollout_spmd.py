@@ -199,6 +199,10 @@ class vLLMRollout(BaseRollout):
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
         self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1
+        elastic_moe_mode = os.environ.get("VLLM_ASCEND_ELASTIC_MOE_MODE",
+                                          "lossy").lower()
+        init_redundancy_expert = int(
+            os.environ.get("VLLM_ASCEND_INIT_REDUNDANCY_EXPERT", "0"))
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=False,
@@ -235,6 +239,8 @@ class vLLMRollout(BaseRollout):
                     "enable_chunked_prefill": False,
                 },
                 "refresh": True,
+                "elastic_moe_mode": elastic_moe_mode,
+                "init_redundancy_expert": init_redundancy_expert,
                 "dynamic_eplb": self.dynamic_eplb,
                 "num_iterations_eplb_update": 400,  # gather stable workload over 400 iterations
                 "gate_eplb": True,
@@ -640,7 +646,15 @@ class vLLMRollout(BaseRollout):
 
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+        if (os.getenv("VLLM_ASCEND_ELASTIC_MOE_MODE", "lossy") == "lossless"
+                and int(os.getenv("VLLM_ASCEND_INIT_REDUNDANCY_EXPERT", "0")) > 0):
+            if not getattr(self, "_lossless_skip_weight_update_warned", False):
+                logger.warning(
+                    "Lossless elastic prototype skips rollout.update_weights when redundant experts are enabled. "
+                    "Redundant replicas remain at checkpoint-initialized values.")
+                self._lossless_skip_weight_update_warned = True
+            return
+        model.load_weights(weights)
         ###new wj
     def get_record(self):
         return moe_stats.snapshot()

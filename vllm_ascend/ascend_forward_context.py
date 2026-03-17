@@ -33,18 +33,22 @@ class MoECommType(Enum):
 # TODO(zzzzwwjj): add soc_version to choose branch
 def _get_fused_moe_state(ep_size: int, with_prefill: bool,
                          is_deepseek_v3_r1: bool):
+    if ep_size == 1:
+        if with_prefill:
+            return FusedMoEState.NaiveMulticast
+        else:
+            return FusedMoEState.AllGather
+    if envs_ascend.VLLM_ASCEND_FORCE_ALLTOALL_MOE:
+        return FusedMoEState.All2All
     # the fusion operator torch_npu.npu_grouped_matmul_finalize_routing called by allgather ep
     # only supports deepseek v3/r1
     if (envs_ascend.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP and ep_size > 1
             and is_deepseek_v3_r1):
         return FusedMoEState.AllGatherEP
-    elif ep_size == 1:
-        if with_prefill:
-            return FusedMoEState.NaiveMulticast
-        else:
-            return FusedMoEState.AllGather
-    # NOTE: mc2 need ep_size >= 16 & all2all can't use in torchair graph.
-    elif ep_size < 16 or with_prefill:
+    # Keep fused MoE state selection aligned with runtime MC2 gating logic.
+    # Prefill still falls back to All2All here; decode may use MC2 once EP is
+    # larger than the configured minimum.
+    elif ep_size < envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE or with_prefill:
         return FusedMoEState.All2All
     else:
         return FusedMoEState.MC2

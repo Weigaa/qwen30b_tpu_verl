@@ -49,8 +49,8 @@ from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
-from vllm.distributed.parallel_state import (get_dp_group, get_pp_group,
-                                             get_tp_group,
+from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
+                                             get_pp_group, get_tp_group,
                                              is_global_first_rank)
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
@@ -1987,12 +1987,35 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         quant_type = getattr(self.vllm_config.model_config.hf_config,
                              'moe_quantize', None)
         model_type = self.vllm_config.model_config.hf_config.model_type
+        elastic_parallel_shrink_enabled = \
+            envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
+        force_alltoall_moe = envs_ascend.VLLM_ASCEND_FORCE_ALLTOALL_MOE
+        current_ep_size = 1
+        if self.parallel_config.enable_expert_parallel:
+            if elastic_parallel_shrink_enabled:
+                current_ep_size = get_ep_group().world_size
+            else:
+                current_ep_size = self.parallel_config.world_size_across_dp
+        mc2_available = (
+            current_ep_size >= envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE
+            and not force_alltoall_moe)
+
+        if (elastic_parallel_shrink_enabled and self.in_profile_run
+                and with_prefill and mc2_available
+                and soc_version in {AscendSocVersion.A3}):
+            moe_comm_type = MoECommType.MC2
+            if is_global_first_rank():
+                logger.debug(
+                    "use MC2 in profile prefill: num_tokens=%s, current_ep_size=%s",
+                    num_tokens, current_ep_size)
+            return moe_comm_type
 
         if not self.parallel_config.enable_expert_parallel:
             moe_comm_type = MoECommType.ALLGATHER
         elif soc_version in {AscendSocVersion.A2}:
-            if (num_tokens <= self.mc2_tokens_capacity
-                    and self.parallel_config.world_size_across_dp >= 16):
+            if force_alltoall_moe and self.parallel_config.enable_expert_parallel:
+                moe_comm_type = MoECommType.ALLTOALL
+            elif num_tokens <= self.mc2_tokens_capacity and mc2_available:
                 moe_comm_type = MoECommType.MC2
             else:
                 # Currently, w4a8_dynamic does not support allgatherep
@@ -2002,11 +2025,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     moe_comm_type = MoECommType.ALLGATHER
 
         elif soc_version in {AscendSocVersion.A3}:
-            moe_comm_type = (MoECommType.MC2
-                             if num_tokens <= self.mc2_tokens_capacity else
-                             MoECommType.ALLTOALL)
-            # #强制走Alltoall
-            # moe_comm_type = MoECommType.ALLTOALL
+            if force_alltoall_moe and self.parallel_config.enable_expert_parallel:
+                moe_comm_type = MoECommType.ALLTOALL
+            elif num_tokens <= self.mc2_tokens_capacity and mc2_available:
+                moe_comm_type = MoECommType.MC2
+            else:
+                moe_comm_type = MoECommType.ALLTOALL
         else:
             raise ValueError(f"Unsupported soc_version: {soc_version}")
 
@@ -2018,8 +2042,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             moe_comm_type = MoECommType.ALLGATHER
 
         if is_global_first_rank():
-            logger.debug(f"num_tokens: {num_tokens}, "
-                         f"moe_comm_type: {moe_comm_type}")
+            logger.debug("num_tokens: %s, current_ep_size: %s, moe_comm_type: %s",
+                         num_tokens, current_ep_size, moe_comm_type)
         return moe_comm_type
 
     @torch.inference_mode()
@@ -2667,7 +2691,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def profile_run(self) -> None:
         # Trigger compilation for general shape.
         with self.set_in_profile_run():
-            hidden_states = self._dummy_run(self.max_num_tokens,
+            profile_num_tokens = min(self.max_num_tokens,
+                                     self.scheduler_config.max_num_batched_tokens)
+            hidden_states = self._dummy_run(profile_num_tokens,
                                             with_prefill=True)
             # MC2 will consume additional NPU memory.
             # Therefore, we need to run the MC2 path once here to complete its initialization,

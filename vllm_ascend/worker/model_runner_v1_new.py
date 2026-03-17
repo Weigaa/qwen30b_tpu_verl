@@ -1933,7 +1933,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             moe_comm_type = MoECommType.ALLGATHER
         elif soc_version in {AscendSocVersion.A2}:
             if (num_tokens <= self.mc2_tokens_capacity
-                    and self.parallel_config.world_size_across_dp >= 16):
+                    and self.parallel_config.world_size_across_dp >=
+                    envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE):
                 moe_comm_type = MoECommType.MC2
             else:
                 # Currently, w4a8_dynamic does not support allgatherep

@@ -1630,7 +1630,7 @@ class DraftTrainer:
             self._train_once(layer_idx, queue_wait_ms=0.0)
 
 
-def build_draft_trainer(model: nn.Module) -> DraftTrainer:
+def build_draft_trainer(model: nn.Module) -> Optional[DraftTrainer]:
     config = DraftTrainerConfig(
         enabled=_get_env_flag("VLLM_ASCEND_ENABLE_DRAFT_TRAIN", False),
         warmup_on_init=_get_env_flag("VLLM_ASCEND_DRAFT_WARMUP_ON_INIT", True),
@@ -1675,4 +1675,7 @@ def build_draft_trainer(model: nn.Module) -> DraftTrainer:
         fastrl_concat_window_len=max(
             1, int(os.getenv("VLLM_ASCEND_DRAFT_FASTRL_CONCAT_WINDOW_LEN", "512"))),
     )
+    dump_enabled = _get_env_flag("VLLM_ASCEND_DRAFT_DUMP_ENABLE", False)
+    if not config.enabled and not config.profile_only and not dump_enabled:
+        return None
     return DraftTrainer(model=model, config=config)

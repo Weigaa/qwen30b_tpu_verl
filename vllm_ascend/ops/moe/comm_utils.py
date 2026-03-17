@@ -19,6 +19,7 @@ import torch
 import torch.distributed
 import torch.distributed as dist
 import torch_npu
+from vllm.logger import logger
 
 COMM_STREAM = None
 
@@ -28,16 +29,36 @@ def async_all_to_all(input_,
                      input_split_sizes,
                      group,
                      event=None):
+    if input_split_sizes is not None:
+        total_input_splits = int(sum(input_split_sizes))
+        if total_input_splits != int(input_.size(0)):
+            logger.error(
+                "all_to_all_single input split mismatch: input_shape=%s input_split_sizes=%s sum_input_splits=%s output_split_sizes=%s",
+                tuple(input_.shape),
+                input_split_sizes,
+                total_input_splits,
+                output_split_sizes,
+            )
+            raise AssertionError("all_to_all_single input split mismatch")
     if output_split_sizes is None:
         # Equal split (all2all)
         a2a_out = torch.empty_like(input_)
     else:
         # Unequal split (all2all-v)
+        total_output_splits = int(sum(output_split_sizes))
         a2a_out = input_.new_empty(
-            size=[sum(output_split_sizes)] + list(input_.size()[1:]),
+            size=[total_output_splits] + list(input_.size()[1:]),
             dtype=input_.dtype,
             device=torch.npu.current_device(),
         )
+        if a2a_out.size(0) != total_output_splits:
+            logger.error(
+                "all_to_all_single output split mismatch: output_shape=%s output_split_sizes=%s sum_output_splits=%s",
+                tuple(a2a_out.shape),
+                output_split_sizes,
+                total_output_splits,
+            )
+            raise AssertionError("all_to_all_single output split mismatch")
 
     if event:
         # multi stream wait event

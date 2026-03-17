@@ -21,6 +21,51 @@ import torch
 from vllm.logger import logger
 
 
+def _determine_primary_rank(global_expert_num, world_size, expert_id):
+    if world_size == 1:
+        return 0
+    local_num_experts = global_expert_num // world_size
+    split_point = local_num_experts * (world_size - 1)
+    if expert_id >= split_point:
+        return world_size - 1
+    return expert_id // local_num_experts
+
+
+def build_redundant_replica_expert_map(global_expert_num, world_size,
+                                       global_redundant_expert_num):
+    expert_map_all = torch.full((world_size, global_expert_num),
+                                -1,
+                                dtype=torch.int32)
+    next_local_ids = [0 for _ in range(world_size)]
+
+    for expert_id in range(global_expert_num):
+        primary_rank = _determine_primary_rank(global_expert_num, world_size,
+                                               expert_id)
+        expert_map_all[primary_rank, expert_id] = next_local_ids[primary_rank]
+        next_local_ids[primary_rank] += 1
+
+    for replica_idx in range(max(int(global_redundant_expert_num), 0)):
+        expert_id = replica_idx % global_expert_num
+        replica_round = replica_idx // global_expert_num
+        primary_rank = _determine_primary_rank(global_expert_num, world_size,
+                                               expert_id)
+        candidate_ranks = [
+            rank for rank in range(world_size)
+            if int(expert_map_all[rank, expert_id].item()) < 0
+        ]
+        if not candidate_ranks:
+            break
+        rotate_start = (primary_rank + 1 + replica_round) % world_size
+        candidate_ranks.sort(
+            key=lambda rank: (next_local_ids[rank],
+                              (rank - rotate_start) % world_size))
+        target_rank = candidate_ranks[0]
+        expert_map_all[target_rank, expert_id] = next_local_ids[target_rank]
+        next_local_ids[target_rank] += 1
+
+    return expert_map_all
+
+
 def determine_default_expert_map(global_expert_num, world_size, rank_id,
                                  global_redundant_expert_num):
     if world_size == 1:
@@ -53,6 +98,15 @@ def determine_default_expert_map(global_expert_num, world_size, rank_id,
         expert_map[start:end] = local_ids
 
     return (local_count, expert_map)
+
+
+def determine_redundant_replica_expert_map(global_expert_num, world_size,
+                                           rank_id,
+                                           global_redundant_expert_num):
+    expert_map_all = build_redundant_replica_expert_map(
+        global_expert_num, world_size, global_redundant_expert_num)
+    local_count = int((expert_map_all[rank_id] != -1).sum().item())
+    return local_count, expert_map_all[rank_id]
 
 
 def generate_log2phy_map(expert_map):
@@ -132,4 +186,13 @@ def determine_default_log2phy_map(global_expert_num, world_size, rank_id,
 
     log2phy_map_all = generate_log2phy_map(expert_map_all)
 
+    return log2phy_map_all[rank_id]
+
+
+def determine_redundant_replica_log2phy_map(global_expert_num, world_size,
+                                            rank_id,
+                                            global_redundant_expert_num):
+    expert_map_all = build_redundant_replica_expert_map(
+        global_expert_num, world_size, global_redundant_expert_num)
+    log2phy_map_all = generate_log2phy_map(expert_map_all)
     return log2phy_map_all[rank_id]

@@ -82,6 +82,28 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP":
     lambda: bool(int(os.getenv("VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP", '0'))
                  ),
+    # Whether to enable elastic DP/EP/MC2 shrink during eager external
+    # launcher rollout. Disabled by default so the original dummy-run path
+    # remains unchanged unless explicitly turned on.
+    "VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK":
+    lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK", '0'))),
+    # Elastic MoE strategy:
+    # - lossy: shrink by masking experts that only exist on exited ranks
+    # - lossless: require preloaded redundant experts and keep the original
+    #   logical expert space after shrink.
+    "VLLM_ASCEND_ELASTIC_MOE_MODE":
+    lambda: os.getenv("VLLM_ASCEND_ELASTIC_MOE_MODE", "lossy").lower(),
+    # Whether to force expert-parallel MoE communication onto the AllToAll
+    # path. This is mainly useful for performance comparisons against elastic
+    # shrink, where MC2 would otherwise introduce another variable.
+    "VLLM_ASCEND_FORCE_ALLTOALL_MOE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_FORCE_ALLTOALL_MOE", '0'))),
+    # Minimum EP size required before the runtime is allowed to select MC2.
+    # The default of 3 matches the current operator requirement discussed for
+    # this project, instead of the older framework-side threshold of 16.
+    "VLLM_ASCEND_MC2_MIN_EP_SIZE":
+    lambda: int(os.getenv("VLLM_ASCEND_MC2_MIN_EP_SIZE", '3')),
     # Whether to enable DBO feature for deepseek model.
     "VLLM_ASCEND_ENABLE_DBO":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DBO", '0'))),

@@ -18,6 +18,8 @@
 #
 
 import copy
+import os
+import time
 from typing import Optional, Union
 
 import torch
@@ -26,11 +28,14 @@ import torch_npu
 import vllm.envs as envs_vllm
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment)
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (get_dp_group, get_pp_group,
+                                             get_tp_group,
+                                             get_world_group,
+                                             init_model_parallel_group)
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
@@ -133,6 +138,13 @@ class NPUWorker(WorkerBase):
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
 
+        # After a rank exits the active rollout group, keep it fully detached
+        # from elastic DP/EP/MC2 rebuilds until the next global restore.
+        self.elastic_parallel_detached = False
+        self._lossless_shrink_payload: dict[int, dict] = {}
+        self._lossless_preloaded_cpu_import_weights: dict[int, dict[int, tuple[
+            torch.Tensor, torch.Tensor]]] = {}
+
     def sleep(self, level: int = 1) -> None:
         if not sleep_mode_enabled():
             raise ValueError(
@@ -190,30 +202,35 @@ class NPUWorker(WorkerBase):
         return device
 
     def init_device(self):
-        device = self._init_device()
-        # Init ModelRunner here, so that we have access to self.device.
-        self.model_runner = NPUModelRunner(self.vllm_config, device)
+        with set_current_vllm_config(self.vllm_config):
+            device = self._init_device()
+            # Init ModelRunner here, so that we have access to self.device.
+            self.model_runner = NPUModelRunner(self.vllm_config, device)
 
     def determine_available_memory(self) -> int:
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         NPUPlatform.clear_npu_memory()
+        NPUPlatform.synchronize()
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         _, total_npu_memory = NPUPlatform.mem_get_info()
         self.model_runner.profile_run()
+        NPUPlatform.synchronize()
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
         free_npu_memory, _ = NPUPlatform.mem_get_info()
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        assert self.init_npu_memory > free_npu_memory, (
-            "Error in memory profiling. "
-            f"Initial free memory {self.init_npu_memory}, current free memory"
-            f" {free_npu_memory}. This happens when the NPU memory was "
-            "not properly cleaned up before initializing the vLLM instance.")
+        if self.init_npu_memory <= free_npu_memory:
+            logger.warning(
+                "Memory profiling saw higher free NPU memory after profile run "
+                "on rank %s: initial_free=%s current_free=%s. Continuing "
+                "because this usually means delayed cleanup or another process "
+                "released memory during initialization.",
+                self.rank, self.init_npu_memory, free_npu_memory)
 
         # Get the peak memory allocation recorded by torch
         peak_memory = torch_npu.npu.memory_stats()["allocated_bytes.all.peak"]
@@ -230,11 +247,71 @@ class NPUWorker(WorkerBase):
         available_kv_cache_memory = int(
             total_npu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
+        if (envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
+                and envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE == "lossless"
+                and int(os.getenv("VLLM_ASCEND_INIT_REDUNDANCY_EXPERT", "0")) <= 0):
+            shrink_headroom_bytes = (
+                self._estimate_zero_redundancy_shrink_headroom_bytes())
+            available_kv_cache_memory = max(
+                available_kv_cache_memory - shrink_headroom_bytes, 0)
+            logger.info(
+                "Applying lossless zero-redundancy shrink headroom: %s bytes",
+                shrink_headroom_bytes)
         available_kv_cache_memory = int(max(available_kv_cache_memory, 0))
         logger.info(
             f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
         )
         return available_kv_cache_memory
+
+    def _estimate_zero_redundancy_shrink_headroom_bytes(self) -> int:
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return 0
+
+        estimated_bytes = 0
+        for module in model.modules():
+            if not isinstance(module, AscendFusedMoE):
+                continue
+            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+                continue
+            if getattr(module, "global_redundant_expert_num", 0) > 0:
+                continue
+
+            logical_num_experts = int(
+                getattr(module, "elastic_original_num_experts",
+                        module.moe_config.num_experts))
+            current_ep_size = int(getattr(module.moe_parallel_config, "ep_size",
+                                          1))
+            next_ep_size = current_ep_size // 2
+            if (logical_num_experts <= 0 or current_ep_size <= 1
+                    or next_ep_size <= 0
+                    or logical_num_experts % next_ep_size != 0):
+                continue
+
+            current_local_num_experts = int(module.w13_weight.shape[0])
+            target_local_num_experts = logical_num_experts // next_ep_size
+            additional_experts = max(target_local_num_experts -
+                                     current_local_num_experts, 0)
+            if additional_experts <= 0 or current_local_num_experts <= 0:
+                continue
+
+            per_expert_bytes = (
+                module.w13_weight[0].numel() * module.w13_weight.element_size()
+                + module.w2_weight[0].numel() * module.w2_weight.element_size())
+            estimated_bytes += additional_experts * per_expert_bytes
+
+        if estimated_bytes <= 0:
+            return 0
+
+        safety_margin_bytes = 4096 * 1024 * 1024
+        total_headroom = estimated_bytes + safety_margin_bytes
+        logger.info(
+            "Estimated lossless zero-redundancy 16->8 shrink bytes=%s safety_margin=%s total=%s",
+            estimated_bytes, safety_margin_bytes, total_headroom)
+        return total_headroom
 
     def execute_model(
         self,
@@ -287,7 +364,7 @@ class NPUWorker(WorkerBase):
         else:
             from contextlib import nullcontext
             context = nullcontext()  # type: ignore
-        with context:
+        with set_current_vllm_config(self.vllm_config), context:
             self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> None:
@@ -332,7 +409,7 @@ class NPUWorker(WorkerBase):
         else:
             from contextlib import nullcontext
             context = nullcontext()  # type: ignore
-        with context:
+        with set_current_vllm_config(self.vllm_config), context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def profile(self, is_start: bool = True):
@@ -360,14 +437,16 @@ class NPUWorker(WorkerBase):
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
-        init_distributed_environment(self.parallel_config.world_size,
-                                     self.rank, self.distributed_init_method,
-                                     self.local_rank, "hccl")
-        ensure_model_parallel_initialized(
-            self.parallel_config.tensor_parallel_size,
-            self.parallel_config.pipeline_parallel_size)
-        init_ascend_model_parallel(self.parallel_config)
-        ensure_kv_transfer_initialized(self.vllm_config)
+        with set_current_vllm_config(self.vllm_config):
+            init_distributed_environment(self.parallel_config.world_size,
+                                         self.rank,
+                                         self.distributed_init_method,
+                                         self.local_rank, "hccl")
+            ensure_model_parallel_initialized(
+                self.parallel_config.tensor_parallel_size,
+                self.parallel_config.pipeline_parallel_size)
+            init_ascend_model_parallel(self.parallel_config)
+            ensure_kv_transfer_initialized(self.vllm_config)
 
     def _init_profiler(self):
         # Torch profiler. Enabled and configured through env vars:
@@ -416,8 +495,794 @@ class NPUWorker(WorkerBase):
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.model_runner.take_draft_token_ids()
-    #新增代码
+
+    def _build_original_dp_group_ranks(self, world_size: int) -> list[list[int]]:
+        parallel_config = self.model_runner.vllm_config.parallel_config
+        all_ranks = torch.arange(world_size).reshape(
+            -1, parallel_config.data_parallel_size,
+            parallel_config.pipeline_parallel_size,
+            parallel_config.tensor_parallel_size)
+        group_ranks = all_ranks.transpose(1, 3).reshape(
+            -1, parallel_config.data_parallel_size).unbind(0)
+        return [x.tolist() for x in group_ranks]
+
+    def _build_original_ep_group_ranks(self, world_size: int) -> list[list[int]]:
+        parallel_config = self.model_runner.vllm_config.parallel_config
+        all_ranks = torch.arange(world_size).reshape(
+            -1, parallel_config.data_parallel_size,
+            parallel_config.pipeline_parallel_size,
+            parallel_config.tensor_parallel_size)
+        group_ranks = all_ranks.transpose(1, 2).reshape(
+            -1, parallel_config.data_parallel_size *
+            parallel_config.tensor_parallel_size).unbind(0)
+        return [x.tolist() for x in group_ranks]
+
+    def _build_original_mc2_group_ranks(self, world_size: int) -> list[list[int]]:
+        parallel_config = self.model_runner.vllm_config.parallel_config
+        all_ranks = torch.arange(world_size).reshape(
+            -1, parallel_config.data_parallel_size *
+            parallel_config.tensor_parallel_size)
+        group_ranks = all_ranks.unbind(0)
+        return [x.tolist() for x in group_ranks]
+
+    def _refresh_elastic_parallel_state(self,
+                                        active_ranks: list[int],
+                                        world_group,
+                                        participate_only: bool = False) -> None:
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        current_rank = torch.distributed.get_rank()
+        is_active_rank = current_rank in active_ranks
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None and is_active_rank:
+            new_dp_group = get_dp_group()
+            model_runner.dp_size = new_dp_group.world_size
+            model_runner.dp_rank = new_dp_group.rank_in_group
+            model_runner.parallel_config.data_parallel_size = \
+                new_dp_group.world_size
+            model_runner.parallel_config.data_parallel_rank = \
+                new_dp_group.rank_in_group
+
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return
+
+        active_cpu_group = get_dp_group().cpu_group if is_active_rank else None
+        lossless_shrink_payload = getattr(self, "_lossless_shrink_payload", {})
+        preloaded_cpu_import_weights = getattr(
+            self, "_lossless_preloaded_cpu_import_weights", {})
+        for module in model.modules():
+            if not isinstance(module, AscendFusedMoE):
+                continue
+
+            use_lossless_mode = (
+                envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE == "lossless"
+                and getattr(module, "elastic_moe_mode", "lossy") == "lossless")
+
+            if use_lossless_mode:
+                payload = lossless_shrink_payload.get(module.layer_idx)
+                if payload is None:
+                    raise RuntimeError(
+                        f"Missing lossless shrink payload for layer={module.layer_idx}."
+                    )
+                local_cpu_import_weights = preloaded_cpu_import_weights.get(
+                    module.layer_idx, {})
+                if participate_only:
+                    module.set_active_expert_mask(None)
+                    module.set_elastic_runtime_log2phy(None)
+                    module.moe_config.num_experts = module.elastic_original_num_experts
+                    continue
+                logical_num_experts = int(module.elastic_original_num_experts)
+                active_expert_mask = torch.ones(logical_num_experts,
+                                                dtype=torch.bool)
+                module.set_active_expert_mask(active_expert_mask.to(
+                    device=module.expert_map.device))
+                assignments = payload["assignments"]
+                my_rank_idx = active_ranks.index(current_rank)
+                ordered_assignments = payload["ordered_assignments"]
+                local_assignments = ordered_assignments[my_rank_idx]
+                local_active_expert_ids = [
+                    expert_id for expert_id, _ in local_assignments
+                ]
+                local_source_local_ids = [
+                    local_id for _, local_id in local_assignments
+                ]
+                module.activate_lossless_local_experts(
+                    local_active_expert_ids,
+                    local_source_local_ids,
+                    cpu_expert_weights=local_cpu_import_weights,
+                    offload_loaded_after_activation=True)
+
+                new_log2phy_cpu = payload["runtime_log2phy_cpu"]
+                module.set_runtime_num_experts(logical_num_experts)
+                if module.log2phy is not None:
+                    module.set_elastic_runtime_log2phy(
+                        new_log2phy_cpu.to(device=module.log2phy.device,
+                                           dtype=module.log2phy.dtype))
+                else:
+                    module.set_elastic_runtime_log2phy(None)
+                # Rebuild the token dispatcher with the post-shrink local expert
+                # count before decode resumes on the new 8-rank EP group.
+                module.refresh_elastic_groups()
+                imported_expert_ids = [
+                    expert_id for expert_id, source_local_id in zip(
+                        local_active_expert_ids, local_source_local_ids)
+                    if source_local_id < 0
+                ]
+                sample_import_stats = None
+                if imported_expert_ids:
+                    sample_import_id = imported_expert_ids[0]
+                    sample_pair = local_cpu_import_weights.get(sample_import_id)
+                    if sample_pair is not None:
+                        sample_w13, sample_w2 = sample_pair
+                        sample_import_stats = {
+                            "expert_id": sample_import_id,
+                            "w13_shape": tuple(sample_w13.shape),
+                            "w2_shape": tuple(sample_w2.shape),
+                            "w13_abs_mean": float(
+                                sample_w13.float().abs().mean().item()),
+                            "w2_abs_mean": float(
+                                sample_w2.float().abs().mean().item()),
+                        }
+                dense_offset = sum(
+                    len(rank_assignments)
+                    for rank_assignments in ordered_assignments[:my_rank_idx])
+                mapping_head = [
+                    (expert_id, int(new_log2phy_cpu[expert_id].item()))
+                    for expert_id in local_active_expert_ids[:4]
+                ]
+                mapping_tail = [
+                    (expert_id, int(new_log2phy_cpu[expert_id].item()))
+                    for expert_id in local_active_expert_ids[-4:]
+                ]
+                mapping_mismatch = sum(
+                    int(new_log2phy_cpu[expert_id].item()) !=
+                    dense_offset + local_slot
+                    for local_slot, expert_id in enumerate(
+                        local_active_expert_ids))
+                if mapping_mismatch:
+                    raise RuntimeError(
+                        "Lossless shrink runtime log2phy mismatch at "
+                        f"layer={module.layer_idx} rank={current_rank}: "
+                        f"mismatch_count={mapping_mismatch}")
+                if module.layer_idx == 0:
+                    logger.info(
+                        "Lossless shrink activation summary: rank=%s layer=%s local_num_experts=%s preserved=%s imported=%s active_ids_head=%s active_ids_tail=%s dense_head=%s dense_tail=%s runtime_num_experts=%s sample_import=%s",
+                        current_rank,
+                        module.layer_idx,
+                        len(local_active_expert_ids),
+                        sum(1 for source_local_id in local_source_local_ids
+                            if source_local_id >= 0),
+                        len(imported_expert_ids),
+                        local_active_expert_ids[:8],
+                        local_active_expert_ids[-8:],
+                        mapping_head,
+                        mapping_tail,
+                        module.moe_config.num_experts,
+                        sample_import_stats)
+                continue
+
+            if not is_active_rank:
+                module.set_active_expert_mask(None)
+                module.set_elastic_runtime_log2phy(None)
+                module.moe_config.num_experts = module.elastic_original_num_experts
+                continue
+            if module.expert_map is None:
+                module.set_active_expert_mask(None)
+                module.set_elastic_runtime_log2phy(None)
+                module.moe_config.num_experts = module.elastic_original_num_experts
+                module.refresh_elastic_groups()
+                continue
+            else:
+                if participate_only:
+                    continue
+                lossless_loaded_expert_map = getattr(module, "loaded_expert_map",
+                                                     None)
+                map_for_shrink = (lossless_loaded_expert_map
+                                  if lossless_loaded_expert_map is not None else
+                                  module.expert_map)
+                local_expert_map_cpu = map_for_shrink.to(device="cpu",
+                                                         dtype=torch.int32)
+                gathered_expert_map = [
+                    torch.empty_like(local_expert_map_cpu)
+                    for _ in range(len(active_ranks))
+                ]
+                torch.distributed.all_gather(gathered_expert_map,
+                                             local_expert_map_cpu,
+                                             group=active_cpu_group)
+                gathered_log2phy = None
+                if module.log2phy is not None and lossless_loaded_expert_map is None:
+                    local_log2phy_cpu = module.log2phy.to(device="cpu",
+                                                          dtype=torch.int32)
+                    gathered_log2phy = [
+                        torch.empty_like(local_log2phy_cpu)
+                        for _ in range(len(active_ranks))
+                    ]
+                    torch.distributed.all_gather(gathered_log2phy,
+                                                 local_log2phy_cpu,
+                                                 group=active_cpu_group)
+                local_expert_counts = [
+                    int((rank_expert_map != -1).sum().item())
+                    for rank_expert_map in gathered_expert_map
+                ]
+                active_expert_mask = torch.zeros_like(local_expert_map_cpu,
+                                                      dtype=torch.bool)
+                for rank_expert_map in gathered_expert_map:
+                    active_expert_mask |= (rank_expert_map != -1)
+                module.set_active_expert_mask(active_expert_mask.to(
+                    device=module.expert_map.device))
+
+                if module.log2phy is not None:
+                    new_log2phy_cpu = torch.zeros_like(local_expert_map_cpu)
+                    active_old_phy_ids: list[int] = []
+                    selected_old_phy_ids: list[int | None] = [None] * int(
+                        local_expert_map_cpu.numel())
+                    for expert_id in range(local_expert_map_cpu.numel()):
+                        selected_rank_idx = None
+                        for rank_idx, rank_expert_map in enumerate(
+                                gathered_expert_map):
+                            if int(rank_expert_map[expert_id].item()) >= 0:
+                                selected_rank_idx = rank_idx
+                                break
+                        if selected_rank_idx is None:
+                            continue
+                        if gathered_log2phy is not None:
+                            old_phy_id = int(
+                                gathered_log2phy[selected_rank_idx][expert_id].
+                                item())
+                        else:
+                            local_id = int(
+                                gathered_expert_map[selected_rank_idx][expert_id].
+                                item())
+                            old_phy_id = sum(local_expert_counts[:selected_rank_idx]
+                                             ) + local_id
+                        selected_old_phy_ids[expert_id] = old_phy_id
+                        active_old_phy_ids.append(old_phy_id)
+                    old_phy_to_dense = {
+                        old_phy_id: dense_id
+                        for dense_id, old_phy_id in enumerate(
+                            sorted(set(active_old_phy_ids)))
+                    }
+                    module.set_runtime_num_experts(len(old_phy_to_dense))
+                    for expert_id, old_phy_id in enumerate(selected_old_phy_ids):
+                        if old_phy_id is None:
+                            continue
+                        new_log2phy_cpu[expert_id] = old_phy_to_dense[old_phy_id]
+                    module.set_elastic_runtime_log2phy(
+                        new_log2phy_cpu.to(device=module.log2phy.device,
+                                           dtype=module.log2phy.dtype))
+                else:
+                    module.set_elastic_runtime_log2phy(None)
+                    module.set_runtime_num_experts(sum(local_expert_counts))
+
+                module.refresh_elastic_groups()
+
+    def _prepare_lossless_shrink_payload(self, active_ranks: list[int],
+                                         world_group) -> None:
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        self._lossless_shrink_payload = {}
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return
+
+        world_cpu_group = world_group.cpu_group
+        world_size = world_group.world_size
+        current_rank = torch.distributed.get_rank()
+        active_rank_to_idx = {rank: idx for idx, rank in enumerate(active_ranks)}
+        logged_pairing_summary = False
+
+        for module in model.modules():
+            if not isinstance(module, AscendFusedMoE):
+                continue
+            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+                continue
+            if module.expert_map is None:
+                continue
+
+            lossless_loaded_expert_map = getattr(module, "loaded_expert_map",
+                                                 None)
+            map_for_shrink = (lossless_loaded_expert_map
+                              if lossless_loaded_expert_map is not None else
+                              module.expert_map)
+            local_loaded_expert_map_cpu = map_for_shrink.to(device="cpu",
+                                                            dtype=torch.int32)
+            gathered_loaded_maps_world = [
+                torch.empty_like(local_loaded_expert_map_cpu)
+                for _ in range(world_size)
+            ]
+            torch.distributed.all_gather(gathered_loaded_maps_world,
+                                         local_loaded_expert_map_cpu,
+                                         group=world_cpu_group)
+
+            logical_num_experts = int(module.elastic_original_num_experts)
+            assignments: list[list[tuple[int, int]]] = [
+                [] for _ in range(len(active_ranks))
+            ]
+            assigned_counts = [0 for _ in range(len(active_ranks))]
+            target_per_rank = (
+                logical_num_experts + len(active_ranks) - 1
+            ) // len(active_ranks)
+            cpu_import_source_rank: dict[int, int] = {}
+            cpu_import_target_rank: dict[int, int] = {}
+            use_paired_zero_redundancy = (
+                getattr(module, "global_redundant_expert_num", 0) <= 0
+                and world_size == 16
+                and len(active_ranks) == 8
+                and logical_num_experts % world_size == 0
+            )
+            inactive_to_active_rank: dict[int, int] = {}
+            if use_paired_zero_redundancy:
+                inactive_ranks = sorted(
+                    rank for rank in range(world_size)
+                    if rank not in active_rank_to_idx)
+                if len(inactive_ranks) == len(active_ranks):
+                    inactive_to_active_rank = {
+                        inactive_rank: active_ranks[idx]
+                            for idx, inactive_rank in enumerate(inactive_ranks)
+                    }
+                else:
+                    use_paired_zero_redundancy = False
+            if (use_paired_zero_redundancy and not logged_pairing_summary
+                    and current_rank == active_ranks[0]
+                    and module.layer_idx == 0):
+                logger.info(
+                    "Lossless shrink fixed rank pairing prepared: active_ranks=%s inactive_to_active=%s logical_num_experts=%s world_size=%s",
+                    active_ranks,
+                    inactive_to_active_rank,
+                    logical_num_experts,
+                    world_size)
+                logged_pairing_summary = True
+
+            for expert_id in range(logical_num_experts):
+                candidate_rank_indices = []
+                for rank in active_ranks:
+                    loaded_local_id = int(
+                        gathered_loaded_maps_world[rank][expert_id].item())
+                    if loaded_local_id >= 0:
+                        candidate_rank_indices.append(active_rank_to_idx[rank])
+
+                if candidate_rank_indices:
+                    preferred_candidates = [
+                        rank_idx for rank_idx in candidate_rank_indices
+                        if assigned_counts[rank_idx] < target_per_rank
+                    ]
+                    candidate_pool = (preferred_candidates if preferred_candidates
+                                      else candidate_rank_indices)
+                    selected_rank_idx = min(
+                        candidate_pool,
+                        key=lambda rank_idx: (assigned_counts[rank_idx], rank_idx))
+                    selected_world_rank = active_ranks[selected_rank_idx]
+                    selected_loaded_local_id = int(
+                        gathered_loaded_maps_world[selected_world_rank][expert_id].item())
+                else:
+                    source_world_rank = None
+                    for world_rank, world_expert_map in enumerate(
+                            gathered_loaded_maps_world):
+                        loaded_local_id = int(world_expert_map[expert_id].item())
+                        if loaded_local_id >= 0:
+                            source_world_rank = world_rank
+                            break
+                    if source_world_rank is None:
+                        raise RuntimeError(
+                            "Lossless elastic shrink cannot cover logical "
+                            f"expert {expert_id} at layer={module.layer_idx}. "
+                            "Increase init redundancy or switch back to lossy mode."
+                        )
+                    if use_paired_zero_redundancy:
+                        selected_world_rank = inactive_to_active_rank[
+                            source_world_rank]
+                        selected_rank_idx = active_rank_to_idx[
+                            selected_world_rank]
+                    else:
+                        selected_rank_idx = min(
+                            range(len(active_ranks)),
+                            key=lambda rank_idx:
+                            (assigned_counts[rank_idx], rank_idx))
+                        selected_world_rank = active_ranks[selected_rank_idx]
+                    selected_loaded_local_id = -1
+                    cpu_import_source_rank[expert_id] = source_world_rank
+                    cpu_import_target_rank[expert_id] = selected_world_rank
+
+                assignments[selected_rank_idx].append(
+                    (expert_id, selected_loaded_local_id))
+                assigned_counts[selected_rank_idx] += 1
+
+            if use_paired_zero_redundancy:
+                expected_local_experts = logical_num_experts // len(active_ranks)
+                for rank_idx, count in enumerate(assigned_counts):
+                    if count != expected_local_experts:
+                        raise RuntimeError(
+                            "Paired zero-redundancy shrink produced uneven "
+                            f"assignment at layer={module.layer_idx}: "
+                            f"rank={active_ranks[rank_idx]} count={count} "
+                            f"expected={expected_local_experts}")
+
+            ordered_assignments: list[list[tuple[int, int]]] = []
+            runtime_log2phy_cpu = torch.full((logical_num_experts, ),
+                                             -1,
+                                             dtype=torch.int32)
+            dense_offset = 0
+            for rank_idx, rank in enumerate(active_ranks):
+                current_runtime_slots = {
+                    expert_id: int(local_slot)
+                    for expert_id, local_slot in enumerate(
+                        gathered_loaded_maps_world[rank].tolist())
+                    if local_slot >= 0
+                }
+                rank_assignment_map = {
+                    expert_id: local_id
+                    for expert_id, local_id in assignments[rank_idx]
+                }
+                preserved_assignments = sorted(
+                    [(expert_id, rank_assignment_map[expert_id])
+                     for expert_id in rank_assignment_map
+                     if expert_id in current_runtime_slots],
+                    key=lambda item: current_runtime_slots[item[0]])
+                preserved_expert_ids = {
+                    expert_id for expert_id, _ in preserved_assignments
+                }
+                appended_assignments = sorted(
+                    [(expert_id, local_id)
+                     for expert_id, local_id in assignments[rank_idx]
+                     if expert_id not in preserved_expert_ids],
+                    key=lambda item: item[0])
+                ordered_rank_assignments = (
+                    preserved_assignments + appended_assignments)
+                ordered_assignments.append(ordered_rank_assignments)
+                for local_slot, (expert_id, _) in enumerate(
+                        ordered_rank_assignments):
+                    runtime_log2phy_cpu[expert_id] = dense_offset + local_slot
+                dense_offset += len(ordered_rank_assignments)
+
+            if int(torch.unique(runtime_log2phy_cpu).numel()) != logical_num_experts:
+                raise RuntimeError(
+                    "Lossless shrink runtime log2phy is not bijective at "
+                    f"layer={module.layer_idx}: unique="
+                    f"{int(torch.unique(runtime_log2phy_cpu).numel())} "
+                    f"logical={logical_num_experts}")
+
+            self._lossless_shrink_payload[module.layer_idx] = {
+                "assignments": assignments,
+                "ordered_assignments": ordered_assignments,
+                "runtime_log2phy_cpu": runtime_log2phy_cpu,
+                "cpu_import_source_rank": cpu_import_source_rank,
+                "cpu_import_target_rank": cpu_import_target_rank,
+            }
+            if module.layer_idx == 0 and current_rank == active_ranks[0]:
+                ordered_heads = {
+                    active_ranks[idx]:
+                    [expert_id for expert_id, _ in rank_assignments[:4]]
+                    for idx, rank_assignments in enumerate(ordered_assignments)
+                }
+                ordered_tails = {
+                    active_ranks[idx]:
+                    [expert_id for expert_id, _ in rank_assignments[-4:]]
+                    for idx, rank_assignments in enumerate(ordered_assignments)
+                }
+                logger.info(
+                    "Lossless shrink payload summary: layer=%s logical_num_experts=%s assignment_counts=%s cpu_imports=%s ordered_heads=%s ordered_tails=%s",
+                    module.layer_idx,
+                    logical_num_experts,
+                    assigned_counts,
+                    len(cpu_import_source_rank),
+                    ordered_heads,
+                    ordered_tails)
+
+    def _stream_lossless_layer_cpu_import_weights(
+            self,
+            module,
+            payload: dict,
+            active_ranks: list[int],
+            world_group,
+            participate_only: bool = False
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        world_cpu_group = world_group.cpu_group
+        world_size = world_group.world_size
+        current_rank = torch.distributed.get_rank()
+        active_rank_to_idx = {rank: idx for idx, rank in enumerate(active_ranks)}
+        my_active_idx = active_rank_to_idx.get(current_rank)
+
+        cpu_import_source_rank = payload["cpu_import_source_rank"]
+        cpu_import_target_rank = payload.get("cpu_import_target_rank", {})
+        local_needed_cpu_import_ids = set()
+        if my_active_idx is not None:
+            local_needed_cpu_import_ids = {
+                expert_id for expert_id, source_rank in cpu_import_source_rank.items()
+                if source_rank is not None and any(
+                    assigned_expert_id == expert_id
+                    for assigned_expert_id, _ in payload["assignments"][my_active_idx])
+            }
+
+        local_cpu_import_weights: dict[int, tuple[torch.Tensor,
+                                                  torch.Tensor]] = {}
+        export_ids_per_source_rank: dict[int, list[int]] = {}
+        for expert_id, source_rank in cpu_import_source_rank.items():
+            export_ids_per_source_rank.setdefault(source_rank, []).append(expert_id)
+        for source_rank in export_ids_per_source_rank:
+            export_ids_per_source_rank[source_rank].sort()
+
+        use_npu_import = (
+            getattr(module, "global_redundant_expert_num", 0) <= 0
+            and world_size == 16
+            and len(active_ranks) == 8
+            and not getattr(module, "lossless_loaded_offloaded", False)
+        )
+
+        if use_npu_import:
+            world_device_group = world_group.device_group
+            w13_tail_shape = tuple(module.w13_weight.shape[1:])
+            w2_tail_shape = tuple(module.w2_weight.shape[1:])
+            recv_w13 = torch.empty((1, ) + w13_tail_shape,
+                                   device=module.expert_map.device,
+                                   dtype=module.w13_weight.dtype)
+            recv_w2 = torch.empty((1, ) + w2_tail_shape,
+                                  device=module.expert_map.device,
+                                  dtype=module.w2_weight.dtype)
+            for source_rank in range(world_size):
+                source_export_ids = export_ids_per_source_rank.get(source_rank, [])
+                if not source_export_ids:
+                    continue
+                for expert_id in source_export_ids:
+                    target_rank = cpu_import_target_rank.get(expert_id)
+                    if target_rank is None:
+                        raise RuntimeError(
+                            f"Missing lossless NPU import target for expert {expert_id} "
+                            f"at layer={module.layer_idx}.")
+                    if current_rank == source_rank:
+                        export_w13, export_w2 = module.export_lossless_expert_npu_weights(
+                            [expert_id])
+                        send_w13 = torch.distributed.isend(
+                            export_w13, dst=target_rank, group=world_device_group)
+                        send_w2 = torch.distributed.isend(
+                            export_w2, dst=target_rank, group=world_device_group)
+                        send_w13.wait()
+                        send_w2.wait()
+                        continue
+                    if ((not participate_only)
+                            and current_rank == target_rank
+                            and expert_id in local_needed_cpu_import_ids):
+                        recv_req_w13 = torch.distributed.irecv(
+                            recv_w13, src=source_rank, group=world_device_group)
+                        recv_req_w2 = torch.distributed.irecv(
+                            recv_w2, src=source_rank, group=world_device_group)
+                        recv_req_w13.wait()
+                        recv_req_w2.wait()
+                        local_cpu_import_weights[expert_id] = (
+                            recv_w13[0].detach().cpu(),
+                            recv_w2[0].detach().cpu(),
+                        )
+            return local_cpu_import_weights
+
+        for source_rank in range(world_size):
+            source_export_ids = export_ids_per_source_rank.get(source_rank, [])
+            source_payload = None
+            if current_rank == source_rank and source_export_ids:
+                source_payload = module.export_lossless_expert_cpu_weights(
+                    source_export_ids)
+            object_list = [source_payload]
+            torch.distributed.broadcast_object_list(object_list,
+                                                    src=source_rank,
+                                                    group=world_cpu_group)
+            received_payload = object_list[0]
+            if (not participate_only) and local_needed_cpu_import_ids and received_payload:
+                for expert_id in local_needed_cpu_import_ids:
+                    if cpu_import_source_rank.get(expert_id) != source_rank:
+                        continue
+                    if expert_id not in received_payload:
+                        raise RuntimeError(
+                            f"Lossless CPU import missing expert {expert_id} "
+                            f"from rank {source_rank} at layer={module.layer_idx}."
+                        )
+                    local_cpu_import_weights[expert_id] = received_payload[expert_id]
+            del object_list
+            del received_payload
+
+        return local_cpu_import_weights
+
+    def _preload_lossless_shrink_import_weights(self, active_ranks: list[int],
+                                                world_group) -> None:
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        self._lossless_preloaded_cpu_import_weights = {}
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return
+
+        lossless_shrink_payload = getattr(self, "_lossless_shrink_payload", {})
+        for module in model.modules():
+            if not isinstance(module, AscendFusedMoE):
+                continue
+            use_lossless_mode = (
+                envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE == "lossless"
+                and getattr(module, "elastic_moe_mode", "lossy") == "lossless")
+            if not use_lossless_mode:
+                continue
+            payload = lossless_shrink_payload.get(module.layer_idx)
+            if payload is None:
+                raise RuntimeError(
+                    f"Missing lossless shrink payload for layer={module.layer_idx}.")
+            self._lossless_preloaded_cpu_import_weights[module.layer_idx] = (
+                self._stream_lossless_layer_cpu_import_weights(
+                    module, payload, active_ranks, world_group))
+
+    def _destroy_group_if_present(self, state_module, attr_name: str) -> None:
+        group = getattr(state_module, attr_name, None)
+        if group is not None:
+            group.destroy()
+            setattr(state_module, attr_name, None)
+
+    def _detach_from_elastic_parallel_groups(self) -> None:
+        import vllm.distributed.parallel_state as vllm_ps
+        import vllm_ascend.distributed.parallel_state as ascend_ps
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        self._destroy_group_if_present(vllm_ps, "_DP")
+        self._destroy_group_if_present(vllm_ps, "_EP")
+        self._destroy_group_if_present(ascend_ps, "_MC2")
+
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            model_runner.dp_size = 1
+            model_runner.dp_rank = 0
+            model_runner.parallel_config.data_parallel_size = 1
+            model_runner.parallel_config.data_parallel_rank = 0
+
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            self.elastic_parallel_detached = True
+            return
+
+        for module in model.modules():
+            if not isinstance(module, AscendFusedMoE):
+                continue
+            module.set_active_expert_mask(None)
+            module.set_elastic_runtime_log2phy(None)
+            module.moe_config.num_experts = module.elastic_original_num_experts
+            module.ep_group = None
+            module.moe_config.dp_group = None
+            module.moe_config.ep_group = None
+            module.moe_config.mc2_group = None
+            module.moe_parallel_config.dp_size = 1
+            module.moe_parallel_config.dp_rank = 0
+            module.moe_parallel_config.ep_size = 1
+            module.moe_parallel_config.ep_rank = 0
+
+        self.elastic_parallel_detached = True
+
+    def _rebuild_group(self, state_module, attr_name: str,
+                       group_ranks: list[list[int]], world_group,
+                       backend: str, group_name: str) -> None:
+        group = getattr(state_module, attr_name, None)
+        if group is not None:
+            group.destroy()
+            setattr(state_module, attr_name, None)
+        setattr(
+            state_module, attr_name,
+            init_model_parallel_group(group_ranks, world_group.local_rank,
+                                      backend, group_name=group_name))
+
+    def _warmup_post_shrink_dp_collectives(self) -> None:
+        dp_group = get_dp_group()
+        if dp_group.world_size <= 1:
+            return
+
+        # Force HCCL to materialize the new DP communicator/workspace before
+        # post-shrink decode hits its first metadata all_reduce.
+        warmup_tensor = torch.zeros(1, dtype=torch.int32, device="npu")
+        warmup_start_t = time.perf_counter()
+        torch.distributed.all_reduce(warmup_tensor, group=dp_group.device_group)
+        if torch.npu.is_available():
+            torch.npu.synchronize()
+        logger.info(
+            "Elastic post-shrink DP all_reduce warmup done: rank=%s dp_size=%s total_ms=%.2f",
+            self.rank, dp_group.world_size,
+            (time.perf_counter() - warmup_start_t) * 1000.0)
+
+    def rebuild_elastic_ep_group(self, active_global_ranks: list[int]) -> bool:
+        if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+
+        import vllm.distributed.parallel_state as vllm_ps
+        import vllm_ascend.distributed.parallel_state as ascend_ps
+
+        start_t = time.perf_counter()
+        world_group = get_world_group()
+        world_size = torch.distributed.get_world_size()
+        active_ranks = sorted(set(active_global_ranks))
+        if not active_ranks:
+            active_ranks = [torch.distributed.get_rank()]
+        current_rank = torch.distributed.get_rank()
+        self._prepare_lossless_shrink_payload(active_ranks, world_group)
+        self._preload_lossless_shrink_import_weights(active_ranks, world_group)
+        is_active_rank = current_rank in active_ranks
+        if not is_active_rank and not self.elastic_parallel_detached:
+            detach_start_t = time.perf_counter()
+            self._detach_from_elastic_parallel_groups()
+            logger.info(
+                "Elastic parallel detach done: rank=%s active_ranks=%s total_ms=%.2f",
+                self.rank, active_ranks,
+                (time.perf_counter() - detach_start_t) * 1000.0)
+
+        rebuild_ms = 0.0
+        refresh_ms = 0.0
+        if is_active_rank:
+            elastic_group_ranks = [active_ranks]
+            backend = torch.distributed.get_backend(world_group.device_group)
+
+            rebuild_start_t = time.perf_counter()
+            with set_current_vllm_config(self.vllm_config):
+                self._rebuild_group(vllm_ps, "_DP", elastic_group_ranks,
+                                    world_group, backend, "dp")
+                self._rebuild_group(vllm_ps, "_EP", elastic_group_ranks,
+                                    world_group, backend, "ep")
+                self._rebuild_group(ascend_ps, "_MC2", elastic_group_ranks,
+                                    world_group, backend, "mc2")
+                self._warmup_post_shrink_dp_collectives()
+            rebuild_ms = (time.perf_counter() - rebuild_start_t) * 1000.0
+
+        refresh_start_t = time.perf_counter()
+        with set_current_vllm_config(self.vllm_config):
+            self._refresh_elastic_parallel_state(active_ranks,
+                                                 world_group,
+                                                 participate_only=not is_active_rank)
+        refresh_ms = (time.perf_counter() - refresh_start_t) * 1000.0
+
+        if is_active_rank:
+            logger.info(
+                "Elastic parallel shrink done: rank=%s active_ranks=%s dp_size=%s ep_size=%s rebuild_ms=%.2f refresh_ms=%.2f total_ms=%.2f",
+                self.rank, active_ranks, get_dp_group().world_size,
+                vllm_ps.get_ep_group().world_size, rebuild_ms, refresh_ms,
+                (time.perf_counter() - start_t) * 1000.0)
+        self._lossless_shrink_payload = {}
+        self._lossless_preloaded_cpu_import_weights = {}
+        return True
+
+    def restore_elastic_parallel_groups(self) -> bool:
+        if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+
+        import vllm.distributed.parallel_state as vllm_ps
+        import vllm_ascend.distributed.parallel_state as ascend_ps
+
+        start_t = time.perf_counter()
+        world_group = get_world_group()
+        world_size = torch.distributed.get_world_size()
+        backend = torch.distributed.get_backend(world_group.device_group)
+
+        rebuild_start_t = time.perf_counter()
+        with set_current_vllm_config(self.vllm_config):
+            self._rebuild_group(vllm_ps, "_DP",
+                                self._build_original_dp_group_ranks(world_size),
+                                world_group, backend, "dp")
+            self._rebuild_group(vllm_ps, "_EP",
+                                self._build_original_ep_group_ranks(world_size),
+                                world_group, backend, "ep")
+            self._rebuild_group(
+                ascend_ps, "_MC2",
+                self._build_original_mc2_group_ranks(world_size),
+                world_group, backend, "mc2")
+        rebuild_ms = (time.perf_counter() - rebuild_start_t) * 1000.0
+
+        refresh_start_t = time.perf_counter()
+        with set_current_vllm_config(self.vllm_config):
+            self._refresh_elastic_parallel_state(list(range(world_size)),
+                                                 world_group)
+        refresh_ms = (time.perf_counter() - refresh_start_t) * 1000.0
+        self.elastic_parallel_detached = False
+
+        logger.info(
+            "Elastic parallel restore done: rank=%s dp_size=%s ep_size=%s rebuild_ms=%.2f refresh_ms=%.2f total_ms=%.2f",
+            self.rank, get_dp_group().world_size, vllm_ps.get_ep_group().world_size,
+            rebuild_ms, refresh_ms, (time.perf_counter() - start_t) * 1000.0)
+        return True
+
     def set_need_allreduce(self, value: bool):
         self.model_runner.need_allreduce = value
         return True
-

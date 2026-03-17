@@ -43,6 +43,14 @@ def get_moe_comm_method(
     return _MoECommMethods.get(moe_comm_type)
 
 
+def _resolve_model_type(moe_config: FusedMoEConfig) -> str:
+    vllm_config = get_current_vllm_config()
+    if (vllm_config is not None and vllm_config.model_config is not None
+            and vllm_config.model_config.hf_config is not None):
+        return vllm_config.model_config.hf_config.model_type
+    return getattr(moe_config, "model_type", "")
+
+
 def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
@@ -55,8 +63,7 @@ class MoECommMethod(ABC):
     """Base class for MoE communication methods."""
 
     def __init__(self, moe_config: FusedMoEConfig):
-        self.model_type = get_current_vllm_config(
-        ).model_config.hf_config.model_type
+        self.model_type = _resolve_model_type(moe_config)
         self.moe_config = moe_config
         self.mc2_mask = None
 
@@ -278,7 +285,10 @@ class MC2CommImpl(MoECommMethod):
     """
 
     def _get_token_dispatcher(self):
-        return TokenDispatcherWithMC2()
+        return TokenDispatcherWithMC2(
+            top_k=self.moe_config.experts_per_token,
+            num_experts=self.moe_config.num_experts,
+            num_local_experts=self.moe_config.num_local_experts)
 
     def _get_fused_moe_prepare_finalize(self):
         return FusedMoEPrepareAndFinalizeWithMC2(self.moe_config)

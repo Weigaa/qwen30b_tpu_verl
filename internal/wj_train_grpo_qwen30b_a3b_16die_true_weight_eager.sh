@@ -23,14 +23,21 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 export MASTER_PORT=23300    # vllm port error
 export D2D_DATA_TRANSFER=1
-
 export VLLM_USE_V1=1
 export PRINT_MEMORY=1
 export USE_ALLTOALL_OVERLAP=1
 export HCCL_OP_EXPANSION_MODE=AIV
 export VLLM_LOGGING_LEVEL=INFO
-export VLLM_ENABLE_MC2=1                     # 910C开启
+export VLLM_ASCEND_FORCE_ALLTOALL_MOE=${VLLM_ASCEND_FORCE_ALLTOALL_MOE:-0}  # 1: force AllToAll for EP MoE, 0: allow MC2
+if [[ "${VLLM_ASCEND_FORCE_ALLTOALL_MOE}" == "1" ]]; then
+    export VLLM_ENABLE_MC2=0
+else
+export VLLM_ENABLE_MC2=1
+fi
 export VLLM_DP_SIZE=16                        # world_size // rollout.tp_size
+export VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK=${VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:-1}  # 1: enable elastic shrink, 0: keep original dummy-run path
+export VLLM_ASCEND_ELASTIC_MOE_MODE=${VLLM_ASCEND_ELASTIC_MOE_MODE:-lossless}  # lossy | lossless
+export VLLM_ASCEND_INIT_REDUNDANCY_EXPERT=${VLLM_ASCEND_INIT_REDUNDANCY_EXPERT:-0}  # total preloaded redundant expert replicas for lossless shrink
 export HCCL_BUFFSIZE=800
 
 export TASK_QUEUE_ENABLE=2
@@ -53,7 +60,7 @@ export ROLLOUT_REBALANCE_ENABLE=0          # 0: disable rollout rebalance, 1: en
 export HCCL_ASYNC_ERROR_HANDLING=1
 
 #Train Drafter开关
-export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=1
+export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=0
 export VLLM_ASCEND_DRAFT_WARMUP_ON_INIT=1
 export VLLM_ASCEND_DRAFT_LR=1e-4
 export VLLM_ASCEND_DRAFT_REUSE_TARGET_EMB_LM=1
@@ -116,10 +123,15 @@ CONFIG_DIR=${CONFIG_DIR:-"${HOME}/verl/trainer/config"}
 DISTCP_PATH="/home/data/Qwen3-30B-A3B_megatron"
 TRAIN_FILE=${TRAIN_FILE:-"/workspace/data/deepscaler/train.parquet"}
 TEST_FILE=${TEST_FILE:-"/workspace/data/deepscaler/test.parquet"}
-    
+RECORD_DIR="/workspace/cann-recipes-train/llm_rl/qwen3/record"
+mkdir -p "${RECORD_DIR}"
 
 time=$(date +%Y%m%d%H%M%S)
-logfile=wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}.txt
+elastic_suffix=""
+if [ "${VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK}" = "1" ]; then
+    elastic_suffix="_elastic"
+fi
+logfile=wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}${elastic_suffix}.txt
 
 set -x
 
@@ -189,8 +201,8 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
-    +trainer.rollout_data_dir=/workspace/data/dump_qwen30b \
-    +trainer.rollout_length_dir=/workspace/data/dump_qwen30b \
+    +trainer.rollout_data_dir="${RECORD_DIR}" \
+    +trainer.rollout_length_dir="${RECORD_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_num_transformer_layers=[[11],[13],[13],[11]] \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type='alltoall' \

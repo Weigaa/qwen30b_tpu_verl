@@ -393,6 +393,8 @@ class LLM:
             # Use default sampling params.
             sampling_params = self.get_default_sampling_params()
 
+        self.llm_engine.restore_elastic_parallel_groups_if_needed()
+
         # Add any modality specific loras to the corresponding prompts
         lora_request = self._get_modality_specific_lora_reqs(
             prompts, lora_request)

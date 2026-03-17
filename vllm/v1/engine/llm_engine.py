@@ -10,6 +10,7 @@ import torch.nn as nn
 from typing_extensions import TypeVar
 
 import vllm.envs as envs
+import vllm_ascend.envs as envs_ascend
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.distributed.parallel_state import get_dp_group
@@ -145,6 +146,13 @@ class LLMEngine:
             # dp_pg 的总大小（DP 组里有多少个进程）
             dp_size = torch.distributed.get_world_size(group=dp_pg)
             print(f"[DP Info] dp_group rank = {dp_rank}, dp_group world_size = {dp_size}")
+
+        # Elastic no-dummy path is only enabled for eager external-launcher DP.
+        self.elastic_ep_no_dummy = (
+            envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
+            and self.external_launcher_dp and self.model_config.enforce_eager)
+        self.elastic_ep_scaled_once = False
+        self.elastic_ep_active_ranks: Optional[tuple[int, ...]] = None
         
         #new code here
         self.dummy_times = 0
@@ -202,12 +210,115 @@ class LLMEngine:
             return has_unfinished or self.engine_core.dp_engines_running()
         return self.has_unfinished_requests_dp(has_unfinished)
 
+    def _get_active_dp_global_ranks(self, has_unfinished: bool) -> list[int]:
+        assert self.dp_group is not None
+        local_global_rank = torch.distributed.get_rank()
+        local_marker = local_global_rank if has_unfinished else -1
+        local_tensor = torch.tensor([local_marker], dtype=torch.int64, device="cpu")
+        dp_world_size = torch.distributed.get_world_size(group=self.dp_group)
+        gathered = [torch.empty_like(local_tensor) for _ in range(dp_world_size)]
+        torch.distributed.all_gather(gathered, local_tensor, group=self.dp_group)
+        return [int(t.item()) for t in gathered if int(t.item()) >= 0]
+
+    def _should_delay_elastic_shrink_for_mc2(self, num_active_ranks: int,
+                                             dp_world_size: int) -> bool:
+        if num_active_ranks >= dp_world_size:
+            return False
+        if envs_ascend.VLLM_ASCEND_FORCE_ALLTOALL_MOE:
+            return False
+        if not self.vllm_config.parallel_config.enable_expert_parallel:
+            return False
+
+        hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
+        num_experts = getattr(hf_config, "num_experts", None)
+        if not isinstance(num_experts, int) or num_experts <= 0:
+            return False
+
+        min_mc2_ep_size = envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE
+        return (num_active_ranks < min_mc2_ep_size
+                or (num_experts % num_active_ranks) != 0)
+
     def has_unfinished_requests_dp(self, has_unfinished: bool) -> bool:
+        if self.elastic_ep_no_dummy:
+            active_global_ranks = self._get_active_dp_global_ranks(
+                has_unfinished)
+            aggregated_has_unfinished = len(active_global_ranks) > 0
+            if not aggregated_has_unfinished:
+                return False
+
+            assert self.dp_group is not None
+            dp_world_size = torch.distributed.get_world_size(group=self.dp_group)
+            if len(active_global_ranks) < dp_world_size:
+                num_active_ranks = len(active_global_ranks)
+                min_mc2_ep_size = envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE
+                num_experts = None
+                hf_config = getattr(self.vllm_config.model_config, "hf_config",
+                                    None)
+                if hf_config is not None:
+                    num_experts = getattr(hf_config, "num_experts", None)
+                delay_for_min_ep = num_active_ranks < min_mc2_ep_size
+                delay_for_divisibility = (
+                    isinstance(num_experts, int) and num_experts > 0
+                    and (num_experts % num_active_ranks) != 0)
+                if self._should_delay_elastic_shrink_for_mc2(
+                        num_active_ranks, dp_world_size):
+                    if not has_unfinished:
+                        logger.info(
+                            "Elastic shrink delayed for MC2 compatibility: global_rank=%s active_ranks=%s active_count=%s dp_world_size=%s delay_for_min_ep=%s delay_for_divisibility=%s local_has_unfinished=%s scaled_once=%s prev_active_ranks=%s",
+                            torch.distributed.get_rank(),
+                            active_global_ranks,
+                            num_active_ranks,
+                            dp_world_size,
+                            delay_for_min_ep,
+                            delay_for_divisibility,
+                            has_unfinished,
+                            self.elastic_ep_scaled_once,
+                            self.elastic_ep_active_ranks)
+                        self.should_execute_dummy_batch = True
+                    return True
+                active_ranks_tuple = tuple(active_global_ranks)
+                if self.elastic_ep_active_ranks != active_ranks_tuple:
+                    if not has_unfinished:
+                        logger.info(
+                            "Elastic EP rank exit start: global_rank=%s active_ranks=%s",
+                            torch.distributed.get_rank(), active_global_ranks)
+                    self.elastic_ep_active_ranks = active_ranks_tuple
+                    self.elastic_ep_scaled_once = True
+                    rebuild_start_t = time.perf_counter()
+                    self.engine_core.collective_rpc(
+                        "rebuild_elastic_ep_group",
+                        args=(active_global_ranks, ))
+                    if self.external_launcher_dp:
+                        current_global_rank = torch.distributed.get_rank()
+                        if current_global_rank in active_global_ranks:
+                            self.dp_group = get_dp_group().cpu_group
+                        else:
+                            self.dp_group = None
+                    logger.info(
+                        "Elastic parallel shrink rpc done: global_rank=%s active_ranks=%s total_ms=%.2f",
+                        torch.distributed.get_rank(), active_global_ranks,
+                        (time.perf_counter() - rebuild_start_t) * 1000.0)
+            return has_unfinished
+
         aggregated_has_unfinished = ParallelConfig.has_unfinished_dp(
             self.dp_group, has_unfinished)
         if not has_unfinished and aggregated_has_unfinished:
             self.should_execute_dummy_batch = True
         return aggregated_has_unfinished
+
+    def restore_elastic_parallel_groups_if_needed(self) -> None:
+        if not self.elastic_ep_no_dummy or not self.elastic_ep_scaled_once:
+            return
+        restore_start_t = time.perf_counter()
+        self.engine_core.collective_rpc("restore_elastic_parallel_groups")
+        if self.external_launcher_dp:
+            self.dp_group = get_dp_group().cpu_group
+        self.elastic_ep_scaled_once = False
+        self.elastic_ep_active_ranks = None
+        logger.info(
+            "Elastic parallel groups restored: global_rank=%s total_ms=%.2f",
+            torch.distributed.get_rank(),
+            (time.perf_counter() - restore_start_t) * 1000.0)
 
     @classmethod
     def validate_outputs(cls, outputs, output_type):

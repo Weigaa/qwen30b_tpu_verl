@@ -32,6 +32,9 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ENABLE_MC2=1                     # 910C开启
 export VLLM_DP_SIZE=16                        # world_size // rollout.tp_size
+export VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK=${VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:-1}
+export VLLM_ASCEND_ELASTIC_MOE_MODE=${VLLM_ASCEND_ELASTIC_MOE_MODE:-lossy}  # lossy | lossless
+export VLLM_ASCEND_INIT_REDUNDANCY_EXPERT=${VLLM_ASCEND_INIT_REDUNDANCY_EXPERT:-0}  # total preloaded redundant expert replicas for lossless shrink
 export HCCL_BUFFSIZE=800
 #debug用
 # export ASCEND_LAUNCH_BLOCKING=1
@@ -140,4 +143,4 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> wjeagerqwen30b-a3b-eager_record_bsz32_profile.txt 
+    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> wjeagerqwen30b-a3b-eager_record_bsz32_noreshard.txt 
