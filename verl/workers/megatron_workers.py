@@ -238,6 +238,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        self._base_hccl_if_base_port = os.environ.get("HCCL_IF_BASE_PORT")
 
         if self._is_actor:
             omega_profiler_config = config.actor.get("profiler", {})
@@ -294,6 +295,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "`log_prob_micro_batch_size` should not be None at the same time."
                 )
             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
+
+    def _set_hccl_if_base_port_for_phase(self, phase: str) -> None:
+        if self._base_hccl_if_base_port is None:
+            return
+        phase_offsets = {
+            "actor": 0,
+            "rollout": 4096,
+            "ref": 8192,
+        }
+        phase_port = str(int(self._base_hccl_if_base_port) + phase_offsets.get(phase, 0))
+        os.environ["HCCL_IF_BASE_PORT"] = phase_port
+        logger.info("Use HCCL_IF_BASE_PORT=%s for %s init", phase_port, phase)
 
     def _build_model_optimizer(
         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None
@@ -513,6 +526,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
 
         if self._is_actor:
+            self._set_hccl_if_base_port_for_phase("actor")
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = MegatronPPOActor(
                 config=actor_cfg,
@@ -525,10 +539,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
 
         if self._is_rollout:
+            self._set_hccl_if_base_port_for_phase("rollout")
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
             log_gpu_memory_usage("After rollout init", logger=logger)
 
         if self._is_ref:
+            self._set_hccl_if_base_port_for_phase("ref")
             self.ref_module, self.ref_model_config = self._build_model_optimizer(
                 model_path=self.config.model.path,
                 optim_config=None,
@@ -702,28 +718,64 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
+        from vllm_ascend import envs as envs_ascend
+        elastic_shrink_enabled = (
+            envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK)
+        elastic_rollout_scaled = False
+        llm_engine = getattr(getattr(self.rollout, "inference_engine", None),
+                             "llm_engine", None)
+        if llm_engine is not None and elastic_shrink_enabled:
+            elastic_rollout_scaled = bool(
+                getattr(llm_engine, "elastic_ep_scaled_once", False))
+
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
-        # We calculate the average timing across all ranks
-        # to make sure meta_info["timing"] is the same
-        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
-            timing_generate["generate_sequences"]
-        )
-        timing_generate = reduce_timing(timing_generate)
-        timing_generate.update(
-            {
-                "generation_timing/max": timing_generate_max,
-                "generation_timing/min": timing_generate_min,
-                "generation_timing/topk_ratio": timing_generate_topk_ratio,
+        if self._is_actor and elastic_shrink_enabled and elastic_rollout_scaled:
+            logger.info(
+                "Skip rollout generate barrier and timing reduce because elastic shrink happened in this generate.")
+            timing_generate = {
+                "generate_sequences": -1.0,
+                "generation_timing/max": -1.0,
+                "generation_timing/min": -1.0,
+                "generation_timing/topk_ratio": -1.0,
+                "generation_timing/reduced": False,
             }
-        )
+        else:
+            # We calculate the average timing across all ranks
+            # to make sure meta_info["timing"] is the same
+            timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
+                timing_generate["generate_sequences"]
+            )
+            timing_generate = reduce_timing(timing_generate)
+            timing_generate.update(
+                {
+                    "generation_timing/max": timing_generate_max,
+                    "generation_timing/min": timing_generate_min,
+                    "generation_timing/topk_ratio": timing_generate_topk_ratio,
+                    "generation_timing/reduced": True,
+                }
+            )
         output.meta_info["timing"] = timing_generate
         output = output.to("cpu")
         # clear kv cache
         aggressive_empty_cache(force_sync=True)
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restore_rollout_elastic_parallel_groups(self):
+        rollout_engine = getattr(self.rollout, "inference_engine", None)
+        llm_engine = getattr(rollout_engine, "llm_engine", None)
+        if llm_engine is None or not hasattr(
+                llm_engine, "restore_elastic_parallel_groups_if_needed"):
+            return False
+        logger.info(
+            "Elastic parallel restore requested after rollout: rank=%s scaled_once=%s active_ranks=%s",
+            self.rank, getattr(llm_engine, "elastic_ep_scaled_once", False),
+            getattr(llm_engine, "elastic_ep_active_ranks", None))
+        llm_engine.restore_elastic_parallel_groups_if_needed()
+        return True
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
@@ -760,9 +812,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        calculate_entropy = bool(getattr(self.actor.config, "entropy_coeff", 0) != 0)
+        output, entropys = self.actor.compute_log_prob(
+            data=data, calculate_entropy=calculate_entropy)
+        tensors = {"old_log_probs": output}
+        if calculate_entropy:
+            tensors["entropys"] = entropys
         output = DataProto.from_dict(
-            tensors={"old_log_probs": output, "entropys": entropys},
+            tensors=tensors,
             meta_info={"temperature": self.config.rollout.temperature},
         )
         output = output.to("cpu")

@@ -43,6 +43,14 @@ def get_moe_comm_method(
     return _MoECommMethods.get(moe_comm_type)
 
 
+def _resolve_model_type(moe_config: FusedMoEConfig) -> str:
+    vllm_config = get_current_vllm_config()
+    if (vllm_config is not None and vllm_config.model_config is not None
+            and vllm_config.model_config.hf_config is not None):
+        return vllm_config.model_config.hf_config.model_type
+    return getattr(moe_config, "model_type", "")
+
+
 def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
@@ -55,8 +63,7 @@ class MoECommMethod(ABC):
     """Base class for MoE communication methods."""
 
     def __init__(self, moe_config: FusedMoEConfig):
-        self.model_type = get_current_vllm_config(
-        ).model_config.hf_config.model_type
+        self.model_type = _resolve_model_type(moe_config)
         self.moe_config = moe_config
         self.mc2_mask = None
 
@@ -111,7 +118,8 @@ class MoECommMethod(ABC):
             log2phy: torch.Tensor = None,
             global_redundant_expert_num: int = 0,
             need_trans: bool = False,
-            dynamic_eplb: bool = False):
+            dynamic_eplb: bool = False,
+            mc2_mask: Optional[torch.Tensor] = None):
         # Check constraints
         assert hidden_states.dtype in [
             torch.float32, torch.float16, torch.bfloat16
@@ -129,6 +137,13 @@ class MoECommMethod(ABC):
         tp_size = get_tensor_model_parallel_world_size()
         max_tokens = (ctx.max_tokens_across_dp + tp_size - 1) // tp_size
         num_tokens = hidden_states.size(0)
+        effective_mc2_mask = self.mc2_mask if mc2_mask is None else mc2_mask
+        if (effective_mc2_mask is not None
+                and effective_mc2_mask.shape[0] != hidden_states.shape[0]):
+            raise RuntimeError(
+                "MC2 mask length mismatch before token dispatch: "
+                f"hidden_tokens={hidden_states.shape[0]} "
+                f"mask_tokens={effective_mc2_mask.shape[0]}")
 
         if max_tokens < chunk_moe_size:
             results = self.token_dispatcher.token_dispatch(
@@ -142,7 +157,7 @@ class MoECommMethod(ABC):
                 shared_experts=shared_experts,
                 quantized_x_for_share=quantized_x_for_share,
                 dynamic_scale_for_share=dynamic_scale_for_share,
-                mc2_mask=self.mc2_mask,
+                mc2_mask=effective_mc2_mask,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 with_quant=use_int8_w8a8 or use_int4_w4a8)
             permuted_hidden_states, expert_tokens, dynamic_scale, group_list_type, topk_scales = \
@@ -175,6 +190,9 @@ class MoECommMethod(ABC):
             chunk_topk_ids = topk_ids[chunk_start:chunk_end]
             chunk_topk_weights = topk_weights[chunk_start:chunk_end]
             chunk_shared_experts = None if shared_experts is None else shared_experts[chunk_start:chunk_end]
+            chunk_mc2_mask = None
+            if effective_mc2_mask is not None:
+                chunk_mc2_mask = effective_mc2_mask[chunk_start:chunk_end]
             results = self.token_dispatcher.token_dispatch(
                 hidden_states=chunk_hidden_states,
                 topk_weights=chunk_topk_weights,
@@ -186,7 +204,7 @@ class MoECommMethod(ABC):
                 shared_experts=chunk_shared_experts,
                 quantized_x_for_share=quantized_x_for_share,
                 dynamic_scale_for_share=dynamic_scale_for_share,
-                mc2_mask=self.mc2_mask,
+                mc2_mask=chunk_mc2_mask,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 with_quant=use_int8_w8a8 or use_int4_w4a8)
             
@@ -278,7 +296,10 @@ class MC2CommImpl(MoECommMethod):
     """
 
     def _get_token_dispatcher(self):
-        return TokenDispatcherWithMC2()
+        return TokenDispatcherWithMC2(
+            top_k=self.moe_config.experts_per_token,
+            num_experts=self.moe_config.num_experts,
+            num_local_experts=self.moe_config.num_local_experts)
 
     def _get_fused_moe_prepare_finalize(self):
         return FusedMoEPrepareAndFinalizeWithMC2(self.moe_config)

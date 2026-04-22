@@ -27,10 +27,12 @@ from typing import Any, Optional
 import torch
 import torch_npu
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.ops.moe.comm_utils import (
-    async_all_to_all, gather_from_sequence_parallel_region)
+from vllm_ascend.ops.moe.comm_utils import (_gather_along_first_dim,
+                                            async_all_to_all)
 from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
 
 
@@ -47,6 +49,11 @@ class MoETokenDispatcher(ABC):
     def ep_group(self):
         """Get expert model parallel group."""
         return get_ep_group().device_group
+
+    @property
+    def ep_metadata_group(self):
+        ep_group = get_ep_group()
+        return getattr(ep_group, "cpu_group", ep_group.device_group)
 
     @property
     def ep_rank(self):
@@ -117,15 +124,15 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         expert_map: torch.Tensor,
         global_redundant_expert_num: int = 0,
     ):
+        # In elastic EP shrink, expert ids are remapped into the active dense
+        # physical space. Dispatch/combine must therefore use the current
+        # runtime expert count, not the original logical expert_map length.
+        moe_expert_num = self.num_experts
         if self.with_quant:
             quant_mode = 2
-            if (expert_map is not None):
-                moe_expert_num = len(expert_map) + global_redundant_expert_num
-            else:
-                moe_expert_num = global_redundant_expert_num
+            moe_expert_num = moe_expert_num + global_redundant_expert_num
         else:
             quant_mode = 0
-            moe_expert_num = len(expert_map)
         kwargs_mc2 = {
             "x": hidden_states,
             "expert_ids": topk_ids,
@@ -176,6 +183,17 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.topk_ids = topk_ids
         self.topk_weights = topk_weights
         self.shared_experts = shared_experts
+        if self.a3_need_extra_args and self.enable_dispatch_v2:
+            if mc2_mask is None:
+                raise RuntimeError(
+                    "MC2 dispatch_v2 on A3 requires x_active_mask/mc2_mask.")
+            mc2_mask = mc2_mask.to(device=hidden_states.device, dtype=torch.bool)
+            if mc2_mask.shape[0] != hidden_states.shape[0]:
+                raise RuntimeError(
+                    "MC2 dispatch mask length mismatch: "
+                    f"hidden_tokens={hidden_states.shape[0]} "
+                    f"mask_tokens={mc2_mask.shape[0]} "
+                    f"topk_rows={topk_ids.shape[0]}")
         self.mc2_mask = mc2_mask
 
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(hidden_states, topk_weights,
@@ -222,7 +240,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         assert self.topk_weights is not None
         assert self.topk_ids is not None
         assert self.output is not None
-        moe_expert_num = len(self.expert_map)
+        moe_expert_num = self.num_experts
         # moeCombine
         kwargs_mc2 = {
             "expand_x": hidden_states,
@@ -481,6 +499,7 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         self.input_splits = None
         self.output_splits = None
         self.hidden_shape_before_permute = None
+        self._hybrid_host_metadata_logged_stage = None
 
         # [tp_ep_size * ep_size, num_local_experts]. Represents the number of tokens sent
         # to each local expert by all ranks.
@@ -531,12 +550,114 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         assert topk_weights.dim() == 2, "Expected 2D tensor for topk_weights"
         assert topk_ids.dim() == 2, "Expected 2D tensor for routing map"
 
+        pre_map_topk_ids = topk_ids
         if log2phy is not None:
             topk_ids = log2phy[topk_ids]
+            if topk_ids.numel() > 0:
+                mapped_topk_max = int(topk_ids.max().item())
+                mapped_topk_min = int(topk_ids.min().item())
+                if mapped_topk_min < 0 or mapped_topk_max >= self.num_experts:
+                    debug_ctx = self._debug_context()
+                    logger.error(
+                        "AllToAll log2phy remap overflow at %s: rank=%s ep_size=%s num_experts=%s pre_topk_min=%s pre_topk_max=%s post_topk_min=%s post_topk_max=%s log2phy_min=%s log2phy_max=%s",
+                        debug_ctx,
+                        self.ep_rank,
+                        self.ep_size,
+                        self.num_experts,
+                        int(pre_map_topk_ids.min().item()),
+                        int(pre_map_topk_ids.max().item()),
+                        mapped_topk_min,
+                        mapped_topk_max,
+                        int(log2phy.min().item()),
+                        int(log2phy.max().item()),
+                    )
 
         permutated_local_input_tokens, reversed_local_input_permutation_mapping, tokens_per_expert = self._dispatch_preprocess(
             hidden_states, topk_ids)
         self.reversed_local_input_permutation_mapping = reversed_local_input_permutation_mapping
+        debug_info = getattr(get_forward_context(), "elastic_debug_info", None)
+        if (debug_info is not None and
+                debug_info.get("reason") == "lossless_pre_shrink_loaded_only"
+                and debug_info.get("route_debug", False)):
+            nonzero_experts = []
+            nonzero_counts = []
+            if tokens_per_expert.numel() > 0:
+                nonzero_mask = tokens_per_expert > 0
+                nonzero_experts = torch.nonzero(
+                    nonzero_mask, as_tuple=False).reshape(-1)
+                nonzero_counts = tokens_per_expert[nonzero_mask]
+            top_expert_pairs = []
+            if len(nonzero_counts) > 0:
+                order = torch.argsort(nonzero_counts, descending=True)[:8]
+                top_expert_pairs = [
+                    (int(nonzero_experts[idx].item()),
+                     int(nonzero_counts[idx].item())) for idx in order
+                ]
+            flat_pre_ids = pre_map_topk_ids.reshape(-1)
+            flat_mapped_ids = topk_ids.reshape(-1)
+            active_local_num_experts = int(
+                debug_info.get("active_local_num_experts", -1))
+            invalid_local_slots = []
+            if len(nonzero_experts) > 0:
+                invalid_mask = ((nonzero_experts < 0) |
+                                (nonzero_experts >= active_local_num_experts))
+                invalid_local_slots = [
+                    int(local_slot.item())
+                    for local_slot in nonzero_experts[invalid_mask]
+                ]
+            logger.info(
+                "Lossless pre-shrink route summary: rank=%s layer=%s tag=%s reason=%s topk_shape=%s pre_topk_min=%s pre_topk_max=%s pre_unique=%s mapped_topk_min=%s mapped_topk_max=%s mapped_unique=%s num_local_experts=%s active_local_num_experts=%s nonzero_local_experts=%s top_local_tokens=%s input_splits=%s output_splits=%s num_out_tokens=%s",
+                self.ep_rank,
+                debug_info.get("layer_idx"),
+                debug_info.get("tag"),
+                debug_info.get("reason"),
+                tuple(topk_ids.shape),
+                int(flat_pre_ids.min().item()) if flat_pre_ids.numel() > 0 else -1,
+                int(flat_pre_ids.max().item()) if flat_pre_ids.numel() > 0 else -1,
+                int(torch.unique(flat_pre_ids).numel())
+                if flat_pre_ids.numel() > 0 else 0,
+                int(flat_mapped_ids.min().item())
+                if flat_mapped_ids.numel() > 0 else -1,
+                int(flat_mapped_ids.max().item())
+                if flat_mapped_ids.numel() > 0 else -1,
+                int(torch.unique(flat_mapped_ids).numel())
+                if flat_mapped_ids.numel() > 0 else 0,
+                self.num_local_experts,
+                active_local_num_experts,
+                int(len(nonzero_experts)),
+                top_expert_pairs,
+                self.input_splits,
+                self.output_splits,
+                self.num_out_tokens,
+            )
+            if invalid_local_slots:
+                logger.warning(
+                    "Lossless pre-shrink invalid local slot: rank=%s layer=%s tag=%s invalid_slots=%s active_local_num_experts=%s top_local_tokens=%s",
+                    self.ep_rank,
+                    debug_info.get("layer_idx"),
+                    debug_info.get("tag"),
+                    invalid_local_slots,
+                    active_local_num_experts,
+                    top_expert_pairs,
+                )
+        expected_input_tokens = sum(self.input_splits)
+        actual_input_tokens = permutated_local_input_tokens.shape[0]
+        if actual_input_tokens != expected_input_tokens:
+            debug_ctx = self._debug_context()
+            logger.error(
+                "AllToAll input split mismatch at %s: rank=%s ep_size=%s num_experts=%s num_local_experts=%s topk_shape=%s num_out_tokens=%s input_splits=%s sum_input_splits=%s actual_input_tokens=%s",
+                debug_ctx,
+                self.ep_rank,
+                self.ep_size,
+                self.num_experts,
+                self.num_local_experts,
+                tuple(topk_ids.shape),
+                self.num_out_tokens,
+                self.input_splits,
+                expected_input_tokens,
+                actual_input_tokens,
+            )
+            raise AssertionError("AllToAll input split mismatch")
 
         dynamic_scale_after_all2all = None
         if self.with_quant:
@@ -604,6 +725,17 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         tokens_per_expert = self._preprocess(topk_ids)
 
         self.hidden_shape_before_permute = hidden_states.shape
+        if self.num_out_tokens == 0:
+            reversed_local_input_permutation_mapping = torch.empty(
+                (0, ),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+            permutated_local_input_tokens = hidden_states.new_empty(
+                (0, hidden_states.shape[-1]))
+            return (permutated_local_input_tokens,
+                    reversed_local_input_permutation_mapping,
+                    tokens_per_expert)
 
         permutated_local_input_tokens, reversed_local_input_permutation_mapping = torch_npu.npu_moe_token_permute(
             tokens=hidden_states,
@@ -612,13 +744,103 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         )
         return permutated_local_input_tokens, reversed_local_input_permutation_mapping, tokens_per_expert
 
+    def _debug_context(self) -> str:
+        forward_context = get_forward_context()
+        layer_idx = getattr(forward_context, "layer_idx", None)
+        return f"layer={layer_idx}" if layer_idx is not None else "layer=unknown"
+
+    def _should_use_host_metadata_gather(self) -> bool:
+        forward_context = get_forward_context()
+        return bool(
+            getattr(forward_context, "hybrid_force_host_alltoall_metadata",
+                    False))
+
+    def _gather_global_tokens_per_expert_host(
+            self, num_local_tokens_per_expert: torch.Tensor) -> torch.Tensor:
+        forward_context = get_forward_context()
+        stage_size = getattr(forward_context, "hybrid_stage_active_ranks", None)
+        if self.ep_rank == 0 and self._hybrid_host_metadata_logged_stage != stage_size:
+            logger.info(
+                "Hybrid AllToAll metadata gather using host path: %s rank=%s ep_size=%s stage=%s num_experts=%s num_local_experts=%s",
+                self._debug_context(),
+                self.ep_rank,
+                self.ep_size,
+                stage_size,
+                self.num_experts,
+                self.num_local_experts,
+            )
+            self._hybrid_host_metadata_logged_stage = stage_size
+
+        local_counts_cpu = num_local_tokens_per_expert.to(
+            device="cpu", non_blocking=False)
+        local_counts_list = [int(x) for x in local_counts_cpu.tolist()]
+        gathered_counts: list[Optional[list[int]]] = [None] * self.ep_size
+        torch.distributed.all_gather_object(
+            gathered_counts, local_counts_list, group=self.ep_metadata_group)
+        for rank_idx, counts in enumerate(gathered_counts):
+            if counts is None or len(counts) != self.num_experts:
+                logger.error(
+                    "Hybrid AllToAll host metadata gather malformed at %s: rank=%s ep_size=%s stage=%s src_rank=%s expected_num_experts=%s actual_len=%s",
+                    self._debug_context(),
+                    self.ep_rank,
+                    self.ep_size,
+                    stage_size,
+                    rank_idx,
+                    self.num_experts,
+                    -1 if counts is None else len(counts),
+                )
+                raise AssertionError(
+                    "Hybrid AllToAll host metadata gather malformed")
+        return torch.tensor(gathered_counts, dtype=torch.int64)
+
     def _preprocess(self, topk_ids: torch.Tensor) -> torch.Tensor:
-        num_local_tokens_per_expert = torch.histc(topk_ids,
-                                                  bins=self.num_experts,
-                                                  min=0,
-                                                  max=self.num_experts)
+        flat_topk_ids = topk_ids.reshape(-1).to(torch.int64)
+        if flat_topk_ids.numel() > 0:
+            topk_min = int(flat_topk_ids.min().item())
+            topk_max = int(flat_topk_ids.max().item())
+            if topk_min < 0 or topk_max >= self.num_experts:
+                debug_ctx = self._debug_context()
+                logger.error(
+                    "AllToAll topk id out of range at %s: rank=%s ep_size=%s num_experts=%s topk_shape=%s topk_min=%s topk_max=%s",
+                    debug_ctx,
+                    self.ep_rank,
+                    self.ep_size,
+                    self.num_experts,
+                    tuple(topk_ids.shape),
+                    topk_min,
+                    topk_max,
+                )
+                raise AssertionError("AllToAll topk id out of range")
+
+        # `histc`/`bincount` on this NPU path produced all-zero counts for valid
+        # topk ids. Use explicit integer accumulation instead.
+        num_local_tokens_per_expert = torch.zeros(
+            self.num_experts,
+            dtype=torch.int64,
+            device=topk_ids.device,
+        )
+        if flat_topk_ids.numel() > 0:
+            num_local_tokens_per_expert.scatter_add_(
+                0,
+                flat_topk_ids,
+                torch.ones_like(flat_topk_ids, dtype=torch.int64),
+            )
 
         ep_size = self.ep_size
+        expected_num_experts = ep_size * self.num_local_experts
+        if self.num_experts != expected_num_experts:
+            debug_ctx = self._debug_context()
+            logger.error(
+                "AllToAll expert layout mismatch at %s: rank=%s ep_size=%s num_experts=%s expected_num_experts=%s num_local_experts=%s topk_shape=%s",
+                debug_ctx,
+                self.ep_rank,
+                ep_size,
+                self.num_experts,
+                expected_num_experts,
+                self.num_local_experts,
+                tuple(topk_ids.shape),
+            )
+            raise AssertionError("AllToAll expert layout mismatch")
 
         # Dropless
         self.num_out_tokens = topk_ids.numel()
@@ -626,36 +848,103 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         # ===================================================
         # Calculate input_splits, output_splits for alltoall-v.
         # ===================================================
-        self.input_splits = (num_local_tokens_per_expert.reshape(
-            ep_size,
-            self.num_local_experts).sum(axis=1).to(torch.device("cpu"),
-                                                   non_blocking=True).numpy())
-        num_global_tokens_per_expert = gather_from_sequence_parallel_region(
-            num_local_tokens_per_expert,
-            group=self.ep_group).reshape(ep_size, self.num_experts)
+        input_splits_tensor = num_local_tokens_per_expert.reshape(
+            ep_size, self.num_local_experts).sum(dim=1)
+        local_input_total = int(input_splits_tensor.sum().item())
+        self.input_splits = input_splits_tensor.cpu().tolist()
+        use_host_metadata_gather = bool(ep_size > 1
+                                        and self._should_use_host_metadata_gather())
+        if ep_size == 1:
+            num_global_tokens_per_expert = num_local_tokens_per_expert.reshape(
+                1, self.num_experts)
+        elif use_host_metadata_gather:
+            num_global_tokens_per_expert = (
+                self._gather_global_tokens_per_expert_host(
+                    num_local_tokens_per_expert))
+        else:
+            num_global_tokens_per_expert = _gather_along_first_dim(
+                num_local_tokens_per_expert, self.ep_group).reshape(
+                    ep_size, self.num_experts)
         self.num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, self.local_expert_indices[
             0]:self.local_expert_indices[-1] + 1]
         if self.num_global_tokens_per_local_expert is None:
             raise ValueError(
                 "num_global_tokens_per_local_expert must be set before sum.")
-        self.output_splits = (self.num_global_tokens_per_local_expert.sum(
-            axis=-1).to(torch.device("cpu"), non_blocking=True).numpy())
+        output_splits_tensor = self.num_global_tokens_per_local_expert.sum(
+            dim=-1)
+        self.output_splits = output_splits_tensor.cpu().tolist()
         num_tokens_per_local_expert = self.num_global_tokens_per_local_expert.sum(
-            axis=0)
+            dim=0)
+        total_input_splits = sum(self.input_splits)
+        total_output_splits = sum(self.output_splits)
+        if local_input_total != self.num_out_tokens:
+            debug_ctx = self._debug_context()
+            logger.error(
+                "AllToAll device input split total mismatch at %s: rank=%s ep_size=%s num_out_tokens=%s local_input_total=%s topk_shape=%s topk_min=%s topk_max=%s",
+                debug_ctx,
+                self.ep_rank,
+                ep_size,
+                self.num_out_tokens,
+                local_input_total,
+                tuple(topk_ids.shape),
+                int(topk_ids.min().item()) if topk_ids.numel() > 0 else -1,
+                int(topk_ids.max().item()) if topk_ids.numel() > 0 else -1,
+            )
+            raise AssertionError("AllToAll device input split total mismatch")
+        if total_input_splits != self.num_out_tokens:
+            debug_ctx = self._debug_context()
+            logger.error(
+                "AllToAll input split total mismatch at %s: rank=%s ep_size=%s num_out_tokens=%s sum_input_splits=%s input_splits=%s topk_shape=%s topk_min=%s topk_max=%s",
+                debug_ctx,
+                self.ep_rank,
+                ep_size,
+                self.num_out_tokens,
+                total_input_splits,
+                self.input_splits,
+                tuple(topk_ids.shape),
+                int(topk_ids.min().item()) if topk_ids.numel() > 0 else -1,
+                int(topk_ids.max().item()) if topk_ids.numel() > 0 else -1,
+            )
+            raise AssertionError("AllToAll input split total mismatch")
+        expected_output_splits = int(
+            self.num_global_tokens_per_local_expert.sum().item())
+        if total_output_splits != expected_output_splits:
+            debug_ctx = self._debug_context()
+            logger.error(
+                "AllToAll output split total mismatch at %s: rank=%s ep_size=%s sum_output_splits=%s expected_output_splits=%s output_splits=%s",
+                debug_ctx,
+                self.ep_rank,
+                ep_size,
+                total_output_splits,
+                expected_output_splits,
+                self.output_splits,
+            )
+            raise AssertionError("AllToAll output split total mismatch")
         # ===================================================
         # num_global_tokens_per_expert: [ep_size, num_experts]
         # num_global_tokens_per_local_expert: [ep_size, num_local_experts]
         # num_tokens_per_local_expert: [num_local_experts]
         # ===================================================
 
+        num_tokens_per_local_expert = num_tokens_per_local_expert.to(
+            device=torch.npu.current_device())
         if self.num_local_experts > 1:
             if self.num_global_tokens_per_local_expert is None:
                 raise ValueError(
                     "num_global_tokens_per_local_expert must be set before operations."
                 )
+            if self.num_global_tokens_per_local_expert.device != self.expert_ids_per_ep_rank.device:
+                self.num_global_tokens_per_local_expert = (
+                    self.num_global_tokens_per_local_expert.to(
+                        device=self.expert_ids_per_ep_rank.device,
+                        dtype=torch.int64,
+                        non_blocking=False))
             self.global_input_tokens_local_experts_indices = torch.repeat_interleave(
                 self.expert_ids_per_ep_rank,
-                self.num_global_tokens_per_local_expert.ravel())
+                self.num_global_tokens_per_local_expert.ravel().to(
+                    device=self.expert_ids_per_ep_rank.device,
+                    dtype=torch.int64,
+                    non_blocking=False))
         else:
             # TODO: This full synchronization can be a performance bottleneck.
             # A more granular sync (e.g., blocking D2H copies) should be investigated.
@@ -711,6 +1000,11 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
         return hidden_states
 
     def _combine_postprocess(self, permutated_local_input_tokens):
+        if (self.hidden_shape_before_permute is not None
+                and len(self.hidden_shape_before_permute) > 0
+                and int(self.hidden_shape_before_permute[0]) == 0):
+            return permutated_local_input_tokens.new_empty(
+                self.hidden_shape_before_permute)
         # Unpermutation 1: AlltoAll output to output
         output = torch_npu.npu_moe_token_unpermute(
             permuted_tokens=permutated_local_input_tokens,

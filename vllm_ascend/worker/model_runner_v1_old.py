@@ -264,6 +264,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.prefetch_stream = torch.npu.Stream(device=device)
         else:
             self.prefetch_stream = None
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 3:
+            self.moe_prefetch_stream = torch.npu.Stream(device=device)
+        else:
+            self.moe_prefetch_stream = None
         self.dtype = self.model_config.dtype
         if envs_ascend.VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION:
             # TODO: drop the env config to use ascend sampler by default
@@ -1911,7 +1915,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             moe_comm_type = MoECommType.ALLGATHER
         elif soc_version in {AscendSocVersion.A2}:
             if (num_tokens <= self.mc2_tokens_capacity
-                    and self.parallel_config.world_size_across_dp >= 16):
+                    and self.parallel_config.world_size_across_dp >=
+                    envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE):
                 moe_comm_type = MoECommType.MC2
             else:
                 # Currently, w4a8_dynamic does not support allgatherep
@@ -1999,6 +2004,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     batch_descriptor=batch_descriptor,
                     num_actual_tokens=total_num_scheduled_tokens,
                     prefetch_stream=self.prefetch_stream,
+                    moe_prefetch_stream=self.moe_prefetch_stream,
                     model_instance=self.model):
                 self.maybe_setup_kv_connector(scheduler_output)
 
@@ -2528,6 +2534,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     prefetch_stream=self.prefetch_stream,
+                    moe_prefetch_stream=self.moe_prefetch_stream,
                     model_instance=self.model):
                 # Run dummy forward pass
                 hidden_states = self._generate_dummy_run_hidden_states(

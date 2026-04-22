@@ -289,7 +289,8 @@ class Scheduler(SchedulerInterface):
                     if self.log_stats:
                         preempted_req.record_event(
                             EngineCoreEventType.PREEMPTED, scheduled_timestamp)
-
+                    logger.info("Preempting request %s for request %s",
+                                preempted_req.request_id, request.request_id)
                     self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
@@ -709,9 +710,17 @@ class Scheduler(SchedulerInterface):
 
         # print("after hash update the result is", len(hash_result))
         req_ids = defaultdict(int)
+        seq_entries = {}
         for key , value in scheduler_output.num_scheduled_tokens.items():
             new_key = PROMPT_HASH_DB[key]
+            request = self.requests.get(key)
+            start_pos = int(getattr(request, "num_computed_tokens", 0))
             req_ids[new_key] += int(value)
+            seq_entries[str(key)] = {
+                "prompt_hash": new_key,
+                "count": int(value),
+                "start_pos": start_pos,
+            }
         schedule_total = sum(scheduler_output.num_scheduled_tokens.values())
         seq_total = sum(req_ids.values())
         if schedule_total != seq_total:
@@ -724,7 +733,7 @@ class Scheduler(SchedulerInterface):
             print("the req_ids is", req_ids)
         # print("after trans the result is", req_ids)
         #update current batch seq_ids
-        moe_stats.get_current_batch_seq_ids(req_ids)
+        moe_stats.get_current_batch_seq_ids(seq_entries)
         # print("this time scheduled tokens are", scheduler_output.num_scheduled_tokens)
 
 

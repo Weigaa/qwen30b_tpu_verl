@@ -25,6 +25,7 @@ from transformers import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, CompilationLevel, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
                                              get_tp_group)
 from vllm.forward_context import get_forward_context
@@ -56,6 +57,8 @@ from vllm.distributed.parallel_state import get_ep_group
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 import torch.distributed as dist
 import time
+
+logger = init_logger(__name__)
 
 
 class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
@@ -105,6 +108,12 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
 
         self.params_dtype = torch.get_default_dtype()
         self.prefix = prefix
+        # Keep pre-shrink logging focused on the MoE output path; gate and
+        # mapping summaries are too noisy for the current kernel-input check.
+        self._pre_shrink_live_gate_debug_logged = True
+        self._pre_shrink_live_gate_debug_remaining = 0
+        self._pre_shrink_live_mapping_debug_logged = True
+        self._pre_shrink_live_moe_io_debug_remaining = 0
 
     def forward(
         self,
@@ -121,6 +130,228 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        forward_context = get_forward_context()
+        pre_shrink_loaded_only = bool(
+            not getattr(forward_context, "in_profile_run", False)
+            and not is_dummy
+            and self.layer_idx == 0
+            and getattr(self.experts,
+                        "lossless_zero_redundancy_preallocated_loaded", False)
+            and getattr(self.experts, "loaded_weight_capacity", 0) >
+            getattr(self.experts, "active_local_num_experts", 0))
+        if pre_shrink_loaded_only:
+            topk_ids = self.compute_topk(router_logits, k=self.top_k)
+            hidden_fp32 = hidden_states.float()
+            logits_fp32 = router_logits.float()
+            hidden_norm = hidden_fp32.norm(dim=-1)
+            top1_vals, _ = torch.topk(logits_fp32, k=min(2, logits_fp32.shape[-1]), dim=-1)
+            top1 = top1_vals[:, 0]
+            top2 = top1_vals[:, 1] if top1_vals.shape[-1] > 1 else torch.zeros_like(top1)
+            unique_ids, unique_counts = torch.unique(topk_ids.reshape(-1),
+                                                     return_counts=True)
+            top_count = min(8, unique_counts.numel())
+            if top_count > 0:
+                top_vals, top_idx = torch.topk(unique_counts, k=top_count)
+                top_pairs = [(int(unique_ids[idx].item()), int(val.item()))
+                             for idx, val in zip(top_idx, top_vals)]
+            else:
+                top_pairs = []
+            top1_ids = topk_ids[:, 0]
+            top2_ids = topk_ids[:, 1] if topk_ids.shape[-1] > 1 else top1_ids
+            top1_unique_ids, top1_counts = torch.unique(top1_ids, return_counts=True)
+            top2_unique_ids, top2_counts = torch.unique(top2_ids, return_counts=True)
+
+            def _top_pairs(ids: torch.Tensor, counts: torch.Tensor) -> list[tuple[int, int]]:
+                if counts.numel() == 0:
+                    return []
+                top_n = min(8, counts.numel())
+                vals, idxs = torch.topk(counts, k=top_n)
+                return [(int(ids[idx].item()), int(val.item()))
+                        for idx, val in zip(idxs, vals)]
+
+            if not self._pre_shrink_live_mapping_debug_logged:
+                active_ids = getattr(self.experts, "active_expert_ids", None)
+                expert_map = getattr(self.experts, "expert_map", None)
+                log2phy = (getattr(self.experts, "elastic_runtime_log2phy", None)
+                           if getattr(self.experts, "elastic_runtime_log2phy",
+                                      None) is not None else
+                           getattr(self.experts, "log2phy", None))
+                runtime_w13 = getattr(self.experts, "runtime_w13_weight", None)
+                runtime_w2 = getattr(self.experts, "runtime_w2_weight", None)
+                loaded_w13 = getattr(self.experts, "w13_weight", None)
+                loaded_w2 = getattr(self.experts, "w2_weight", None)
+                compute_w13 = runtime_w13 if runtime_w13 is not None else loaded_w13
+                compute_w2 = runtime_w2 if runtime_w2 is not None else loaded_w2
+                compute_source = ("runtime_weight_view"
+                                  if runtime_w13 is not None else "loaded_weight")
+
+                active_ids_list = []
+                mapping_pairs = []
+                row_summaries = []
+                inactive_row_summaries = []
+                active_nonzero_slots = 0
+                inactive_nonzero_slots = 0
+                if active_ids is not None:
+                    if isinstance(active_ids, torch.Tensor):
+                        active_ids_list = [int(x) for x in active_ids.detach().cpu().tolist()]
+                    else:
+                        active_ids_list = [int(x) for x in active_ids]
+
+                if expert_map is not None and active_ids_list:
+                    if isinstance(expert_map, torch.Tensor):
+                        expert_map_cpu = expert_map.detach().cpu()
+                        for expert_id in active_ids_list:
+                            slot = int(expert_map_cpu[expert_id].item())
+                            mapping_pairs.append((expert_id, slot))
+                    else:
+                        for expert_id in active_ids_list:
+                            slot = int(expert_map[expert_id])
+                            mapping_pairs.append((expert_id, slot))
+
+                if compute_w13 is not None and mapping_pairs:
+                    for expert_id, slot in mapping_pairs[:4] + mapping_pairs[-4:]:
+                        if slot < 0 or slot >= compute_w13.shape[0]:
+                            row_abs_mean = float("nan")
+                        else:
+                            row_abs_mean = float(compute_w13[slot].float().abs().mean().item())
+                        row_summaries.append((expert_id, slot, round(row_abs_mean, 6)))
+                    capacity = int(compute_w13.shape[0])
+                    active_cap = min(len(mapping_pairs), capacity)
+                    for slot in range(active_cap):
+                        if float(compute_w13[slot].float().abs().max().item()) > 0.0:
+                            active_nonzero_slots += 1
+                    for slot in range(active_cap, capacity):
+                        max_abs = float(compute_w13[slot].float().abs().max().item())
+                        if max_abs > 0.0:
+                            inactive_nonzero_slots += 1
+                        if len(inactive_row_summaries) < 4:
+                            inactive_row_summaries.append((slot, round(max_abs, 6)))
+                compute_head_samples = []
+                if compute_w13 is not None and compute_w2 is not None:
+                    for row in range(min(4, int(compute_w13.shape[0]))):
+                        compute_head_samples.append((
+                            row,
+                            round(float(compute_w13[row].float().abs().mean().item()), 6),
+                            round(float(compute_w2[row].float().abs().mean().item()), 6),
+                        ))
+
+                identity_mismatches = []
+                if log2phy is not None:
+                    if isinstance(log2phy, torch.Tensor):
+                        log2phy_cpu = log2phy.detach().cpu()
+                        sample_n = min(128, int(log2phy_cpu.numel()))
+                        for expert_id in range(sample_n):
+                            mapped = int(log2phy_cpu[expert_id].item())
+                            if mapped != expert_id:
+                                identity_mismatches.append((expert_id, mapped))
+                                if len(identity_mismatches) >= 8:
+                                    break
+
+                logger.info(
+                    "Lossless pre-shrink expert mapping summary: rank=%s layer=%s "
+                    "active_ids_head=%s active_ids_tail=%s mapping_head=%s "
+                    "mapping_tail=%s row_abs_mean_samples=%s "
+                    "active_nonzero_slots=%s inactive_nonzero_slots=%s "
+                    "inactive_row_samples=%s compute_source=%s "
+                    "compute_head_samples=%s "
+                    "log2phy_identity_mismatch_count=%s mismatch_samples=%s",
+                    self.ep_group.rank_in_group,
+                    self.layer_idx,
+                    active_ids_list[:4],
+                    active_ids_list[-4:],
+                    mapping_pairs[:4],
+                    mapping_pairs[-4:],
+                    row_summaries,
+                    active_nonzero_slots,
+                    inactive_nonzero_slots,
+                    inactive_row_summaries,
+                    compute_source,
+                    compute_head_samples,
+                    len(identity_mismatches),
+                    identity_mismatches,
+                )
+                self._pre_shrink_live_mapping_debug_logged = True
+
+            if not self._pre_shrink_live_gate_debug_logged:
+                logger.info(
+                    "Lossless pre-shrink gate input summary: rank=%s layer=%s "
+                    "tokens=%s hidden_shape=%s hidden_abs_mean=%.6f "
+                    "hidden_norm_mean=%.6f hidden_norm_max=%.6f "
+                    "hidden_min=%.6f hidden_max=%.6f",
+                    self.ep_group.rank_in_group,
+                    self.layer_idx,
+                    hidden_states.shape[0],
+                    tuple(hidden_states.shape),
+                    float(hidden_fp32.abs().mean().item()),
+                    float(hidden_norm.mean().item()),
+                    float(hidden_norm.max().item()),
+                    float(hidden_fp32.min().item()),
+                    float(hidden_fp32.max().item()),
+                )
+                logger.info(
+                    "Lossless pre-shrink gate output summary: rank=%s layer=%s "
+                    "logits_shape=%s logits_abs_mean=%.6f logits_std=%.6f "
+                    "logits_min=%.6f logits_max=%.6f top1_mean=%.6f "
+                    "top1_max=%.6f top1_gap_mean=%.6f top1_gap_min=%.6f "
+                    "topk_min=%s topk_max=%s topk_unique=%s topk_top=%s",
+                    self.ep_group.rank_in_group,
+                    self.layer_idx,
+                    tuple(router_logits.shape),
+                    float(logits_fp32.abs().mean().item()),
+                    float(logits_fp32.std().item()),
+                    float(logits_fp32.min().item()),
+                    float(logits_fp32.max().item()),
+                    float(top1.mean().item()),
+                    float(top1.max().item()),
+                    float((top1 - top2).mean().item()),
+                    float((top1 - top2).min().item()),
+                    int(topk_ids.min().item()),
+                    int(topk_ids.max().item()),
+                    int(unique_ids.numel()),
+                    top_pairs,
+                )
+                self._pre_shrink_live_gate_debug_logged = True
+            if self._pre_shrink_live_gate_debug_remaining > 0:
+                call_idx = 7 - self._pre_shrink_live_gate_debug_remaining
+                top1_pairs = _top_pairs(top1_unique_ids, top1_counts)
+                top2_pairs = _top_pairs(top2_unique_ids, top2_counts)
+                logger.info(
+                    "Lossless pre-shrink gate evolution: rank=%s layer=%s "
+                    "call=%s tokens=%s hidden_abs_mean=%.6f "
+                    "hidden_norm_mean=%.6f hidden_norm_max=%.6f "
+                    "logits_abs_mean=%.6f logits_std=%.6f "
+                    "top1_unique=%s top1_top=%s top2_unique=%s top2_top=%s "
+                    "topk_unique=%s topk_top=%s gap_mean=%.6f gap_min=%.6f",
+                    self.ep_group.rank_in_group,
+                    self.layer_idx,
+                    call_idx,
+                    hidden_states.shape[0],
+                    float(hidden_fp32.abs().mean().item()),
+                    float(hidden_norm.mean().item()),
+                    float(hidden_norm.max().item()),
+                    float(logits_fp32.abs().mean().item()),
+                    float(logits_fp32.std().item()),
+                    int(top1_unique_ids.numel()),
+                    top1_pairs,
+                    int(top2_unique_ids.numel()),
+                    top2_pairs,
+                    int(unique_ids.numel()),
+                    top_pairs,
+                    float((top1 - top2).mean().item()),
+                    float((top1 - top2).min().item()),
+                )
+                if int(unique_ids.numel()) <= max(self.top_k, 8):
+                    logger.warning(
+                        "Lossless pre-shrink gate collapse suspected: rank=%s "
+                        "layer=%s call=%s topk_unique=%s top1_top=%s top2_top=%s",
+                        self.ep_group.rank_in_group,
+                        self.layer_idx,
+                        call_idx,
+                        int(unique_ids.numel()),
+                        top1_pairs,
+                        top2_pairs,
+                    )
+                self._pre_shrink_live_gate_debug_remaining -= 1
         #NPU并没有走到这个方法,eager会走到，图模式不会
         # add record
         # topk_ids = torch.topk(router_logits, k=self.top_k, dim=-1).indices
@@ -146,6 +377,35 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
             shared_experts=None,
             is_dummy=is_dummy,
         )
+
+        if pre_shrink_loaded_only and self._pre_shrink_live_moe_io_debug_remaining > 0:
+            output_fp32 = hidden_states.float()
+            output_norm = output_fp32.norm(dim=-1)
+            delta = output_fp32 - hidden_fp32
+            delta_norm = delta.norm(dim=-1)
+            call_idx = 7 - self._pre_shrink_live_moe_io_debug_remaining
+            logger.info(
+                "Lossless pre-shrink moe io summary: rank=%s layer=%s call=%s "
+                "input_abs_mean=%.6f input_norm_mean=%.6f input_norm_max=%.6f "
+                "output_abs_mean=%.6f output_norm_mean=%.6f output_norm_max=%.6f "
+                "delta_abs_mean=%.6f delta_norm_mean=%.6f delta_norm_max=%.6f "
+                "output_min=%.6f output_max=%.6f",
+                self.ep_group.rank_in_group,
+                self.layer_idx,
+                call_idx,
+                float(hidden_fp32.abs().mean().item()),
+                float(hidden_norm.mean().item()),
+                float(hidden_norm.max().item()),
+                float(output_fp32.abs().mean().item()),
+                float(output_norm.mean().item()),
+                float(output_norm.max().item()),
+                float(delta.abs().mean().item()),
+                float(delta_norm.mean().item()),
+                float(delta_norm.max().item()),
+                float(output_fp32.min().item()),
+                float(output_fp32.max().item()),
+            )
+            self._pre_shrink_live_moe_io_debug_remaining -= 1
 
         return hidden_states
 

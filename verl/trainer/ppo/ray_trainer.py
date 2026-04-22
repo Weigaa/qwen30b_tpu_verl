@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import uuid
 import time
@@ -59,6 +60,10 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
+from vllm.utils.moe_stats import (merge_moe_pattern_records,
+                                  strip_prompt_token_from_worker_records,
+                                  write_moe_pattern_csvs,
+                                  write_prompt_token_epoch_artifact_from_worker_records)
 
 #新增开始
 import json
@@ -66,6 +71,8 @@ import json
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -355,6 +362,15 @@ class RayPPOTrainer:
         )
         self.rollout_early_stop_factor = float(os.getenv("VLLM_ROLLOUT_EARLY_STOP_FACTOR", "2.0"))
         self.rollout_early_stop_min_tokens = int(os.getenv("VLLM_ROLLOUT_EARLY_STOP_MIN_TOKENS", "10000"))
+
+    def _restore_rollout_elastic_parallel_groups_if_needed(self) -> None:
+        if self.async_rollout_mode:
+            return
+        restore_fn = getattr(self.actor_rollout_wg,
+                             "restore_rollout_elastic_parallel_groups", None)
+        if restore_fn is None:
+            return
+        restore_fn()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1053,6 +1069,57 @@ class RayPPOTrainer:
         # Return unchanged batch and empty metrics if IS is disabled
         return batch, {}
 
+    def _dump_moe_pattern_csvs(self, epoch: int) -> None:
+        if not hasattr(self, "actor_rollout_wg") or self.actor_rollout_wg is None:
+            return
+        dump_start = time.perf_counter()
+        phase_start = dump_start
+        worker_records = self.actor_rollout_wg.get_record()
+        get_record_s = time.perf_counter() - phase_start
+        output_dir = os.getenv("VLLM_MOE_STATS_DIR", "./moe_stats")
+        phase_start = time.perf_counter()
+        prompt_token_artifact_path = write_prompt_token_epoch_artifact_from_worker_records(
+            worker_records,
+            output_dir=output_dir,
+            epoch=int(epoch),
+        )
+        prompt_token_artifact_s = time.perf_counter() - phase_start
+        strip_prompt_token_from_worker_records(worker_records)
+        phase_start = time.perf_counter()
+        merged_record = merge_moe_pattern_records(worker_records)
+        merge_s = time.perf_counter() - phase_start
+        if int(merged_record.get("num_experts", 0)) <= 0:
+            return
+        phase_start = time.perf_counter()
+        write_moe_pattern_csvs(
+            merged_record,
+            output_dir=output_dir,
+            prefix="cumulative",
+        )
+        cumulative_write_s = time.perf_counter() - phase_start
+        phase_start = time.perf_counter()
+        write_moe_pattern_csvs(
+            merged_record,
+            output_dir=output_dir,
+            prefix=f"epoch_{int(epoch):04d}",
+        )
+        epoch_write_s = time.perf_counter() - phase_start
+        total_s = time.perf_counter() - dump_start
+        logger.info(
+            "MoE stats dump timing: epoch=%s get_record_ms=%.3f merge_ms=%.3f "
+            "prompt_token_artifact_ms=%.3f write_cumulative_ms=%.3f "
+            "write_epoch_ms=%.3f total_ms=%.3f artifact=%s",
+            epoch,
+            get_record_s * 1000.0,
+            merge_s * 1000.0,
+            prompt_token_artifact_s * 1000.0,
+            cumulative_write_s * 1000.0,
+            epoch_write_s * 1000.0,
+            total_s * 1000.0,
+            prompt_token_artifact_path,
+        )
+        print(f"MoE pattern CSVs written to {output_dir} for epoch={epoch}.")
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1064,7 +1131,7 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
-        logger = Tracking(
+        tracker = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
@@ -1082,7 +1149,7 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            tracker.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1106,10 +1173,11 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        if hasattr(self, "actor_rollout_wg") and self.actor_rollout_wg is not None:
+            self.actor_rollout_wg.flush_record()
+
         for epoch in range(self.config.trainer.total_epochs):
             beginning_epoch_time = time.time()
-            #正式训练前，清空记录moe_stats
-            # self.actor_rollout_wg.flush_record()
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1132,6 +1200,7 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                gen_batch.meta_info["epoch"] = epoch
 
                 # data_rebalance = self.config.actor_rollout_ref.rollout.data_rebalance if hasattr(
                 #     self.config.actor_rollout_ref.rollout, 'data_rebalance') else True
@@ -1153,6 +1222,7 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            self._restore_rollout_elastic_parallel_groups_if_needed()
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
 
@@ -1206,10 +1276,12 @@ class RayPPOTrainer:
                     # 仅做rollouts阶段
                     end_gen_time = time.time()
                     batch_time = end_gen_time - beginning_gen_time
-                    print("global_token_num: ", batch.meta_info["global_token_num"])
-                    print("batch_time:", batch_time)
-                    print("rollouts speed tokens/s: ", sum(batch.meta_info["global_token_num"])/batch_time)
-                    # continue
+                    rollout_tokens_per_sec = (
+                        sum(batch.meta_info["global_token_num"]) / batch_time if batch_time > 0 else float("inf")
+                    )
+                    logger.info("global_token_num: %s", batch.meta_info["global_token_num"])
+                    logger.info("rollout_output_time_s: %.6f", batch_time)
+                    logger.info("rollouts speed tokens/s: %.6f", rollout_tokens_per_sec)
                     ######
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1226,13 +1298,17 @@ class RayPPOTrainer:
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         if self.config.actor_rollout_ref.actor.recompute_old_log_prob:
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                            entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
+                            entropys = old_log_prob.batch.pop("entropys", None)
+                            if entropys is not None:
+                                response_masks = batch.batch["response_mask"]
+                                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys,
+                                    loss_mask=response_masks,
+                                    loss_agg_mode=loss_agg_mode,
+                                )
+                                old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                                metrics.update(old_log_prob_metrics)
                             batch = batch.union(old_log_prob)
                         else:
                             batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
@@ -1401,7 +1477,7 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                tracker.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
@@ -1420,9 +1496,7 @@ class RayPPOTrainer:
                     end_epoch_time = time.time()
                     epoch_duration = end_epoch_time - beginning_epoch_time
                     print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")
-                    # epoch_stats = self.actor_rollout_wg.get_record()  # 得到 {prompt_id: {layer_idx: [per-expert prob sums]}}
-                    # with open(f"moe_step_{epoch}.json", "w") as f:
-                    #     json.dump(epoch_stats, f)
+                    self._dump_moe_pattern_csvs(epoch)
                     return
 
                 # this is experimental and may be changed/removed in the future
@@ -1433,6 +1507,7 @@ class RayPPOTrainer:
             end_epoch_time = time.time()
             epoch_duration = end_epoch_time - beginning_epoch_time
             print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")
+            self._dump_moe_pattern_csvs(epoch)
             save_epoch_freq = int(self.config.trainer.get("save_epoch_freq", 0))
             if save_epoch_freq > 0 and (epoch + 1) % save_epoch_freq == 0:
                 # global_steps has already advanced to the next step id.

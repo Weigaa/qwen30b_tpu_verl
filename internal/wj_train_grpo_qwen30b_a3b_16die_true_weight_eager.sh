@@ -23,14 +23,18 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 export MASTER_PORT=23300    # vllm port error
 export D2D_DATA_TRANSFER=1
-
 export VLLM_USE_V1=1
 export PRINT_MEMORY=1
 export USE_ALLTOALL_OVERLAP=1
 export HCCL_OP_EXPANSION_MODE=AIV
 export VLLM_LOGGING_LEVEL=INFO
-export VLLM_ENABLE_MC2=1                     # 910C开启
-export VLLM_DP_SIZE=16                        # world_size // rollout.tp_size
+export VLLM_ASCEND_FORCE_ALLTOALL_MOE=${VLLM_ASCEND_FORCE_ALLTOALL_MOE:-0}  # 1: force AllToAll for EP MoE, 0: allow MC2
+if [[ "${VLLM_ASCEND_FORCE_ALLTOALL_MOE}" == "1" ]]; then
+    export VLLM_ENABLE_MC2=0
+else
+export VLLM_ENABLE_MC2=1
+fi
+export VLLM_DP_SIZE=16                        # world_size // rollout.tp_sizebaseline dummy-run, 1: redundant experts only, 2: redundant experts + CPU/NPU hybrid tail
 export HCCL_BUFFSIZE=800
 
 export TASK_QUEUE_ENABLE=2
@@ -53,7 +57,7 @@ export ROLLOUT_REBALANCE_ENABLE=0          # 0: disable rollout rebalance, 1: en
 export HCCL_ASYNC_ERROR_HANDLING=1
 
 #Train Drafter开关
-export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=1
+export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=0
 export VLLM_ASCEND_DRAFT_WARMUP_ON_INIT=1
 export VLLM_ASCEND_DRAFT_LR=1e-4
 export VLLM_ASCEND_DRAFT_REUSE_TARGET_EMB_LM=1
@@ -95,6 +99,50 @@ export VLLM_ASCEND_DRAFT_WARMUP_STEPS=5
 export VLLM_ASCEND_DRAFT_PROFILE_BREAKDOWN=1
 export VLLM_ASCEND_DRAFT_PROFILE_SYNC=0
 export VLLM_ASCEND_DRAFT_ASYNC_TRAIN=0
+# 弹性执行模式:
+# 0: baseline dummy-run
+# 1: 冗余专家模式
+# 2: CPU/NPU 混合模式
+# 3: 无冗余专家 + 跨层双缓冲 hybrid tail
+#    使用建议:
+#    - mode=3 主要面向 shrink 到 <=8 rank 之后的 MoE 主路径
+#    - 若希望允许 2 -> 1 的 single-rank no-EP tail，保持
+#      VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=1
+#    - mode=3 不依赖冗余专家；运行时 expert double buffer 固定为 128 expert slots
+#    - VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS 在 mode=3 下只保留
+#      primary prefix 语义，不再决定运行时 buffer 容量
+export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE:-3}
+# 弹性缩容的最小计算组:
+#   1  -> 允许在 2-rank 阶段后进入 single-rank no-EP tail
+#   2/4/8/16 -> 最多缩到该 floor 结束，不再进入 1-rank tail
+export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=1
+# mode=2 时每个 rank 固定保留的 NPU resident expert 槽位数
+# mode=3 时该值不控制双缓冲大小；当前 runtime double buffer 固定为 128 experts
+export VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS:-8}
+# mode=3 step-1: allow next-layer NPU resident experts to prefetch into the
+# alternate runtime buffer. CPU-only experts still fill synchronously at bind.
+export VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH:-1}
+# mode=3 step-2: prefetch CPU-only experts into a plain NPU staging buffer on
+# a separate stream.
+export VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE:-1}
+# mode=3 step-3: after CPU staging, pack CPU-only experts into their final
+# runtime slots on the CPU staging stream. The main prefetch stream only waits
+# for cpu_pack_event before marking the alternate buffer ready.
+export VLLM_ASCEND_MODE3_ASYNC_CPU_PACK=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK:-1}
+# mode=3 step-4: bind current layer by inserting a device-side wait on the
+# slot ready event, instead of blocking Python with event.synchronize().
+export VLLM_ASCEND_MODE3_DEVICE_READY_WAIT=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT:-1}
+# mode=3 step-5: try direct CPU shadow row copies into the final runtime
+# expert slots on the CPU prefetch stream, bypassing the staging buffer.
+export VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT:-1}
+#控制moe记录是否开启
+export VLLM_MOE_PATTERN_STATS=${VLLM_MOE_PATTERN_STATS:-0}  # 1: enable MoE pattern stats collection, 0: disable
+export VLLM_MOE_STATS=${VLLM_MOE_PATTERN_STATS}
+export VLLM_MOE_STATS_DIR=${VLLM_MOE_STATS_DIR:-./moe_stats}
+echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT}"
+#模拟样本缩短规则
+export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
+# export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
 
 if [ "${DRAFT_PROFILE_MODE}" = "profile_only" ]; then
     # 只关注 draft train 的耗时拆分，不进入整套 RL 训练
@@ -116,10 +164,15 @@ CONFIG_DIR=${CONFIG_DIR:-"${HOME}/verl/trainer/config"}
 DISTCP_PATH="/home/data/Qwen3-30B-A3B_megatron"
 TRAIN_FILE=${TRAIN_FILE:-"/workspace/data/deepscaler/train.parquet"}
 TEST_FILE=${TEST_FILE:-"/workspace/data/deepscaler/test.parquet"}
-    
+RECORD_DIR="/workspace/cann-recipes-train/llm_rl/qwen3/record"
+mkdir -p "${RECORD_DIR}"
 
 time=$(date +%Y%m%d%H%M%S)
-logfile=wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}.txt
+elastic_suffix=""
+if [ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" != "0" ]; then
+    elastic_suffix="_elastic"
+fi
+logfile=wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}${elastic_suffix}.txt
 
 set -x
 
@@ -134,7 +187,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \
-    +data.dataset_fraction=0.001\
+    +data.dataset_fraction=0.003\
     custom_reward_function.path=deepscaler.py \
     custom_reward_function.name=compute_score  \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
@@ -189,8 +242,8 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
-    +trainer.rollout_data_dir=/workspace/data/dump_qwen30b \
-    +trainer.rollout_length_dir=/workspace/data/dump_qwen30b \
+    +trainer.rollout_data_dir="${RECORD_DIR}" \
+    +trainer.rollout_length_dir="${RECORD_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_num_transformer_layers=[[11],[13],[13],[11]] \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type='alltoall' \

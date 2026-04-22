@@ -144,7 +144,10 @@ class vLLMRollout(vLLMRolloutBase):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        from vllm_ascend import envs as envs_ascend
         VLLM_ENABLE_GRAPGH_MODE = int(os.environ.get("VLLM_ENABLE_GRAPH_MODE", "0"))
+        elastic_moe_mode = envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE
+        init_redundancy_expert = envs_ascend.VLLM_ASCEND_INIT_REDUNDANCY_EXPERT
         self.inference_engine = LLM(
             model=model_path,
             # NPU-ADAPTATION: Enable inference EP and disable sleep mode.
@@ -184,6 +187,8 @@ class vLLMRollout(vLLMRolloutBase):
                     "enabled": True,
                 },
                 "refresh": True,
+                "elastic_moe_mode": elastic_moe_mode,
+                "init_redundancy_expert": init_redundancy_expert,
             },
             # NPU-ADAPTATION END
             **compilation_config,

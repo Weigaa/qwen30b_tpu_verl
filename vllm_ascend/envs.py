@@ -19,14 +19,147 @@
 #
 
 import os
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
 # begin-env-vars-definition
 
+def _get_optional_positive_power_of_two_env(name: str) -> Optional[int]:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value == "":
+        return None
+    value = int(raw_value)
+    if value <= 0 or (value & (value - 1)) != 0:
+        raise ValueError(
+            f"{name} must be a positive power of two, got {raw_value!r}.")
+    return value
+
+
+def _get_optional_positive_int_env(name: str) -> Optional[int]:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value == "":
+        return None
+    value = int(raw_value)
+    if value <= 0:
+        raise ValueError(
+            f"{name} must be a positive integer, got {raw_value!r}.")
+    return value
+
+
+def _has_explicit_elastic_execution_mode() -> bool:
+    raw_value = os.getenv("VLLM_ASCEND_ELASTIC_EXECUTION_MODE")
+    return raw_value is not None and raw_value != ""
+
+
+def _parse_elastic_execution_mode(raw_value: str) -> int:
+    value = int(raw_value)
+    if value not in (0, 1, 2, 3):
+        raise ValueError(
+            "VLLM_ASCEND_ELASTIC_EXECUTION_MODE must be one of 0, 1, 2, or 3, "
+            f"got {raw_value!r}.")
+    return value
+
+
+def get_elastic_execution_mode() -> int:
+    if _has_explicit_elastic_execution_mode():
+        return _parse_elastic_execution_mode(
+            os.environ["VLLM_ASCEND_ELASTIC_EXECUTION_MODE"])
+
+    shrink_enabled = bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK", "0")))
+    if not shrink_enabled:
+        return 0
+
+    elastic_moe_mode = os.getenv("VLLM_ASCEND_ELASTIC_MOE_MODE",
+                                 "lossy").lower().strip()
+    if elastic_moe_mode != "lossless":
+        return 0
+
+    init_redundancy_expert = int(
+        os.getenv("VLLM_ASCEND_INIT_REDUNDANCY_EXPERT", "0"))
+    return 1 if init_redundancy_expert > 0 else 2
+
+
+def get_effective_elastic_parallel_shrink_enabled() -> bool:
+    if _has_explicit_elastic_execution_mode():
+        return get_elastic_execution_mode() != 0
+    return bool(int(os.getenv("VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK",
+                              "0")))
+
+
+def get_effective_elastic_moe_mode() -> str:
+    if _has_explicit_elastic_execution_mode():
+        return "lossless" if get_elastic_execution_mode() in (1, 2, 3) else "lossy"
+    return os.getenv("VLLM_ASCEND_ELASTIC_MOE_MODE", "lossy").lower().strip()
+
+
+def compute_elastic_init_redundancy_expert(logical_num_experts: int,
+                                           initial_ep_size: int,
+                                           explicit_value: Optional[int] = None
+                                           ) -> int:
+    if explicit_value is None:
+        explicit_value = int(os.getenv("VLLM_ASCEND_INIT_REDUNDANCY_EXPERT",
+                                       "0"))
+
+    if not _has_explicit_elastic_execution_mode():
+        return max(int(explicit_value), 0)
+
+    mode = get_elastic_execution_mode()
+    if mode == 0:
+        return 0
+
+    if logical_num_experts <= 0 or initial_ep_size <= 0:
+        raise ValueError(
+            "compute_elastic_init_redundancy_expert requires positive "
+            f"logical_num_experts and initial_ep_size, got "
+            f"{logical_num_experts} and {initial_ep_size}.")
+    if logical_num_experts % initial_ep_size != 0:
+        raise ValueError(
+            f"logical_num_experts={logical_num_experts} must divide the "
+            f"initial EP size={initial_ep_size}.")
+
+    current_local_experts = logical_num_experts // initial_ep_size
+    if mode == 1:
+        min_compute_group_size = _get_optional_positive_power_of_two_env(
+            "VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE")
+        if min_compute_group_size is None:
+            return max(int(explicit_value), 0)
+        if initial_ep_size % min_compute_group_size != 0:
+            raise ValueError(
+                "VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE must divide the "
+                f"initial EP size: {min_compute_group_size} vs {initial_ep_size}.")
+        if logical_num_experts % min_compute_group_size != 0:
+            raise ValueError(
+                f"logical_num_experts={logical_num_experts} must divide the "
+                f"configured floor={min_compute_group_size}.")
+        target_local_experts = logical_num_experts // min_compute_group_size
+    elif mode == 3:
+        return 0
+    else:
+        hybrid_resident_slots = _get_optional_positive_int_env(
+            "VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS")
+        if hybrid_resident_slots is None:
+            return max(int(explicit_value), 0)
+        target_local_experts = max(current_local_experts,
+                                   int(hybrid_resident_slots))
+
+    if target_local_experts <= current_local_experts:
+        return 0
+    return initial_ep_size * (target_local_experts - current_local_experts)
+
+
 env_variables: Dict[str, Callable[[], Any]] = {
+    # Unified elastic execution mode:
+    # - 0: baseline dummy-run path
+    # - 1: preloaded redundant experts only
+    # - 2: preloaded redundant experts + CPU/NPU hybrid fallback
+    # - 3: no redundancy + cross-layer double-buffer hybrid tail
+    # When this is set, it overrides the older elastic enable / moe mode /
+    # init redundancy expert knobs.
+    "VLLM_ASCEND_ELASTIC_EXECUTION_MODE":
+    lambda: get_elastic_execution_mode(),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
@@ -82,6 +215,57 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP":
     lambda: bool(int(os.getenv("VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP", '0'))
                  ),
+    # Whether to enable elastic DP/EP/MC2 shrink during eager external
+    # launcher rollout. Disabled by default so the original dummy-run path
+    # remains unchanged unless explicitly turned on.
+    "VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK":
+    lambda: get_effective_elastic_parallel_shrink_enabled(),
+    # Elastic MoE strategy:
+    # - lossy: shrink by masking experts that only exist on exited ranks
+    # - lossless: require preloaded redundant experts and keep the original
+    #   logical expert space after shrink.
+    "VLLM_ASCEND_ELASTIC_MOE_MODE":
+    lambda: get_effective_elastic_moe_mode(),
+    # Explicit redundant expert replica count. This remains available for
+    # backward compatibility, but the unified elastic execution mode may
+    # derive a larger effective redundancy count from the configured floor.
+    "VLLM_ASCEND_INIT_REDUNDANCY_EXPERT":
+    lambda: int(os.getenv("VLLM_ASCEND_INIT_REDUNDANCY_EXPERT", "0")),
+    # Fixed resident NPU expert slots per rank for elastic execution mode 2.
+    # When set, mode 2 preloads enough experts to fill these slots and enters
+    # CPU/NPU hybrid execution only when shrink would require more experts than
+    # the configured resident capacity.
+    "VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS":
+    lambda: _get_optional_positive_int_env(
+        "VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS"),
+    # Whether to force expert-parallel MoE communication onto the AllToAll
+    # path. This is mainly useful for performance comparisons against elastic
+    # shrink, where MC2 would otherwise introduce another variable.
+    "VLLM_ASCEND_FORCE_ALLTOALL_MOE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_FORCE_ALLTOALL_MOE", '0'))),
+    # Minimum EP size required before the runtime is allowed to select MC2.
+    # Default to 2 so the elastic floor=2 hybrid path can keep using MC2
+    # when the usual token-count / prefill fallbacks still allow it.
+    "VLLM_ASCEND_MC2_MIN_EP_SIZE":
+    lambda: int(os.getenv("VLLM_ASCEND_MC2_MIN_EP_SIZE", '2')),
+    # Hybrid lossless shrink import mode used when active ranks <= 4.
+    # - cpu_p2p: source rank sends CPU shadow weights directly over the CPU group
+    # - npu_p2p_to_cpu: source rank sends NPU weights P2P; target stores them on CPU
+    "VLLM_ASCEND_LOSSLESS_HYBRID_IMPORT_MODE":
+    lambda: os.getenv("VLLM_ASCEND_LOSSLESS_HYBRID_IMPORT_MODE",
+                      "cpu_p2p").lower(),
+    # Optional chunk size for hybrid point-to-point expert import. Smaller
+    # chunks reduce temporary memory pressure; 1 means per-expert streaming.
+    "VLLM_ASCEND_LOSSLESS_HYBRID_IMPORT_CHUNK_EXPERTS":
+    lambda: max(
+        1, int(os.getenv("VLLM_ASCEND_LOSSLESS_HYBRID_IMPORT_CHUNK_EXPERTS",
+                         "1"))),
+    # Minimum active elastic compute-group size allowed for real shrink.
+    # When unset, the runtime keeps the current stable behavior and does not
+    # enable repeated real shrink stages by default.
+    "VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE":
+    lambda: _get_optional_positive_power_of_two_env(
+        "VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE"),
     # Whether to enable DBO feature for deepseek model.
     "VLLM_ASCEND_ENABLE_DBO":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DBO", '0'))),

@@ -536,6 +536,39 @@ class Qwen3MoeModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
+        def _lossless_log_moe_load_snapshot(stage: str) -> None:
+            try:
+                ep_rank = get_ep_group().rank_in_group
+            except Exception:
+                ep_rank = -1
+
+            sample = None
+            for param_name, param in self.named_parameters():
+                if (param_name.endswith("mlp.experts.w13_weight")
+                        or param_name.endswith("mlp.experts.w2_weight")):
+                    head = []
+                    try:
+                        num_rows = min(4, param.shape[0]) if param.ndim >= 1 else 0
+                        for row_idx in range(num_rows):
+                            head.append(
+                                (row_idx,
+                                 round(
+                                     float(param[row_idx].float().abs().mean().item()),
+                                     6)))
+                    except Exception as exc:
+                        head = [("error", str(exc))]
+                    sample = {
+                        "param_name": param_name,
+                        "param_id": id(param),
+                        "ptr": int(param.data.data_ptr()),
+                        "shape": tuple(param.shape),
+                        "device": str(param.device),
+                        "head": head,
+                    }
+                    break
+
+            pass  # debug log removed
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -553,6 +586,18 @@ class Qwen3MoeModel(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
+        lossless_reload_modules: list[tuple[nn.Module, object]] = []
+        _lossless_log_moe_load_snapshot("enter")
+        for module in self.modules():
+            quant_method = getattr(module, "quant_method", None)
+            invalidate_runtime = getattr(quant_method,
+                                         "invalidate_lossless_runtime_state_for_reload",
+                                         None)
+            if callable(invalidate_runtime):
+                invalidated = invalidate_runtime(
+                    layer=module, reason="Qwen3MoeModel.load_weights")
+                if invalidated:
+                    lossless_reload_modules.append((module, quant_method))
         # print("vllm moe expert_params_mapping is", expert_params_mapping)
         for name, loaded_weight in weights:
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
@@ -668,6 +713,15 @@ class Qwen3MoeModel(nn.Module):
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        for module, quant_method in lossless_reload_modules:
+            process_after_reload = getattr(quant_method,
+                                           "process_weights_after_loading",
+                                           None)
+            if callable(process_after_reload):
+                process_after_reload(module)
+
+        _lossless_log_moe_load_snapshot("exit")
         return loaded_params
 
 

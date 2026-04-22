@@ -30,6 +30,7 @@ import asyncio
 import getpass
 import gc
 import inspect
+import json
 import logging
 import os
 import pickle
@@ -37,6 +38,7 @@ import socket
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import Path
 from types import MethodType
 from typing import Any, Generator
 
@@ -53,6 +55,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
 from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
 from vllm.lora.request import LoRARequest
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 
 try:
@@ -73,10 +76,23 @@ from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
 #new wj import
 import copy
+import os
 from vllm.utils.moe_stats import moe_stats
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _load_model_num_experts(model_path: str) -> int:
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return 0
+    try:
+        config = json.loads(config_path.read_text())
+    except Exception:
+        return 0
+    num_experts = config.get("num_experts")
+    return int(num_experts) if isinstance(num_experts, int) and num_experts > 0 else 0
 
 # TODO
 # 1. support pp in vllm
@@ -199,6 +215,30 @@ class vLLMRollout(BaseRollout):
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
         self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1
+        elastic_execution_mode = envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE
+        elastic_moe_mode = envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE
+        init_redundancy_expert = envs_ascend.VLLM_ASCEND_INIT_REDUNDANCY_EXPERT
+        if elastic_execution_mode in (1, 2):
+            initial_ep_size = int(os.environ.get("VLLM_DP_SIZE", "1"))
+            model_num_experts = _load_model_num_experts(model_path)
+            init_redundancy_expert = (
+                envs_ascend.compute_elastic_init_redundancy_expert(
+                    model_num_experts,
+                    initial_ep_size,
+                    init_redundancy_expert,
+                ))
+            logger.info(
+                "Elastic execution mode resolved: mode=%s elastic_moe_mode=%s initial_ep_size=%s floor=%s hybrid_resident_slots=%s num_experts=%s init_redundancy_expert=%s",
+                elastic_execution_mode,
+                elastic_moe_mode,
+                initial_ep_size,
+                envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE,
+                envs_ascend.VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS,
+                model_num_experts,
+                init_redundancy_expert,
+            )
+        self.elastic_execution_mode = elastic_execution_mode
+        self.elastic_init_redundancy_expert = init_redundancy_expert
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=False,
@@ -235,6 +275,8 @@ class vLLMRollout(BaseRollout):
                     "enable_chunked_prefill": False,
                 },
                 "refresh": True,
+                "elastic_moe_mode": elastic_moe_mode,
+                "init_redundancy_expert": init_redundancy_expert,
                 "dynamic_eplb": self.dynamic_eplb,
                 "num_iterations_eplb_update": 400,  # gather stable workload over 400 iterations
                 "gate_eplb": True,
@@ -446,6 +488,11 @@ class vLLMRollout(BaseRollout):
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
             raise RuntimeError("vllm sharding manager is not work properly.")
 
+        moe_stats.set_generation_context(
+            epoch=prompts.meta_info.get("epoch", -1),
+            global_step=prompts.meta_info.get("global_steps", -1),
+        )
+
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
             for raw_prompt_ids, multi_modal_data in zip(
@@ -496,6 +543,54 @@ class vLLMRollout(BaseRollout):
                 kwargs["max_tokens"] = max(1, min(response_cap, current_max, max_resp_len))
             except Exception:
                 logger.warning("Ignore invalid response_max_tokens_cap=%s", response_cap)
+
+        tail_validate_caps = os.environ.get("VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS")
+        if tail_validate_caps:
+            try:
+                level_caps = [int(x.strip()) for x in tail_validate_caps.split(",") if x.strip()]
+            except ValueError:
+                logger.warning("Invalid VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=%s",
+                               tail_validate_caps)
+                level_caps = []
+
+            if level_caps and torch.distributed.is_available() and torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                global_rank = torch.distributed.get_rank()
+                max_resp_len = int(self.config.response_length)
+                current_max = kwargs.get("max_tokens",
+                                         getattr(self.sampling_params, "max_tokens", max_resp_len))
+                current_max = int(current_max) if current_max is not None else max_resp_len
+
+                # Build repeated-halving buckets: N/2, N/4, ..., 1, 1.
+                bucket_sizes: list[int] = []
+                remaining = world_size
+                next_bucket = max(world_size // 2, 1)
+                while remaining > 0:
+                    take = min(next_bucket, remaining)
+                    bucket_sizes.append(take)
+                    remaining -= take
+                    next_bucket = max(next_bucket // 2, 1)
+
+                bucket_idx = len(bucket_sizes) - 1
+                cursor = 0
+                for bucket_id, bucket_size in enumerate(bucket_sizes):
+                    if global_rank < cursor + bucket_size:
+                        bucket_idx = bucket_id
+                        break
+                    cursor += bucket_size
+
+                cap_idx = min(bucket_idx, len(level_caps) - 1)
+                kwargs["max_tokens"] = max(1, min(level_caps[cap_idx], current_max, max_resp_len))
+                logger.info(
+                    "Elastic tail validation cap override: rank=%s world_size=%s "
+                    "bucket=%s/%s bucket_sizes=%s max_tokens=%s",
+                    global_rank,
+                    world_size,
+                    bucket_idx,
+                    len(bucket_sizes),
+                    bucket_sizes,
+                    kwargs["max_tokens"],
+                )
 
         lora_requests = None
         if self.lora_kwargs:
@@ -623,6 +718,26 @@ class vLLMRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        filtered_weights: list[tuple[str, torch.Tensor]] = []
+        skipped = 0
+        skipped_names: list[str] = []
+        for name, weight in weights:
+            if isinstance(weight, torch.Tensor) and weight.numel() == 0:
+                skipped += 1
+                if len(skipped_names) < 8:
+                    skipped_names.append(name)
+                continue
+            filtered_weights.append((name, weight))
+        if skipped > 0 and not getattr(self, "_empty_weight_update_warned",
+                                       False):
+            logger.warning(
+                "Skip %s empty rollout weight shards during update_weights. sample_names=%s",
+                skipped,
+                skipped_names,
+            )
+            self._empty_weight_update_warned = True
+
+        weights = filtered_weights
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
@@ -640,10 +755,17 @@ class vLLMRollout(BaseRollout):
 
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+        if (self.elastic_execution_mode in (1, 2)
+                and self.elastic_init_redundancy_expert > 0
+                and not getattr(self, "_lossless_weight_update_sync_logged", False)):
+            logger.info(
+                "Elastic execution mode=%s enables rollout.update_weights with redundant experts.",
+                self.elastic_execution_mode)
+            self._lossless_weight_update_sync_logged = True
+        model.load_weights(weights)
         ###new wj
     def get_record(self):
-        return moe_stats.snapshot()
+        return moe_stats.snapshot_pattern()
     
     def flush_record(self):
         return moe_stats.reset_epoch()

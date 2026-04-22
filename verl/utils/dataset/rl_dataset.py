@@ -147,6 +147,10 @@ class RLHFDataset(Dataset):
             # 直接取前 sample_size 个样本以保证可复现（不打乱）
             self.dataframe = self.dataframe.select(range(sample_size))
             total = len(self.dataframe)
+            #如果要只取中间样本，打开下面的代码，但可能会导致结果不稳定（尤其是当样本数较少时），不建议使用
+            if total >= 64:
+                #取中间的第32-64个样本更好地复现缩容
+                self.dataframe = self.dataframe.select(range(32, 64))
             print(f"Sampled dataset len: {total} (fraction: {dataset_fraction})")
 
         # 2) 按最大样本数裁剪（max_samples），可选择是否随机（shuffle）并支持 seed

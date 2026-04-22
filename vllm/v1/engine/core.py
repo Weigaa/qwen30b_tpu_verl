@@ -262,7 +262,23 @@ class EngineCore:
     ) -> ModelRunnerOutput:
         """Execute the model and log detailed info on failure."""
         try:
-            return model_fn(scheduler_output)
+            if not getattr(self, "_elastic_first_model_exec_entered", False):
+                logger.info(
+                    "Elastic first model exec: entering model_fn "
+                    "scheduled_tokens=%s num_reqs=%s",
+                    getattr(scheduler_output, "total_num_scheduled_tokens",
+                            "unknown"),
+                    len(getattr(scheduler_output, "scheduled_new_reqs", [])
+                        or []),
+                )
+                self._elastic_first_model_exec_entered = True
+            output = model_fn(scheduler_output)
+            if (getattr(self, "_elastic_first_model_exec_entered", False)
+                    and not getattr(self, "_elastic_first_model_exec_returned",
+                                    False)):
+                logger.info("Elastic first model exec: model_fn returned")
+                self._elastic_first_model_exec_returned = True
+            return output
         except Exception as err:
             # We do not want to catch BaseException here since we're only
             # interested in dumping info when the exception is due to an

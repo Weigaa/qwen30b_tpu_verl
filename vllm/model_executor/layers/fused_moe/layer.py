@@ -824,7 +824,7 @@ def determine_expert_map(
         return (global_num_experts, None)
     
     #check ep_size
-    print("ep_size: ", ep_size)
+    # print("ep_size: ", ep_size)
 
     # Distribute experts as evenly as possible to each rank.
     base_experts = global_num_experts // ep_size
@@ -1037,11 +1037,11 @@ def determine_expert_map(
                          f"'{expert_placement_strategy}', expected one of "
                          f"{get_args(ExpertPlacementStrategy)}")
     # print("use original expert placement for ep_rank", ep_rank, "layer_idx", layer_idx)
-    print("original local num_experts:", local_num_experts)
-    print("use original expert placement for ep_rank", ep_rank, "original expert_map:", expert_map.size(), expert_map)
+    # print("original local num_experts:", local_num_experts)
+    # print("use original expert placement for ep_rank", ep_rank, "original expert_map:", expert_map.size(), expert_map)
     #l2p = None
-    l2p = torch.arange(128, dtype=torch.int32)
-    print("l2p is:", l2p.size(), l2p)
+    l2p = torch.arange(global_num_experts, dtype=torch.int32)
+    # print("l2p is:", l2p.size(), l2p)
     return (local_num_experts, expert_map, l2p)
     
 
@@ -1198,7 +1198,7 @@ class FusedMoE(CustomOp):
                 dp_size_=dp_size_,
                 vllm_parallel_config=vllm_config.parallel_config))
         mpc = self.moe_parallel_config
-        print(f"[MoE] backend={envs.VLLM_ALL2ALL_BACKEND} pplx={mpc.use_pplx_kernels} deepep_ht={mpc.use_deepep_ht_kernels} deepep_ll={mpc.use_deepep_ll_kernels} dp={mpc.dp_size} ep={mpc.ep_size} tp={mpc.tp_size} use_all2all={mpc.dp_size>1 and mpc.use_ep}")
+        # print(f"[MoE] backend={envs.VLLM_ALL2ALL_BACKEND} pplx={mpc.use_pplx_kernels} deepep_ht={mpc.use_deepep_ht_kernels} deepep_ll={mpc.use_deepep_ll_kernels} dp={mpc.dp_size} ep={mpc.ep_size} tp={mpc.tp_size} use_all2all={mpc.dp_size>1 and mpc.use_ep}")
 
         self.global_num_experts = num_experts + num_redundant_experts
         self.zero_expert_num = zero_expert_num
@@ -1553,7 +1553,18 @@ class FusedMoE(CustomOp):
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+        if (expert_data.device.type == "npu"
+                and getattr(self, "lossless_zero_redundancy_preallocated_loaded",
+                            False)):
+            loaded_weight = loaded_weight.contiguous().clone()
+            loaded_weight = loaded_weight.to(device=expert_data.device,
+                                             dtype=expert_data.dtype)
+            loaded_weight = loaded_weight.contiguous()
         expert_data.copy_(loaded_weight)
+        if (expert_data.device.type == "npu"
+                and getattr(self, "lossless_zero_redundancy_preallocated_loaded",
+                            False) and hasattr(torch, "npu")):
+            torch.npu.synchronize()
 
     def _load_w2(self,
                  expert_data: torch.Tensor,
@@ -1571,7 +1582,18 @@ class FusedMoE(CustomOp):
                                                  shard_size * tp_rank,
                                                  shard_size)
         # w2, down_proj: Load into only logical weight of w2.
+        if (expert_data.device.type == "npu"
+                and getattr(self, "lossless_zero_redundancy_preallocated_loaded",
+                            False)):
+            loaded_weight = loaded_weight.contiguous().clone()
+            loaded_weight = loaded_weight.to(device=expert_data.device,
+                                             dtype=expert_data.dtype)
+            loaded_weight = loaded_weight.contiguous()
         expert_data.copy_(loaded_weight)
+        if (expert_data.device.type == "npu"
+                and getattr(self, "lossless_zero_redundancy_preallocated_loaded",
+                            False) and hasattr(torch, "npu")):
+            torch.npu.synchronize()
 
     def _load_single_value(self, param: torch.nn.Parameter,
                            loaded_weight: torch.Tensor, expert_id: int):
@@ -1619,6 +1641,37 @@ class FusedMoE(CustomOp):
                       expert_id: int,
                       return_success: bool = False) -> Optional[bool]:
 
+        def _lossless_log_writeback(stage: str, target_tensor: torch.Tensor) -> None:
+            if getattr(self, "layer_idx", -1) != 0:
+                return
+            if not 0 <= int(expert_id) < 16:
+                return
+            if not hasattr(self, "_lossless_weight_writeback_debugged"):
+                self._lossless_weight_writeback_debugged = set()
+            debug_key = (str(stage), str(weight_name), str(shard_id),
+                         int(expert_id))
+            if debug_key in self._lossless_weight_writeback_debugged:
+                return
+            self._lossless_weight_writeback_debugged.add(debug_key)
+            try:
+                target_abs_mean = round(
+                    float(target_tensor.float().abs().mean().item()), 6)
+            except Exception as exc:  # pragma: no cover - debug only
+                target_abs_mean = f"error:{exc}"
+            try:
+                target_ptr = int(target_tensor.data_ptr())
+            except Exception as exc:  # pragma: no cover - debug only
+                target_ptr = f"error:{exc}"
+            try:
+                param_ptr = int(param.data.data_ptr())
+            except Exception as exc:  # pragma: no cover - debug only
+                param_ptr = f"error:{exc}"
+            try:
+                storage_offset = int(target_tensor.storage_offset())
+            except Exception as exc:  # pragma: no cover - debug only
+                storage_offset = f"error:{exc}"
+            pass  # debug log removed
+
         if self.quant_config and self.quant_config.get_name() == "mxfp4":
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
@@ -1633,6 +1686,13 @@ class FusedMoE(CustomOp):
         #     print("rank", self.ep_rank, "loading weight:", loaded_weight.shape)
         #     print("ep_rank", self.ep_rank, "before map, expert_id:", expert_id)
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+        if getattr(self, "layer_idx", -1) == 0 and 0 <= int(expert_id) < 16:
+            if not hasattr(self, "_lossless_weight_loader_debugged"):
+                self._lossless_weight_loader_debugged = set()
+            debug_key = (str(shard_id), int(expert_id))
+            if debug_key not in self._lossless_weight_loader_debugged:
+                self._lossless_weight_loader_debugged.add(debug_key)
+                pass  # debug log removed
         # if self.ep_rank == 0:
         #     print("ep_rank", self.ep_rank,"after map, expert_id:", expert_id)
         # print(f"ep_rank: {self.ep_rank}, local expert_id: {expert_id}")
@@ -1641,6 +1701,12 @@ class FusedMoE(CustomOp):
             # Failed to load this param since it's not local to this rank
             return False if return_success else None
         # Hereafter, `expert_id` is local physical id
+
+        # Megatron rollout resharding intentionally emits empty expert shards
+        # for non-owning ranks to avoid materializing redundant tensors. Treat
+        # these as "not for this rank" instead of hard-failing the load.
+        if loaded_weight.numel() == 0:
+            return False if return_success else None
 
         quant_method_name = self.quant_method.__class__.__name__
         # compressed-tensors checkpoints with packed weights are stored flipped
@@ -1686,6 +1752,8 @@ class FusedMoE(CustomOp):
                     tp_rank=self.tp_rank,
                     load_full=full_load,
                 )
+            if "weight" in weight_name:
+                _lossless_log_writeback("post_bitsandbytes_write", expert_data)
             return True if return_success else None
 
         # is_transposed: if the dim to shard the weight
@@ -1787,6 +1855,8 @@ class FusedMoE(CustomOp):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=self.tp_rank)
+                _lossless_log_writeback("post_modelopt_weight_write",
+                                        expert_data)
             return True if return_success else None
 
         # Case weight scales, zero_points and offset, weight/input global scales
@@ -1845,6 +1915,7 @@ class FusedMoE(CustomOp):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=self.tp_rank)
+            _lossless_log_writeback("post_weight_write", expert_data)
             return True if return_success else None
 
         return False if return_success else None

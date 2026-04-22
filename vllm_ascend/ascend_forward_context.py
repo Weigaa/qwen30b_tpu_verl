@@ -33,18 +33,22 @@ class MoECommType(Enum):
 # TODO(zzzzwwjj): add soc_version to choose branch
 def _get_fused_moe_state(ep_size: int, with_prefill: bool,
                          is_deepseek_v3_r1: bool):
+    if ep_size == 1:
+        if with_prefill:
+            return FusedMoEState.NaiveMulticast
+        else:
+            return FusedMoEState.AllGather
+    if envs_ascend.VLLM_ASCEND_FORCE_ALLTOALL_MOE:
+        return FusedMoEState.All2All
     # the fusion operator torch_npu.npu_grouped_matmul_finalize_routing called by allgather ep
     # only supports deepseek v3/r1
     if (envs_ascend.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP and ep_size > 1
             and is_deepseek_v3_r1):
         return FusedMoEState.AllGatherEP
-    elif ep_size == 1:
-        if with_prefill:
-            return FusedMoEState.NaiveMulticast
-        else:
-            return FusedMoEState.AllGather
-    # NOTE: mc2 need ep_size >= 16 & all2all can't use in torchair graph.
-    elif ep_size < 16 or with_prefill:
+    # Keep fused MoE state selection aligned with runtime MC2 gating logic.
+    # Prefill still falls back to All2All here; decode may use MC2 once EP is
+    # larger than the configured minimum.
+    elif ep_size < envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE or with_prefill:
         return FusedMoEState.All2All
     else:
         return FusedMoEState.MC2
@@ -65,6 +69,7 @@ def set_ascend_forward_context(
         aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor: Optional[BatchDescriptor] = None,
         prefetch_stream: torch.npu.Stream = None,
+        moe_prefetch_stream: torch.npu.Stream = None,
         model_instance: torch.nn.Module = None):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -83,6 +88,10 @@ def set_ascend_forward_context(
 
         from vllm_ascend.ops.moe.moe_comm_method import get_moe_comm_method
         forward_context.moe_comm_type = moe_comm_type
+        # Preserve the model-runner decision so later hybrid/wave logic can
+        # align to the original baseline comm choice instead of any temporary
+        # runtime override.
+        forward_context.selected_moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
 
         forward_context.with_prefill = with_prefill
@@ -138,6 +147,10 @@ def set_ascend_forward_context(
             forward_context.prefetch_mlp_gate_up_proj = False
             forward_context.prefetch_mlp_down_proj = False
         forward_context.prefetch_mlp_enabled = prefetch_mlp_enabled
+        forward_context.prefetch_stream = prefetch_stream
+        forward_context.moe_prefetch_stream = moe_prefetch_stream
+        forward_context.model_instance = model_instance
+        forward_context.moe_double_buffer_manager = None
 
         # TODO(rjg-lyh): The current implementation is somewhat brute force and not elegant.
         # It will be improved later by implementing operator fusion through the FX graph.

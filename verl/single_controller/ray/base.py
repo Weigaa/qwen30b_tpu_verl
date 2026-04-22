@@ -14,6 +14,7 @@
 import inspect
 import logging
 import socket
+import threading
 from copy import deepcopy
 from typing import Any, Optional
 
@@ -30,12 +31,29 @@ from verl.utils.py_functional import temp_env_var
 __all__ = ["Worker"]
 
 
+_HCCL_IF_BASE_PORT_LOCK = threading.Lock()
+_HCCL_IF_BASE_PORT_NEXT = 20000
+_HCCL_IF_BASE_PORT_BLOCK = 12288
+_HCCL_IF_BASE_PORT_LIMIT = 65535 - _HCCL_IF_BASE_PORT_BLOCK
+
+
 def get_random_string(length: int) -> str:
     import random
     import string
 
     letters_digits = string.ascii_letters + string.digits
     return "".join(random.choice(letters_digits) for _ in range(length))
+
+
+def _alloc_hccl_if_base_port() -> str:
+    global _HCCL_IF_BASE_PORT_NEXT
+    with _HCCL_IF_BASE_PORT_LOCK:
+        port = _HCCL_IF_BASE_PORT_NEXT
+        if port > _HCCL_IF_BASE_PORT_LIMIT:
+            port = 20000
+            _HCCL_IF_BASE_PORT_NEXT = 20000
+        _HCCL_IF_BASE_PORT_NEXT += _HCCL_IF_BASE_PORT_BLOCK
+        return str(port)
 
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
@@ -80,12 +98,25 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
 
 
 @ray.remote
-def get_master_addr_port() -> tuple[str, str]:
+def get_master_addr_port() -> tuple[str, str, str]:
     addr = ray.util.get_node_ip_address().strip("[]")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    return addr, str(port)
+    hccl_port_headroom = 12288
+    hccl_if_base_port = None
+    for _ in range(64):
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            candidate = sock.getsockname()[1]
+        if candidate <= 65535 - hccl_port_headroom:
+            hccl_if_base_port = candidate
+            break
+    if hccl_if_base_port is None:
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            hccl_if_base_port = min(sock.getsockname()[1], 65535 - hccl_port_headroom)
+    return addr, str(port), str(hccl_if_base_port)
 
 
 class RayResourcePool(ResourcePool):
@@ -351,12 +382,23 @@ class RayWorkerGroup(WorkerGroup):
 
     def _get_master_addr_port(self, pg):
         """Get master addr and port for this worker group"""
-        self._master_addr, self._master_port = ray.get(
+        self._master_addr, self._master_port, _ = ray.get(
             get_master_addr_port.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg, placement_group_bundle_index=0
                 ),
             ).remote()
+        )
+        # Allocate a non-overlapping HCCL base-port block per WorkerGroup
+        # within the current trainer process. Reusing a random free port as a
+        # "base" is not enough because actor/rollout/ref phases then carve out
+        # overlapping sub-ranges and can race into Bind_Failed(EJ0003).
+        self._hccl_if_base_port = _alloc_hccl_if_base_port()
+        logging.info(
+            "WorkerGroup %s uses MASTER_PORT=%s HCCL_IF_BASE_PORT=%s",
+            self.name_prefix,
+            self._master_port,
+            self._hccl_if_base_port,
         )
 
     def _init_with_resource_pool(self, resource_pool, ray_cls_with_init, bin_pack, detached, worker_env=None):
@@ -398,6 +440,7 @@ class RayWorkerGroup(WorkerGroup):
                     "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
                     "MASTER_ADDR": self._master_addr,
                     "MASTER_PORT": self._master_port,
+                    "HCCL_IF_BASE_PORT": self._hccl_if_base_port,
                 }
                 if worker_env is not None:
                     logging.debug(f"Appending ray class env, origin: {env_vars}, customized env: {worker_env}")

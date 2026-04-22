@@ -28,6 +28,27 @@ from vllm.utils import is_pin_memory_available
 logger = init_logger(__name__)
 
 
+def _lossless_stdout_module_snapshot(module: nn.Module, stage: str) -> None:
+    if not hasattr(module, "w13_weight") or not hasattr(module, "w2_weight"):
+        return
+    try:
+        w13 = module.w13_weight
+        rows = min(4, int(w13.shape[0])) if getattr(w13, "ndim", 0) >= 1 else 0
+        head = []
+        for i in range(rows):
+            head.append((i, round(float(w13[i].float().abs().mean().item()), 6)))
+        pass  # debug log removed
+    except Exception as exc:
+        pass  # debug log removed
+
+
+def _is_lossless_ascend_fused_moe(module: nn.Module,
+                                  quant_method: QuantizeMethodBase) -> bool:
+    return (hasattr(module, "w13_weight") and hasattr(module, "w2_weight")
+            and type(quant_method).__name__ == "AscendUnquantizedFusedMoEMethod"
+            and type(quant_method).__module__.startswith("vllm_ascend"))
+
+
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
@@ -103,13 +124,29 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             continue
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
+            if _is_lossless_ascend_fused_moe(module, quant_method):
+                _lossless_stdout_module_snapshot(module,
+                                                "before_direct_process_weights_after_loading")
+                pass  # debug log removed
+                quant_method.process_weights_after_loading(module)
+                _lossless_stdout_module_snapshot(module,
+                                                "after_direct_process_weights_after_loading")
+                continue
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
             # case where cpu offloading is used, where we will move the
             # parameters onto device for processing and back off after.
+            _lossless_stdout_module_snapshot(module,
+                                            "before_device_loading_context")
             with device_loading_context(module, target_device):
+                _lossless_stdout_module_snapshot(
+                    module, "inside_device_loading_context_before_process")
                 quant_method.process_weights_after_loading(module)
+                _lossless_stdout_module_snapshot(
+                    module, "inside_device_loading_context_after_process")
+            _lossless_stdout_module_snapshot(module,
+                                            "after_device_loading_context")
 
     # Currently only used by MLA.
     # NOTE: This intentionally happens after other modules so we can easily

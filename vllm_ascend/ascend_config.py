@@ -50,6 +50,11 @@ class AscendConfig:
         self.expert_map_record_path = additional_config.get(
             "expert_map_record_path",
             None)  # Provide path to export expert map
+        self.elastic_moe_mode = additional_config.get("elastic_moe_mode",
+                                                      "lossy").lower()
+        if self.elastic_moe_mode not in ("lossy", "lossless"):
+            raise ValueError(
+                f"Unsupported elastic_moe_mode={self.elastic_moe_mode}")
         self.init_redundancy_expert = additional_config.get(
             "init_redundancy_expert", 0)
         self.dynamic_eplb = additional_config.get("dynamic_eplb", False)

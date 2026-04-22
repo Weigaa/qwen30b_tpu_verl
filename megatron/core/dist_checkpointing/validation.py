@@ -38,6 +38,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 # pylint: disable=line-too-long
 # list of local saved/loaded ShardedBase objects
+
+_GLOBAL_METADATA_GLOO_GROUP = None
+
+
+def _get_global_metadata_group():
+    global _GLOBAL_METADATA_GLOO_GROUP
+    if not torch.distributed.is_initialized():
+        return None
+    if torch.distributed.get_backend() == "gloo":
+        return None
+    if _GLOBAL_METADATA_GLOO_GROUP is None:
+        world_size = torch.distributed.get_world_size()
+        ranks = list(range(world_size))
+        _GLOBAL_METADATA_GLOO_GROUP = torch.distributed.new_group(
+            ranks=ranks, backend="gloo")
+    return _GLOBAL_METADATA_GLOO_GROUP
 _LocalMetadata = List[Union[ShardedTensor, ShardedObject]]
 # list of lists of global saved/loaded ShardedBase objects (each element corresponds to global rank)
 _GlobalMetadata = List[_LocalMetadata]
@@ -529,8 +545,12 @@ def determine_global_metadata(
         Tuple[_LocalMetadata, _GlobalMetadata]: local and global ShardedBase objects with stripped data
     """
     local_metadata = [ten.without_data() for ten in nested_values(sharded_state_dict)]
-    global_metadata = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(global_metadata, local_metadata)
+    metadata_group = _get_global_metadata_group()
+    global_metadata = [None] * torch.distributed.get_world_size(
+        group=metadata_group)
+    torch.distributed.all_gather_object(global_metadata,
+                                        local_metadata,
+                                        group=metadata_group)
     return local_metadata, global_metadata
 
 

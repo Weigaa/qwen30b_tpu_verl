@@ -16,6 +16,7 @@
 #
 import time
 from collections import deque
+from collections import defaultdict
 from typing import Iterable, Union
 
 from vllm.config import VllmConfig
@@ -389,8 +390,9 @@ class AscendScheduler(Scheduler):
                                 scheduled_timestamp)
                         self.waiting.appendleft(preempted_req)
                         preempted_reqs.append(preempted_req)
-                        print("Preempting request", preempted_req.request_id,
-                              "for request", request.request_id)
+                        logger.info("Preempting request %s for request %s",
+                                    preempted_req.request_id,
+                                    request.request_id)
                         if preempted_req == request:
                             # No more request to preempt.
                             can_schedule = False
@@ -604,7 +606,58 @@ class AscendScheduler(Scheduler):
         # #update current batch seq_ids
         # moe_stats.get_current_batch_seq_ids(req_ids)
         # # print("this time scheduled tokens are", scheduler_output.num_scheduled_tokens)
-        # ################
+        def tokens_sha256_hex(tokens: Iterable[int]) -> str:
+            h = hashlib.sha256()
+            for t in tokens:
+                h.update(int(t).to_bytes(8, byteorder="little", signed=False))
+            return h.hexdigest()
+
+        from collections.abc import Iterable as _Iterable
+
+        def build_seqid_to_hash(scheduler_output: Any, *,
+                                return_delta: bool = True) -> Dict[SeqId, str]:
+            delta: Dict[SeqId, str] = {}
+            new_reqs = getattr(scheduler_output, "scheduled_new_reqs", None)
+            if isinstance(new_reqs, _Iterable) and not isinstance(new_reqs,
+                                                                   (str, bytes)):
+                for req in new_reqs:
+                    seq_id = getattr(req, "seq_id", None)
+                    if seq_id is None:
+                        seq_id = getattr(req, "req_id", None)
+                    tokens = getattr(req, "prompt_token_ids", None)
+                    if seq_id is None or tokens is None:
+                        continue
+                    if isinstance(tokens, (str, bytes)):
+                        continue
+                    try:
+                        h = tokens_sha256_hex(tokens)
+                    except Exception:
+                        if hasattr(tokens, "tolist"):
+                            h = tokens_sha256_hex(tokens.tolist())
+                        else:
+                            continue
+                    if seq_id not in PROMPT_HASH_DB:
+                        PROMPT_HASH_DB[seq_id] = h
+                        delta[seq_id] = h
+            return delta if return_delta else dict(PROMPT_HASH_DB)
+
+        build_seqid_to_hash(scheduler_output, return_delta=True)
+        req_ids = defaultdict(int)
+        seq_entries = {}
+        for key, value in scheduler_output.num_scheduled_tokens.items():
+            prompt_hash = PROMPT_HASH_DB.get(key)
+            if prompt_hash is None:
+                continue
+            request = self.requests.get(key)
+            start_pos = int(getattr(request, "num_computed_tokens", 0))
+            req_ids[prompt_hash] += int(value)
+            seq_entries[str(key)] = {
+                "prompt_hash": prompt_hash,
+                "count": int(value),
+                "start_pos": start_pos,
+            }
+        if req_ids:
+            moe_stats.get_current_batch_seq_ids(seq_entries)
 
         return scheduler_output
 

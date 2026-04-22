@@ -49,8 +49,8 @@ from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
-from vllm.distributed.parallel_state import (get_dp_group, get_pp_group,
-                                             get_tp_group,
+from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
+                                             get_pp_group, get_tp_group,
                                              is_global_first_rank)
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
@@ -266,6 +266,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.prefetch_stream = torch.npu.Stream(device=device)
         else:
             self.prefetch_stream = None
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 3:
+            self.moe_prefetch_stream = torch.npu.Stream(device=device)
+        else:
+            self.moe_prefetch_stream = None
         self.dtype = self.model_config.dtype
         if envs_ascend.VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION:
             # TODO: drop the env config to use ascend sampler by default
@@ -854,6 +858,79 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         return max_tokens_across_dp, num_tokens_after_padding, global_with_prefill, global_enable_dbo
 
+    def _log_elastic_forward_fingerprint_if_changed(
+        self,
+        *,
+        local_num_reqs: int,
+        local_num_scheduled_tokens: int,
+        local_num_input_tokens: int,
+        synced_num_input_tokens: int,
+        num_tokens_across_dp: Optional[torch.Tensor],
+        local_with_prefill: bool,
+        global_with_prefill: bool,
+        local_enable_dbo: bool,
+        global_enable_dbo: bool,
+        attn_state: AscendAttentionState,
+        moe_comm_type: MoECommType,
+    ) -> None:
+        if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
+            return
+        if not self.parallel_config.enable_expert_parallel:
+            return
+
+        if num_tokens_across_dp is None:
+            synced_tokens_tuple = None
+        else:
+            synced_tokens_tuple = tuple(
+                int(v) for v in num_tokens_across_dp.to(
+                    device="cpu", non_blocking=False).tolist())
+
+        current_ep_size = 1
+        if self.parallel_config.enable_expert_parallel:
+            current_ep_size = get_ep_group().world_size
+
+        signature = (
+            local_num_reqs,
+            local_num_scheduled_tokens,
+            local_num_input_tokens,
+            synced_num_input_tokens,
+            synced_tokens_tuple,
+            bool(local_with_prefill),
+            bool(global_with_prefill),
+            bool(local_enable_dbo),
+            bool(global_enable_dbo),
+            str(attn_state),
+            str(moe_comm_type),
+            int(current_ep_size),
+        )
+        if getattr(self, "_last_elastic_forward_fingerprint", None) == signature:
+            return
+        self._last_elastic_forward_fingerprint = signature
+
+        global_rank = dist.get_rank() if dist.is_initialized() else self.dp_rank
+        logger.info(
+            "Elastic forward fingerprint: global_rank=%s dp_rank=%s ep_size=%s "
+            "local_reqs=%s local_scheduled_tokens=%s local_input_tokens=%s "
+            "synced_input_tokens=%s synced_tokens_across_dp=%s "
+            "local_with_prefill=%s global_with_prefill=%s "
+            "local_enable_dbo=%s global_enable_dbo=%s "
+            "attn_state=%s moe_comm_type=%s",
+            global_rank,
+            self.dp_rank,
+            current_ep_size,
+            local_num_reqs,
+            local_num_scheduled_tokens,
+            local_num_input_tokens,
+            synced_num_input_tokens,
+            synced_tokens_tuple,
+            local_with_prefill,
+            global_with_prefill,
+            local_enable_dbo,
+            global_enable_dbo,
+            attn_state,
+            moe_comm_type,
+        )
+
     def _check_dbo_is_valid(self, query_lens: torch.Tensor,
                             attn_state: AscendAttentionState,
                             num_tokens: int) -> bool:
@@ -1329,6 +1406,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         enable_dbo = self._check_dbo_is_valid(self.query_lens.tolist(),
                                               attn_state,
                                               total_num_scheduled_tokens)
+        local_num_input_tokens = num_input_tokens
+        local_with_prefill = with_prefill
+        local_enable_dbo = enable_dbo
+        local_attn_state = attn_state
 
         # Get info across DP ranks.
         # NOTE: maybe_padded_num_tokens is only used when using TorchAir with DP,
@@ -1437,6 +1518,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         self.with_prefill = with_prefill
         self.num_tokens_across_dp = num_tokens_across_dp
+        self._elastic_local_num_reqs = num_reqs
+        self._elastic_local_num_scheduled_tokens = total_num_scheduled_tokens
+        self._elastic_local_num_input_tokens = local_num_input_tokens
+        self._elastic_local_with_prefill = local_with_prefill
+        self._elastic_local_enable_dbo = local_enable_dbo
+        self._elastic_global_enable_dbo = enable_dbo
+        self._elastic_local_attn_state = local_attn_state
         self._update_graph_pad_size(with_prefill, maybe_padded_num_tokens)
         attn_metadata: dict[str, Any] = {}
 
@@ -1987,12 +2075,27 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         quant_type = getattr(self.vllm_config.model_config.hf_config,
                              'moe_quantize', None)
         model_type = self.vllm_config.model_config.hf_config.model_type
+        elastic_parallel_shrink_enabled = \
+            envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
+        force_alltoall_moe = envs_ascend.VLLM_ASCEND_FORCE_ALLTOALL_MOE
+        current_ep_size = 1
+        if self.parallel_config.enable_expert_parallel:
+            if elastic_parallel_shrink_enabled:
+                current_ep_size = get_ep_group().world_size
+            else:
+                current_ep_size = self.parallel_config.world_size_across_dp
+        mc2_available = (
+            current_ep_size >= envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE
+            and not force_alltoall_moe)
 
         if not self.parallel_config.enable_expert_parallel:
             moe_comm_type = MoECommType.ALLGATHER
+        elif current_ep_size <= 1:
+            moe_comm_type = MoECommType.ALLGATHER
         elif soc_version in {AscendSocVersion.A2}:
-            if (num_tokens <= self.mc2_tokens_capacity
-                    and self.parallel_config.world_size_across_dp >= 16):
+            if force_alltoall_moe and self.parallel_config.enable_expert_parallel:
+                moe_comm_type = MoECommType.ALLTOALL
+            elif num_tokens <= self.mc2_tokens_capacity and mc2_available:
                 moe_comm_type = MoECommType.MC2
             else:
                 # Currently, w4a8_dynamic does not support allgatherep
@@ -2002,11 +2105,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     moe_comm_type = MoECommType.ALLGATHER
 
         elif soc_version in {AscendSocVersion.A3}:
-            moe_comm_type = (MoECommType.MC2
-                             if num_tokens <= self.mc2_tokens_capacity else
-                             MoECommType.ALLTOALL)
-            # #强制走Alltoall
-            # moe_comm_type = MoECommType.ALLTOALL
+            if force_alltoall_moe and self.parallel_config.enable_expert_parallel:
+                moe_comm_type = MoECommType.ALLTOALL
+            elif num_tokens <= self.mc2_tokens_capacity and mc2_available:
+                moe_comm_type = MoECommType.MC2
+            else:
+                moe_comm_type = MoECommType.ALLTOALL
         else:
             raise ValueError(f"Unsupported soc_version: {soc_version}")
 
@@ -2018,8 +2122,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             moe_comm_type = MoECommType.ALLGATHER
 
         if is_global_first_rank():
-            logger.debug(f"num_tokens: {num_tokens}, "
-                         f"moe_comm_type: {moe_comm_type}")
+            logger.debug("num_tokens: %s, current_ep_size: %s, moe_comm_type: %s",
+                         num_tokens, current_ep_size, moe_comm_type)
         return moe_comm_type
 
     @torch.inference_mode()
@@ -2054,6 +2158,28 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         moe_comm_type = self._select_moe_comm_method(num_input_tokens,
                                                      self.with_prefill)
+        self._log_elastic_forward_fingerprint_if_changed(
+            local_num_reqs=getattr(self, "_elastic_local_num_reqs",
+                                   self.input_batch.num_reqs),
+            local_num_scheduled_tokens=getattr(
+                self, "_elastic_local_num_scheduled_tokens",
+                scheduler_output.total_num_scheduled_tokens),
+            local_num_input_tokens=getattr(self,
+                                           "_elastic_local_num_input_tokens",
+                                           num_input_tokens),
+            synced_num_input_tokens=num_input_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            local_with_prefill=getattr(self, "_elastic_local_with_prefill",
+                                       self.with_prefill),
+            global_with_prefill=self.with_prefill,
+            local_enable_dbo=getattr(self, "_elastic_local_enable_dbo",
+                                     False),
+            global_enable_dbo=bool(
+                getattr(self, "_elastic_global_enable_dbo", False)),
+            attn_state=getattr(self, "_elastic_local_attn_state",
+                               self.attn_state),
+            moe_comm_type=moe_comm_type,
+        )
 
         uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
             scheduler_output.total_num_scheduled_tokens
@@ -2082,12 +2208,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     batch_descriptor=batch_descriptor,
                     num_actual_tokens=total_num_scheduled_tokens,
                     prefetch_stream=self.prefetch_stream,
+                    moe_prefetch_stream=self.moe_prefetch_stream,
                     model_instance=self.model):
                 self.maybe_setup_kv_connector(scheduler_output)
-
+                # torch.npu.synchronize()
+                # begin_time = time.time()
                 hidden_states = self._generate_process_reqs_hidden_states(
                     attn_metadata, self.with_prefill, maybe_padded_num_tokens,
                     input_ids, positions, intermediate_tensors, inputs_embeds)
+                # torch.npu.synchronize()
+                # print("Execute forward time: %s" % (time.time() - begin_time))
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = self.get_finished_kv_transfer(
@@ -2492,6 +2622,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         #  _) = self._sync_metadata_across_dp(num_tokens, with_prefill, False)
         #尝试dummy_run不通信,一旦最大的剩余是16就不通信了
         #print("rank", self.dp_rank, "dummy need_allreduce:", self.need_allreduce)
+        local_with_prefill = with_prefill
         if self.need_allreduce:
             (num_tokens, num_tokens_across_dp, with_prefill,
             _) = self._sync_metadata_across_dp(num_tokens, with_prefill, False)
@@ -2547,6 +2678,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         assert len(num_scheduled_tokens_list) == num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list,
                                         dtype=np.int32)
+        self._log_elastic_forward_fingerprint_if_changed(
+            local_num_reqs=0 if is_long_tail else num_reqs,
+            local_num_scheduled_tokens=before_num_tokens,
+            local_num_input_tokens=before_num_tokens,
+            synced_num_input_tokens=num_tokens,
+            num_tokens_across_dp=num_tokens_across_dp,
+            local_with_prefill=local_with_prefill,
+            global_with_prefill=with_prefill,
+            local_enable_dbo=False,
+            global_enable_dbo=False,
+            attn_state=AscendAttentionState.PrefillCacheHit
+            if with_prefill else AscendAttentionState.DecodeOnly,
+            moe_comm_type=moe_comm_type,
+        )
 
         # Force dummy run on prefill stage when this node is deemed as kv producer.
         if self.is_kv_producer and not self.is_kv_consumer:
@@ -2632,6 +2777,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     prefetch_stream=self.prefetch_stream,
+                    moe_prefetch_stream=self.moe_prefetch_stream,
                     model_instance=self.model):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     with_prefill, is_torchair_compile, input_ids, positions,
@@ -2667,15 +2813,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def profile_run(self) -> None:
         # Trigger compilation for general shape.
         with self.set_in_profile_run():
-            hidden_states = self._dummy_run(self.max_num_tokens,
+            profile_num_tokens = min(self.max_num_tokens,
+                                     self.scheduler_config.max_num_batched_tokens)
+            hidden_states = self._dummy_run(profile_num_tokens,
                                             with_prefill=True)
-            # MC2 will consume additional NPU memory.
-            # Therefore, we need to run the MC2 path once here to complete its initialization,
-            # allowing vLLM to correctly estimate the maximum memory required.
-            if self._select_moe_comm_method(
-                    self.mc2_tokens_capacity,
-                    with_prefill=True) == MoECommType.MC2:
-                self._dummy_run(self.mc2_tokens_capacity, with_prefill=True)
+            # Run an additional prefill using the MC2 threshold token count. This
+            # warms up whichever MoE comm path the normal runtime selection would
+            # choose at that boundary, so profile-time memory reflects the real
+            # first-request behavior instead of forcing a profile-only path.
+            self._dummy_run(self.mc2_tokens_capacity, with_prefill=True)
 
         output = None
         if get_pp_group().is_last_rank:
