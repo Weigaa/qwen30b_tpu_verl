@@ -58,6 +58,60 @@ from vllm.utils.moe_stats import moe_stats
 import time
 
 logger = init_logger(__name__)
+_MODE3_TIMING_COUNTS = defaultdict(int)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+def _parse_layer_filter(value: str) -> Optional[set[int]]:
+    value = value.strip().lower()
+    if value in ("", "all", "*"):
+        return None
+    layers: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            layers.add(int(item))
+        except ValueError:
+            continue
+    return layers
+
+
+def _new_npu_event(*, enable_timing: bool = False) -> torch.npu.Event:
+    try:
+        return torch.npu.Event(enable_timing=enable_timing)
+    except TypeError:
+        return torch.npu.Event()
+
+
+def _elapsed_ms(start_event: Any, end_event: Any) -> float:
+    if start_event is None or end_event is None:
+        return -1.0
+    try:
+        end_event.synchronize()
+        return float(start_event.elapsed_time(end_event))
+    except Exception:
+        return -1.0
+
+
+def _event_record(event: Optional[Any]) -> None:
+    if event is None:
+        return
+    try:
+        event.record()
+    except Exception:
+        pass
 
 
 def _maybe_pin_cpu_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -162,6 +216,57 @@ def _allocate_formatted_buffer_like(weight: torch.Tensor,
     return buffer
 
 
+def _hybrid_rank_owned_signature(
+        rank_owned: Optional[list[list[int]]]) -> tuple[tuple[int, ...], ...]:
+    if not rank_owned:
+        return ()
+    return tuple(
+        tuple(int(expert_id) for expert_id in expert_ids)
+        for expert_ids in rank_owned)
+
+
+def _hybrid_dispatch_topology_signature(layer: Any) -> tuple[Any, ...]:
+    return (
+        int(
+            getattr(layer, "elastic_original_num_experts",
+                    getattr(layer, "num_experts", 0))),
+        tuple(
+            int(rank)
+            for rank in getattr(layer, "lossless_hybrid_active_ranks", [])),
+        _hybrid_rank_owned_signature(
+            getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)),
+    )
+
+
+def _build_dispatch_log2phy_tensor(
+        logical_num_experts: int,
+        rank_owned: list[list[int]],
+        owned_per_rank: int,
+        device: torch.device) -> tuple[torch.Tensor, int]:
+    dispatch_num_experts = len(rank_owned) * owned_per_rank
+    dispatch_log2phy_cpu = torch.full((logical_num_experts, ),
+                                      -1,
+                                      dtype=torch.int32,
+                                      device="cpu")
+    for rank_idx, expert_ids in enumerate(rank_owned):
+        if len(expert_ids) != owned_per_rank:
+            raise RuntimeError(
+                "Hybrid single-dispatch requires uniform owned experts per "
+                f"rank: owned_counts={[len(ids) for ids in rank_owned]}")
+        if not expert_ids:
+            continue
+        expert_index = torch.tensor([int(expert_id) for expert_id in expert_ids],
+                                    dtype=torch.long,
+                                    device="cpu")
+        dense_ids = torch.arange(rank_idx * owned_per_rank,
+                                 (rank_idx + 1) * owned_per_rank,
+                                 dtype=torch.int32,
+                                 device="cpu")
+        dispatch_log2phy_cpu[expert_index] = dense_ids
+    return dispatch_log2phy_cpu.to(device=device, non_blocking=False), \
+        dispatch_num_experts
+
+
 class _Mode3DoubleBufferSlot:
 
     def __init__(self) -> None:
@@ -186,6 +291,14 @@ class _Mode3DoubleBufferSlot:
         self.ready_event = torch.npu.Event()
         self.cpu_ready_event = torch.npu.Event()
         self.cpu_pack_event = torch.npu.Event()
+        self.prefetch_start_event = None
+        self.prefetch_end_event = None
+        self.prefetch_timing: dict[str, Any] = {}
+        self.dispatch_log2phy = None
+        self.dispatch_num_experts = 0
+        self.dispatch_signature: Optional[tuple[Any, ...]] = None
+        self.dispatch_active_rank_count = 0
+        self.dispatch_owned_per_rank = 0
 
 
 class Mode3DoubleBufferManager:
@@ -204,26 +317,38 @@ class Mode3DoubleBufferManager:
         self.prefetch_wait_us = defaultdict(float)
         self.prefetch_hit = defaultdict(int)
         self.prefetch_wait_count = defaultdict(int)
+        self.last_bind_timing: dict[str, Any] = {}
         self._logged_slot_bindings: set[tuple[int, int, int]] = set()
         self._logged_prefetches: set[tuple[int, int]] = set()
         self._logged_prefetch_deferrals: set[tuple[int, int]] = set()
         self._logged_cpu_fill_deferrals: set[tuple[int, int]] = set()
         self._logged_async_cpu_stage: set[tuple[int, int]] = set()
-        self.enable_async_npu_prefetch = (
-            os.getenv("VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH", "0").lower()
-            in ("1", "true", "yes", "on"))
-        self.enable_async_cpu_stage = (
-            os.getenv("VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE", "0").lower()
-            in ("1", "true", "yes", "on"))
-        self.enable_async_cpu_pack = (
-            os.getenv("VLLM_ASCEND_MODE3_ASYNC_CPU_PACK", "0").lower()
-            in ("1", "true", "yes", "on"))
-        self.enable_direct_cpu_slot = (
-            os.getenv("VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT", "0").lower()
-            in ("1", "true", "yes", "on"))
-        self.enable_device_ready_wait = (
-            os.getenv("VLLM_ASCEND_MODE3_DEVICE_READY_WAIT", "0").lower()
-            in ("1", "true", "yes", "on"))
+        self._dispatch_remap_cache: dict[
+            tuple[str, tuple[Any, ...]], dict[str, Any]] = {}
+        self.enable_async_npu_prefetch = _env_flag(
+            "VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH")
+        self.enable_async_cpu_stage = _env_flag(
+            "VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE")
+        self.enable_async_cpu_pack = _env_flag(
+            "VLLM_ASCEND_MODE3_ASYNC_CPU_PACK")
+        self.enable_direct_cpu_slot = _env_flag(
+            "VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT")
+        self.enable_device_ready_wait = _env_flag(
+            "VLLM_ASCEND_MODE3_DEVICE_READY_WAIT")
+        self.enable_transfer_logs = _env_flag(
+            "VLLM_ASCEND_MODE3_TRANSFER_LOG")
+        self.enable_timing_logs = _env_flag(
+            "VLLM_ASCEND_MODE3_TIMING_LOG")
+        self.enable_timing_sync = _env_flag(
+            "VLLM_ASCEND_MODE3_TIMING_SYNC")
+        self.timing_every = _env_int("VLLM_ASCEND_MODE3_TIMING_EVERY",
+                                     512,
+                                     minimum=1)
+        self.timing_first_n = _env_int("VLLM_ASCEND_MODE3_TIMING_FIRST_N",
+                                       1,
+                                       minimum=0)
+        self.timing_layers = _parse_layer_filter(
+            os.getenv("VLLM_ASCEND_MODE3_TIMING_LAYERS", "all"))
 
     @staticmethod
     def _build_layer_lookup(model_instance: Any) -> dict[int, Any]:
@@ -245,6 +370,30 @@ class Mode3DoubleBufferManager:
     @staticmethod
     def _slot_id_for_layer(layer_idx: int) -> int:
         return int(layer_idx) & 1
+
+    def should_profile_layer(self, layer: Any, path: str) -> bool:
+        if not self.enable_timing_logs:
+            return False
+        layer_idx = int(getattr(layer, "layer_idx", -1))
+        if self.timing_layers is not None and layer_idx not in self.timing_layers:
+            return False
+        active_rank_count = len(
+            getattr(layer, "lossless_hybrid_active_ranks", []))
+        rank = int(getattr(layer, "rank", -1))
+        key = (rank, path, active_rank_count, layer_idx)
+        _MODE3_TIMING_COUNTS[key] += 1
+        count = _MODE3_TIMING_COUNTS[key]
+        return count <= self.timing_first_n or count % self.timing_every == 0
+
+    def new_timing_event(self) -> Optional[torch.npu.Event]:
+        if not self.enable_timing_sync:
+            return None
+        return _new_npu_event(enable_timing=True)
+
+    def _prefetch_device_ms(self, timing: Optional[dict[str, Any]]) -> float:
+        if not timing:
+            return -1.0
+        return _elapsed_ms(timing.get("start_event"), timing.get("end_event"))
 
     def _get_next_layer(self, current_layer_idx: int) -> Optional[Any]:
         for layer_idx in sorted(self.layer_lookup):
@@ -303,6 +452,45 @@ class Mode3DoubleBufferManager:
                 f"{getattr(layer, 'layer_idx', -1)}: "
                 f"owned={len(owned_expert_ids)} ordered={len(slot_expert_ids)}")
         return slot_expert_ids
+
+    def _get_cached_dispatch_remap(
+            self, layer: Any,
+            device: torch.device) -> tuple[Optional[torch.Tensor], int,
+                                           Optional[tuple[Any, ...]], int, int]:
+        topology_signature = _hybrid_dispatch_topology_signature(layer)
+        rank_owned = getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)
+        if not rank_owned:
+            return None, 0, topology_signature, 0, 0
+        active_rank_count = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+        if active_rank_count <= 0:
+            return None, 0, topology_signature, 0, 0
+        owned_per_rank = len(rank_owned[0]) if rank_owned else 0
+        if owned_per_rank <= 0:
+            return None, 0, topology_signature, active_rank_count, 0
+        cache_key = (str(device), topology_signature)
+        cached = self._dispatch_remap_cache.get(cache_key)
+        if cached is None:
+            dispatch_log2phy, dispatch_num_experts = _build_dispatch_log2phy_tensor(
+                int(layer.elastic_original_num_experts),
+                rank_owned,
+                owned_per_rank,
+                device,
+            )
+            cached = {
+                "dispatch_log2phy": dispatch_log2phy,
+                "dispatch_num_experts": dispatch_num_experts,
+                "dispatch_signature": topology_signature,
+                "active_rank_count": active_rank_count,
+                "owned_per_rank": owned_per_rank,
+            }
+            self._dispatch_remap_cache[cache_key] = cached
+        return (
+            cached["dispatch_log2phy"],
+            int(cached["dispatch_num_experts"]),
+            cached["dispatch_signature"],
+            int(cached["active_rank_count"]),
+            int(cached["owned_per_rank"]),
+        )
 
     @staticmethod
     def _copy_row(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -485,7 +673,7 @@ class Mode3DoubleBufferManager:
         slot.has_async_cpu_pack = pack_to_runtime
         slot.needs_sync_cpu_fill = False
         log_key = (int(layer.layer_idx), len(cpu_assignments))
-        if log_key not in self._logged_async_cpu_stage:
+        if self.enable_transfer_logs and log_key not in self._logged_async_cpu_stage:
             logger.info(
                 "Mode3 async CPU stage scheduled: layer=%s cpu_rows=%s staging=plain_npu pack_to_runtime=%s",
                 layer.layer_idx,
@@ -512,7 +700,7 @@ class Mode3DoubleBufferManager:
         slot.has_async_cpu_direct = True
         slot.needs_sync_cpu_fill = False
         log_key = (int(layer.layer_idx), len(cpu_assignments))
-        if log_key not in self._logged_async_cpu_stage:
+        if self.enable_transfer_logs and log_key not in self._logged_async_cpu_stage:
             logger.info(
                 "Mode3 async CPU direct slot scheduled: layer=%s cpu_rows=%s target=runtime_slot",
                 layer.layer_idx,
@@ -631,7 +819,8 @@ class Mode3DoubleBufferManager:
                 self._ensure_cpu_stage_capacity(slot, layer, len(cpu_assignments))
                 slot.needs_sync_cpu_fill = True
                 log_key = (int(layer.layer_idx), len(cpu_assignments))
-                if log_key not in self._logged_cpu_fill_deferrals:
+                if (self.enable_transfer_logs
+                        and log_key not in self._logged_cpu_fill_deferrals):
                     logger.info(
                         "Mode3 CPU shadow fill deferred to bind: layer=%s cpu_rows=%s reason=async_cpu_stage_disabled staging=plain_npu",
                         layer.layer_idx,
@@ -644,14 +833,23 @@ class Mode3DoubleBufferManager:
                                                      cpu_w2)
         slot.expert_map = self._build_slot_expert_map(layer, slot_expert_ids,
                                                       slot.w13.device)
+        dispatch_log2phy, dispatch_num_experts, dispatch_signature, \
+            dispatch_active_rank_count, dispatch_owned_per_rank = \
+            self._get_cached_dispatch_remap(layer, slot.w13.device)
         slot.layer_idx = int(layer.layer_idx)
         slot.expert_ids = tuple(slot_expert_ids)
         slot.valid_expert_count = valid_expert_count
         slot.source_from_npu = source_from_npu
         slot.source_from_cpu = source_from_cpu
+        slot.dispatch_log2phy = dispatch_log2phy
+        slot.dispatch_num_experts = dispatch_num_experts
+        slot.dispatch_signature = dispatch_signature
+        slot.dispatch_active_rank_count = dispatch_active_rank_count
+        slot.dispatch_owned_per_rank = dispatch_owned_per_rank
 
     def _slot_matches(self, slot: _Mode3DoubleBufferSlot, layer: Any) -> bool:
         ordered_slot_expert_ids = tuple(self._ordered_mode3_slot_expert_ids(layer))
+        dispatch_signature = _hybrid_dispatch_topology_signature(layer)
         return (
             slot.layer_idx == int(layer.layer_idx)
             and slot.expert_ids == ordered_slot_expert_ids
@@ -659,6 +857,7 @@ class Mode3DoubleBufferManager:
             and slot.expert_map is not None
             and slot.w13 is not None
             and slot.w2 is not None
+            and slot.dispatch_signature == dispatch_signature
         )
 
     def prepare_slot(self,
@@ -670,12 +869,16 @@ class Mode3DoubleBufferManager:
         slot = self.slots[slot_id]
         if self._slot_matches(slot, layer) and not slot.inflight_prefetch:
             return slot
+        submit_start = time.perf_counter()
+        start_event = self.new_timing_event() if async_copy else None
+        end_event = self.new_timing_event() if async_copy else None
         if async_copy and self.prefetch_stream is not None:
             current_stream = torch.npu.current_stream()
             if self.cpu_prefetch_stream is not None:
                 self.cpu_prefetch_stream.wait_stream(current_stream)
             with torch.npu.stream(self.prefetch_stream):
                 self.prefetch_stream.wait_stream(current_stream)
+                _event_record(start_event)
                 self._populate_slot(slot,
                                     layer,
                                     async_copy=True,
@@ -690,14 +893,27 @@ class Mode3DoubleBufferManager:
                                        slot.cpu_stage_w13[stage_idx])
                         self._copy_row(slot.w2[slot_idx],
                                        slot.cpu_stage_w2[stage_idx])
+                _event_record(end_event)
                 slot.ready_event.record()
             slot.inflight_prefetch = True
         else:
             self._populate_slot(slot, layer, async_copy=False)
             slot.ready_event.record()
             slot.inflight_prefetch = False
+        slot.prefetch_timing = {
+            "layer_idx": int(layer.layer_idx),
+            "slot_id": int(slot_id),
+            "reason": reason,
+            "async": bool(async_copy),
+            "submit_us": (time.perf_counter() - submit_start) * 1e6,
+            "start_event": start_event,
+            "end_event": end_event,
+            "valid_experts": int(slot.valid_expert_count),
+            "source_from_npu": int(slot.source_from_npu),
+            "source_from_cpu": int(slot.source_from_cpu),
+        }
         if ((int(layer.layer_idx), slot_id) not in self._logged_prefetches
-                and async_copy):
+                and async_copy and self.enable_transfer_logs):
             logger.info(
                 "Mode3 prefetch scheduled: layer=%s slot=%s reason=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s slot_head=%s",
                 layer.layer_idx,
@@ -737,6 +953,18 @@ class Mode3DoubleBufferManager:
         self.prefetch_wait_count[int(layer.layer_idx)] += 1
         if prefetched_hit:
             self.prefetch_hit[int(layer.layer_idx)] += 1
+        self.last_bind_timing = {
+            "layer_idx": int(layer.layer_idx),
+            "slot_id": int(slot_id),
+            "valid_experts": int(slot.valid_expert_count),
+            "source_from_npu": int(slot.source_from_npu),
+            "source_from_cpu": int(slot.source_from_cpu),
+            "wait_mode": wait_mode,
+            "wait_us": float(wait_us),
+            "cpu_fill_us": float(cpu_fill_us),
+            "prefetched_hit": bool(prefetched_hit),
+            "prefetch_hit_count": int(self.prefetch_hit[int(layer.layer_idx)]),
+        }
         layer.runtime_w13_weight = slot.w13[:slot.valid_expert_count]
         layer.runtime_w2_weight = slot.w2[:slot.valid_expert_count]
         layer.runtime_weight_capacity = int(slot.w13.shape[0])
@@ -748,10 +976,18 @@ class Mode3DoubleBufferManager:
         layer.moe_config.num_local_experts = slot.valid_expert_count
         layer.moe_config.num_experts = slot.valid_expert_count
         layer.num_experts = slot.valid_expert_count
+        layer.lossless_runtime_dispatch_log2phy = slot.dispatch_log2phy
+        layer.lossless_runtime_dispatch_num_experts = int(
+            slot.dispatch_num_experts)
+        layer.lossless_runtime_dispatch_signature = slot.dispatch_signature
+        layer.lossless_runtime_dispatch_active_rank_count = int(
+            slot.dispatch_active_rank_count)
+        layer.lossless_runtime_dispatch_owned_per_rank = int(
+            slot.dispatch_owned_per_rank)
         layer.lossless_runtime_activated = True
         slot.inflight_prefetch = False
         log_key = (int(layer.layer_idx), slot_id, slot.valid_expert_count)
-        if log_key not in self._logged_slot_bindings:
+        if self.enable_transfer_logs and log_key not in self._logged_slot_bindings:
             logger.info(
                 "Mode3 slot binding: layer=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s wait_mode=%s wait_us=%.1f cpu_fill_us=%.1f slot_head=%s",
                 layer.layer_idx,
@@ -767,41 +1003,54 @@ class Mode3DoubleBufferManager:
             self._logged_slot_bindings.add(log_key)
         return slot
 
-    def prefetch_next_layer(self, current_layer: Any) -> None:
+    def prefetch_next_layer(self, current_layer: Any) -> dict[str, Any]:
         next_layer = self._get_next_layer(int(current_layer.layer_idx))
         if next_layer is None:
-            return
+            return {"status": "no_next_layer"}
         if getattr(next_layer, "elastic_execution_mode", 0) != 3:
-            return
+            return {"status": "next_not_mode3"}
         if not getattr(next_layer, "lossless_hybrid_active", False):
-            return
+            return {"status": "next_inactive"}
         cpu_only_count = len(
             getattr(next_layer, "lossless_hybrid_cpu_only_expert_ids", []))
         if not self.enable_async_npu_prefetch:
             log_key = (int(next_layer.layer_idx), cpu_only_count)
-            if log_key not in self._logged_prefetch_deferrals:
+            if (self.enable_transfer_logs
+                    and log_key not in self._logged_prefetch_deferrals):
                 logger.info(
                     "Mode3 prefetch deferred to layer entry: layer=%s reason=async_npu_prefetch_unstable cpu_only_experts=%s",
                     next_layer.layer_idx,
                     cpu_only_count,
                 )
                 self._logged_prefetch_deferrals.add(log_key)
-            return
+            return {
+                "status": "disabled",
+                "next_layer": int(next_layer.layer_idx),
+                "cpu_only": int(cpu_only_count),
+            }
         if cpu_only_count > 0 and self.cpu_prefetch_stream is None:
             log_key = (int(next_layer.layer_idx), cpu_only_count)
-            if log_key not in self._logged_prefetch_deferrals:
+            if (self.enable_transfer_logs
+                    and log_key not in self._logged_prefetch_deferrals):
                 logger.info(
                     "Mode3 prefetch deferred to layer entry: layer=%s reason=cpu_shadow_copy_stability cpu_only_experts=%s",
                     next_layer.layer_idx,
                     cpu_only_count,
                 )
                 self._logged_prefetch_deferrals.add(log_key)
-            return
+            return {
+                "status": "no_cpu_stream",
+                "next_layer": int(next_layer.layer_idx),
+                "cpu_only": int(cpu_only_count),
+            }
         next_slot_id = self._slot_id_for_layer(int(next_layer.layer_idx))
-        self.prepare_slot(next_layer,
-                          next_slot_id,
-                          async_copy=True,
-                          reason=f"after_layer_{current_layer.layer_idx}")
+        slot = self.prepare_slot(next_layer,
+                                 next_slot_id,
+                                 async_copy=True,
+                                 reason=f"after_layer_{current_layer.layer_idx}")
+        timing = dict(getattr(slot, "prefetch_timing", {}))
+        timing["status"] = "scheduled"
+        return timing
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
@@ -1056,6 +1305,41 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         ])
 
     @staticmethod
+    def _get_dispatch_log2phy_for_layer(
+            layer: Any,
+            *,
+            device: torch.device,
+            rank_owned: list[list[int]],
+            active_rank_count: int,
+            owned_per_rank: int) -> tuple[torch.Tensor, int]:
+        topology_signature = _hybrid_dispatch_topology_signature(layer)
+        expected_dispatch_num_experts = active_rank_count * owned_per_rank
+        cached_dispatch_log2phy = getattr(layer, "lossless_runtime_dispatch_log2phy",
+                                          None)
+        cached_dispatch_num_experts = int(
+            getattr(layer, "lossless_runtime_dispatch_num_experts", -1))
+        cached_signature = getattr(layer, "lossless_runtime_dispatch_signature",
+                                   None)
+        if (cached_dispatch_log2phy is not None
+                and cached_dispatch_log2phy.device == device
+                and cached_dispatch_num_experts == expected_dispatch_num_experts
+                and cached_signature == topology_signature):
+            return cached_dispatch_log2phy, cached_dispatch_num_experts
+        dispatch_log2phy, dispatch_num_experts = _build_dispatch_log2phy_tensor(
+            int(layer.elastic_original_num_experts),
+            rank_owned,
+            owned_per_rank,
+            device,
+        )
+        layer.lossless_runtime_dispatch_log2phy = dispatch_log2phy
+        layer.lossless_runtime_dispatch_num_experts = int(dispatch_num_experts)
+        layer.lossless_runtime_dispatch_signature = topology_signature
+        layer.lossless_runtime_dispatch_active_rank_count = int(
+            active_rank_count)
+        layer.lossless_runtime_dispatch_owned_per_rank = int(owned_per_rank)
+        return dispatch_log2phy, dispatch_num_experts
+
+    @staticmethod
     def _compute_local_dispatch_counts_from_topk(
             dispatch_topk_ids: torch.Tensor,
             mc2_mask: Optional[torch.Tensor],
@@ -1207,8 +1491,19 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             raise RuntimeError(
                 "Mode3 single-rank AllGather path requires forward-context "
                 f"model instance and prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        profile_timing = manager.should_profile_layer(layer,
+                                                      "single_rank_allgather")
         bound_slot = manager.bind_current_layer(layer)
-        manager.prefetch_next_layer(layer)
+        bind_timing = dict(manager.last_bind_timing)
+        next_prefetch_timing = manager.prefetch_next_layer(layer)
+        compute_wall_start = time.perf_counter()
+        compute_start_event = manager.new_timing_event() if profile_timing else None
+        compute_end_event = manager.new_timing_event() if profile_timing else None
+        remap_start_event = manager.new_timing_event() if profile_timing else None
+        remap_end_event = manager.new_timing_event() if profile_timing else None
+        fused_start_event = manager.new_timing_event() if profile_timing else None
+        fused_end_event = manager.new_timing_event() if profile_timing else None
+        _event_record(compute_start_event)
 
         moe_comm_method = get_forward_context().moe_comm_method
         token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
@@ -1220,6 +1515,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 f"{token_dispatcher.__class__.__name__ if token_dispatcher is not None else None} "
                 f"at layer={getattr(layer, 'layer_idx', -1)}.")
 
+        remap_wall_start = time.perf_counter()
+        _event_record(remap_start_event)
         slot_log2phy = bound_slot.expert_map.to(device=logical_topk_ids.device)
         local_topk_ids = slot_log2phy[logical_topk_ids]
         if torch.any(local_topk_ids < 0):
@@ -1234,12 +1531,16 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                              device=local_topk_ids.device)
                 % bound_slot.valid_expert_count).to(torch.int32).reshape(
                     local_topk_ids.shape)
+        _event_record(remap_end_event)
+        remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
 
         old_num_experts = getattr(token_dispatcher, "num_experts", None)
         old_num_experts_local = getattr(token_dispatcher, "num_experts_local",
                                         None)
         token_dispatcher.num_experts = bound_slot.valid_expert_count
         token_dispatcher.num_experts_local = bound_slot.valid_expert_count
+        fused_wall_start = time.perf_counter()
+        _event_record(fused_start_event)
         try:
             final_hidden_states = moe_comm_method.fused_experts(
                 hidden_states=x,
@@ -1258,11 +1559,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 need_trans=True,
                 dynamic_eplb=self.dynamic_eplb,
                 mc2_mask=None)
+            _event_record(fused_end_event)
         finally:
             if old_num_experts is not None:
                 token_dispatcher.num_experts = old_num_experts
             if old_num_experts_local is not None:
                 token_dispatcher.num_experts_local = old_num_experts_local
+        fused_wall_ms = (time.perf_counter() - fused_wall_start) * 1e3
+        _event_record(compute_end_event)
+        compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
         layer.lossless_hybrid_last_stats = {
             "mode3_slot": int(layer.layer_idx) & 1,
@@ -1271,7 +1576,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             "source_from_cpu": bound_slot.source_from_cpu,
             "single_rank_allgather": 1,
         }
-        if layer.layer_idx == 0:
+        if layer.layer_idx == 0 and manager.enable_transfer_logs:
             logger.info(
                 "Mode3 single-rank AllGather execution: rank=%s layer=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s",
                 layer.rank if hasattr(layer, "rank") else -1,
@@ -1279,6 +1584,35 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 bound_slot.valid_expert_count,
                 bound_slot.source_from_npu,
                 bound_slot.source_from_cpu,
+            )
+        if profile_timing:
+            prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
+            logger.info(
+                "Mode3 timing single-rank-allgather: rank=%s layer=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_submit_us=%.1f prefetch_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f fused_allgather_wall_ms=%.3f fused_allgather_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s",
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                int(bind_timing.get("slot_id", -1)),
+                bound_slot.valid_expert_count,
+                bound_slot.source_from_npu,
+                bound_slot.source_from_cpu,
+                float(bind_timing.get("wait_us", -1.0)),
+                float(bind_timing.get("cpu_fill_us", -1.0)),
+                bind_timing.get("wait_mode", "unknown"),
+                next_prefetch_timing.get("layer_idx", -1),
+                next_prefetch_timing.get("slot_id", -1),
+                next_prefetch_timing.get("source_from_cpu", -1),
+                float(next_prefetch_timing.get("submit_us", -1.0)),
+                prefetch_dev_ms,
+                compute_wall_ms,
+                compute_dev_ms,
+                remap_wall_ms,
+                _elapsed_ms(remap_start_event, remap_end_event),
+                fused_wall_ms,
+                _elapsed_ms(fused_start_event, fused_end_event),
+                prefetch_dev_ms - compute_dev_ms
+                if prefetch_dev_ms >= 0 and compute_dev_ms >= 0 else -1.0,
+                int(x.shape[0]) if hasattr(x, "shape") else -1,
             )
         return final_hidden_states
 
@@ -1297,8 +1631,22 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             raise RuntimeError(
                 "Mode3 single-dispatch requires forward-context model instance "
                 f"and moe prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        profile_timing = manager.should_profile_layer(layer, "single_dispatch")
         bound_slot = manager.bind_current_layer(layer)
-        manager.prefetch_next_layer(layer)
+        bind_timing = dict(manager.last_bind_timing)
+        next_prefetch_timing = manager.prefetch_next_layer(layer)
+        compute_wall_start = time.perf_counter()
+        compute_start_event = manager.new_timing_event() if profile_timing else None
+        compute_end_event = manager.new_timing_event() if profile_timing else None
+        remap_start_event = manager.new_timing_event() if profile_timing else None
+        remap_end_event = manager.new_timing_event() if profile_timing else None
+        dispatch_start_event = manager.new_timing_event() if profile_timing else None
+        dispatch_end_event = manager.new_timing_event() if profile_timing else None
+        mlp_start_event = manager.new_timing_event() if profile_timing else None
+        mlp_end_event = manager.new_timing_event() if profile_timing else None
+        combine_start_event = manager.new_timing_event() if profile_timing else None
+        combine_end_event = manager.new_timing_event() if profile_timing else None
+        _event_record(compute_start_event)
 
         moe_comm_method = get_forward_context().moe_comm_method
         token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
@@ -1325,21 +1673,16 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 "Invalid hybrid mode3 dispatch shape: "
                 f"active_rank_count={active_rank_count} "
                 f"owned_per_rank={owned_per_rank}")
-        dispatch_num_experts = active_rank_count * owned_per_rank
-        logical_num_experts = int(layer.elastic_original_num_experts)
-        dispatch_log2phy = torch.full((logical_num_experts, ),
-                                      -1,
-                                      dtype=torch.int32,
-                                      device=logical_topk_ids.device)
-        for rank_idx, expert_ids in enumerate(rank_owned):
-            if len(expert_ids) != owned_per_rank:
-                raise RuntimeError(
-                    "Mode3 single-dispatch requires uniform owned experts per rank "
-                    f"at layer={getattr(layer, 'layer_idx', -1)}: "
-                    f"owned_counts={[len(ids) for ids in rank_owned]}")
-            dense_offset = rank_idx * owned_per_rank
-            for local_idx, expert_id in enumerate(expert_ids):
-                dispatch_log2phy[int(expert_id)] = dense_offset + local_idx
+        remap_wall_start = time.perf_counter()
+        _event_record(remap_start_event)
+        dispatch_log2phy, dispatch_num_experts = \
+            self._get_dispatch_log2phy_for_layer(
+                layer,
+                device=logical_topk_ids.device,
+                rank_owned=rank_owned,
+                active_rank_count=active_rank_count,
+                owned_per_rank=owned_per_rank,
+            )
         dispatch_topk_ids = dispatch_log2phy[logical_topk_ids]
         if torch.any(dispatch_topk_ids < 0):
             invalid_count = int(torch.count_nonzero(dispatch_topk_ids < 0).item())
@@ -1353,10 +1696,20 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                              device=dispatch_topk_ids.device)
                 % dispatch_num_experts).to(torch.int32).reshape(
                     dispatch_topk_ids.shape)
+        _event_record(remap_end_event)
+        remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
 
         old_dispatch_num_experts = int(getattr(token_dispatcher, "num_experts", 0))
         token_dispatcher.num_experts = dispatch_num_experts
+        dispatch_wall_ms = -1.0
+        group_wall_ms = -1.0
+        mlp_wall_ms = -1.0
+        combine_wall_ms = -1.0
+        dispatched_rows = -1
+        dispatched_active_rows = -1
         try:
+            dispatch_wall_start = time.perf_counter()
+            _event_record(dispatch_start_event)
             dispatch_results = token_dispatcher.token_dispatch(
                 hidden_states=x,
                 topk_weights=topk_weights,
@@ -1372,9 +1725,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 mc2_mask=getattr(moe_comm_method, "mc2_mask", None),
                 apply_router_weight_on_input=False,
                 with_quant=False)
+            _event_record(dispatch_end_event)
+            dispatch_wall_ms = (time.perf_counter() -
+                                dispatch_wall_start) * 1e3
             dispatched_hidden_states = dispatch_results["hidden_states"]
             dispatched_group_list = dispatch_results["group_list"]
             dispatched_group_list_type = int(dispatch_results["group_list_type"])
+            group_wall_start = time.perf_counter()
             dispatched_group_counts = self._group_list_to_counts(
                 dispatched_group_list,
                 dispatched_group_list_type,
@@ -1388,6 +1745,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     f"group_list_type={dispatched_group_list_type}")
             dispatch_offsets = self._counts_to_offsets(dispatched_group_counts)
             dispatched_active_rows = int(dispatch_offsets[-1].item())
+            dispatched_rows = int(dispatched_hidden_states.shape[0])
+            group_wall_ms = (time.perf_counter() - group_wall_start) * 1e3
             if dispatched_active_rows > int(dispatched_hidden_states.shape[0]):
                 raise RuntimeError(
                     "Mode3 single-dispatch local token count mismatch: "
@@ -1403,6 +1762,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             if runtime_w13_weight is None or runtime_w2_weight is None:
                 raise RuntimeError(
                     f"Missing runtime expert weights for mode3 path at layer={layer.layer_idx}.")
+            mlp_wall_start = time.perf_counter()
+            _event_record(mlp_start_event)
             dispatched_output = unified_apply_mlp(
                 hidden_states=dispatched_hidden_states,
                 w1=runtime_w13_weight,
@@ -1419,9 +1780,18 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 with_quant=False,
                 fusion=False,
                 need_trans=True)
+            _event_record(mlp_end_event)
+            mlp_wall_ms = (time.perf_counter() - mlp_wall_start) * 1e3
+            combine_wall_start = time.perf_counter()
+            _event_record(combine_start_event)
             final_hidden_states = token_dispatcher.token_combine(dispatched_output)
+            _event_record(combine_end_event)
+            combine_wall_ms = (time.perf_counter() -
+                               combine_wall_start) * 1e3
         finally:
             token_dispatcher.num_experts = old_dispatch_num_experts
+        _event_record(compute_end_event)
+        compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
         layer.lossless_hybrid_last_stats = {
             "mode3_slot": int(layer.layer_idx) & 1,
@@ -1431,7 +1801,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             "prefetch_wait_us": float(manager.prefetch_wait_us[int(layer.layer_idx)]),
             "prefetch_hit": int(manager.prefetch_hit[int(layer.layer_idx)]),
         }
-        if layer.layer_idx == 0:
+        if layer.layer_idx == 0 and manager.enable_transfer_logs:
             logger.info(
                 "Mode3 single-dispatch execution: rank=%s layer=%s stage=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s prefetch_wait_us=%.1f prefetch_hit=%s",
                 layer.rank if hasattr(layer, "rank") else -1,
@@ -1442,6 +1812,45 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 bound_slot.source_from_cpu,
                 float(manager.prefetch_wait_us[int(layer.layer_idx)]),
                 int(manager.prefetch_hit[int(layer.layer_idx)]),
+            )
+        if profile_timing:
+            prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
+            logger.info(
+                "Mode3 timing single-dispatch: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_submit_us=%.1f prefetch_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f token_dispatch_wall_ms=%.3f token_dispatch_dev_ms=%.3f group_wall_ms=%.3f mlp_wall_ms=%.3f mlp_dev_ms=%.3f token_combine_wall_ms=%.3f token_combine_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s dispatched_rows=%s active_rows=%s owned_per_rank=%s dispatch_num_experts=%s",
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                active_rank_count,
+                int(bind_timing.get("slot_id", -1)),
+                bound_slot.valid_expert_count,
+                bound_slot.source_from_npu,
+                bound_slot.source_from_cpu,
+                float(bind_timing.get("wait_us", -1.0)),
+                float(bind_timing.get("cpu_fill_us", -1.0)),
+                bind_timing.get("wait_mode", "unknown"),
+                next_prefetch_timing.get("layer_idx", -1),
+                next_prefetch_timing.get("slot_id", -1),
+                next_prefetch_timing.get("source_from_cpu", -1),
+                float(next_prefetch_timing.get("submit_us", -1.0)),
+                prefetch_dev_ms,
+                compute_wall_ms,
+                compute_dev_ms,
+                remap_wall_ms,
+                _elapsed_ms(remap_start_event, remap_end_event),
+                dispatch_wall_ms,
+                _elapsed_ms(dispatch_start_event, dispatch_end_event),
+                group_wall_ms,
+                mlp_wall_ms,
+                _elapsed_ms(mlp_start_event, mlp_end_event),
+                combine_wall_ms,
+                _elapsed_ms(combine_start_event, combine_end_event),
+                prefetch_dev_ms - compute_dev_ms
+                if prefetch_dev_ms >= 0 and compute_dev_ms >= 0 else -1.0,
+                int(x.shape[0]) if hasattr(x, "shape") else -1,
+                dispatched_rows,
+                dispatched_active_rows,
+                owned_per_rank,
+                dispatch_num_experts,
             )
         return final_hidden_states
 
@@ -1478,21 +1887,14 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 "Invalid hybrid mode2 dispatch shape: "
                 f"active_rank_count={active_rank_count} "
                 f"owned_per_rank={owned_per_rank}")
-        dispatch_num_experts = active_rank_count * owned_per_rank
-        logical_num_experts = int(layer.elastic_original_num_experts)
-        dispatch_log2phy = torch.full((logical_num_experts, ),
-                                      -1,
-                                      dtype=torch.int32,
-                                      device=logical_topk_ids.device)
-        for rank_idx, expert_ids in enumerate(rank_owned):
-            if len(expert_ids) != owned_per_rank:
-                raise RuntimeError(
-                    "Hybrid mode2 single-dispatch requires uniform owned "
-                    f"experts per rank at layer={getattr(layer, 'layer_idx', -1)}: "
-                    f"owned_counts={[len(ids) for ids in rank_owned]}")
-            dense_offset = rank_idx * owned_per_rank
-            for local_idx, expert_id in enumerate(expert_ids):
-                dispatch_log2phy[int(expert_id)] = dense_offset + local_idx
+        dispatch_log2phy, dispatch_num_experts = \
+            self._get_dispatch_log2phy_for_layer(
+                layer,
+                device=logical_topk_ids.device,
+                rank_owned=rank_owned,
+                active_rank_count=active_rank_count,
+                owned_per_rank=owned_per_rank,
+            )
         dispatch_topk_ids = dispatch_log2phy[logical_topk_ids]
         if torch.any(dispatch_topk_ids < 0):
             invalid_count = int(torch.count_nonzero(dispatch_topk_ids < 0).item())

@@ -115,7 +115,7 @@ export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE:-
 # 弹性缩容的最小计算组:
 #   1  -> 允许在 2-rank 阶段后进入 single-rank no-EP tail
 #   2/4/8/16 -> 最多缩到该 floor 结束，不再进入 1-rank tail
-export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=1
+export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=8
 # mode=2 时每个 rank 固定保留的 NPU resident expert 槽位数
 # mode=3 时该值不控制双缓冲大小；当前 runtime double buffer 固定为 128 experts
 export VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS:-8}
@@ -134,15 +134,29 @@ export VLLM_ASCEND_MODE3_ASYNC_CPU_PACK=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK:-1}
 export VLLM_ASCEND_MODE3_DEVICE_READY_WAIT=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT:-1}
 # mode=3 step-5: try direct CPU shadow row copies into the final runtime
 # expert slots on the CPU prefetch stream, bypassing the staging buffer.
+#
+# Default to staging for the next A/B run so it can be compared with the
+# previous direct-slot run. Override to 1 to restore direct CPU -> runtime slot.
 export VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT:-1}
+# mode=3 profile controls:
+#   TRANSFER_LOG=0 closes high-frequency binding/prefetch logs.
+#   TIMING_LOG=1 emits sampled compute-vs-prefetch breakdown lines.
+#   TIMING_SYNC=1 records NPU timing events for accurate sampled timings.
+export VLLM_ASCEND_MODE3_TRANSFER_LOG=${VLLM_ASCEND_MODE3_TRANSFER_LOG:-0}
+export VLLM_ASCEND_MODE3_TIMING_LOG=${VLLM_ASCEND_MODE3_TIMING_LOG:-1}
+export VLLM_ASCEND_MODE3_TIMING_SYNC=${VLLM_ASCEND_MODE3_TIMING_SYNC:-1}
+export VLLM_ASCEND_MODE3_TIMING_EVERY=${VLLM_ASCEND_MODE3_TIMING_EVERY:-1024}
+export VLLM_ASCEND_MODE3_TIMING_FIRST_N=${VLLM_ASCEND_MODE3_TIMING_FIRST_N:-1}
+export VLLM_ASCEND_MODE3_TIMING_LAYERS=${VLLM_ASCEND_MODE3_TIMING_LAYERS:-all}
 #控制moe记录是否开启
 export VLLM_MOE_PATTERN_STATS=${VLLM_MOE_PATTERN_STATS:-0}  # 1: enable MoE pattern stats collection, 0: disable
 export VLLM_MOE_STATS=${VLLM_MOE_PATTERN_STATS}
 export VLLM_MOE_STATS_DIR=${VLLM_MOE_STATS_DIR:-./moe_stats}
-echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT}"
+echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS}"
 #模拟样本缩短规则
-export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
-# export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
+# export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
+export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
+echo "[elastic tail validate] VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=${VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS}"
 
 if [ "${DRAFT_PROFILE_MODE}" = "profile_only" ]; then
     # 只关注 draft train 的耗时拆分，不进入整套 RL 训练
