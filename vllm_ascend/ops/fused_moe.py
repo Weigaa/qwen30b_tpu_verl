@@ -335,6 +335,20 @@ class Mode3DoubleBufferManager:
             "VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT")
         self.enable_device_ready_wait = _env_flag(
             "VLLM_ASCEND_MODE3_DEVICE_READY_WAIT")
+        self.enable_bulk_npu_copy = _env_flag(
+            "VLLM_ASCEND_MODE3_BULK_NPU_COPY", "1")
+        self.enable_bulk_cpu_stage = _env_flag(
+            "VLLM_ASCEND_MODE3_BULK_CPU_STAGE", "1")
+        self.enable_bulk_cpu_direct = _env_flag(
+            "VLLM_ASCEND_MODE3_BULK_CPU_DIRECT")
+        self.enable_active_rows_sync = _env_flag(
+            "VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC")
+        self.expert_token_nums_type = _env_int(
+            "VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE", 0, minimum=0)
+        if self.expert_token_nums_type not in (0, 1):
+            self.expert_token_nums_type = 0
+        self.use_fused_experts_path = _env_flag(
+            "VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH", "1")
         self.enable_transfer_logs = _env_flag(
             "VLLM_ASCEND_MODE3_TRANSFER_LOG")
         self.enable_timing_logs = _env_flag(
@@ -556,6 +570,121 @@ class Mode3DoubleBufferManager:
         dst.copy_(src, non_blocking=True)
 
     @staticmethod
+    def _assignment_runs(
+            assignments: list[tuple[int, int]]) -> list[tuple[int, int, int]]:
+        if not assignments:
+            return []
+        runs: list[tuple[int, int, int]] = []
+        dst_start, src_start = assignments[0]
+        prev_dst, prev_src = dst_start, src_start
+        length = 1
+        for dst_idx, src_idx in assignments[1:]:
+            if dst_idx == prev_dst + 1 and src_idx == prev_src + 1:
+                length += 1
+            else:
+                runs.append((int(dst_start), int(src_start), int(length)))
+                dst_start, src_start = dst_idx, src_idx
+                length = 1
+            prev_dst, prev_src = dst_idx, src_idx
+        runs.append((int(dst_start), int(src_start), int(length)))
+        return runs
+
+    def _copy_npu_assignment_runs(self, dst: torch.Tensor, src: torch.Tensor,
+                                  assignments: list[tuple[int, int]],
+                                  *, async_copy: bool) -> None:
+        if not assignments:
+            return
+        copy_row = self._copy_row if async_copy else self._copy_row_sync
+        if not self.enable_bulk_npu_copy:
+            for dst_idx, src_idx in assignments:
+                copy_row(dst[int(dst_idx)], src[int(src_idx)])
+            return
+        for dst_start, src_start, length in self._assignment_runs(assignments):
+            if length <= 1:
+                copy_row(dst[dst_start], src[src_start])
+                continue
+            non_blocking = async_copy and src.device.type != "cpu"
+            dst[dst_start:dst_start + length].copy_(
+                src[src_start:src_start + length],
+                non_blocking=non_blocking)
+
+    def _copy_cpu_assignments_to_stage(
+            self, slot: _Mode3DoubleBufferSlot,
+            cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
+            cpu_w2: torch.Tensor, *, async_copy: bool) -> None:
+        if not cpu_assignments:
+            return
+        if not self.enable_bulk_cpu_stage:
+            for stage_idx, (_slot_idx, cpu_slot) in enumerate(cpu_assignments):
+                copy_fn = (self._copy_cpu_row_to_stage_async
+                           if async_copy else self._copy_row_sync)
+                copy_fn(slot.cpu_stage_w13[stage_idx], cpu_w13[int(cpu_slot)])
+                copy_fn(slot.cpu_stage_w2[stage_idx], cpu_w2[int(cpu_slot)])
+            return
+        stage_assignments = [
+            (stage_idx, int(cpu_slot))
+            for stage_idx, (_slot_idx, cpu_slot) in enumerate(cpu_assignments)
+        ]
+        copy_row = (self._copy_cpu_row_to_stage_async
+                    if async_copy else self._copy_row_sync)
+        for stage_start, cpu_start, length in self._assignment_runs(
+                stage_assignments):
+            if length <= 1:
+                copy_row(slot.cpu_stage_w13[stage_start], cpu_w13[cpu_start])
+                copy_row(slot.cpu_stage_w2[stage_start], cpu_w2[cpu_start])
+                continue
+            src_w13 = cpu_w13[cpu_start:cpu_start + length].detach()
+            src_w2 = cpu_w2[cpu_start:cpu_start + length].detach()
+            if not src_w13.is_contiguous() or not src_w2.is_contiguous():
+                for offset in range(length):
+                    copy_row(slot.cpu_stage_w13[stage_start + offset],
+                             cpu_w13[cpu_start + offset])
+                    copy_row(slot.cpu_stage_w2[stage_start + offset],
+                             cpu_w2[cpu_start + offset])
+                continue
+            slot.cpu_stage_w13[stage_start:stage_start + length].copy_(
+                src_w13, non_blocking=async_copy)
+            slot.cpu_stage_w2[stage_start:stage_start + length].copy_(
+                src_w2, non_blocking=async_copy)
+
+    def _copy_cpu_assignments_to_runtime_direct(
+            self, slot: _Mode3DoubleBufferSlot,
+            cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
+            cpu_w2: torch.Tensor) -> None:
+        if not cpu_assignments:
+            return
+        if not self.enable_bulk_cpu_direct:
+            for slot_idx, cpu_slot in cpu_assignments:
+                self._copy_cpu_row_to_runtime_slot_async(
+                    slot.w13[int(slot_idx)], cpu_w13[int(cpu_slot)])
+                self._copy_cpu_row_to_runtime_slot_async(
+                    slot.w2[int(slot_idx)], cpu_w2[int(cpu_slot)])
+            return
+        for slot_start, cpu_start, length in self._assignment_runs(
+                cpu_assignments):
+            if length <= 1:
+                self._copy_cpu_row_to_runtime_slot_async(
+                    slot.w13[slot_start], cpu_w13[cpu_start])
+                self._copy_cpu_row_to_runtime_slot_async(
+                    slot.w2[slot_start], cpu_w2[cpu_start])
+                continue
+            src_w13 = cpu_w13[cpu_start:cpu_start + length].detach()
+            src_w2 = cpu_w2[cpu_start:cpu_start + length].detach()
+            if not src_w13.is_contiguous() or not src_w2.is_contiguous():
+                for offset in range(length):
+                    self._copy_cpu_row_to_runtime_slot_async(
+                        slot.w13[slot_start + offset],
+                        cpu_w13[cpu_start + offset])
+                    self._copy_cpu_row_to_runtime_slot_async(
+                        slot.w2[slot_start + offset],
+                        cpu_w2[cpu_start + offset])
+                continue
+            slot.w13[slot_start:slot_start + length].copy_(
+                src_w13, non_blocking=True)
+            slot.w2[slot_start:slot_start + length].copy_(
+                src_w2, non_blocking=True)
+
+    @staticmethod
     def _copy_rows(dst: torch.Tensor, src: torch.Tensor) -> None:
         if src.device.type == "cpu" and dst.device.type == "npu":
             for row_idx in range(int(dst.shape[0])):
@@ -628,18 +757,26 @@ class Mode3DoubleBufferManager:
             raise RuntimeError(
                 "Mode3 CPU staging buffers were not allocated: "
                 f"layer={getattr(layer, 'layer_idx', -1)}")
-        for stage_idx, (slot_idx, cpu_slot) in enumerate(cpu_assignments):
-            # First materialize CPU rows into a plain NPU staging buffer. The
-            # final runtime slot may be FRACTAL_NZ, so keep that formatted copy
-            # as an explicit NPU->NPU step instead of targeting it from host.
-            self._copy_row_sync(slot.cpu_stage_w13[stage_idx],
-                                cpu_w13[int(cpu_slot)])
-            self._copy_row_sync(slot.cpu_stage_w2[stage_idx],
-                                cpu_w2[int(cpu_slot)])
-            self._copy_row_sync(slot.w13[int(slot_idx)],
-                                slot.cpu_stage_w13[stage_idx])
-            self._copy_row_sync(slot.w2[int(slot_idx)],
-                                slot.cpu_stage_w2[stage_idx])
+        # First materialize CPU rows into a plain NPU staging buffer. The final
+        # runtime slot may be FRACTAL_NZ, so keep that formatted copy as an
+        # explicit NPU->NPU step instead of targeting it from host.
+        self._copy_cpu_assignments_to_stage(slot,
+                                            cpu_assignments,
+                                            cpu_w13,
+                                            cpu_w2,
+                                            async_copy=False)
+        stage_to_slot = [
+            (int(slot_idx), stage_idx)
+            for stage_idx, (slot_idx, _cpu_slot) in enumerate(cpu_assignments)
+        ]
+        self._copy_npu_assignment_runs(slot.w13,
+                                       slot.cpu_stage_w13,
+                                       stage_to_slot,
+                                       async_copy=False)
+        self._copy_npu_assignment_runs(slot.w2,
+                                       slot.cpu_stage_w2,
+                                       stage_to_slot,
+                                       async_copy=False)
 
     def _schedule_cpu_assignments_to_stage_async(
             self, slot: _Mode3DoubleBufferSlot, layer: Any,
@@ -654,18 +791,25 @@ class Mode3DoubleBufferManager:
                 "Mode3 async CPU staging buffers were not allocated: "
                 f"layer={getattr(layer, 'layer_idx', -1)}")
         with torch.npu.stream(cpu_prefetch_stream):
-            for stage_idx, (_slot_idx, cpu_slot) in enumerate(cpu_assignments):
-                self._copy_cpu_row_to_stage_async(
-                    slot.cpu_stage_w13[stage_idx], cpu_w13[int(cpu_slot)])
-                self._copy_cpu_row_to_stage_async(
-                    slot.cpu_stage_w2[stage_idx], cpu_w2[int(cpu_slot)])
+            self._copy_cpu_assignments_to_stage(slot,
+                                                cpu_assignments,
+                                                cpu_w13,
+                                                cpu_w2,
+                                                async_copy=True)
             if pack_to_runtime:
-                for stage_idx, (slot_idx, _cpu_slot) in enumerate(
-                        cpu_assignments):
-                    self._copy_row(slot.w13[int(slot_idx)],
-                                   slot.cpu_stage_w13[stage_idx])
-                    self._copy_row(slot.w2[int(slot_idx)],
-                                   slot.cpu_stage_w2[stage_idx])
+                stage_to_slot = [
+                    (int(slot_idx), stage_idx)
+                    for stage_idx, (slot_idx, _cpu_slot) in enumerate(
+                        cpu_assignments)
+                ]
+                self._copy_npu_assignment_runs(slot.w13,
+                                               slot.cpu_stage_w13,
+                                               stage_to_slot,
+                                               async_copy=True)
+                self._copy_npu_assignment_runs(slot.w2,
+                                               slot.cpu_stage_w2,
+                                               stage_to_slot,
+                                               async_copy=True)
                 slot.cpu_pack_event.record()
             else:
                 slot.cpu_ready_event.record()
@@ -689,11 +833,8 @@ class Mode3DoubleBufferManager:
         if not cpu_assignments:
             return
         with torch.npu.stream(cpu_prefetch_stream):
-            for slot_idx, cpu_slot in cpu_assignments:
-                self._copy_cpu_row_to_runtime_slot_async(
-                    slot.w13[int(slot_idx)], cpu_w13[int(cpu_slot)])
-                self._copy_cpu_row_to_runtime_slot_async(
-                    slot.w2[int(slot_idx)], cpu_w2[int(cpu_slot)])
+            self._copy_cpu_assignments_to_runtime_direct(
+                slot, cpu_assignments, cpu_w13, cpu_w2)
             slot.cpu_pack_event.record()
         slot.has_async_cpu_copy = False
         slot.has_async_cpu_pack = False
@@ -781,10 +922,14 @@ class Mode3DoubleBufferManager:
                         f"layer={layer.layer_idx} expert_id={int(expert_id)}")
                 cpu_assignments.append((slot_idx, int(cpu_slot)))
                 source_from_cpu += 1
-        copy_row = self._copy_row if async_copy else self._copy_row_sync
-        for slot_idx, source_local_slot in npu_assignments:
-            copy_row(slot.w13[slot_idx], layer.w13_weight[source_local_slot])
-            copy_row(slot.w2[slot_idx], layer.w2_weight[source_local_slot])
+        self._copy_npu_assignment_runs(slot.w13,
+                                       layer.w13_weight,
+                                       npu_assignments,
+                                       async_copy=async_copy)
+        self._copy_npu_assignment_runs(slot.w2,
+                                       layer.w2_weight,
+                                       npu_assignments,
+                                       async_copy=async_copy)
         slot.has_async_cpu_copy = False
         slot.has_async_cpu_pack = False
         slot.has_async_cpu_direct = False
@@ -887,12 +1032,19 @@ class Mode3DoubleBufferManager:
                     self.prefetch_stream.wait_event(slot.cpu_pack_event)
                 elif slot.has_async_cpu_copy:
                     self.prefetch_stream.wait_event(slot.cpu_ready_event)
-                    for stage_idx, slot_idx in enumerate(
-                            slot.cpu_stage_slot_ids[:slot.cpu_stage_count]):
-                        self._copy_row(slot.w13[slot_idx],
-                                       slot.cpu_stage_w13[stage_idx])
-                        self._copy_row(slot.w2[slot_idx],
-                                       slot.cpu_stage_w2[stage_idx])
+                    stage_to_slot = [
+                        (int(slot_idx), stage_idx)
+                        for stage_idx, slot_idx in enumerate(
+                            slot.cpu_stage_slot_ids[:slot.cpu_stage_count])
+                    ]
+                    self._copy_npu_assignment_runs(slot.w13,
+                                                   slot.cpu_stage_w13,
+                                                   stage_to_slot,
+                                                   async_copy=True)
+                    self._copy_npu_assignment_runs(slot.w2,
+                                                   slot.cpu_stage_w2,
+                                                   stage_to_slot,
+                                                   async_copy=True)
                 _event_record(end_event)
                 slot.ready_event.record()
             slot.inflight_prefetch = True
@@ -1616,6 +1768,157 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
         return final_hidden_states
 
+    def _execute_mode3_fused_experts_hybrid(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            logical_topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            row_idx: torch.Tensor,
+            shared_experts: Optional[Any],
+            enable_force_load_balance: bool,
+            kwargs: dict[str, Any],
+            manager: Optional[Mode3DoubleBufferManager] = None) -> torch.Tensor:
+        if manager is None:
+            manager = self._get_or_create_mode3_double_buffer_manager(layer)
+        if manager is None:
+            raise RuntimeError(
+                "Mode3 fused-experts path requires forward-context model "
+                f"instance and moe prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        profile_timing = manager.should_profile_layer(layer, "fused_experts")
+        bound_slot = manager.bind_current_layer(layer)
+        bind_timing = dict(manager.last_bind_timing)
+        next_prefetch_timing = manager.prefetch_next_layer(layer)
+
+        local_rank_idx = int(
+            getattr(layer, "lossless_hybrid_active_rank_index", -1))
+        rank_owned = getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)
+        if (rank_owned is None or local_rank_idx < 0
+                or local_rank_idx >= len(rank_owned)):
+            raise RuntimeError(
+                "Invalid hybrid rank ownership state for mode3 fused-experts "
+                f"path at layer={getattr(layer, 'layer_idx', -1)}.")
+        local_owned_expert_ids = [int(x) for x in rank_owned[local_rank_idx]]
+        active_rank_count = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+        owned_per_rank = len(local_owned_expert_ids)
+        if active_rank_count <= 0 or owned_per_rank <= 0:
+            raise RuntimeError(
+                "Invalid hybrid mode3 fused-experts shape: "
+                f"active_rank_count={active_rank_count} "
+                f"owned_per_rank={owned_per_rank}")
+
+        remap_wall_start = time.perf_counter()
+        dispatch_log2phy, dispatch_num_experts = \
+            self._get_dispatch_log2phy_for_layer(
+                layer,
+                device=logical_topk_ids.device,
+                rank_owned=rank_owned,
+                active_rank_count=active_rank_count,
+                owned_per_rank=owned_per_rank,
+            )
+        remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
+
+        compute_wall_start = time.perf_counter()
+        compute_start_event = manager.new_timing_event() if profile_timing else None
+        compute_end_event = manager.new_timing_event() if profile_timing else None
+        fused_start_event = manager.new_timing_event() if profile_timing else None
+        fused_end_event = manager.new_timing_event() if profile_timing else None
+        _event_record(compute_start_event)
+
+        moe_comm_method = get_forward_context().moe_comm_method
+        token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
+        old_dispatch_num_experts = int(getattr(token_dispatcher, "num_experts", 0)
+                                       ) if token_dispatcher is not None else 0
+        old_expert_token_nums_type = int(
+            getattr(token_dispatcher, "expert_token_nums_type", 0)
+        ) if token_dispatcher is not None else 0
+        try:
+            if token_dispatcher is not None:
+                token_dispatcher.num_experts = dispatch_num_experts
+                token_dispatcher.expert_token_nums_type = (
+                    manager.expert_token_nums_type)
+            fused_wall_start = time.perf_counter()
+            _event_record(fused_start_event)
+            final_hidden_states = self._execute_single_wave(
+                layer=layer,
+                hidden_states=x,
+                logical_topk_ids=logical_topk_ids,
+                topk_weights=topk_weights,
+                row_idx=row_idx,
+                global_num_experts=dispatch_num_experts,
+                shared_experts=shared_experts,
+                log2phy=dispatch_log2phy,
+                mc2_mask=getattr(moe_comm_method, "mc2_mask", None),
+                enable_force_load_balance=enable_force_load_balance,
+                kwargs=kwargs)
+            _event_record(fused_end_event)
+            fused_wall_ms = (time.perf_counter() - fused_wall_start) * 1e3
+        finally:
+            if token_dispatcher is not None:
+                token_dispatcher.num_experts = old_dispatch_num_experts
+                token_dispatcher.expert_token_nums_type = (
+                    old_expert_token_nums_type)
+        _event_record(compute_end_event)
+        compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
+
+        layer.lossless_hybrid_last_stats = {
+            "mode3_slot": int(layer.layer_idx) & 1,
+            "valid_experts": bound_slot.valid_expert_count,
+            "source_from_npu": bound_slot.source_from_npu,
+            "source_from_cpu": bound_slot.source_from_cpu,
+            "prefetch_wait_us": float(
+                manager.prefetch_wait_us[int(layer.layer_idx)]),
+            "prefetch_hit": int(manager.prefetch_hit[int(layer.layer_idx)]),
+            "fused_experts_path": 1,
+        }
+        if layer.layer_idx == 0 and manager.enable_transfer_logs:
+            logger.info(
+                "Mode3 fused-experts execution: rank=%s layer=%s stage=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s dispatch_experts=%s prefetch_wait_us=%.1f prefetch_hit=%s",
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                active_rank_count,
+                bound_slot.valid_expert_count,
+                bound_slot.source_from_npu,
+                bound_slot.source_from_cpu,
+                dispatch_num_experts,
+                float(manager.prefetch_wait_us[int(layer.layer_idx)]),
+                int(manager.prefetch_hit[int(layer.layer_idx)]),
+            )
+        if profile_timing:
+            prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
+            fused_dev_ms = _elapsed_ms(fused_start_event, fused_end_event)
+            logger.info(
+                "Mode3 timing fused-experts: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_submit_us=%.1f prefetch_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f fused_wall_ms=%.3f fused_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s owned_per_rank=%s dispatch_num_experts=%s expert_token_nums_type=%s",
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                active_rank_count,
+                int(bind_timing.get("slot_id", -1)),
+                bound_slot.valid_expert_count,
+                bound_slot.source_from_npu,
+                bound_slot.source_from_cpu,
+                float(bind_timing.get("wait_us", -1.0)),
+                float(bind_timing.get("cpu_fill_us", -1.0)),
+                bind_timing.get("wait_mode", "unknown"),
+                next_prefetch_timing.get("layer_idx", -1),
+                next_prefetch_timing.get("slot_id", -1),
+                next_prefetch_timing.get("source_from_cpu", -1),
+                float(next_prefetch_timing.get("submit_us", -1.0)),
+                prefetch_dev_ms,
+                compute_wall_ms,
+                compute_dev_ms,
+                remap_wall_ms,
+                fused_wall_ms,
+                fused_dev_ms,
+                prefetch_dev_ms - compute_dev_ms
+                if prefetch_dev_ms >= 0 and compute_dev_ms >= 0 else -1.0,
+                int(x.shape[0]) if hasattr(x, "shape") else -1,
+                owned_per_rank,
+                dispatch_num_experts,
+                manager.expert_token_nums_type,
+            )
+        return final_hidden_states
+
     def _execute_mode3_single_dispatch_hybrid(
             self,
             layer: torch.nn.Module,
@@ -1631,6 +1934,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             raise RuntimeError(
                 "Mode3 single-dispatch requires forward-context model instance "
                 f"and moe prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        if manager.use_fused_experts_path:
+            return self._execute_mode3_fused_experts_hybrid(
+                layer=layer,
+                x=x,
+                logical_topk_ids=logical_topk_ids,
+                topk_weights=topk_weights,
+                row_idx=row_idx,
+                shared_experts=shared_experts,
+                enable_force_load_balance=enable_force_load_balance,
+                kwargs=kwargs,
+                manager=manager)
         profile_timing = manager.should_profile_layer(layer, "single_dispatch")
         bound_slot = manager.bind_current_layer(layer)
         bind_timing = dict(manager.last_bind_timing)
@@ -1700,7 +2014,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
 
         old_dispatch_num_experts = int(getattr(token_dispatcher, "num_experts", 0))
+        old_expert_token_nums_type = int(
+            getattr(token_dispatcher, "expert_token_nums_type", 0))
         token_dispatcher.num_experts = dispatch_num_experts
+        token_dispatcher.expert_token_nums_type = manager.expert_token_nums_type
         dispatch_wall_ms = -1.0
         group_wall_ms = -1.0
         mlp_wall_ms = -1.0
@@ -1743,11 +2060,14 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     f"expected_experts={owned_per_rank} "
                     f"actual_experts={int(dispatched_group_counts.numel())} "
                     f"group_list_type={dispatched_group_list_type}")
-            dispatch_offsets = self._counts_to_offsets(dispatched_group_counts)
-            dispatched_active_rows = int(dispatch_offsets[-1].item())
             dispatched_rows = int(dispatched_hidden_states.shape[0])
+            if profile_timing and manager.enable_active_rows_sync:
+                # Keep the hot path asynchronous. This host read is only for
+                # sampled diagnostics and used to cost ~ms in group_wall_ms.
+                dispatched_active_rows = int(dispatched_group_counts.sum().item())
             group_wall_ms = (time.perf_counter() - group_wall_start) * 1e3
-            if dispatched_active_rows > int(dispatched_hidden_states.shape[0]):
+            if (dispatched_active_rows >= 0
+                    and dispatched_active_rows > int(dispatched_hidden_states.shape[0])):
                 raise RuntimeError(
                     "Mode3 single-dispatch local token count mismatch: "
                     f"expected<={int(dispatched_hidden_states.shape[0])} "
@@ -1790,6 +2110,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                combine_wall_start) * 1e3
         finally:
             token_dispatcher.num_experts = old_dispatch_num_experts
+            token_dispatcher.expert_token_nums_type = old_expert_token_nums_type
         _event_record(compute_end_event)
         compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
@@ -1817,7 +2138,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
             compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
             logger.info(
-                "Mode3 timing single-dispatch: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_submit_us=%.1f prefetch_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f token_dispatch_wall_ms=%.3f token_dispatch_dev_ms=%.3f group_wall_ms=%.3f mlp_wall_ms=%.3f mlp_dev_ms=%.3f token_combine_wall_ms=%.3f token_combine_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s dispatched_rows=%s active_rows=%s owned_per_rank=%s dispatch_num_experts=%s",
+                "Mode3 timing single-dispatch: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_submit_us=%.1f prefetch_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f token_dispatch_wall_ms=%.3f token_dispatch_dev_ms=%.3f group_wall_ms=%.3f mlp_wall_ms=%.3f mlp_dev_ms=%.3f token_combine_wall_ms=%.3f token_combine_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s dispatched_rows=%s active_rows=%s owned_per_rank=%s dispatch_num_experts=%s expert_token_nums_type=%s group_list_type=%s",
                 layer.rank if hasattr(layer, "rank") else -1,
                 layer.layer_idx,
                 active_rank_count,
@@ -1851,6 +2172,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 dispatched_active_rows,
                 owned_per_rank,
                 dispatch_num_experts,
+                manager.expert_token_nums_type,
+                dispatched_group_list_type,
             )
         return final_hidden_states
 

@@ -115,6 +115,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.shared_experts = None
         self.mc2_mask = None
         self.with_quant = False
+        self.expert_token_nums_type = 0
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -140,7 +141,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "shared_expert_rank_num": 0,
             "moe_expert_num": moe_expert_num,
             "global_bs": 0,
-            "expert_token_nums_type": 0,
+            "expert_token_nums_type": int(
+                getattr(self, "expert_token_nums_type", 0)),
         }
 
         stage1_kwargs = {
@@ -227,7 +229,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             if shared_experts is not None:
                 shared_gate_up, _ = shared_experts.gate_up_proj(hidden_states)
                 self.shared_act = shared_experts.act_fn(shared_gate_up)
-        group_list_type = 0
+        group_list_type = int(getattr(self, "expert_token_nums_type", 0))
         return {
             "group_list_type": group_list_type,
             "hidden_states": expand_x,
