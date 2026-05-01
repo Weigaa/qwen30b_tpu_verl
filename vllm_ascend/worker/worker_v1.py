@@ -1296,6 +1296,8 @@ class NPUWorker(WorkerBase):
                             "w2_abs_mean": float(
                                 sample_w2.float().abs().mean().item()),
                         }
+                mapping_mismatch = 0
+                if new_log2phy_cpu is not None:
                     if use_hybrid_cpu_swap:
                         resident_capacity = int(
                             module.lossless_hybrid_resident_capacity)

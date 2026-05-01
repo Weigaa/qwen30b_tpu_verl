@@ -19,6 +19,7 @@
 
 import copy
 import gc
+import inspect
 import itertools
 import time
 import os
@@ -452,6 +453,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
+        self._model_forward_accepts_is_dummy: Optional[bool] = None
 
         # kv role
         self.is_kv_producer = False
@@ -957,6 +959,24 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if isinstance(self.model, ACLGraphWrapper):
             return self.model.unwrap()
         return self.model
+
+    def _model_forward_supports_is_dummy(self) -> bool:
+        if self._model_forward_accepts_is_dummy is not None:
+            return self._model_forward_accepts_is_dummy
+
+        model = self.get_model()
+        try:
+            signature = inspect.signature(model.forward)
+        except (TypeError, ValueError):
+            self._model_forward_accepts_is_dummy = False
+            return False
+
+        params = signature.parameters
+        self._model_forward_accepts_is_dummy = (
+            "is_dummy" in params or any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in params.values()))
+        return self._model_forward_accepts_is_dummy
 
     def get_supported_generation_tasks(self) -> "list[GenerationTask]":
         model = self.get_model()
@@ -2569,11 +2589,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                           positions, attn_metadata, num_tokens,
                                           intermediate_tensors, inputs_embeds, is_long_tail):
         #print("dummy forward in model_runner_v1.py")
-        hidden_states = self.model(input_ids=input_ids,
-                                   positions=positions,
-                                   intermediate_tensors=intermediate_tensors,
-                                   inputs_embeds=inputs_embeds,
-                                   is_dummy=is_long_tail)
+        model_kwargs = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "intermediate_tensors": intermediate_tensors,
+            "inputs_embeds": inputs_embeds,
+        }
+        if self._model_forward_supports_is_dummy():
+            model_kwargs["is_dummy"] = is_long_tail
+        hidden_states = self.model(**model_kwargs)
         if self.drafter and self.drafter.name == SpecDcodeType.EAGLE3:
             hidden_states, _ = hidden_states
         else:

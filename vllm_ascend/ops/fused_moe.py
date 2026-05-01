@@ -114,6 +114,68 @@ def _event_record(event: Optional[Any]) -> None:
         pass
 
 
+_MODE3_SUBMIT_TIMING_KEYS = (
+    "submit_event_alloc_us",
+    "submit_stream_wait_us",
+    "submit_prefetch_wait_stream_us",
+    "submit_start_event_record_us",
+    "submit_populate_us",
+    "submit_order_us",
+    "submit_assign_us",
+    "submit_layer_local_check_us",
+    "submit_npu_us",
+    "submit_cpu_us",
+    "submit_cpu_direct_async_us",
+    "submit_cpu_stage_async_us",
+    "submit_plan_log_us",
+    "submit_expert_map_us",
+    "submit_dispatch_cache_us",
+    "submit_slot_state_us",
+    "submit_post_cpu_wait_us",
+    "submit_ready_record_us",
+)
+
+
+def _timing_float(timing: Optional[dict[str, Any]], key: str) -> float:
+    if not timing:
+        return -1.0
+    try:
+        return float(timing.get(key, -1.0))
+    except Exception:
+        return -1.0
+
+
+def _mode3_submit_accounted_us(timing: Optional[dict[str, Any]]) -> float:
+    if not timing:
+        return -1.0
+    total = 0.0
+    seen = False
+    for key in _MODE3_SUBMIT_TIMING_KEYS:
+        value = _timing_float(timing, key)
+        if value >= 0.0:
+            total += value
+            seen = True
+    return total if seen else -1.0
+
+
+def _tensor_is_pinned(tensor: Optional[torch.Tensor]) -> int:
+    if tensor is None or tensor.device.type != "cpu":
+        return 0
+    try:
+        return int(bool(tensor.is_pinned()))
+    except Exception:
+        return -1
+
+
+def _tensor_is_contiguous(tensor: Optional[torch.Tensor]) -> int:
+    if tensor is None:
+        return 0
+    try:
+        return int(bool(tensor.is_contiguous()))
+    except Exception:
+        return -1
+
+
 def _maybe_pin_cpu_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     if tensor is None or tensor.device.type != "cpu":
         return tensor
@@ -288,12 +350,14 @@ class _Mode3DoubleBufferSlot:
         self.has_async_cpu_pack = False
         self.has_async_cpu_direct = False
         self.needs_sync_cpu_fill = False
+        self.uses_layer_local_buffer = False
         self.ready_event = torch.npu.Event()
         self.cpu_ready_event = torch.npu.Event()
         self.cpu_pack_event = torch.npu.Event()
         self.prefetch_start_event = None
         self.prefetch_end_event = None
         self.prefetch_timing: dict[str, Any] = {}
+        self.prefetch_cpu_path = "none"
         self.dispatch_log2phy = None
         self.dispatch_num_experts = 0
         self.dispatch_signature: Optional[tuple[Any, ...]] = None
@@ -323,8 +387,11 @@ class Mode3DoubleBufferManager:
         self._logged_prefetch_deferrals: set[tuple[int, int]] = set()
         self._logged_cpu_fill_deferrals: set[tuple[int, int]] = set()
         self._logged_async_cpu_stage: set[tuple[int, int]] = set()
+        self._logged_transfer_plans: set[tuple[int, int, str]] = set()
         self._dispatch_remap_cache: dict[
             tuple[str, tuple[Any, ...]], dict[str, Any]] = {}
+        self._slot_expert_map_cache: dict[
+            tuple[str, int, tuple[int, ...]], torch.Tensor] = {}
         self.enable_async_npu_prefetch = _env_flag(
             "VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH")
         self.enable_async_cpu_stage = _env_flag(
@@ -341,6 +408,8 @@ class Mode3DoubleBufferManager:
             "VLLM_ASCEND_MODE3_BULK_CPU_STAGE", "1")
         self.enable_bulk_cpu_direct = _env_flag(
             "VLLM_ASCEND_MODE3_BULK_CPU_DIRECT")
+        self.enable_layer_local_buffer = _env_flag(
+            "VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER")
         self.enable_active_rows_sync = _env_flag(
             "VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC")
         self.expert_token_nums_type = _env_int(
@@ -351,6 +420,10 @@ class Mode3DoubleBufferManager:
             "VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH", "1")
         self.enable_transfer_logs = _env_flag(
             "VLLM_ASCEND_MODE3_TRANSFER_LOG")
+        self.enable_transfer_plan_logs = _env_flag(
+            "VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG")
+        self.transfer_plan_first_n = _env_int(
+            "VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N", 4, minimum=0)
         self.enable_timing_logs = _env_flag(
             "VLLM_ASCEND_MODE3_TIMING_LOG")
         self.enable_timing_sync = _env_flag(
@@ -429,6 +502,19 @@ class Mode3DoubleBufferManager:
             seen_experts.add(int(expert_id))
             expert_map[int(expert_id)] = slot_idx
         return expert_map
+
+    def _get_cached_slot_expert_map(
+            self, layer: Any, expert_ids: list[int],
+            device: torch.device) -> tuple[torch.Tensor, bool]:
+        expert_ids_key = tuple(int(expert_id) for expert_id in expert_ids)
+        cache_key = (str(device), int(layer.elastic_original_num_experts),
+                     expert_ids_key)
+        cached = self._slot_expert_map_cache.get(cache_key)
+        if cached is not None:
+            return cached, True
+        expert_map = self._build_slot_expert_map(layer, expert_ids, device)
+        self._slot_expert_map_cache[cache_key] = expert_map
+        return expert_map, False
 
     @staticmethod
     def _ordered_mode3_slot_expert_ids(layer: Any) -> list[int]:
@@ -588,6 +674,105 @@ class Mode3DoubleBufferManager:
             prev_dst, prev_src = dst_idx, src_idx
         runs.append((int(dst_start), int(src_start), int(length)))
         return runs
+
+    def _assignment_submit_count(self, assignments: list[tuple[int, int]],
+                                 *, bulk_enabled: bool) -> int:
+        if not assignments:
+            return 0
+        if not bulk_enabled:
+            return len(assignments)
+        return len(self._assignment_runs(assignments))
+
+    def _maybe_log_transfer_plan(
+            self, layer: Any, *, reason: str, async_copy: bool,
+            slot_id: int, npu_assignments: list[tuple[int, int]],
+            cpu_assignments: list[tuple[int, int]], cpu_path: str,
+            use_layer_local_buffer: bool,
+            cpu_prefetch_stream: Optional[torch.npu.Stream],
+            cpu_w13: Optional[torch.Tensor],
+            cpu_w2: Optional[torch.Tensor]) -> None:
+        if not self.enable_transfer_plan_logs:
+            return
+        layer_idx = int(getattr(layer, "layer_idx", -1))
+        if self.transfer_plan_first_n <= 0:
+            return
+        if layer_idx >= self.transfer_plan_first_n:
+            return
+        log_key = (layer_idx, int(async_copy), str(reason))
+        if log_key in self._logged_transfer_plans:
+            return
+        stage_assignments = [
+            (stage_idx, int(cpu_slot))
+            for stage_idx, (_slot_idx, cpu_slot) in enumerate(cpu_assignments)
+        ]
+        stage_to_slot = [
+            (int(slot_idx), stage_idx)
+            for stage_idx, (slot_idx, _cpu_slot) in enumerate(cpu_assignments)
+        ]
+        npu_path = "layer_local" if use_layer_local_buffer else (
+            "bulk" if self.enable_bulk_npu_copy else "per_row")
+        npu_submit_count = 0 if use_layer_local_buffer else \
+            self._assignment_submit_count(
+                npu_assignments, bulk_enabled=self.enable_bulk_npu_copy)
+        cpu_direct_submits = -1
+        cpu_stage_submits = -1
+        cpu_pack_submits = -1
+        if cpu_path == "direct_async":
+            cpu_direct_submits = self._assignment_submit_count(
+                cpu_assignments, bulk_enabled=self.enable_bulk_cpu_direct)
+        elif cpu_path in ("stage_async_pack", "stage_async_wait_pack",
+                          "sync_stage"):
+            cpu_stage_submits = self._assignment_submit_count(
+                stage_assignments, bulk_enabled=self.enable_bulk_cpu_stage)
+            if cpu_path in ("stage_async_pack", "sync_stage"):
+                cpu_pack_submits = self._assignment_submit_count(
+                    stage_to_slot, bulk_enabled=self.enable_bulk_npu_copy)
+        elif cpu_path == "defer_sync_fill":
+            cpu_stage_submits = self._assignment_submit_count(
+                stage_assignments, bulk_enabled=self.enable_bulk_cpu_stage)
+            cpu_pack_submits = self._assignment_submit_count(
+                stage_to_slot, bulk_enabled=self.enable_bulk_npu_copy)
+
+        logger.info(
+            "Mode3 transfer plan: layer=%s slot=%s reason=%s async=%s "
+            "cpu_stream=%s valid_experts=%s npu_rows=%s npu_path=%s "
+            "npu_submit_count=%s cpu_rows=%s cpu_path=%s "
+            "cpu_direct_submit_count=%s cpu_stage_submit_count=%s "
+            "cpu_pack_submit_count=%s bulk_npu=%s bulk_cpu_stage=%s "
+            "bulk_cpu_direct=%s async_cpu_stage=%s async_cpu_pack=%s "
+            "direct_cpu_slot=%s device_ready_wait=%s layer_local=%s "
+            "cpu_w13_contig=%s cpu_w2_contig=%s "
+            "cpu_w13_pinned=%s cpu_w2_pinned=%s npu_head=%s cpu_head=%s",
+            layer_idx,
+            slot_id,
+            reason,
+            int(async_copy),
+            int(cpu_prefetch_stream is not None),
+            len(npu_assignments) + len(cpu_assignments),
+            len(npu_assignments),
+            npu_path,
+            npu_submit_count,
+            len(cpu_assignments),
+            cpu_path,
+            cpu_direct_submits,
+            cpu_stage_submits,
+            cpu_pack_submits,
+            int(self.enable_bulk_npu_copy),
+            int(self.enable_bulk_cpu_stage),
+            int(self.enable_bulk_cpu_direct),
+            int(self.enable_async_cpu_stage),
+            int(self.enable_async_cpu_pack),
+            int(self.enable_direct_cpu_slot),
+            int(self.enable_device_ready_wait),
+            int(use_layer_local_buffer),
+            _tensor_is_contiguous(cpu_w13),
+            _tensor_is_contiguous(cpu_w2),
+            _tensor_is_pinned(cpu_w13),
+            _tensor_is_pinned(cpu_w2),
+            npu_assignments[:4],
+            cpu_assignments[:4],
+        )
+        self._logged_transfer_plans.add(log_key)
 
     def _copy_npu_assignment_runs(self, dst: torch.Tensor, src: torch.Tensor,
                                   assignments: list[tuple[int, int]],
@@ -778,30 +963,54 @@ class Mode3DoubleBufferManager:
                                        stage_to_slot,
                                        async_copy=False)
 
+    def _can_use_layer_local_buffer(
+            self, layer: Any, valid_expert_count: int,
+            npu_assignments: list[tuple[int, int]]) -> bool:
+        if not self.enable_layer_local_buffer:
+            return False
+        if valid_expert_count <= 0:
+            return False
+        if (layer.w13_weight is None or layer.w2_weight is None
+                or int(layer.w13_weight.shape[0]) < valid_expert_count
+                or int(layer.w2_weight.shape[0]) < valid_expert_count):
+            return False
+        # The fixed resident experts are already materialized in the layer's
+        # prefix slots. Reuse them only when the desired dense runtime slot is
+        # exactly the resident source slot; otherwise fall back to the safe
+        # runtime double-buffer copy path.
+        return all(int(dst_idx) == int(src_idx)
+                   for dst_idx, src_idx in npu_assignments)
+
     def _schedule_cpu_assignments_to_stage_async(
             self, slot: _Mode3DoubleBufferSlot, layer: Any,
             cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
             cpu_w2: torch.Tensor, cpu_prefetch_stream: torch.npu.Stream,
-            *, pack_to_runtime: bool) -> None:
+            *, pack_to_runtime: bool,
+            timing_events: Optional[dict[str, Any]] = None,
+            host_timing: Optional[dict[str, float]] = None) -> None:
         if not cpu_assignments:
             return
+        host_start = time.perf_counter() if host_timing is not None else 0.0
         self._ensure_cpu_stage_capacity(slot, layer, len(cpu_assignments))
         if slot.cpu_stage_w13 is None or slot.cpu_stage_w2 is None:
             raise RuntimeError(
                 "Mode3 async CPU staging buffers were not allocated: "
                 f"layer={getattr(layer, 'layer_idx', -1)}")
         with torch.npu.stream(cpu_prefetch_stream):
+            _event_record((timing_events or {}).get("cpu_start_event"))
             self._copy_cpu_assignments_to_stage(slot,
                                                 cpu_assignments,
                                                 cpu_w13,
                                                 cpu_w2,
                                                 async_copy=True)
+            _event_record((timing_events or {}).get("cpu_end_event"))
             if pack_to_runtime:
                 stage_to_slot = [
                     (int(slot_idx), stage_idx)
                     for stage_idx, (slot_idx, _cpu_slot) in enumerate(
                         cpu_assignments)
                 ]
+                _event_record((timing_events or {}).get("cpu_pack_start_event"))
                 self._copy_npu_assignment_runs(slot.w13,
                                                slot.cpu_stage_w13,
                                                stage_to_slot,
@@ -810,9 +1019,13 @@ class Mode3DoubleBufferManager:
                                                slot.cpu_stage_w2,
                                                stage_to_slot,
                                                async_copy=True)
+                _event_record((timing_events or {}).get("cpu_pack_end_event"))
                 slot.cpu_pack_event.record()
             else:
                 slot.cpu_ready_event.record()
+        if host_timing is not None:
+            host_timing["submit_cpu_stage_async_us"] = (
+                time.perf_counter() - host_start) * 1e6
         slot.has_async_cpu_copy = not pack_to_runtime
         slot.has_async_cpu_pack = pack_to_runtime
         slot.needs_sync_cpu_fill = False
@@ -829,13 +1042,21 @@ class Mode3DoubleBufferManager:
     def _schedule_cpu_assignments_to_slot_async(
             self, slot: _Mode3DoubleBufferSlot, layer: Any,
             cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
-            cpu_w2: torch.Tensor, cpu_prefetch_stream: torch.npu.Stream) -> None:
+            cpu_w2: torch.Tensor, cpu_prefetch_stream: torch.npu.Stream,
+            timing_events: Optional[dict[str, Any]] = None,
+            host_timing: Optional[dict[str, float]] = None) -> None:
         if not cpu_assignments:
             return
+        host_start = time.perf_counter() if host_timing is not None else 0.0
         with torch.npu.stream(cpu_prefetch_stream):
+            _event_record((timing_events or {}).get("cpu_start_event"))
             self._copy_cpu_assignments_to_runtime_direct(
                 slot, cpu_assignments, cpu_w13, cpu_w2)
+            _event_record((timing_events or {}).get("cpu_end_event"))
             slot.cpu_pack_event.record()
+        if host_timing is not None:
+            host_timing["submit_cpu_direct_async_us"] = (
+                time.perf_counter() - host_start) * 1e6
         slot.has_async_cpu_copy = False
         slot.has_async_cpu_pack = False
         slot.has_async_cpu_direct = True
@@ -890,13 +1111,22 @@ class Mode3DoubleBufferManager:
                        layer: Any,
                        *,
                        async_copy: bool,
-                       cpu_prefetch_stream: Optional[torch.npu.Stream] = None) -> None:
-        self._ensure_slot_capacity(slot, layer)
+                       cpu_prefetch_stream: Optional[torch.npu.Stream] = None,
+                       reason: str = "",
+                       timing_events: Optional[dict[str, Any]] = None,
+                       host_timing: Optional[dict[str, float]] = None) -> None:
+        populate_host_start = (
+            time.perf_counter() if host_timing is not None else 0.0)
+        phase_start = time.perf_counter() if host_timing is not None else 0.0
         slot_expert_ids = self._ordered_mode3_slot_expert_ids(layer)
         valid_expert_count = len(slot_expert_ids)
         if valid_expert_count <= 0:
             raise RuntimeError(
                 f"Mode3 slot population requires owned experts at layer={layer.layer_idx}.")
+        if host_timing is not None:
+            host_timing["submit_order_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
         primary_slots = getattr(layer, "lossless_mode3_primary_prefix_local_slots",
                                 {})
         cpu_shadow_slots = getattr(layer, "lossless_cpu_shadow_local_slots", {})
@@ -905,6 +1135,13 @@ class Mode3DoubleBufferManager:
         if cpu_w13 is None or cpu_w2 is None:
             raise RuntimeError(
                 f"Mode3 slot population requires CPU shadow weights at layer={layer.layer_idx}.")
+        if host_timing is not None:
+            host_timing["cpu_w13_pinned"] = float(_tensor_is_pinned(cpu_w13))
+            host_timing["cpu_w2_pinned"] = float(_tensor_is_pinned(cpu_w2))
+            host_timing["cpu_w13_contig"] = float(
+                _tensor_is_contiguous(cpu_w13))
+            host_timing["cpu_w2_contig"] = float(
+                _tensor_is_contiguous(cpu_w2))
         source_from_npu = 0
         source_from_cpu = 0
         npu_assignments: list[tuple[int, int]] = []
@@ -922,30 +1159,58 @@ class Mode3DoubleBufferManager:
                         f"layer={layer.layer_idx} expert_id={int(expert_id)}")
                 cpu_assignments.append((slot_idx, int(cpu_slot)))
                 source_from_cpu += 1
-        self._copy_npu_assignment_runs(slot.w13,
-                                       layer.w13_weight,
-                                       npu_assignments,
-                                       async_copy=async_copy)
-        self._copy_npu_assignment_runs(slot.w2,
-                                       layer.w2_weight,
-                                       npu_assignments,
-                                       async_copy=async_copy)
+        if host_timing is not None:
+            host_timing["submit_assign_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        use_layer_local_buffer = self._can_use_layer_local_buffer(
+            layer, valid_expert_count, npu_assignments)
+        if host_timing is not None:
+            host_timing["submit_layer_local_check_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        if use_layer_local_buffer:
+            slot.w13 = layer.w13_weight
+            slot.w2 = layer.w2_weight
+        else:
+            if slot.uses_layer_local_buffer:
+                slot.w13 = None
+                slot.w2 = None
+            self._ensure_slot_capacity(slot, layer)
+            _event_record((timing_events or {}).get("npu_start_event"))
+            self._copy_npu_assignment_runs(slot.w13,
+                                           layer.w13_weight,
+                                           npu_assignments,
+                                           async_copy=async_copy)
+            self._copy_npu_assignment_runs(slot.w2,
+                                           layer.w2_weight,
+                                           npu_assignments,
+                                           async_copy=async_copy)
+            _event_record((timing_events or {}).get("npu_end_event"))
+        if host_timing is not None:
+            host_timing["submit_npu_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
         slot.has_async_cpu_copy = False
         slot.has_async_cpu_pack = False
         slot.has_async_cpu_direct = False
         slot.needs_sync_cpu_fill = False
+        slot.uses_layer_local_buffer = bool(use_layer_local_buffer)
         slot.cpu_stage_slot_ids = tuple(slot_idx for slot_idx, _ in cpu_assignments)
         slot.cpu_stage_cpu_slots = tuple(cpu_slot for _, cpu_slot in cpu_assignments)
         slot.cpu_stage_count = len(cpu_assignments)
+        cpu_path = "none"
         if cpu_assignments:
             if (async_copy and cpu_prefetch_stream is not None
                     and self.enable_direct_cpu_slot):
                 # Direct-slot experiment: write CPU shadow rows directly into
                 # their final runtime expert slots on the CPU prefetch stream,
                 # bypassing the plain NPU staging buffer.
+                cpu_path = "direct_async"
                 self._schedule_cpu_assignments_to_slot_async(
                     slot, layer, cpu_assignments, cpu_w13, cpu_w2,
-                    cpu_prefetch_stream)
+                    cpu_prefetch_stream, timing_events=timing_events,
+                    host_timing=host_timing)
             elif (async_copy and cpu_prefetch_stream is not None
                     and self.enable_async_cpu_stage):
                 # CPU shadow rows first land in a plain NPU staging buffer on
@@ -953,14 +1218,19 @@ class Mode3DoubleBufferManager:
                 # stream also copies staged rows into their final runtime
                 # slots; otherwise the main prefetch stream does that after
                 # waiting on the CPU staging event.
+                cpu_path = ("stage_async_pack" if self.enable_async_cpu_pack
+                            else "stage_async_wait_pack")
                 self._schedule_cpu_assignments_to_stage_async(
                     slot, layer, cpu_assignments, cpu_w13, cpu_w2,
                     cpu_prefetch_stream,
-                    pack_to_runtime=self.enable_async_cpu_pack)
+                    pack_to_runtime=self.enable_async_cpu_pack,
+                    timing_events=timing_events,
+                    host_timing=host_timing)
             elif async_copy and cpu_prefetch_stream is not None:
                 # Keep resident NPU experts prefetched, but fill CPU shadow rows
                 # at bind-time through the plain NPU staging buffer when async
                 # CPU staging is disabled.
+                cpu_path = "defer_sync_fill"
                 self._ensure_cpu_stage_capacity(slot, layer, len(cpu_assignments))
                 slot.needs_sync_cpu_fill = True
                 log_key = (int(layer.layer_idx), len(cpu_assignments))
@@ -973,14 +1243,48 @@ class Mode3DoubleBufferManager:
                     )
                     self._logged_cpu_fill_deferrals.add(log_key)
             else:
+                cpu_path = "sync_stage"
                 self._copy_cpu_assignments_via_stage(slot, layer,
                                                      cpu_assignments, cpu_w13,
                                                      cpu_w2)
-        slot.expert_map = self._build_slot_expert_map(layer, slot_expert_ids,
-                                                      slot.w13.device)
+        if host_timing is not None:
+            host_timing["submit_cpu_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        self._maybe_log_transfer_plan(
+            layer,
+            reason=reason,
+            async_copy=async_copy,
+            slot_id=self._slot_id_for_layer(int(layer.layer_idx)),
+            npu_assignments=npu_assignments,
+            cpu_assignments=cpu_assignments,
+            cpu_path=cpu_path,
+            use_layer_local_buffer=use_layer_local_buffer,
+            cpu_prefetch_stream=cpu_prefetch_stream,
+            cpu_w13=cpu_w13,
+            cpu_w2=cpu_w2,
+        )
+        if host_timing is not None:
+            host_timing["submit_plan_log_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        slot.prefetch_cpu_path = cpu_path
+        slot.expert_map, expert_map_cache_hit = \
+            self._get_cached_slot_expert_map(layer, slot_expert_ids,
+                                             slot.w13.device)
+        if host_timing is not None:
+            host_timing["submit_expert_map_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            host_timing["expert_map_cache_hit"] = float(
+                int(expert_map_cache_hit))
+            phase_start = time.perf_counter()
         dispatch_log2phy, dispatch_num_experts, dispatch_signature, \
             dispatch_active_rank_count, dispatch_owned_per_rank = \
             self._get_cached_dispatch_remap(layer, slot.w13.device)
+        if host_timing is not None:
+            host_timing["submit_dispatch_cache_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
         slot.layer_idx = int(layer.layer_idx)
         slot.expert_ids = tuple(slot_expert_ids)
         slot.valid_expert_count = valid_expert_count
@@ -991,6 +1295,11 @@ class Mode3DoubleBufferManager:
         slot.dispatch_signature = dispatch_signature
         slot.dispatch_active_rank_count = dispatch_active_rank_count
         slot.dispatch_owned_per_rank = dispatch_owned_per_rank
+        if host_timing is not None:
+            host_timing["submit_slot_state_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            host_timing["submit_populate_total_us"] = (
+                time.perf_counter() - populate_host_start) * 1e6
 
     def _slot_matches(self, slot: _Mode3DoubleBufferSlot, layer: Any) -> bool:
         ordered_slot_expert_ids = tuple(self._ordered_mode3_slot_expert_ids(layer))
@@ -1012,22 +1321,56 @@ class Mode3DoubleBufferManager:
                      *,
                      reason: str) -> _Mode3DoubleBufferSlot:
         slot = self.slots[slot_id]
-        if self._slot_matches(slot, layer) and not slot.inflight_prefetch:
+        if self._slot_matches(slot, layer):
             return slot
         submit_start = time.perf_counter()
+        host_timing: Optional[dict[str, float]] = (
+            {} if self.enable_timing_logs else None)
+        event_alloc_start = time.perf_counter()
         start_event = self.new_timing_event() if async_copy else None
         end_event = self.new_timing_event() if async_copy else None
+        timing_events = {
+            "npu_start_event": self.new_timing_event() if async_copy else None,
+            "npu_end_event": self.new_timing_event() if async_copy else None,
+            "cpu_start_event": self.new_timing_event() if async_copy else None,
+            "cpu_end_event": self.new_timing_event() if async_copy else None,
+            "cpu_pack_start_event": self.new_timing_event() if async_copy else None,
+            "cpu_pack_end_event": self.new_timing_event() if async_copy else None,
+        }
+        if host_timing is not None:
+            host_timing["submit_event_alloc_us"] = (
+                time.perf_counter() - event_alloc_start) * 1e6
         if async_copy and self.prefetch_stream is not None:
+            stream_wait_start = time.perf_counter()
             current_stream = torch.npu.current_stream()
             if self.cpu_prefetch_stream is not None:
                 self.cpu_prefetch_stream.wait_stream(current_stream)
+            if host_timing is not None:
+                host_timing["submit_stream_wait_us"] = (
+                    time.perf_counter() - stream_wait_start) * 1e6
             with torch.npu.stream(self.prefetch_stream):
+                stream_wait_start = time.perf_counter()
                 self.prefetch_stream.wait_stream(current_stream)
+                if host_timing is not None:
+                    host_timing["submit_prefetch_wait_stream_us"] = (
+                        time.perf_counter() - stream_wait_start) * 1e6
+                record_start = time.perf_counter()
                 _event_record(start_event)
+                if host_timing is not None:
+                    host_timing["submit_start_event_record_us"] = (
+                        time.perf_counter() - record_start) * 1e6
+                populate_start = time.perf_counter()
                 self._populate_slot(slot,
                                     layer,
                                     async_copy=True,
-                                    cpu_prefetch_stream=self.cpu_prefetch_stream)
+                                    cpu_prefetch_stream=self.cpu_prefetch_stream,
+                                    reason=reason,
+                                    timing_events=timing_events,
+                                    host_timing=host_timing)
+                if host_timing is not None:
+                    host_timing["submit_populate_us"] = (
+                        time.perf_counter() - populate_start) * 1e6
+                post_cpu_start = time.perf_counter()
                 if slot.has_async_cpu_direct or slot.has_async_cpu_pack:
                     self.prefetch_stream.wait_event(slot.cpu_pack_event)
                 elif slot.has_async_cpu_copy:
@@ -1037,6 +1380,7 @@ class Mode3DoubleBufferManager:
                         for stage_idx, slot_idx in enumerate(
                             slot.cpu_stage_slot_ids[:slot.cpu_stage_count])
                     ]
+                    _event_record(timing_events.get("cpu_pack_start_event"))
                     self._copy_npu_assignment_runs(slot.w13,
                                                    slot.cpu_stage_w13,
                                                    stage_to_slot,
@@ -1045,12 +1389,33 @@ class Mode3DoubleBufferManager:
                                                    slot.cpu_stage_w2,
                                                    stage_to_slot,
                                                    async_copy=True)
+                    _event_record(timing_events.get("cpu_pack_end_event"))
+                if host_timing is not None:
+                    host_timing["submit_post_cpu_wait_us"] = (
+                        time.perf_counter() - post_cpu_start) * 1e6
+                record_start = time.perf_counter()
                 _event_record(end_event)
                 slot.ready_event.record()
+                if host_timing is not None:
+                    host_timing["submit_ready_record_us"] = (
+                        time.perf_counter() - record_start) * 1e6
             slot.inflight_prefetch = True
         else:
-            self._populate_slot(slot, layer, async_copy=False)
+            populate_start = time.perf_counter()
+            self._populate_slot(slot,
+                                layer,
+                                async_copy=False,
+                                reason=reason,
+                                timing_events=timing_events,
+                                host_timing=host_timing)
+            if host_timing is not None:
+                host_timing["submit_populate_us"] = (
+                    time.perf_counter() - populate_start) * 1e6
+            record_start = time.perf_counter()
             slot.ready_event.record()
+            if host_timing is not None:
+                host_timing["submit_ready_record_us"] = (
+                    time.perf_counter() - record_start) * 1e6
             slot.inflight_prefetch = False
         slot.prefetch_timing = {
             "layer_idx": int(layer.layer_idx),
@@ -1060,20 +1425,26 @@ class Mode3DoubleBufferManager:
             "submit_us": (time.perf_counter() - submit_start) * 1e6,
             "start_event": start_event,
             "end_event": end_event,
+            **timing_events,
             "valid_experts": int(slot.valid_expert_count),
             "source_from_npu": int(slot.source_from_npu),
             "source_from_cpu": int(slot.source_from_cpu),
+            "cpu_path": slot.prefetch_cpu_path,
+            "layer_local_buffer": int(slot.uses_layer_local_buffer),
         }
+        if host_timing is not None:
+            slot.prefetch_timing.update(host_timing)
         if ((int(layer.layer_idx), slot_id) not in self._logged_prefetches
                 and async_copy and self.enable_transfer_logs):
             logger.info(
-                "Mode3 prefetch scheduled: layer=%s slot=%s reason=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s slot_head=%s",
+                "Mode3 prefetch scheduled: layer=%s slot=%s reason=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s layer_local_buffer=%s slot_head=%s",
                 layer.layer_idx,
                 slot_id,
                 reason,
                 slot.valid_expert_count,
                 slot.source_from_npu,
                 slot.source_from_cpu,
+                int(slot.uses_layer_local_buffer),
                 list(slot.expert_ids[:8]),
             )
             self._logged_prefetches.add((int(layer.layer_idx), slot_id))
@@ -1087,13 +1458,20 @@ class Mode3DoubleBufferManager:
             slot = self.prepare_slot(layer, slot_id, async_copy=False,
                                      reason="sync_current")
         wait_start = time.perf_counter()
+        ready_wait_start_event = None
+        ready_wait_end_event = None
         # Ensure the current layer never starts computing before every expert
         # row for this slot has fully arrived in the runtime buffer. The
         # device-event path preserves the dependency without blocking Python,
         # which lets the double-buffered prefetch pipeline stay deeper.
         wait_mode = "host_sync"
         if slot.inflight_prefetch and self.enable_device_ready_wait:
-            torch.npu.current_stream().wait_event(slot.ready_event)
+            ready_wait_start_event = self.new_timing_event()
+            ready_wait_end_event = self.new_timing_event()
+            current_stream = torch.npu.current_stream()
+            _event_record(ready_wait_start_event)
+            current_stream.wait_event(slot.ready_event)
+            _event_record(ready_wait_end_event)
             wait_mode = "device_event"
         else:
             slot.ready_event.synchronize()
@@ -1111,8 +1489,11 @@ class Mode3DoubleBufferManager:
             "valid_experts": int(slot.valid_expert_count),
             "source_from_npu": int(slot.source_from_npu),
             "source_from_cpu": int(slot.source_from_cpu),
+            "layer_local_buffer": int(slot.uses_layer_local_buffer),
             "wait_mode": wait_mode,
             "wait_us": float(wait_us),
+            "ready_wait_start_event": ready_wait_start_event,
+            "ready_wait_end_event": ready_wait_end_event,
             "cpu_fill_us": float(cpu_fill_us),
             "prefetched_hit": bool(prefetched_hit),
             "prefetch_hit_count": int(self.prefetch_hit[int(layer.layer_idx)]),
@@ -1155,54 +1536,61 @@ class Mode3DoubleBufferManager:
             self._logged_slot_bindings.add(log_key)
         return slot
 
-    def prefetch_next_layer(self, current_layer: Any) -> dict[str, Any]:
-        next_layer = self._get_next_layer(int(current_layer.layer_idx))
-        if next_layer is None:
-            return {"status": "no_next_layer"}
-        if getattr(next_layer, "elastic_execution_mode", 0) != 3:
+    def _prefetch_layer(self, target_layer: Any, reason: str) -> dict[str, Any]:
+        if target_layer is None:
+            return {"status": "no_target_layer"}
+        if getattr(target_layer, "elastic_execution_mode", 0) != 3:
             return {"status": "next_not_mode3"}
-        if not getattr(next_layer, "lossless_hybrid_active", False):
+        if not getattr(target_layer, "lossless_hybrid_active", False):
             return {"status": "next_inactive"}
         cpu_only_count = len(
-            getattr(next_layer, "lossless_hybrid_cpu_only_expert_ids", []))
+            getattr(target_layer, "lossless_hybrid_cpu_only_expert_ids", []))
         if not self.enable_async_npu_prefetch:
-            log_key = (int(next_layer.layer_idx), cpu_only_count)
+            log_key = (int(target_layer.layer_idx), cpu_only_count)
             if (self.enable_transfer_logs
                     and log_key not in self._logged_prefetch_deferrals):
                 logger.info(
                     "Mode3 prefetch deferred to layer entry: layer=%s reason=async_npu_prefetch_unstable cpu_only_experts=%s",
-                    next_layer.layer_idx,
+                    target_layer.layer_idx,
                     cpu_only_count,
                 )
                 self._logged_prefetch_deferrals.add(log_key)
             return {
                 "status": "disabled",
-                "next_layer": int(next_layer.layer_idx),
+                "next_layer": int(target_layer.layer_idx),
                 "cpu_only": int(cpu_only_count),
             }
         if cpu_only_count > 0 and self.cpu_prefetch_stream is None:
-            log_key = (int(next_layer.layer_idx), cpu_only_count)
+            log_key = (int(target_layer.layer_idx), cpu_only_count)
             if (self.enable_transfer_logs
                     and log_key not in self._logged_prefetch_deferrals):
                 logger.info(
                     "Mode3 prefetch deferred to layer entry: layer=%s reason=cpu_shadow_copy_stability cpu_only_experts=%s",
-                    next_layer.layer_idx,
+                    target_layer.layer_idx,
                     cpu_only_count,
                 )
                 self._logged_prefetch_deferrals.add(log_key)
             return {
                 "status": "no_cpu_stream",
-                "next_layer": int(next_layer.layer_idx),
+                "next_layer": int(target_layer.layer_idx),
                 "cpu_only": int(cpu_only_count),
             }
-        next_slot_id = self._slot_id_for_layer(int(next_layer.layer_idx))
-        slot = self.prepare_slot(next_layer,
+        next_slot_id = self._slot_id_for_layer(int(target_layer.layer_idx))
+        was_match = self._slot_matches(self.slots[next_slot_id], target_layer)
+        slot = self.prepare_slot(target_layer,
                                  next_slot_id,
                                  async_copy=True,
-                                 reason=f"after_layer_{current_layer.layer_idx}")
+                                 reason=reason)
         timing = dict(getattr(slot, "prefetch_timing", {}))
-        timing["status"] = "scheduled"
+        timing["status"] = "hit" if was_match else "scheduled"
         return timing
+
+    def prefetch_next_layer(self, current_layer: Any) -> dict[str, Any]:
+        next_layer = self._get_next_layer(int(current_layer.layer_idx))
+        if next_layer is None:
+            return {"status": "no_next_layer"}
+        return self._prefetch_layer(
+            next_layer, reason=f"after_layer_{current_layer.layer_idx}")
 
 class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
@@ -1739,9 +2127,21 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
         if profile_timing:
             prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            prefetch_npu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_start_event"),
+                next_prefetch_timing.get("npu_end_event"))
+            prefetch_cpu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_start_event"),
+                next_prefetch_timing.get("cpu_end_event"))
+            prefetch_cpu_pack_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_pack_start_event"),
+                next_prefetch_timing.get("cpu_pack_end_event"))
             compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
+            ready_wait_dev_ms = _elapsed_ms(
+                bind_timing.get("ready_wait_start_event"),
+                bind_timing.get("ready_wait_end_event"))
             logger.info(
-                "Mode3 timing single-rank-allgather: rank=%s layer=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_submit_us=%.1f prefetch_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f fused_allgather_wall_ms=%.3f fused_allgather_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s",
+                "Mode3 timing single-rank-allgather: rank=%s layer=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s ready_wait_dev_ms=%.3f prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_cpu_path=%s prefetch_cpu_w13_pinned=%s prefetch_cpu_w2_pinned=%s prefetch_cpu_w13_contig=%s prefetch_cpu_w2_contig=%s prefetch_submit_us=%.1f submit_accounted_us=%.1f submit_event_alloc_us=%.1f submit_stream_wait_us=%.1f submit_prefetch_wait_stream_us=%.1f submit_start_event_record_us=%.1f submit_populate_us=%.1f submit_order_us=%.1f submit_assign_us=%.1f submit_layer_local_check_us=%.1f submit_npu_us=%.1f submit_cpu_us=%.1f submit_cpu_direct_async_us=%.1f submit_cpu_stage_async_us=%.1f submit_plan_log_us=%.1f submit_expert_map_us=%.1f submit_expert_map_cache_hit=%s submit_dispatch_cache_us=%.1f submit_slot_state_us=%.1f submit_post_cpu_wait_us=%.1f submit_ready_record_us=%.1f prefetch_dev_ms=%.3f prefetch_npu_dev_ms=%.3f prefetch_cpu_dev_ms=%.3f prefetch_cpu_pack_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f fused_allgather_wall_ms=%.3f fused_allgather_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s",
                 layer.rank if hasattr(layer, "rank") else -1,
                 layer.layer_idx,
                 int(bind_timing.get("slot_id", -1)),
@@ -1751,11 +2151,47 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 float(bind_timing.get("wait_us", -1.0)),
                 float(bind_timing.get("cpu_fill_us", -1.0)),
                 bind_timing.get("wait_mode", "unknown"),
+                ready_wait_dev_ms,
                 next_prefetch_timing.get("layer_idx", -1),
                 next_prefetch_timing.get("slot_id", -1),
                 next_prefetch_timing.get("source_from_cpu", -1),
+                next_prefetch_timing.get("cpu_path", "unknown"),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_contig")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_contig")),
                 float(next_prefetch_timing.get("submit_us", -1.0)),
+                _mode3_submit_accounted_us(next_prefetch_timing),
+                _timing_float(next_prefetch_timing, "submit_event_alloc_us"),
+                _timing_float(next_prefetch_timing, "submit_stream_wait_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_prefetch_wait_stream_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_start_event_record_us"),
+                _timing_float(next_prefetch_timing, "submit_populate_us"),
+                _timing_float(next_prefetch_timing, "submit_order_us"),
+                _timing_float(next_prefetch_timing, "submit_assign_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_layer_local_check_us"),
+                _timing_float(next_prefetch_timing, "submit_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_cpu_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_direct_async_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_stage_async_us"),
+                _timing_float(next_prefetch_timing, "submit_plan_log_us"),
+                _timing_float(next_prefetch_timing, "submit_expert_map_us"),
+                int(_timing_float(next_prefetch_timing,
+                                  "expert_map_cache_hit")),
+                _timing_float(next_prefetch_timing,
+                              "submit_dispatch_cache_us"),
+                _timing_float(next_prefetch_timing, "submit_slot_state_us"),
+                _timing_float(next_prefetch_timing, "submit_post_cpu_wait_us"),
+                _timing_float(next_prefetch_timing, "submit_ready_record_us"),
                 prefetch_dev_ms,
+                prefetch_npu_dev_ms,
+                prefetch_cpu_dev_ms,
+                prefetch_cpu_pack_dev_ms,
                 compute_wall_ms,
                 compute_dev_ms,
                 remap_wall_ms,
@@ -1866,6 +2302,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             "valid_experts": bound_slot.valid_expert_count,
             "source_from_npu": bound_slot.source_from_npu,
             "source_from_cpu": bound_slot.source_from_cpu,
+            "layer_local_buffer": int(bound_slot.uses_layer_local_buffer),
             "prefetch_wait_us": float(
                 manager.prefetch_wait_us[int(layer.layer_idx)]),
             "prefetch_hit": int(manager.prefetch_hit[int(layer.layer_idx)]),
@@ -1873,23 +2310,36 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         }
         if layer.layer_idx == 0 and manager.enable_transfer_logs:
             logger.info(
-                "Mode3 fused-experts execution: rank=%s layer=%s stage=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s dispatch_experts=%s prefetch_wait_us=%.1f prefetch_hit=%s",
+                "Mode3 fused-experts execution: rank=%s layer=%s stage=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s layer_local_buffer=%s dispatch_experts=%s prefetch_wait_us=%.1f prefetch_hit=%s",
                 layer.rank if hasattr(layer, "rank") else -1,
                 layer.layer_idx,
                 active_rank_count,
                 bound_slot.valid_expert_count,
                 bound_slot.source_from_npu,
                 bound_slot.source_from_cpu,
+                int(bound_slot.uses_layer_local_buffer),
                 dispatch_num_experts,
                 float(manager.prefetch_wait_us[int(layer.layer_idx)]),
                 int(manager.prefetch_hit[int(layer.layer_idx)]),
             )
         if profile_timing:
             prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            prefetch_npu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_start_event"),
+                next_prefetch_timing.get("npu_end_event"))
+            prefetch_cpu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_start_event"),
+                next_prefetch_timing.get("cpu_end_event"))
+            prefetch_cpu_pack_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_pack_start_event"),
+                next_prefetch_timing.get("cpu_pack_end_event"))
             compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
             fused_dev_ms = _elapsed_ms(fused_start_event, fused_end_event)
+            ready_wait_dev_ms = _elapsed_ms(
+                bind_timing.get("ready_wait_start_event"),
+                bind_timing.get("ready_wait_end_event"))
             logger.info(
-                "Mode3 timing fused-experts: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_submit_us=%.1f prefetch_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f fused_wall_ms=%.3f fused_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s owned_per_rank=%s dispatch_num_experts=%s expert_token_nums_type=%s",
+                "Mode3 timing fused-experts: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s layer_local_buffer=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s ready_wait_dev_ms=%.3f prefetch_status=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_cpu_path=%s prefetch_layer_local_buffer=%s prefetch_cpu_w13_pinned=%s prefetch_cpu_w2_pinned=%s prefetch_cpu_w13_contig=%s prefetch_cpu_w2_contig=%s prefetch_submit_us=%.1f submit_accounted_us=%.1f submit_event_alloc_us=%.1f submit_stream_wait_us=%.1f submit_prefetch_wait_stream_us=%.1f submit_start_event_record_us=%.1f submit_populate_us=%.1f submit_order_us=%.1f submit_assign_us=%.1f submit_layer_local_check_us=%.1f submit_npu_us=%.1f submit_cpu_us=%.1f submit_cpu_direct_async_us=%.1f submit_cpu_stage_async_us=%.1f submit_plan_log_us=%.1f submit_expert_map_us=%.1f submit_expert_map_cache_hit=%s submit_dispatch_cache_us=%.1f submit_slot_state_us=%.1f submit_post_cpu_wait_us=%.1f submit_ready_record_us=%.1f prefetch_dev_ms=%.3f prefetch_npu_dev_ms=%.3f prefetch_cpu_dev_ms=%.3f prefetch_cpu_pack_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f fused_wall_ms=%.3f fused_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s owned_per_rank=%s dispatch_num_experts=%s expert_token_nums_type=%s",
                 layer.rank if hasattr(layer, "rank") else -1,
                 layer.layer_idx,
                 active_rank_count,
@@ -1897,14 +2347,53 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 bound_slot.valid_expert_count,
                 bound_slot.source_from_npu,
                 bound_slot.source_from_cpu,
+                int(bound_slot.uses_layer_local_buffer),
                 float(bind_timing.get("wait_us", -1.0)),
                 float(bind_timing.get("cpu_fill_us", -1.0)),
                 bind_timing.get("wait_mode", "unknown"),
+                ready_wait_dev_ms,
+                next_prefetch_timing.get("status", "unknown"),
                 next_prefetch_timing.get("layer_idx", -1),
                 next_prefetch_timing.get("slot_id", -1),
                 next_prefetch_timing.get("source_from_cpu", -1),
+                next_prefetch_timing.get("cpu_path", "unknown"),
+                next_prefetch_timing.get("layer_local_buffer", -1),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_contig")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_contig")),
                 float(next_prefetch_timing.get("submit_us", -1.0)),
+                _mode3_submit_accounted_us(next_prefetch_timing),
+                _timing_float(next_prefetch_timing, "submit_event_alloc_us"),
+                _timing_float(next_prefetch_timing, "submit_stream_wait_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_prefetch_wait_stream_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_start_event_record_us"),
+                _timing_float(next_prefetch_timing, "submit_populate_us"),
+                _timing_float(next_prefetch_timing, "submit_order_us"),
+                _timing_float(next_prefetch_timing, "submit_assign_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_layer_local_check_us"),
+                _timing_float(next_prefetch_timing, "submit_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_cpu_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_direct_async_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_stage_async_us"),
+                _timing_float(next_prefetch_timing, "submit_plan_log_us"),
+                _timing_float(next_prefetch_timing, "submit_expert_map_us"),
+                int(_timing_float(next_prefetch_timing,
+                                  "expert_map_cache_hit")),
+                _timing_float(next_prefetch_timing,
+                              "submit_dispatch_cache_us"),
+                _timing_float(next_prefetch_timing, "submit_slot_state_us"),
+                _timing_float(next_prefetch_timing, "submit_post_cpu_wait_us"),
+                _timing_float(next_prefetch_timing, "submit_ready_record_us"),
                 prefetch_dev_ms,
+                prefetch_npu_dev_ms,
+                prefetch_cpu_dev_ms,
+                prefetch_cpu_pack_dev_ms,
                 compute_wall_ms,
                 compute_dev_ms,
                 remap_wall_ms,
@@ -2136,9 +2625,21 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             )
         if profile_timing:
             prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            prefetch_npu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_start_event"),
+                next_prefetch_timing.get("npu_end_event"))
+            prefetch_cpu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_start_event"),
+                next_prefetch_timing.get("cpu_end_event"))
+            prefetch_cpu_pack_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_pack_start_event"),
+                next_prefetch_timing.get("cpu_pack_end_event"))
             compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
+            ready_wait_dev_ms = _elapsed_ms(
+                bind_timing.get("ready_wait_start_event"),
+                bind_timing.get("ready_wait_end_event"))
             logger.info(
-                "Mode3 timing single-dispatch: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_submit_us=%.1f prefetch_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f token_dispatch_wall_ms=%.3f token_dispatch_dev_ms=%.3f group_wall_ms=%.3f mlp_wall_ms=%.3f mlp_dev_ms=%.3f token_combine_wall_ms=%.3f token_combine_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s dispatched_rows=%s active_rows=%s owned_per_rank=%s dispatch_num_experts=%s expert_token_nums_type=%s group_list_type=%s",
+                "Mode3 timing single-dispatch: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s ready_wait_dev_ms=%.3f prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_cpu=%s prefetch_cpu_path=%s prefetch_cpu_w13_pinned=%s prefetch_cpu_w2_pinned=%s prefetch_cpu_w13_contig=%s prefetch_cpu_w2_contig=%s prefetch_submit_us=%.1f submit_accounted_us=%.1f submit_event_alloc_us=%.1f submit_stream_wait_us=%.1f submit_prefetch_wait_stream_us=%.1f submit_start_event_record_us=%.1f submit_populate_us=%.1f submit_order_us=%.1f submit_assign_us=%.1f submit_layer_local_check_us=%.1f submit_npu_us=%.1f submit_cpu_us=%.1f submit_cpu_direct_async_us=%.1f submit_cpu_stage_async_us=%.1f submit_plan_log_us=%.1f submit_expert_map_us=%.1f submit_expert_map_cache_hit=%s submit_dispatch_cache_us=%.1f submit_slot_state_us=%.1f submit_post_cpu_wait_us=%.1f submit_ready_record_us=%.1f prefetch_dev_ms=%.3f prefetch_npu_dev_ms=%.3f prefetch_cpu_dev_ms=%.3f prefetch_cpu_pack_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f token_dispatch_wall_ms=%.3f token_dispatch_dev_ms=%.3f group_wall_ms=%.3f mlp_wall_ms=%.3f mlp_dev_ms=%.3f token_combine_wall_ms=%.3f token_combine_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s dispatched_rows=%s active_rows=%s owned_per_rank=%s dispatch_num_experts=%s expert_token_nums_type=%s group_list_type=%s",
                 layer.rank if hasattr(layer, "rank") else -1,
                 layer.layer_idx,
                 active_rank_count,
@@ -2149,11 +2650,47 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 float(bind_timing.get("wait_us", -1.0)),
                 float(bind_timing.get("cpu_fill_us", -1.0)),
                 bind_timing.get("wait_mode", "unknown"),
+                ready_wait_dev_ms,
                 next_prefetch_timing.get("layer_idx", -1),
                 next_prefetch_timing.get("slot_id", -1),
                 next_prefetch_timing.get("source_from_cpu", -1),
+                next_prefetch_timing.get("cpu_path", "unknown"),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_contig")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_contig")),
                 float(next_prefetch_timing.get("submit_us", -1.0)),
+                _mode3_submit_accounted_us(next_prefetch_timing),
+                _timing_float(next_prefetch_timing, "submit_event_alloc_us"),
+                _timing_float(next_prefetch_timing, "submit_stream_wait_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_prefetch_wait_stream_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_start_event_record_us"),
+                _timing_float(next_prefetch_timing, "submit_populate_us"),
+                _timing_float(next_prefetch_timing, "submit_order_us"),
+                _timing_float(next_prefetch_timing, "submit_assign_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_layer_local_check_us"),
+                _timing_float(next_prefetch_timing, "submit_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_cpu_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_direct_async_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_stage_async_us"),
+                _timing_float(next_prefetch_timing, "submit_plan_log_us"),
+                _timing_float(next_prefetch_timing, "submit_expert_map_us"),
+                int(_timing_float(next_prefetch_timing,
+                                  "expert_map_cache_hit")),
+                _timing_float(next_prefetch_timing,
+                              "submit_dispatch_cache_us"),
+                _timing_float(next_prefetch_timing, "submit_slot_state_us"),
+                _timing_float(next_prefetch_timing, "submit_post_cpu_wait_us"),
+                _timing_float(next_prefetch_timing, "submit_ready_record_us"),
                 prefetch_dev_ms,
+                prefetch_npu_dev_ms,
+                prefetch_cpu_dev_ms,
+                prefetch_cpu_pack_dev_ms,
                 compute_wall_ms,
                 compute_dev_ms,
                 remap_wall_ms,
