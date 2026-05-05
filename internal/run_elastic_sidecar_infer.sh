@@ -310,6 +310,25 @@ def _read_jsonl_ids(path: Path) -> set[int]:
     return ids
 
 
+def _read_epoch(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    return int(data.get("sidecar_epoch", 0) or 0)
+
+
+def _write_epoch(path: Path, sidecar_epoch: int) -> None:
+    _atomic_write_json(path, {
+        "time": time.time(),
+        "sidecar_epoch": int(sidecar_epoch),
+        "shard_index": shard_index,
+        "num_shards": num_shards,
+    })
+
+
 def _read_inflight_ids(path: Path) -> list[int]:
     if not path.exists():
         return []
@@ -337,6 +356,50 @@ def _read_resume_records(path: Path) -> dict[int, dict]:
             if item.get("prompt_id") is not None:
                 records[int(item["prompt_id"])] = item
     return records
+
+
+def _shard_prompt_ids(records: list[dict]) -> set[int]:
+    return {
+        int(item["prompt_id"])
+        for item in records
+        if int(item["prompt_id"]) % num_shards == shard_index
+    }
+
+
+def _is_shard_epoch_complete(records: list[dict], completed_ids: set[int],
+                             inflight_ids: list[int],
+                             resume_records: dict[int, dict]) -> bool:
+    shard_ids = _shard_prompt_ids(records)
+    if not shard_ids:
+        return False
+    if inflight_ids or resume_records:
+        return False
+    return shard_ids.issubset(completed_ids)
+
+
+def _reset_shard_state_for_next_epoch(
+        completed_file: Path, inflight_file: Path, resume_file: Path,
+        partials_file: Path, epoch_file: Path, sidecar_epoch: int,
+        records: list[dict], completed_ids: set[int]) -> int:
+    next_epoch = sidecar_epoch + 1
+    for path in (completed_file, inflight_file, resume_file, partials_file):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    _write_epoch(epoch_file, next_epoch)
+    print(json.dumps({
+        "event": "sidecar_epoch_rollover",
+        "completed_sidecar_epoch": sidecar_epoch,
+        "next_sidecar_epoch": next_epoch,
+        "shard_index": shard_index,
+        "num_shards": num_shards,
+        "total_prompts": len(records),
+        "shard_prompts": len(_shard_prompt_ids(records)),
+        "completed_prompts": len(completed_ids),
+        "state_dir": str(epoch_file.parent),
+    }, ensure_ascii=False), flush=True)
+    return next_epoch
 
 
 def _write_resume_records(path: Path, records: dict[int, dict]) -> None:
@@ -449,6 +512,7 @@ def _write_final_output(output_file: Path, completed_file: Path, resume_file: Pa
     prompt_id = int(source["prompt_id"])
     with output_file.open("a", encoding="utf-8") as out_f:
         out_f.write(json.dumps({
+            "sidecar_epoch": sidecar_epoch,
             "iteration": iteration,
             "chunk_start": chunk_start,
             "prompt_id": prompt_id,
@@ -464,6 +528,7 @@ def _write_final_output(output_file: Path, completed_file: Path, resume_file: Pa
         os.fsync(out_f.fileno())
     _append_jsonl(completed_file, [{
         "time": time.time(),
+        "sidecar_epoch": sidecar_epoch,
         "iteration": iteration,
         "chunk_start": chunk_start,
         "prompt_id": prompt_id,
@@ -541,6 +606,7 @@ def _generate_chunk_streaming(llm, chunk_records: list[dict], sampling_params,
                 latest_tokens = latest_token_count
             partial_row = {
                 "time": time.time(),
+                "sidecar_epoch": sidecar_epoch,
                 "iteration": iteration,
                 "chunk_start": chunk_start,
                 "request_id": request_id,
@@ -566,6 +632,7 @@ def _generate_chunk_streaming(llm, chunk_records: list[dict], sampling_params,
             else:
                 resume_records[prompt_id] = {
                     "time": time.time(),
+                    "sidecar_epoch": sidecar_epoch,
                     "iteration": iteration,
                     "chunk_start": chunk_start,
                     "prompt_id": prompt_id,
@@ -626,6 +693,8 @@ completed_file = state_dir / f"completed.shard{shard_index}.jsonl"
 inflight_file = state_dir / f"inflight.shard{shard_index}.json"
 resume_file = state_dir / f"resume.shard{shard_index}.jsonl"
 partials_file = state_dir / f"partials.shard{shard_index}.jsonl"
+epoch_file = state_dir / f"epoch.shard{shard_index}.json"
+sidecar_epoch = _read_epoch(epoch_file)
 
 records = load_prompt_records()
 completed_ids = _read_jsonl_ids(completed_file)
@@ -633,6 +702,18 @@ inflight_ids = _read_inflight_ids(inflight_file)
 resume_records = _read_resume_records(resume_file)
 initial_records = _select_pending_records(records, completed_ids, inflight_ids,
                                           resume_records, max_records_per_iteration)
+if (not initial_records and repeat_until_killed
+        and _is_shard_epoch_complete(records, completed_ids, inflight_ids,
+                                     resume_records)):
+    sidecar_epoch = _reset_shard_state_for_next_epoch(
+        completed_file, inflight_file, resume_file, partials_file, epoch_file,
+        sidecar_epoch, records, completed_ids)
+    completed_ids = _read_jsonl_ids(completed_file)
+    inflight_ids = _read_inflight_ids(inflight_file)
+    resume_records = _read_resume_records(resume_file)
+    initial_records = _select_pending_records(records, completed_ids,
+                                              inflight_ids, resume_records,
+                                              max_records_per_iteration)
 if not initial_records:
     output_file.touch()
     print(json.dumps({
@@ -642,6 +723,7 @@ if not initial_records:
         "total_prompts": len(records),
         "completed_prompts": len(completed_ids),
         "resume_prompts": len(resume_records),
+        "sidecar_epoch": sidecar_epoch,
         "state_dir": str(state_dir),
         "output_file": str(output_file),
     }, ensure_ascii=False), flush=True)
@@ -675,6 +757,7 @@ print(json.dumps({
     "completed_prompts": len(completed_ids),
     "inflight_prompts": len(inflight_ids),
     "resume_prompts": len(resume_records),
+    "sidecar_epoch": sidecar_epoch,
     "stream_checkpoint": stream_checkpoint,
     "shard_index": shard_index,
     "num_shards": num_shards,
@@ -716,6 +799,19 @@ while True:
     last_total_prompts = len(records)
     selected_records = _select_pending_records(records, completed_ids, inflight_ids,
                                                resume_records, max_records_per_iteration)
+    if (not selected_records and repeat_until_killed
+            and not _shutdown_requested
+            and _is_shard_epoch_complete(records, completed_ids, inflight_ids,
+                                         resume_records)):
+        sidecar_epoch = _reset_shard_state_for_next_epoch(
+            completed_file, inflight_file, resume_file, partials_file,
+            epoch_file, sidecar_epoch, records, completed_ids)
+        completed_ids = _read_jsonl_ids(completed_file)
+        inflight_ids = _read_inflight_ids(inflight_file)
+        resume_records = _read_resume_records(resume_file)
+        selected_records = _select_pending_records(records, completed_ids,
+                                                   inflight_ids, resume_records,
+                                                   max_records_per_iteration)
     prompt_offset = int(os.environ.get("VERL_SIDECAR_PROMPT_OFFSET", "0"))
     if not selected_records:
         print(json.dumps({
@@ -727,6 +823,7 @@ while True:
             "total_prompts": len(records),
             "completed_prompts": len(completed_ids),
             "resume_prompts": len(resume_records),
+            "sidecar_epoch": sidecar_epoch,
             "state_dir": str(state_dir),
             "output_file": str(output_file),
         }, ensure_ascii=False), flush=True)
@@ -741,6 +838,7 @@ while True:
             "time": time.time(),
             "iteration": iteration,
             "chunk_start": chunk_start,
+            "sidecar_epoch": sidecar_epoch,
             "prompt_ids": chunk_ids,
             "shard_index": shard_index,
             "num_shards": num_shards,
@@ -749,6 +847,7 @@ while True:
             "event": "sidecar_chunk_start",
             "iteration": iteration,
             "chunk_start": chunk_start,
+            "sidecar_epoch": sidecar_epoch,
             "chunk_size": len(chunk_records),
             "prompt_ids_first": chunk_ids[:8],
             "stream_checkpoint": stream_checkpoint,
@@ -778,6 +877,7 @@ while True:
             "event": "sidecar_chunk_done",
             "iteration": iteration,
             "chunk_start": chunk_start,
+            "sidecar_epoch": sidecar_epoch,
             "inference_time_s": infer_s,
             "num_requests": finished_requests,
             "submitted_requests": len(chunk_records),
@@ -801,6 +901,7 @@ while True:
         "event": "sidecar_iteration_done",
         "iteration": iteration,
         "prompt_offset": prompt_offset,
+        "sidecar_epoch": sidecar_epoch,
         "inference_time_s": iteration_infer_s,
         "num_requests": iteration_requests,
         "total_prompts": len(records),
@@ -836,6 +937,7 @@ print(json.dumps({
     "total_prompts_last_iteration": last_total_prompts,
     "completed_prompts": len(_read_jsonl_ids(completed_file)),
     "resume_prompts": len(_read_resume_records(resume_file)),
+    "sidecar_epoch": sidecar_epoch,
     "shutdown_requested": _shutdown_requested,
     "shard_index": shard_index,
     "num_shards": num_shards,
