@@ -17,6 +17,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+import time
 
 import hydra
 import ray
@@ -30,6 +31,12 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 from verl.utils.import_utils import load_extern_type
+from verl.utils.ray_startup_patch import apply_ray_startup_patches
+
+
+def _env_enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() not in (
+        "0", "false", "no", "off")
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -64,8 +71,14 @@ def run_ppo(config) -> None:
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = apply_ray_startup_patches(OmegaConf.to_container(ray_init_kwargs, resolve=True))
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray_init_start = time.perf_counter()
+        print("[ray_timing] ray_init_begin", flush=True)
+        ray.init(**ray_init_kwargs)
+        print(
+            f"[ray_timing] ray_init_done elapsed_s={time.perf_counter() - ray_init_start:.3f}",
+            flush=True)
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
@@ -81,11 +94,25 @@ def run_ppo(config) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
+        actor_create_start = time.perf_counter()
         runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
     else:
+        actor_create_start = time.perf_counter()
         runner = TaskRunner.remote()
+    print(
+        f"[ray_timing] taskrunner_actor_created elapsed_s={time.perf_counter() - actor_create_start:.3f}",
+        flush=True)
     print("[main_ppo] Before ray.get(runner.run.remote)", flush=True)
-    ray.get(runner.run.remote(config))
+    task_submit_start = time.perf_counter()
+    task_ref = runner.run.remote(config)
+    print(
+        f"[ray_timing] taskrunner_run_submitted elapsed_s={time.perf_counter() - task_submit_start:.3f}",
+        flush=True)
+    task_get_start = time.perf_counter()
+    ray.get(task_ref)
+    print(
+        f"[ray_timing] taskrunner_run_done elapsed_s={time.perf_counter() - task_get_start:.3f}",
+        flush=True)
     print("[main_ppo] After ray.get, about to exit run_ppo()", flush=True)
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
@@ -243,9 +270,17 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
-        print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))
+        run_start = time.perf_counter()
+        print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}", flush=True)
+        if _env_enabled("VERL_LOG_FULL_CONFIG", "0"):
+            pprint(OmegaConf.to_container(config, resolve=True))
+        else:
+            print("[TaskRunnerTiming] full config print skipped; set VERL_LOG_FULL_CONFIG=1 to enable",
+                  flush=True)
         OmegaConf.resolve(config)
+        print(
+            f"[TaskRunnerTiming] resolve_config_done elapsed_s={time.perf_counter() - run_start:.3f}",
+            flush=True)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
@@ -260,6 +295,9 @@ class TaskRunner:
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
+        print(
+            f"[TaskRunnerTiming] worker_mapping_done elapsed_s={time.perf_counter() - run_start:.3f}",
+            flush=True)
 
         # validate config
         validate_config(
@@ -267,20 +305,31 @@ class TaskRunner:
             use_reference_policy=need_reference_policy(self.role_worker_mapping),
             use_critic=need_critic(config),
         )
+        print(
+            f"[TaskRunnerTiming] validate_config_done elapsed_s={time.perf_counter() - run_start:.3f}",
+            flush=True)
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        copy_start = time.perf_counter()
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
         )
+        print(
+            f"[TaskRunnerTiming] copy_to_local_done elapsed_s={time.perf_counter() - copy_start:.3f} total_s={time.perf_counter() - run_start:.3f}",
+            flush=True)
 
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
 
+        tokenizer_start = time.perf_counter()
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        print(
+            f"[TaskRunnerTiming] tokenizer_processor_done elapsed_s={time.perf_counter() - tokenizer_start:.3f} total_s={time.perf_counter() - run_start:.3f}",
+            flush=True)
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
@@ -298,6 +347,9 @@ class TaskRunner:
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
+        print(
+            f"[TaskRunnerTiming] dataset_done total_s={time.perf_counter() - run_start:.3f}",
+            flush=True)
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
@@ -315,12 +367,20 @@ class TaskRunner:
             train_sampler=train_sampler,
         )
         # Initialize the workers of the trainer.
+        init_workers_start = time.perf_counter()
+        print("[TaskRunnerTiming] init_workers_begin", flush=True)
         trainer.init_workers()
+        print(
+            f"[TaskRunnerTiming] init_workers_done elapsed_s={time.perf_counter() - init_workers_start:.3f} total_s={time.perf_counter() - run_start:.3f}",
+            flush=True)
 
         # Start the training process.
         print("[TaskRunner] Before trainer.fit()", flush=True)
+        fit_start = time.perf_counter()
         trainer.fit()
-        print("[TaskRunner] After trainer.fit(), about to finish run()", flush=True)
+        print(
+            f"[TaskRunner] After trainer.fit(), about to finish run() elapsed_s={time.perf_counter() - fit_start:.3f} total_s={time.perf_counter() - run_start:.3f}",
+            flush=True)
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):

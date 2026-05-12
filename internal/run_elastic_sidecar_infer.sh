@@ -9,6 +9,20 @@ set -euo pipefail
 #   VERL_SIDECAR_PROMPTS_FILE=/path/to/prompts.txt|jsonl|json|parquet|dataset_dir
 #   VERL_SIDECAR_OUTPUT_FILE=/path/to/output.jsonl
 #   VERL_SIDECAR_MAX_SECONDS=60
+# Parallel layout:
+#   VERL_SIDECAR_PARALLEL_MODE=dp|tp|hybrid|replica_tp|auto
+#   VERL_SIDECAR_TENSOR_PARALLEL_SIZE=<cards per replica>
+#   VERL_SIDECAR_REPLICA_COUNT=<number of independent replicas>
+# Examples with 8 released NPUs:
+#   DP8:         TENSOR_PARALLEL_SIZE=1, REPLICA_COUNT=8
+#   TP8:         TENSOR_PARALLEL_SIZE=8, REPLICA_COUNT=1
+#   4 replicas:  TENSOR_PARALLEL_SIZE=2, REPLICA_COUNT=4
+# As long as the selected model fits in each replica group, the sidecar does
+# not assume a fixed model size or fixed parallelism.
+# Expert parallel:
+#   VERL_SIDECAR_ENABLE_EXPERT_PARALLEL=1 only permits EP.
+#   EP is enabled effectively only when the sidecar model is detected as MoE.
+#   Override detection with VERL_SIDECAR_MODEL_IS_MOE=0|1 if needed.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TS=$(date +%Y%m%d%H%M%S)
@@ -16,7 +30,10 @@ TS=$(date +%Y%m%d%H%M%S)
 : "${VERL_SIDECAR_MODEL_PATH:?VERL_SIDECAR_MODEL_PATH must point to the sidecar inference model}"
 : "${VERL_SIDECAR_NPU_DEVICES:?VERL_SIDECAR_NPU_DEVICES must be set by the shrink watcher or manually for direct use}"
 VERL_SIDECAR_MASTER_PORT=${VERL_SIDECAR_MASTER_PORT:-24300}
+VERL_SIDECAR_MASTER_ADDR=${VERL_SIDECAR_MASTER_ADDR:-127.0.0.1}
 VERL_SIDECAR_HCCL_IF_BASE_PORT=${VERL_SIDECAR_HCCL_IF_BASE_PORT:-52000}
+VERL_SIDECAR_MASTER_PORT_STRIDE=${VERL_SIDECAR_MASTER_PORT_STRIDE:-32}
+VERL_SIDECAR_HCCL_PORT_STRIDE=${VERL_SIDECAR_HCCL_PORT_STRIDE:-1024}
 VERL_SIDECAR_LOG_FILE=${VERL_SIDECAR_LOG_FILE:-"${ROOT_DIR}/sidecar_infer_${TS}.log"}
 VERL_SIDECAR_OUTPUT_FILE=${VERL_SIDECAR_OUTPUT_FILE:-"${ROOT_DIR}/sidecar_infer_${TS}.jsonl"}
 VERL_SIDECAR_MAX_SECONDS=${VERL_SIDECAR_MAX_SECONDS:-0}
@@ -32,18 +49,117 @@ if [[ "${VERL_SIDECAR_DEVICE_COUNT}" == "0" ]]; then
     exit 2
 fi
 VERL_SIDECAR_PARALLEL_MODE=${VERL_SIDECAR_PARALLEL_MODE:-dp}
-case "${VERL_SIDECAR_PARALLEL_MODE}" in
-    dp)
-        VERL_SIDECAR_TENSOR_PARALLEL_SIZE=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-1}
-        ;;
-    tp)
-        VERL_SIDECAR_TENSOR_PARALLEL_SIZE=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-"${VERL_SIDECAR_DEVICE_COUNT}"}
-        ;;
-    *)
-        echo "Unsupported VERL_SIDECAR_PARALLEL_MODE=${VERL_SIDECAR_PARALLEL_MODE}; expected dp or tp" >&2
-        exit 2
-        ;;
-esac
+SIDECAR_PARALLEL_PLAN=$(python3 - \
+    "${VERL_SIDECAR_NPU_DEVICES}" \
+    "${VERL_SIDECAR_PARALLEL_MODE}" \
+    "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-}" \
+    "${VERL_SIDECAR_REPLICA_COUNT:-}" <<'PY'
+import shlex
+import sys
+
+devices_arg, mode, tp_arg, replica_arg = sys.argv[1:5]
+devices = [item.strip() for item in devices_arg.split(",") if item.strip()]
+device_count = len(devices)
+mode = (mode or "dp").strip().lower()
+valid_modes = {"dp", "tp", "hybrid", "replica_tp", "auto"}
+if mode not in valid_modes:
+    raise SystemExit(
+        f"Unsupported VERL_SIDECAR_PARALLEL_MODE={mode}; "
+        f"expected one of {sorted(valid_modes)}")
+
+if tp_arg.strip():
+    tp_size = int(tp_arg)
+elif mode == "tp":
+    tp_size = device_count
+else:
+    tp_size = 1
+if tp_size <= 0:
+    raise SystemExit(f"Invalid VERL_SIDECAR_TENSOR_PARALLEL_SIZE={tp_size}")
+
+if replica_arg.strip():
+    replica_count = int(replica_arg)
+    if replica_count <= 0:
+        raise SystemExit(f"Invalid VERL_SIDECAR_REPLICA_COUNT={replica_count}")
+    used_devices = replica_count * tp_size
+    if used_devices > device_count:
+        raise SystemExit(
+            "VERL_SIDECAR_REPLICA_COUNT * VERL_SIDECAR_TENSOR_PARALLEL_SIZE "
+            f"exceeds available devices: {replica_count} * {tp_size} > {device_count}")
+else:
+    if device_count % tp_size != 0:
+        raise SystemExit(
+            f"Device count {device_count} is not divisible by tensor parallel "
+            f"size {tp_size}; set VERL_SIDECAR_REPLICA_COUNT explicitly if "
+            "you intentionally want to leave some devices unused.")
+    replica_count = device_count // tp_size
+    used_devices = device_count
+
+groups = [
+    ",".join(devices[start:start + tp_size])
+    for start in range(0, used_devices, tp_size)
+]
+unused = devices[used_devices:]
+print(f"VERL_SIDECAR_TENSOR_PARALLEL_SIZE={tp_size}")
+print(f"VERL_SIDECAR_REPLICA_COUNT={replica_count}")
+print("VERL_SIDECAR_DEVICE_GROUPS=" + shlex.quote(";".join(groups)))
+print("VERL_SIDECAR_UNUSED_DEVICES=" + shlex.quote(",".join(unused)))
+PY
+)
+eval "${SIDECAR_PARALLEL_PLAN}"
+SIDECAR_EP_PLAN=$(python3 - \
+    "${VERL_SIDECAR_MODEL_PATH}" \
+    "${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL:-0}" \
+    "${VERL_SIDECAR_MODEL_IS_MOE:-}" <<'PY'
+import json
+import shlex
+import sys
+from pathlib import Path
+
+model_path, ep_allowed_arg, override_arg = sys.argv[1:4]
+
+def as_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def detect_moe(path: str) -> tuple[bool, str]:
+    config_path = Path(path) / "config.json"
+    data = {}
+    if config_path.exists():
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    haystack = " ".join([
+        str(data.get("model_type", "")),
+        " ".join(str(item) for item in data.get("architectures", []) or []),
+        Path(path).name,
+    ]).lower()
+    moe_keys = {
+        "num_experts",
+        "num_local_experts",
+        "moe_intermediate_size",
+        "decoder_sparse_step",
+        "moe_layer_freq",
+    }
+    is_moe = "moe" in haystack or any(key in data for key in moe_keys)
+    reason = "override" if override_arg.strip() else (
+        "config_or_name" if is_moe else "dense_or_unknown")
+    return is_moe, reason
+
+if override_arg.strip():
+    model_is_moe = as_bool(override_arg)
+    reason = "override"
+else:
+    model_is_moe, reason = detect_moe(model_path)
+
+ep_allowed = as_bool(ep_allowed_arg)
+effective = ep_allowed and model_is_moe
+print(f"VERL_SIDECAR_ENABLE_EXPERT_PARALLEL={int(ep_allowed)}")
+print(f"VERL_SIDECAR_MODEL_IS_MOE={int(model_is_moe)}")
+print(f"VERL_SIDECAR_MODEL_IS_MOE_REASON={shlex.quote(reason)}")
+print(f"VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE={int(effective)}")
+PY
+)
+eval "${SIDECAR_EP_PLAN}"
 VERL_SIDECAR_GPU_MEMORY_UTILIZATION=${VERL_SIDECAR_GPU_MEMORY_UTILIZATION:-0.90}
 VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-2048}
 VERL_SIDECAR_MAX_NUM_SEQS=${VERL_SIDECAR_MAX_NUM_SEQS:-128}
@@ -54,14 +170,19 @@ VERL_SIDECAR_TOP_P=${VERL_SIDECAR_TOP_P:-1.0}
 VERL_SIDECAR_N=${VERL_SIDECAR_N:-1}
 VERL_SIDECAR_TRUST_REMOTE_CODE=${VERL_SIDECAR_TRUST_REMOTE_CODE:-1}
 VERL_SIDECAR_PROMPT=${VERL_SIDECAR_PROMPT:-"Explain elastic resource sharing in one sentence."}
-VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE=${VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE:-"${VERL_SIDECAR_MAX_NUM_SEQS}"}
-VERL_SIDECAR_MAX_PROMPTS=${VERL_SIDECAR_MAX_PROMPTS:-$((VERL_SIDECAR_DEVICE_COUNT * VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE))}
+VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA=${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA:-"${VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE:-${VERL_SIDECAR_MAX_NUM_SEQS}}"}
+# Backward-compatible alias: in DP mode a replica is one device, but with TP>1
+# scheduling capacity is controlled per replica rather than per physical card.
+VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE=${VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE:-"${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA}"}
+VERL_SIDECAR_MAX_PROMPTS=${VERL_SIDECAR_MAX_PROMPTS:-$((VERL_SIDECAR_REPLICA_COUNT * VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA))}
 VERL_SIDECAR_REPEAT_UNTIL_KILLED=${VERL_SIDECAR_REPEAT_UNTIL_KILLED:-1}
 VERL_SIDECAR_MAX_ITERATIONS=${VERL_SIDECAR_MAX_ITERATIONS:-0}
 VERL_SIDECAR_ITERATION_SLEEP_SECONDS=${VERL_SIDECAR_ITERATION_SLEEP_SECONDS:-0}
 VERL_SIDECAR_GENERATE_CHUNK_SIZE=${VERL_SIDECAR_GENERATE_CHUNK_SIZE:-32}
 VERL_SIDECAR_STREAM_CHECKPOINT=${VERL_SIDECAR_STREAM_CHECKPOINT:-1}
 VERL_SIDECAR_PARTIAL_SYNC_EVERY_STEPS=${VERL_SIDECAR_PARTIAL_SYNC_EVERY_STEPS:-0}
+VERL_SIDECAR_STOP_FILE=${VERL_SIDECAR_STOP_FILE:-"${VERL_SIDECAR_OUTPUT_FILE}.stop_requested"}
+VERL_SIDECAR_PRIMARY_DEVICE_GROUP=${VERL_SIDECAR_DEVICE_GROUPS%%;*}
 if [[ -z "${VERL_SIDECAR_STATE_DIR:-}" ]]; then
     VERL_SIDECAR_STATE_DIR=$(python3 - "${ROOT_DIR}" "${VERL_SIDECAR_MODEL_PATH}" "${VERL_SIDECAR_PROMPTS_FILE:-default}" "${VERL_SIDECAR_DATA_SPLIT:-train}" <<'PY'
 import os
@@ -87,6 +208,7 @@ mkdir -p "$(dirname "${VERL_SIDECAR_LOG_FILE}")" \
     "${VERL_SIDECAR_STATE_DIR}"
 
 export ASCEND_RT_VISIBLE_DEVICES="${VERL_SIDECAR_NPU_DEVICES}"
+export MASTER_ADDR="${VERL_SIDECAR_MASTER_ADDR}"
 export MASTER_PORT="${VERL_SIDECAR_MASTER_PORT}"
 export HCCL_IF_BASE_PORT="${VERL_SIDECAR_HCCL_IF_BASE_PORT}"
 export VLLM_DP_MASTER_PORT="${VERL_SIDECAR_MASTER_PORT}"
@@ -96,9 +218,21 @@ export VERL_SIDECAR_MODEL_PATH
 export VERL_SIDECAR_PROMPTS_FILE
 export VERL_SIDECAR_MAX_PROMPTS
 export VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE
+export VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA
 export VERL_SIDECAR_DEVICE_COUNT
+export VERL_SIDECAR_REPLICA_COUNT
+export VERL_SIDECAR_DEVICE_GROUPS
+export VERL_SIDECAR_UNUSED_DEVICES
+export VERL_SIDECAR_PRIMARY_DEVICE_GROUP
+export VERL_SIDECAR_MASTER_ADDR
+export VERL_SIDECAR_MASTER_PORT_STRIDE
+export VERL_SIDECAR_HCCL_PORT_STRIDE
 export VERL_SIDECAR_PARALLEL_MODE
 export VERL_SIDECAR_TENSOR_PARALLEL_SIZE
+export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL
+export VERL_SIDECAR_MODEL_IS_MOE
+export VERL_SIDECAR_MODEL_IS_MOE_REASON
+export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE
 export VERL_SIDECAR_GPU_MEMORY_UTILIZATION
 export VERL_SIDECAR_MAX_MODEL_LEN
 export VERL_SIDECAR_MAX_NUM_SEQS
@@ -115,6 +249,7 @@ export VERL_SIDECAR_ITERATION_SLEEP_SECONDS
 export VERL_SIDECAR_GENERATE_CHUNK_SIZE
 export VERL_SIDECAR_STREAM_CHECKPOINT
 export VERL_SIDECAR_PARTIAL_SYNC_EVERY_STEPS
+export VERL_SIDECAR_STOP_FILE
 export VERL_SIDECAR_STATE_DIR
 export VERL_SIDECAR_DATA_SPLIT="${VERL_SIDECAR_DATA_SPLIT:-train}"
 export VERL_SIDECAR_USE_SHORT_DATA="${VERL_SIDECAR_USE_SHORT_DATA:-0}"
@@ -124,7 +259,14 @@ export VLLM_DP_SIZE="${VERL_SIDECAR_DP_SIZE:-1}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export VLLM_LOGGING_LEVEL="${VERL_SIDECAR_VLLM_LOGGING_LEVEL:-INFO}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
-export VLLM_ENABLE_EXPERT_PARALLEL="${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL:-0}"
+export VLLM_ENABLE_EXPERT_PARALLEL="${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}"
+
+# The sidecar is launched from a training process tree, so make sure vLLM TP
+# does not inherit training/Ray distributed rank metadata.
+unset RANK WORLD_SIZE LOCAL_RANK LOCAL_WORLD_SIZE GROUP_RANK GROUP_WORLD_SIZE
+unset ROLE_RANK ROLE_WORLD_SIZE NODE_RANK
+unset OMPI_COMM_WORLD_RANK OMPI_COMM_WORLD_SIZE OMPI_COMM_WORLD_LOCAL_RANK
+unset PMI_RANK PMI_SIZE PMI_LOCAL_RANK
 
 SIDECAR_SHARD_OUTPUTS=()
 PY_SCRIPT=$(mktemp /tmp/elastic_sidecar_infer.XXXXXX.py)
@@ -144,6 +286,7 @@ trap cleanup_sidecar EXIT
 
 cat > "${PY_SCRIPT}" <<'PY'
 from copy import copy
+import gc
 import json
 import os
 import signal
@@ -481,6 +624,32 @@ def _chunks(items: list[dict], size: int):
 
 
 _shutdown_requested = False
+_stop_file_logged = False
+
+
+def _stop_file_path() -> Path | None:
+    value = os.environ.get("VERL_SIDECAR_STOP_FILE", "").strip()
+    return Path(value) if value else None
+
+
+def _stop_requested() -> bool:
+    global _shutdown_requested, _stop_file_logged
+    if _shutdown_requested:
+        return True
+    path = _stop_file_path()
+    if path is not None and path.exists():
+        _shutdown_requested = True
+        if not _stop_file_logged:
+            _stop_file_logged = True
+            print(json.dumps({
+                "event": "sidecar_soft_stop_observed",
+                "time": time.time(),
+                "stop_file": str(path),
+                "shard_index": shard_index,
+                "num_shards": num_shards,
+            }, ensure_ascii=False), flush=True)
+        return True
+    return False
 
 
 def _request_shutdown(signum, frame):
@@ -490,6 +659,91 @@ def _request_shutdown(signum, frame):
 
 signal.signal(signal.SIGTERM, _request_shutdown)
 signal.signal(signal.SIGINT, _request_shutdown)
+
+
+def _call_if_present(obj, label: str, method_names: tuple[str, ...]) -> dict:
+    if obj is None:
+        return {"label": label, "status": "missing"}
+    for method_name in method_names:
+        method = getattr(obj, method_name, None)
+        if callable(method):
+            start = time.perf_counter()
+            try:
+                method()
+                return {
+                    "label": label,
+                    "method": method_name,
+                    "status": "ok",
+                    "time_s": time.perf_counter() - start,
+                }
+            except Exception as exc:
+                return {
+                    "label": label,
+                    "method": method_name,
+                    "status": "error",
+                    "error": repr(exc),
+                    "time_s": time.perf_counter() - start,
+                }
+    return {"label": label, "status": "no_method"}
+
+
+def _shutdown_llm_engine(llm) -> None:
+    start = time.perf_counter()
+    print(json.dumps({
+        "event": "sidecar_engine_shutdown_start",
+        "time": time.time(),
+        "shard_index": shard_index,
+        "num_shards": num_shards,
+    }, ensure_ascii=False), flush=True)
+
+    engine = getattr(llm, "llm_engine", None)
+    engine_core = getattr(engine, "engine_core", None)
+    model_executor = getattr(engine, "model_executor", None)
+    results = []
+    seen = set()
+    for label, obj, methods in (
+            ("llm", llm, ("shutdown", "close")),
+            ("llm.llm_engine", engine, ("shutdown", "close")),
+            ("llm.llm_engine.engine_core", engine_core, ("shutdown", "close")),
+            ("llm.llm_engine.model_executor", model_executor, ("shutdown", "close")),
+    ):
+        if obj is not None and id(obj) in seen:
+            continue
+        if obj is not None:
+            seen.add(id(obj))
+        results.append(_call_if_present(obj, label, methods))
+
+    cache_result = {"label": "torch.npu.empty_cache", "status": "skipped"}
+    try:
+        import torch
+        npu = getattr(torch, "npu", None)
+        if npu is not None:
+            try:
+                npu.empty_cache()
+                cache_result = {"label": "torch.npu.empty_cache", "status": "ok"}
+            except Exception as exc:
+                cache_result = {
+                    "label": "torch.npu.empty_cache",
+                    "status": "error",
+                    "error": repr(exc),
+                }
+    except Exception as exc:
+        cache_result = {
+            "label": "torch.npu.empty_cache",
+            "status": "import_error",
+            "error": repr(exc),
+        }
+    results.append(cache_result)
+    gc.collect()
+
+    print(json.dumps({
+        "event": "sidecar_engine_shutdown_done",
+        "time": time.time(),
+        "shutdown_time_s": time.perf_counter() - start,
+        "results": results,
+        "shard_index": shard_index,
+        "num_shards": num_shards,
+    }, ensure_ascii=False), flush=True)
 
 
 def _completion_payload(out, prefix_text: str = "") -> tuple[dict, int, str, int]:
@@ -648,10 +902,24 @@ def _generate_chunk_streaming(llm, chunk_records: list[dict], sampling_params,
             _write_resume_records(resume_file, resume_records)
             partial_rows.clear()
 
-        if _shutdown_requested:
+        if _stop_requested():
             if latest_by_request:
                 _append_jsonl(partials_file, list(latest_by_request.values()))
             _write_resume_records(resume_file, resume_records)
+            print(json.dumps({
+                "event": "sidecar_soft_stop_checkpointed",
+                "time": time.time(),
+                "iteration": iteration,
+                "chunk_start": chunk_start,
+                "sidecar_epoch": sidecar_epoch,
+                "active_requests": len(request_to_record),
+                "checkpointed_requests": len(latest_by_request),
+                "resume_prompts": len(resume_records),
+                "shard_index": shard_index,
+                "num_shards": num_shards,
+                "resume_file": str(resume_file),
+                "partials_file": str(partials_file),
+            }, ensure_ascii=False), flush=True)
             if request_to_record:
                 try:
                     llm.llm_engine.abort_request(list(request_to_record))
@@ -769,6 +1037,12 @@ print(json.dumps({
     "state_dir": str(state_dir),
     "resume_file": str(resume_file),
     "partials_file": str(partials_file),
+    "stop_file": os.environ.get("VERL_SIDECAR_STOP_FILE", ""),
+    "expert_parallel_allowed": os.environ.get("VERL_SIDECAR_ENABLE_EXPERT_PARALLEL", ""),
+    "expert_parallel_effective": os.environ.get("VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE", ""),
+    "model_is_moe": os.environ.get("VERL_SIDECAR_MODEL_IS_MOE", ""),
+    "model_is_moe_reason": os.environ.get("VERL_SIDECAR_MODEL_IS_MOE_REASON", ""),
+    "vllm_enable_expert_parallel": os.environ.get("VLLM_ENABLE_EXPERT_PARALLEL", ""),
     "max_prompts": max_prompts,
     "max_prompts_per_device": max_prompts_per_device,
     "max_records_per_iteration": max_records_per_iteration,
@@ -792,6 +1066,17 @@ total_output_tokens = 0
 total_infer_s = 0.0
 last_total_prompts = len(records)
 while True:
+    if _stop_requested():
+        print(json.dumps({
+            "event": "sidecar_stop_before_iteration",
+            "iteration": iteration,
+            "sidecar_epoch": sidecar_epoch,
+            "shard_index": shard_index,
+            "num_shards": num_shards,
+            "state_dir": str(state_dir),
+        }, ensure_ascii=False), flush=True)
+        break
+
     completed_ids = _read_jsonl_ids(completed_file)
     inflight_ids = _read_inflight_ids(inflight_file)
     resume_records = _read_resume_records(resume_file)
@@ -833,6 +1118,18 @@ while True:
     iteration_output_tokens = 0
     iteration_infer_s = 0.0
     for chunk_start, chunk_records in _chunks(selected_records, chunk_size):
+        if _stop_requested():
+            print(json.dumps({
+                "event": "sidecar_stop_before_chunk",
+                "iteration": iteration,
+                "chunk_start": chunk_start,
+                "sidecar_epoch": sidecar_epoch,
+                "shard_index": shard_index,
+                "num_shards": num_shards,
+                "state_dir": str(state_dir),
+            }, ensure_ascii=False), flush=True)
+            break
+
         chunk_ids = [int(item["prompt_id"]) for item in chunk_records]
         _atomic_write_json(inflight_file, {
             "time": time.time(),
@@ -947,39 +1244,59 @@ print(json.dumps({
     "output_file": str(output_file),
 }, ensure_ascii=False), flush=True)
 
+try:
+    _shutdown_llm_engine(llm)
+finally:
+    llm = None
+    gc.collect()
+
 PY
 
 {
     echo "sidecar_start_time=$(date +%s.%N)"
     echo "sidecar_devices=${VERL_SIDECAR_NPU_DEVICES}"
     echo "sidecar_device_count=${VERL_SIDECAR_DEVICE_COUNT}"
+    echo "sidecar_replica_count=${VERL_SIDECAR_REPLICA_COUNT}"
     echo "sidecar_parallel_mode=${VERL_SIDECAR_PARALLEL_MODE}"
     echo "sidecar_tensor_parallel_size=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}"
+    echo "sidecar_device_groups=${VERL_SIDECAR_DEVICE_GROUPS}"
+    echo "sidecar_unused_devices=${VERL_SIDECAR_UNUSED_DEVICES}"
+    echo "sidecar_master_addr=${VERL_SIDECAR_MASTER_ADDR}"
+    echo "sidecar_master_port_base=${VERL_SIDECAR_MASTER_PORT}"
+    echo "sidecar_master_port_stride=${VERL_SIDECAR_MASTER_PORT_STRIDE}"
+    echo "sidecar_hccl_if_base_port=${VERL_SIDECAR_HCCL_IF_BASE_PORT}"
+    echo "sidecar_hccl_port_stride=${VERL_SIDECAR_HCCL_PORT_STRIDE}"
+    echo "sidecar_ep_allowed=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL}"
+    echo "sidecar_model_is_moe=${VERL_SIDECAR_MODEL_IS_MOE}"
+    echo "sidecar_model_is_moe_reason=${VERL_SIDECAR_MODEL_IS_MOE_REASON}"
+    echo "sidecar_ep_effective=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}"
     echo "sidecar_model=${VERL_SIDECAR_MODEL_PATH}"
     echo "sidecar_output=${VERL_SIDECAR_OUTPUT_FILE}"
     echo "sidecar_state_dir=${VERL_SIDECAR_STATE_DIR}"
     echo "sidecar_generate_chunk_size=${VERL_SIDECAR_GENERATE_CHUNK_SIZE}"
     echo "sidecar_stream_checkpoint=${VERL_SIDECAR_STREAM_CHECKPOINT}"
     echo "sidecar_partial_sync_every_steps=${VERL_SIDECAR_PARTIAL_SYNC_EVERY_STEPS}"
+    echo "sidecar_stop_file=${VERL_SIDECAR_STOP_FILE}"
     set +e
-    if [[ "${VERL_SIDECAR_PARALLEL_MODE}" == "dp" && "${VERL_SIDECAR_DEVICE_COUNT}" -gt 1 ]]; then
-        IFS=',' read -r -a sidecar_devices <<< "${VERL_SIDECAR_NPU_DEVICES}"
+    if [[ "${VERL_SIDECAR_REPLICA_COUNT}" -gt 1 ]]; then
+        IFS=';' read -r -a sidecar_device_groups <<< "${VERL_SIDECAR_DEVICE_GROUPS}"
         sidecar_pids=()
         shard_index=0
-        for raw_device in "${sidecar_devices[@]}"; do
-            device=$(echo "${raw_device}" | xargs)
-            [[ -n "${device}" ]] || continue
+        for raw_group in "${sidecar_device_groups[@]}"; do
+            device_group=$(echo "${raw_group}" | xargs)
+            [[ -n "${device_group}" ]] || continue
             shard_output="${VERL_SIDECAR_OUTPUT_FILE}.shard${shard_index}"
             SIDECAR_SHARD_OUTPUTS+=("${shard_output}")
             (
-                export ASCEND_RT_VISIBLE_DEVICES="${device}"
+                export ASCEND_RT_VISIBLE_DEVICES="${device_group}"
+                export MASTER_ADDR="${VERL_SIDECAR_MASTER_ADDR}"
                 export VERL_SIDECAR_SHARD_INDEX="${shard_index}"
-                export VERL_SIDECAR_NUM_SHARDS="${VERL_SIDECAR_DEVICE_COUNT}"
+                export VERL_SIDECAR_NUM_SHARDS="${VERL_SIDECAR_REPLICA_COUNT}"
                 export VERL_SIDECAR_OUTPUT_FILE="${shard_output}"
-                export MASTER_PORT=$((VERL_SIDECAR_MASTER_PORT + shard_index))
-                export HCCL_IF_BASE_PORT=$((VERL_SIDECAR_HCCL_IF_BASE_PORT + shard_index * 16))
+                export MASTER_PORT=$((VERL_SIDECAR_MASTER_PORT + shard_index * VERL_SIDECAR_MASTER_PORT_STRIDE))
+                export HCCL_IF_BASE_PORT=$((VERL_SIDECAR_HCCL_IF_BASE_PORT + shard_index * VERL_SIDECAR_HCCL_PORT_STRIDE))
                 export VLLM_DP_MASTER_PORT="${MASTER_PORT}"
-                echo "sidecar_shard_start_time=$(date +%s.%N) shard=${shard_index} device=${device} output=${shard_output}"
+                echo "sidecar_shard_start_time=$(date +%s.%N) shard=${shard_index} device_group=${device_group} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} master_port=${MASTER_PORT} hccl_if_base_port=${HCCL_IF_BASE_PORT} output=${shard_output}"
                 if [[ "${VERL_SIDECAR_MAX_SECONDS}" != "0" ]]; then
                     timeout --kill-after=10s "${VERL_SIDECAR_MAX_SECONDS}s" python3 -u "${PY_SCRIPT}" 2>&1
                     shard_rc=$?
@@ -987,7 +1304,7 @@ PY
                     python3 -u "${PY_SCRIPT}" 2>&1
                     shard_rc=$?
                 fi
-                echo "sidecar_shard_end_time=$(date +%s.%N) shard=${shard_index} device=${device} exit_code=${shard_rc}"
+                echo "sidecar_shard_end_time=$(date +%s.%N) shard=${shard_index} device_group=${device_group} exit_code=${shard_rc}"
                 exit "${shard_rc}"
             ) &
             sidecar_pids+=("$!")
@@ -1008,9 +1325,15 @@ PY
             fi
         done
     elif [[ "${VERL_SIDECAR_MAX_SECONDS}" != "0" ]]; then
+        export ASCEND_RT_VISIBLE_DEVICES="${VERL_SIDECAR_PRIMARY_DEVICE_GROUP}"
+        export VERL_SIDECAR_SHARD_INDEX=0
+        export VERL_SIDECAR_NUM_SHARDS=1
         timeout --kill-after=10s "${VERL_SIDECAR_MAX_SECONDS}s" python3 -u "${PY_SCRIPT}" 2>&1
         rc=$?
     else
+        export ASCEND_RT_VISIBLE_DEVICES="${VERL_SIDECAR_PRIMARY_DEVICE_GROUP}"
+        export VERL_SIDECAR_SHARD_INDEX=0
+        export VERL_SIDECAR_NUM_SHARDS=1
         python3 -u "${PY_SCRIPT}" 2>&1
         rc=$?
     fi

@@ -17,15 +17,28 @@ WORLD_SIZE=${VERL_SIDECAR_WORLD_SIZE:-16}
 POLL_INTERVAL=${VERL_SIDECAR_WATCH_POLL_INTERVAL:-1}
 START_ONCE=${VERL_SIDECAR_START_ONCE:-1}
 GRACEFUL_KILL_SECONDS=${VERL_SIDECAR_GRACEFUL_KILL_SECONDS:-3}
+START_TRIGGER=${VERL_SIDECAR_START_TRIGGER:-shrink_done}
+SIDECAR_STOP_FILE=${VERL_SIDECAR_STOP_FILE:-}
+if [[ -z "${SIDECAR_STOP_FILE}" ]]; then
+    if [[ -n "${VERL_SIDECAR_OUTPUT_FILE:-}" ]]; then
+        SIDECAR_STOP_FILE="${VERL_SIDECAR_OUTPUT_FILE}.stop_requested"
+    else
+        SIDECAR_STOP_FILE="${LEASE_LOG}.stop_requested"
+    fi
+fi
+export VERL_SIDECAR_STOP_FILE="${SIDECAR_STOP_FILE}"
 
 mkdir -p "$(dirname "${LEASE_LOG}")"
+mkdir -p "$(dirname "${VERL_SIDECAR_STOP_FILE}")"
 
 echo "watch_start_time=$(date +%s.%N)" | tee -a "${LEASE_LOG}"
 echo "watch_train_log=${TRAIN_LOG}" | tee -a "${LEASE_LOG}"
 echo "watch_sidecar_script=${SIDECAR_SCRIPT}" | tee -a "${LEASE_LOG}"
 echo "watch_expected_active_ranks=${EXPECTED_ACTIVE_RANKS}" | tee -a "${LEASE_LOG}"
 echo "watch_world_size=${WORLD_SIZE}" | tee -a "${LEASE_LOG}"
+echo "watch_start_trigger=${START_TRIGGER}" | tee -a "${LEASE_LOG}"
 echo "watch_graceful_kill_seconds=${GRACEFUL_KILL_SECONDS}" | tee -a "${LEASE_LOG}"
+echo "watch_sidecar_stop_file=${VERL_SIDECAR_STOP_FILE}" | tee -a "${LEASE_LOG}"
 
 sidecar_pid=""
 sidecar_started=0
@@ -54,15 +67,23 @@ merge_sidecar_outputs() {
     echo "sidecar_output_merge_time=$(date +%s.%N) output=${output_file} shards=${#shard_outputs[@]}" | tee -a "${LEASE_LOG}"
 }
 
-kill_sidecar() {
+stop_sidecar() {
     local reason=${1:-unknown}
     if [[ -n "${sidecar_pid}" ]] && kill -0 "${sidecar_pid}" 2>/dev/null; then
-        echo "sidecar_kill_time=$(date +%s.%N) reason=${reason} pid=${sidecar_pid}" | tee -a "${LEASE_LOG}"
-        kill -- -"${sidecar_pid}" 2>/dev/null || kill "${sidecar_pid}" 2>/dev/null || true
+        echo "sidecar_stop_request_time=$(date +%s.%N) reason=${reason} pid=${sidecar_pid} stop_file=${VERL_SIDECAR_STOP_FILE}" | tee -a "${LEASE_LOG}"
+        printf "time=%s\nreason=%s\npid=%s\n" "$(date +%s.%N)" "${reason}" "${sidecar_pid}" > "${VERL_SIDECAR_STOP_FILE}"
         local deadline=$((SECONDS + GRACEFUL_KILL_SECONDS))
         while kill -0 "${sidecar_pid}" 2>/dev/null && (( SECONDS < deadline )); do
             sleep 0.2
         done
+        if kill -0 "${sidecar_pid}" 2>/dev/null; then
+            echo "sidecar_kill_time=$(date +%s.%N) reason=${reason} pid=${sidecar_pid} after_soft_stop=1" | tee -a "${LEASE_LOG}"
+            kill -- -"${sidecar_pid}" 2>/dev/null || kill "${sidecar_pid}" 2>/dev/null || true
+            local term_deadline=$((SECONDS + 2))
+            while kill -0 "${sidecar_pid}" 2>/dev/null && (( SECONDS < term_deadline )); do
+                sleep 0.2
+            done
+        fi
         if kill -0 "${sidecar_pid}" 2>/dev/null; then
             echo "sidecar_force_kill_time=$(date +%s.%N) reason=${reason} pid=${sidecar_pid}" | tee -a "${LEASE_LOG}"
             kill -9 -- -"${sidecar_pid}" 2>/dev/null || kill -9 "${sidecar_pid}" 2>/dev/null || true
@@ -73,7 +94,7 @@ kill_sidecar() {
 }
 
 cleanup() {
-    kill_sidecar "watcher_exit"
+    stop_sidecar "watcher_exit"
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
@@ -126,6 +147,7 @@ start_sidecar() {
         export VERL_SIDECAR_NPU_DEVICES="${devices_csv}"
         echo "sidecar_devices_source=auto_from_inactive_ranks" | tee -a "${LEASE_LOG}"
     fi
+    rm -f "${VERL_SIDECAR_STOP_FILE}"
     sidecar_started=1
     echo "sidecar_start_time=$(date +%s.%N)" | tee -a "${LEASE_LOG}"
     echo "sidecar_active_ranks=${active_csv}" | tee -a "${LEASE_LOG}"
@@ -138,6 +160,23 @@ start_sidecar() {
 while [[ ! -f "${TRAIN_LOG}" ]]; do
     sleep "${POLL_INTERVAL}"
 done
+
+is_sidecar_start_line() {
+    local line=$1
+    case "${START_TRIGGER}" in
+        shrink_done)
+            [[ "${line}" == *"Elastic parallel shrink done"* ]]
+            ;;
+        detach_or_shrink)
+            [[ "${line}" == *"Elastic parallel detach done"* ]] || \
+                [[ "${line}" == *"Elastic parallel shrink done"* ]]
+            ;;
+        *)
+            echo "unsupported_start_trigger=${START_TRIGGER}" | tee -a "${LEASE_LOG}"
+            return 1
+            ;;
+    esac
+}
 
 while true; do
     if [[ ! -f "${TRAIN_LOG}" ]]; then
@@ -152,8 +191,7 @@ while true; do
     total_lines=$(wc -l < "${TRAIN_LOG}" || echo 0)
     if (( total_lines > line_offset )); then
         while IFS= read -r line; do
-            if [[ "${sidecar_started}" == "0" ]] && \
-               { [[ "${line}" == *"Elastic parallel detach done"* ]] || [[ "${line}" == *"Elastic parallel shrink done"* ]]; }; then
+            if [[ "${sidecar_started}" == "0" ]] && is_sidecar_start_line "${line}"; then
                 active_count=$(count_active_ranks "${line}")
                 if [[ "${active_count}" == "${EXPECTED_ACTIVE_RANKS}" ]]; then
                     active_csv=$(extract_active_ranks_csv "${line}")
@@ -164,12 +202,13 @@ while true; do
             fi
 
             if [[ "${sidecar_started}" == "1" && "${sidecar_done}" == "0" ]] && \
-               { [[ "${line}" == *"Elastic parallel restore requested after rollout"* ]] || \
+               { [[ "${line}" == *"Elastic parallel restore requested before rollout restore rpc"* ]] || \
+                 [[ "${line}" == *"Elastic parallel restore requested after rollout"* ]] || \
                  [[ "${line}" == *"Elastic parallel restore"* ]] || \
                  [[ "${line}" == *"rollout_output_time_s"* ]]; }; then
                 echo "sidecar_deadline_signal_time=$(date +%s.%N)" | tee -a "${LEASE_LOG}"
                 echo "sidecar_deadline_signal_line=${line}" | tee -a "${LEASE_LOG}"
-                kill_sidecar "training_rollout_done_or_restore"
+                stop_sidecar "training_rollout_done_or_restore"
                 sidecar_done=1
             fi
         done < <(tail -n +$((line_offset + 1)) "${TRAIN_LOG}")

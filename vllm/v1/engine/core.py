@@ -78,8 +78,11 @@ class EngineCore:
         self.vllm_config = vllm_config
         logger.info("Initializing a V1 LLM engine (v%s) with config: %s",
                     VLLM_VERSION, vllm_config)
-        logger.warning("EngineCore __init__ pid=%s stack=\n%s",
-               os.getpid(), "".join(traceback.format_stack(limit=30)))
+        if os.getenv("VLLM_ENGINE_CORE_INIT_STACK_LOG", "0").lower() not in (
+                "0", "false", "no", "off"):
+            logger.warning("EngineCore __init__ pid=%s stack=\n%s",
+                           os.getpid(),
+                           "".join(traceback.format_stack(limit=30)))
 
         self.log_stats = log_stats
 
@@ -683,8 +686,14 @@ class EngineCoreProc(EngineCore):
                         local_dp_rank: int = 0,
                         **kwargs):
         """Launch EngineCore busy loop in background process."""
-        print("### run_engine_core entered ###", flush=True)
-        print("vllm parallel config:", kwargs["vllm_config"].parallel_config, flush=True)
+        debug_engine_core = os.getenv("VLLM_ENGINE_CORE_DEBUG_LOG",
+                                      "0").lower() not in (
+                                          "0", "false", "no", "off")
+        if debug_engine_core:
+            print("### run_engine_core entered ###", flush=True)
+            print("vllm parallel config:",
+                  kwargs["vllm_config"].parallel_config,
+                  flush=True)
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
@@ -708,7 +717,8 @@ class EngineCoreProc(EngineCore):
         try:
             parallel_config: ParallelConfig = kwargs[
                 "vllm_config"].parallel_config
-            print("vllm parallel config,", parallel_config)
+            if debug_engine_core:
+                print("vllm parallel config,", parallel_config)
             if parallel_config.data_parallel_size > 1 or dp_rank > 0:
                 set_process_title("EngineCore", f"DP{dp_rank}")
                 decorate_logs()

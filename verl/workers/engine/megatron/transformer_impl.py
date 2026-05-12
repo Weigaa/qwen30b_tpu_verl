@@ -118,7 +118,9 @@ class MegatronEngine(BaseEngine):
         if not self.bridge:
             self.weight_converter = get_mcore_weight_converter(self.model_config.hf_config, self.dtype)
 
-        if torch.distributed.get_rank() == 0:
+        if (torch.distributed.get_rank() == 0
+                and os.getenv("VERL_LOG_FULL_TRANSFORMER_CONFIG", "0").lower()
+                not in ("0", "false", "no", "off")):
             print(f"TF config: {tf_config}")
         self.tf_config = tf_config
 

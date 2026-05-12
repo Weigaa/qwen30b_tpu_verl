@@ -176,7 +176,9 @@ class MegatronWorker(Worker):
             tf_config = hf_to_mcore_config(hf_config, dtype, **override_transformer_config)
             self.bridge = None
 
-        print(f"TF config: {tf_config}")
+        if os.getenv("VERL_LOG_FULL_TRANSFORMER_CONFIG", "0").lower() not in (
+                "0", "false", "no", "off"):
+            print(f"TF config: {tf_config}")
         self.hf_config = hf_config
         self.tf_config = tf_config
 
