@@ -389,10 +389,8 @@ class RayWorkerGroup(WorkerGroup):
                 ),
             ).remote()
         )
-        # Allocate a non-overlapping HCCL base-port block per WorkerGroup
-        # within the current trainer process. Reusing a random free port as a
-        # "base" is not enough because actor/rollout/ref phases then carve out
-        # overlapping sub-ranges and can race into Bind_Failed(EJ0003).
+        # Keep each WorkerGroup on a non-overlapping HCCL port block so the
+        # later actor/rollout/ref phase offsets do not race into each other.
         self._hccl_if_base_port = _alloc_hccl_if_base_port()
         logging.info(
             "WorkerGroup %s uses MASTER_PORT=%s HCCL_IF_BASE_PORT=%s",
@@ -822,7 +820,6 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
                     self.worker_dict[key] = user_defined_cls(
                         *init_args_dict[key].get("args", ()), **init_args_dict[key].get("kwargs", {})
                     )
-
     # now monkey-patch the methods from inner class to WorkerDict
     for key, user_defined_cls in cls_dict.items():
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)

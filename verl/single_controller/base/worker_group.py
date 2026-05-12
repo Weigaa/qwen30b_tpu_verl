@@ -147,7 +147,6 @@ class WorkerGroup:
 
         self._master_addr = None
         self._master_port = None
-        self._hccl_if_base_port = None
 
         self._checker_thread: threading.Thread = None
 

@@ -27,10 +27,10 @@ When working with Megatron:
 """
 
 import asyncio
-import getpass
+import copy
 import gc
+import getpass
 import inspect
-import json
 import logging
 import os
 import pickle
@@ -38,7 +38,6 @@ import socket
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
-from pathlib import Path
 from types import MethodType
 from typing import Any, Generator
 
@@ -53,8 +52,9 @@ from omegaconf import ListConfig
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh
 from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
+from vllm.config.lora import LoRAConfig
 from vllm.lora.request import LoRARequest
+from vllm.utils.moe_stats import moe_stats
 from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 
@@ -74,25 +74,41 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-#new wj import
-import copy
-import os
-from vllm.utils.moe_stats import moe_stats
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def _load_model_num_experts(model_path: str) -> int:
-    config_path = Path(model_path) / "config.json"
-    if not config_path.exists():
-        return 0
+def _rollout_memory_probe(stage: str) -> None:
+    if os.environ.get("VLLM_ROLLOUT_PHASE_MEMORY_LOG", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    if not is_npu_available:
+        return
     try:
-        config = json.loads(config_path.read_text())
+        torch.npu.synchronize()
     except Exception:
-        return 0
-    num_experts = config.get("num_experts")
-    return int(num_experts) if isinstance(num_experts, int) and num_experts > 0 else 0
+        pass
+    logger.info(
+        "rollout_memory_probe stage=%s allocated_gb=%.3f reserved_gb=%.3f "
+        "max_allocated_gb=%.3f max_reserved_gb=%.3f",
+        stage,
+        torch.npu.memory_allocated() / (1024**3),
+        torch.npu.memory_reserved() / (1024**3),
+        torch.npu.max_memory_allocated() / (1024**3),
+        torch.npu.max_memory_reserved() / (1024**3),
+    )
+
+
+# ignore redundant logs
+import warnings
+from numba.core.errors import NumbaPendingDeprecationWarning
+warnings.filterwarnings("ignore", category=NumbaPendingDeprecationWarning)
+logging.getLogger("torch._dynamo").setLevel(logging.CRITICAL)
 
 # TODO
 # 1. support pp in vllm
@@ -114,6 +130,231 @@ if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
 
+def _resolve_rollout_sleep_level(default_level: int, layered_summon: bool) -> int:
+    """Allow RL rollout to override vLLM's generic sleep policy.
+
+    vllm-ascend defaults NPU sleep mode to level 1 because generic serving must
+    preserve weights across sleep/wake. In RL rollout we immediately reload all
+    model weights before generation, so level 2 can avoid expensive weight
+    D2H/H2D backup while still preserving model buffers.
+    """
+    if layered_summon:
+        return 1
+
+    override = os.environ.get("VLLM_ROLLOUT_SLEEP_LEVEL")
+    if override is None or override == "":
+        return default_level
+
+    try:
+        sleep_level = int(override)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid VLLM_ROLLOUT_SLEEP_LEVEL=%r; using %s",
+            override,
+            default_level,
+        )
+        return default_level
+
+    if sleep_level not in (1, 2):
+        logger.warning(
+            "Ignoring unsupported VLLM_ROLLOUT_SLEEP_LEVEL=%s; using %s",
+            sleep_level,
+            default_level,
+        )
+        return default_level
+
+    logger.info(
+        "Using rollout sleep level %s (default=%s) for full-weight-reload RL rollout",
+        sleep_level,
+        default_level,
+    )
+    return sleep_level
+
+
+@contextmanager
+def _maybe_use_rollout_weight_pool(enabled: bool):
+    """Allocate reload-time post-processed weights in vLLM sleep's weight pool."""
+    use_pool = os.environ.get("VLLM_ROLLOUT_CAMEM_WEIGHT_RELOAD", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not enabled or not use_pool:
+        yield
+        return
+
+    try:
+        from vllm_ascend.device_allocator.camem import CaMemAllocator
+    except Exception as exc:
+        logger.warning(
+            "Cannot use CaMem weight pool during rollout weight reload: %s",
+            exc,
+        )
+        yield
+        return
+
+    allocator = CaMemAllocator.get_instance()
+    with allocator.use_memory_pool(tag="weights"):
+        yield
+
+
+def _moe_load_layout_shapes(model: torch.nn.Module) -> dict[str, tuple[int, ...]]:
+    """Return original MoE parameter shapes needed by vLLM load_weights().
+
+    Ascend split-MoE post-processes unquantized weights from loader layout
+    [E, 2I, H] / [E, H, I] into execution layout [E, H, 2I] / [E, I, H].
+    The old verl phase switch drops parameter storage between trainer and
+    rollout. When that storage is re-allocated before the next load, it must
+    use the loader layout or FusedMoE.weight_loader derives the wrong shard
+    size and can fail with "length (1024) exceeds dimension size (768)".
+    """
+    shapes: dict[str, tuple[int, ...]] = {}
+    for module_name, module in model.named_modules():
+        w13 = getattr(module, "w13_weight", None)
+        w2 = getattr(module, "w2_weight", None)
+        if not isinstance(w13, torch.nn.Parameter):
+            continue
+        if not isinstance(w2, torch.nn.Parameter):
+            continue
+        if w13.ndim != 3 or w2.ndim != 3:
+            continue
+
+        w13_shape = tuple(w13.shape)
+        w2_shape = tuple(w2.shape)
+        if (
+            w13_shape[0] == w2_shape[0]
+            and w13_shape[1] == w2_shape[2]
+            and w13_shape[2] == 2 * w2_shape[1]
+        ):
+            prefix = f"{module_name}." if module_name else ""
+            shapes[f"{prefix}w13_weight"] = (
+                w13_shape[0],
+                w13_shape[2],
+                w13_shape[1],
+            )
+            shapes[f"{prefix}w2_weight"] = (
+                w2_shape[0],
+                w2_shape[2],
+                w2_shape[1],
+            )
+    return shapes
+
+
+def _invalidate_rollout_aclgraphs(model_runner: Any, stage: str) -> int:
+    """Invalidate init-time ACL graphs after RL rollout weight reloads.
+
+    vLLM serving normally captures graphs once because model weights are
+    stable.  Hybrid RL rollout reloads and post-processes weights every step,
+    so any graph captured during dummy initialization can hold stale task
+    groups or tensor addresses and must not be replayed for real generation.
+    """
+    if os.environ.get("VLLM_ROLLOUT_INVALIDATE_ACLGRAPH_AFTER_WEIGHT_UPDATE",
+                      "1").lower() not in ("1", "true", "yes", "on"):
+        return 0
+    if not is_npu_available:
+        return 0
+
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    if cudagraph_mode is None or str(cudagraph_mode).endswith(".NONE"):
+        return 0
+
+    try:
+        from vllm_ascend.compilation.acl_graph import clear_aclgraph_caches
+    except Exception as exc:
+        logger.warning("Cannot invalidate rollout ACL graphs at %s: %s", stage, exc)
+        return 0
+
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+    cleared = clear_aclgraph_caches(getattr(model_runner, "model", None))
+    logger.warning(
+        "Invalidated %s rollout ACL graph entries after %s; next graph "
+        "eligible generation will recapture using current weights.",
+        cleared,
+        stage,
+    )
+    return cleared
+
+
+def _recapture_rollout_aclgraphs(model_runner: Any, stage: str) -> None:
+    """Recapture ACL graphs through the official vLLM capture path.
+
+    Attention task groups require the outer graph_capture context established by
+    model_runner.capture_model(); recapturing lazily from an individual wrapper
+    can enter attention graph-task-group code on a non-capturing stream.
+    """
+    if os.environ.get("VLLM_ROLLOUT_RECAPTURE_ACLGRAPH_AFTER_WEIGHT_UPDATE",
+                      "1").lower() not in ("1", "true", "yes", "on"):
+        return
+    if not is_npu_available:
+        return
+
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    if cudagraph_mode is None or str(cudagraph_mode).endswith(".NONE"):
+        return
+
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+    logger.warning("Recapturing rollout ACL graphs at %s using current weights.", stage)
+    model_runner.capture_model()
+    logger.warning("Finished recapturing rollout ACL graphs at %s.", stage)
+
+
+def _capture_rollout_graphs_after_weight_load(model_runner: Any, stage: str) -> None:
+    """Capture rollout graphs after real RL weights replace dummy init weights.
+
+    vLLM serving normally compiles/captures once during engine initialization.
+    In RL rollout the engine is initialized with dummy weights, then every
+    step reloads Megatron weights and runs process_weights_after_loading().
+    Capturing before that post-load layout exists can bind graph fragments to
+    dummy-time tensors/layouts and change generation stop behavior.
+    """
+    if os.environ.get("VLLM_ROLLOUT_DELAY_GRAPH_CAPTURE_UNTIL_WEIGHT_LOAD",
+                      "0").lower() not in ("1", "true", "yes", "on"):
+        return
+    if os.environ.get("VLLM_ROLLOUT_CAPTURE_GRAPH_AFTER_WEIGHT_LOAD",
+                      "0").lower() not in ("1", "true", "yes", "on"):
+        logger.warning_once(
+            "VLLM_ROLLOUT_DELAY_GRAPH_CAPTURE_UNTIL_WEIGHT_LOAD=1 but "
+            "VLLM_ROLLOUT_CAPTURE_GRAPH_AFTER_WEIGHT_LOAD is disabled; "
+            "skipping explicit post-load ACL graph capture.",
+        )
+        return
+    if not is_npu_available:
+        return
+
+    vllm_config = getattr(model_runner, "vllm_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+    if cudagraph_mode is None or str(cudagraph_mode).endswith(".NONE"):
+        return
+    if getattr(model_runner, "_rollout_graphs_captured_after_weight_load",
+               False):
+        return
+
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+    logger.warning(
+        "Capturing rollout ACL graphs at %s after real weights were loaded and "
+        "post-processed.",
+        stage,
+    )
+    model_runner.capture_model()
+    setattr(model_runner, "_rollout_graphs_captured_after_weight_load", True)
+    logger.warning("Finished delayed rollout ACL graph capture at %s.", stage)
+
+
 class vLLMRollout(BaseRollout):
     def __init__(
         self,
@@ -121,17 +362,12 @@ class vLLMRollout(BaseRollout):
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
     ):
-        self.config = config
-        self.model_config = model_config
-        self.device_mesh = device_mesh
+        super().__init__(config, model_config, device_mesh)
 
-        from vllm_ascend.patch import platform
-        from vllm_ascend.patch import worker
-
-        if config.layered_summon:
-            self.sleep_level = 1
-        else:
-            self.sleep_level = VLLM_SLEEP_LEVEL
+        self.sleep_level = _resolve_rollout_sleep_level(
+            VLLM_SLEEP_LEVEL,
+            bool(config.layered_summon),
+        )
 
         model_path = model_config.local_path
         tokenizer = model_config.tokenizer
@@ -149,7 +385,7 @@ class vLLMRollout(BaseRollout):
         )
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
-        #If VLLM_DP_SIZE is configured, the DP communication domain needs to be explicitly initialized.
+        # If VLLM_DP_SIZE is configured, the DP communication domain needs to be explicitly initialized.
         if int(os.environ.get("VLLM_DP_SIZE", "1")) > 1:
             from r1_ascend.vllm_parallel_state import init_parallel_state
             init_parallel_state(tensor_parallel_size)
@@ -189,6 +425,12 @@ class vLLMRollout(BaseRollout):
 
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
 
+        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+            raise ValueError(
+                "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+                             please increase max_num_batched_tokens or disable chunked prefill"
+            )
+
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
 
         # copy it to avoid secretly modifying the engine config
@@ -207,43 +449,76 @@ class vLLMRollout(BaseRollout):
         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
         # enforce_eager must be False to use cudagraph
         if not config.enforce_eager and cudagraph_capture_sizes:
-            if isinstance(cudagraph_capture_sizes, ListConfig):
-                compilation_config["compilation_config"] = CompilationConfig(
-                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=cudagraph_capture_sizes
-                )
-            else:
-                logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+            torch._dynamo.config.log_compilation_metrics = False
+            compilation_config["compilation_config"] = {
+                "cudagraph_capture_sizes": cudagraph_capture_sizes,
+                "cudagraph_mode": "FULL",
+            }
 
         self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1
-        elastic_execution_mode = envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE
-        elastic_moe_mode = envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE
-        init_redundancy_expert = envs_ascend.VLLM_ASCEND_INIT_REDUNDANCY_EXPERT
-        if elastic_execution_mode in (1, 2):
-            initial_ep_size = int(os.environ.get("VLLM_DP_SIZE", "1"))
-            model_num_experts = _load_model_num_experts(model_path)
-            init_redundancy_expert = (
-                envs_ascend.compute_elastic_init_redundancy_expert(
-                    model_num_experts,
-                    initial_ep_size,
-                    init_redundancy_expert,
-                ))
-            logger.info(
-                "Elastic execution mode resolved: mode=%s elastic_moe_mode=%s initial_ep_size=%s floor=%s hybrid_resident_slots=%s num_experts=%s init_redundancy_expert=%s",
-                elastic_execution_mode,
-                elastic_moe_mode,
-                initial_ep_size,
-                envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE,
-                envs_ascend.VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS,
-                model_num_experts,
-                init_redundancy_expert,
+        elastic_shrink_enabled = bool(envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK)
+        legacy_runtime_enabled = bool(getattr(envs_ascend, "VLLM_ASCEND_USE_LEGACY_FUSED_MOE", False))
+        alloc_conf = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
+        if "expandable_segments:True" in alloc_conf:
+            # vllm_ascend CaMem allocator rejects expandable segments.
+            fallback_conf = "garbage_collection_threshold:0.6,max_split_size_mb:24"
+            logger.warning(
+                "Replacing incompatible PYTORCH_NPU_ALLOC_CONF=%s with %s for vLLM rollout",
+                alloc_conf,
+                fallback_conf,
             )
-        self.elastic_execution_mode = elastic_execution_mode
-        self.elastic_init_redundancy_expert = init_redundancy_expert
+            os.environ["PYTORCH_NPU_ALLOC_CONF"] = fallback_conf
+        if str(os.environ.get("VLLM_ASCEND_ENABLE_NZ", "0")) != "0":
+            logger.warning(
+                "Replacing incompatible VLLM_ASCEND_ENABLE_NZ=%s with 0 for RL rollout",
+                os.environ.get("VLLM_ASCEND_ENABLE_NZ"),
+            )
+            os.environ["VLLM_ASCEND_ENABLE_NZ"] = "0"
+        self.manual_free_cache_engine = (
+            os.environ.get("VLLM_ROLLOUT_MANUAL_FREE_CACHE_ENGINE", "0").lower()
+            in ("1", "true", "yes", "on")
+        )
+        if self.manual_free_cache_engine:
+            logger.warning(
+                "Using manual rollout cache/weight offload instead of native vLLM sleep mode."
+            )
+        additional_config = {
+            "ascend_scheduler_config": {
+                "enabled": True,
+                # Keep the Ascend-side scheduler behavior aligned with the
+                # user-facing rollout flag instead of silently forcing the
+                # chunked-prefill path on.
+                "enable_chunked_prefill": config.enable_chunked_prefill,
+            },
+            "refresh": True,
+            "dynamic_eplb": self.dynamic_eplb,
+            "num_iterations_eplb_update": 400,  # gather stable workload over 400 iterations
+            "gate_eplb": True,
+            "num_wait_worker_iterations": 30,  # wait for 30 iterations to complete the EPLB calculation
+            "npugraph_ex_config": {
+                "enable": True,
+                "enable_static_kernel": eval(os.environ.get("NPUGRAPH_EX_ENABLE_STATIC_KERNEL", "False"))
+            }
+        }
+        if elastic_shrink_enabled:
+            additional_config.update({
+                "elastic_execution_mode": envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE,
+                "elastic_moe_mode": envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE,
+                "init_redundancy_expert": envs_ascend.VLLM_ASCEND_INIT_REDUNDANCY_EXPERT,
+            })
+
         self.inference_engine = LLM(
             model=model_path,
-            enable_sleep_mode=False,
+            # Use vLLM/vllm_ascend native sleep mode so the allocator keeps
+            # parameter storage and post-load layout state consistent.
+            enable_sleep_mode=config.free_cache_engine and not self.manual_free_cache_engine,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
+            worker_cls=(
+                "vllm_ascend.worker.worker_v1.NPUWorker"
+                if elastic_shrink_enabled or legacy_runtime_enabled
+                else "auto"
+            ),
             dtype=config.dtype,
             enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
@@ -255,48 +530,32 @@ class vLLMRollout(BaseRollout):
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
+            async_scheduling=config.async_scheduling,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=False,
+            enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
-            additional_config={
-                "torchair_graph_config": {
-                    "enabled": int(os.environ.get("VLLM_ENABLE_GRAPH_MODE", "0")),
-                    "use_cached_graph": False,
-                    "graph_batch_sizes_init": True,
-                    "enable_multistream_mla": False,
-                    "enable_zero_tp_to_ep": True,
-                    "enable_view_optimize": False,
-                    "enable_kv_nz": False,
-                    "enable_frozen_parameter": False,
-                } if not config.enforce_eager else {"enabled": False},
-                "ascend_scheduler_config": {
-                    "enabled": True,
-                    "enable_chunked_prefill": False,
-                },
-                "refresh": True,
-                "elastic_moe_mode": elastic_moe_mode,
-                "init_redundancy_expert": init_redundancy_expert,
-                "dynamic_eplb": self.dynamic_eplb,
-                "num_iterations_eplb_update": 400,  # gather stable workload over 400 iterations
-                "gate_eplb": True,
-                "num_wait_worker_iterations": 30,  # wait for 30 iterations to complete the EPLB calculation
-            },
+            additional_config=additional_config,
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
         )
 
-        # Offload vllm model to reduce peak memory usage
         self.model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
         self.model = self.model_runner.get_model()
-        self.kv_cache_configs = None
-        self.cpu_model = {}
-        self.gpu_buffers = None
-        for name, params in self.model.named_parameters():
-            self.cpu_model[name] = torch.empty_like(params, device="cpu")
-        self.free_cache_engine()
-        self.offload_model_weights()
+        # vLLM can expose padded vocab logits from tensor-parallel output heads.
+        # Mask them before sampling so graph/eager produce the same valid-token
+        # distribution and cannot sample pseudo tokens beyond tokenizer vocab.
+        _monkey_patch_compute_logits(self.model, len(tokenizer))
+        self.model_device = next(self.model.parameters()).device
+        self.cpu_model: dict[str, torch.Tensor] = {}
+        self.gpu_buffers: dict[str, torch.Tensor] | None = None
+        self._needs_rollout_aclgraph_recapture = False
+        if self.manual_free_cache_engine:
+            for name, params in self.model.named_parameters():
+                self.cpu_model[name] = torch.empty_like(params, device="cpu")
+            self.free_cache_engine()
+            self.offload_model_weights()
 
         kwargs = dict(
             n=1,
@@ -324,90 +583,6 @@ class vLLMRollout(BaseRollout):
 
         self.eplb_end()
 
-    def init_cache_engine(self):
-        if os.environ['VLLM_USE_V1'] == '1':
-            worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
-            if not worker.model_runner.kv_caches:
-                # v1 Use Explicit Initialization Method
-                self.inference_engine.llm_engine.engine_core.engine_core.model_executor.initialize_from_config(
-                    self.inference_engine.llm_engine.engine_core.engine_core.kv_cache_configs)
-                self.inference_engine.llm_engine.reset_prefix_cache()
-        else:
-            if self.inference_engine.llm_engine.model_executor.driver_worker.worker.cache_engine is None:
-                self.inference_engine.llm_engine.model_executor.driver_worker.worker._init_cache_engine()
-
-    def onload_model_weights(self):
-        """
-        Advantages over model.cuda():
-        1) Avoids CPU to GPU data transfer entirely, leveraging pre-allocated GPU buffers
-        instead of copying data from CPU tensors.
-        2) Eliminates the recursive traversal of submodules inherent in .cuda(),
-        which can be particularly slow for deeply nested model architectures.
-        """
-        self.gpu_buffers = {}
-        for name, param in self.model.named_parameters():
-            self.gpu_buffers[name] = torch.empty_like(
-                param, device='cuda'
-            )
-        for name, param in self.model.named_parameters():
-            param.data = self.gpu_buffers[name]
-
-    def offload_model_weights(self):
-        for name, params in self.model.named_parameters():
-            params.data = self.cpu_model[name]
-
-        if hasattr(self.model.model.layers[0].self_attn, "mla_attn"):
-            for i in range(self.model.model.start_layer, self.model.model.end_layer):
-                mla = self.model.model.layers[i].self_attn.mla_attn.impl
-                if hasattr(mla, "w_kc"):
-                    mla.w_kc = None
-                    mla.w_vc = None
-                if hasattr(mla, "W_UV"):
-                    mla.W_UV = None
-                    mla.W_UK_T = None
-        self.gpu_buffers = None
-        gc.collect()
-        torch.npu.empty_cache()
-
-    def free_cache_engine(self):
-        if os.environ['VLLM_USE_V1'] == '1':
-            worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
-            ctx = worker.model_runner.vllm_config.compilation_config.static_forward_context
-        else:
-            ctx = self.inference_engine.llm_engine.model_executor.driver_worker.worker.compilation_config.static_forward_context
-        from vllm.attention import AttentionType
-
-        layer_need_kv_cache = []
-        for layer_name in ctx:
-            if hasattr(ctx[layer_name], 'attn_type') and ctx[layer_name].attn_type in (AttentionType.DECODER, AttentionType.ENCODER_DECODER):
-                layer_need_kv_cache.append(layer_name)
-
-        pipeline_parallel_size = self.inference_engine.llm_engine.vllm_config.parallel_config.pipeline_parallel_size
-        for layer_name in layer_need_kv_cache:
-            kv_cache = []
-            for _ in range(pipeline_parallel_size):
-                kv_cache.append(torch.tensor([]))
-            ctx[layer_name].kv_cache = kv_cache
-
-        if os.environ['VLLM_USE_V1'] == '1':
-            worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
-
-            # Clearing the cache engine
-            worker.model_runner.kv_caches = []
-        else:
-            self.inference_engine.llm_engine.model_executor.driver_worker.worker.cache_engine = None
-            self.inference_engine.llm_engine.model_executor.driver_worker.worker.gpu_cache = None
-
-        if hasattr(self.model.model.layers[0].self_attn, "attn"):
-            for i in range(self.model.model.start_layer, self.model.model.end_layer):
-                attn_impl = self.model.model.layers[i].self_attn.attn.impl
-                if hasattr(attn_impl, "key_cache"):
-                    attn_impl.key_cache = None
-                    attn_impl.value_cache = None
-
-        gc.collect()
-        torch.npu.empty_cache()
-
     def eplb_start(self):
         # Restart the EPLB process before switching from training to inference.
         if self.dynamic_eplb:
@@ -434,17 +609,28 @@ class vLLMRollout(BaseRollout):
     def update_sampling_params(self, **kwargs):
         # update sampling params
         old_sampling_params_args = {}
-        if kwargs:
-            for key, value in kwargs.items():
-                if hasattr(self.sampling_params, key):
-                    old_value = getattr(self.sampling_params, key)
-                    old_sampling_params_args[key] = old_value
-                    setattr(self.sampling_params, key, value)
-        yield
-        # roll back to previous sampling params
-        # if len(old_sampling_params_args):
-        for key, value in old_sampling_params_args.items():
-            setattr(self.sampling_params, key, value)
+        invalidate_sampling_type = False
+        try:
+            if kwargs:
+                for key, value in kwargs.items():
+                    if hasattr(self.sampling_params, key):
+                        old_value = getattr(self.sampling_params, key)
+                        old_sampling_params_args[key] = old_value
+                        setattr(self.sampling_params, key, value)
+                        invalidate_sampling_type = invalidate_sampling_type or key in (
+                            "seed",
+                            "temperature",
+                        )
+                if invalidate_sampling_type:
+                    self.sampling_params.__dict__.pop("sampling_type", None)
+            yield
+        finally:
+            # roll back to previous sampling params
+            # if len(old_sampling_params_args):
+            for key, value in old_sampling_params_args.items():
+                setattr(self.sampling_params, key, value)
+            if invalidate_sampling_type:
+                self.sampling_params.__dict__.pop("sampling_type", None)
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
@@ -513,6 +699,7 @@ class vLLMRollout(BaseRollout):
 
             input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
 
+        kwargs = {}
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
@@ -549,20 +736,20 @@ class vLLMRollout(BaseRollout):
             try:
                 level_caps = [int(x.strip()) for x in tail_validate_caps.split(",") if x.strip()]
             except ValueError:
-                logger.warning("Invalid VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=%s",
-                               tail_validate_caps)
+                logger.warning(
+                    "Invalid VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=%s",
+                    tail_validate_caps,
+                )
                 level_caps = []
 
             if level_caps and torch.distributed.is_available() and torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
                 global_rank = torch.distributed.get_rank()
                 max_resp_len = int(self.config.response_length)
-                current_max = kwargs.get("max_tokens",
-                                         getattr(self.sampling_params, "max_tokens", max_resp_len))
+                current_max = kwargs.get("max_tokens", getattr(self.sampling_params, "max_tokens", max_resp_len))
                 current_max = int(current_max) if current_max is not None else max_resp_len
 
-                # Build repeated-halving buckets: N/2, N/4, ..., 1, 1.
-                bucket_sizes: list[int] = []
+                bucket_sizes = []
                 remaining = world_size
                 next_bucket = max(world_size // 2, 1)
                 while remaining > 0:
@@ -582,6 +769,14 @@ class vLLMRollout(BaseRollout):
                 cap_idx = min(bucket_idx, len(level_caps) - 1)
                 kwargs["max_tokens"] = max(1, min(level_caps[cap_idx], current_max, max_resp_len))
                 logger.info(
+                    "Elastic tail validation cap override: rank=%s world_size=%s bucket=%s max_tokens=%s raw_caps=%s",
+                    global_rank,
+                    world_size,
+                    bucket_idx,
+                    kwargs["max_tokens"],
+                    level_caps,
+                )
+                logger.info(
                     "Elastic tail validation cap override: rank=%s world_size=%s "
                     "bucket=%s/%s bucket_sizes=%s max_tokens=%s",
                     global_rank,
@@ -591,6 +786,24 @@ class vLLMRollout(BaseRollout):
                     bucket_sizes,
                     kwargs["max_tokens"],
                 )
+
+        diversify_sampling_seed = False
+        per_rank_sampling_seed = None
+        if (
+            do_sample
+            and not is_validate
+            and os.environ.get("VLLM_ROLLOUT_DIVERSIFY_SAMPLING_SEED", "0").lower()
+            in ("1", "true", "yes", "on")
+        ):
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = int(torch.distributed.get_rank())
+            base_seed = int(os.environ.get("VLLM_ROLLOUT_SAMPLING_BASE_SEED", "0"))
+            seed_stride = int(os.environ.get("VLLM_ROLLOUT_SAMPLING_SEED_STRIDE", "104729"))
+            global_step = int(prompts.meta_info.get("global_steps", 0) or 0)
+            epoch = int(prompts.meta_info.get("epoch", 0) or 0)
+            per_rank_sampling_seed = base_seed + rank * seed_stride + epoch * 1000003 + global_step
+            diversify_sampling_seed = True
 
         lora_requests = None
         if self.lora_kwargs:
@@ -602,13 +815,27 @@ class vLLMRollout(BaseRollout):
                 ] * batch_size
 
         # users can customize different sampling_params at different run
-        # 核心运行引擎调用
         with self.update_sampling_params(**kwargs):
+            sampling_params = self.sampling_params
+            if diversify_sampling_seed:
+                sampling_params = []
+                assert per_rank_sampling_seed is not None
+                for prompt_idx in range(len(vllm_inputs)):
+                    request_sampling_params = copy.copy(self.sampling_params)
+                    request_sampling_params.seed = per_rank_sampling_seed + prompt_idx
+                    request_sampling_params.__dict__.pop("sampling_type", None)
+                    sampling_params.append(request_sampling_params)
+            use_tqdm = os.environ.get("VLLM_ROLLOUT_USE_TQDM", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params,
                 lora_request=lora_requests,
-                use_tqdm=True,
+                use_tqdm=use_tqdm,
             )
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
@@ -618,21 +845,114 @@ class vLLMRollout(BaseRollout):
             rollout_log_probs = []
             request_ids = []
             rollout_ranks = []
+            debug_prompt_indices = []
+            debug_repeat_indices = []
+            debug_generation = os.environ.get("VLLM_ROLLOUT_DEBUG_GENERATION", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            debug_records = []
+            finish_reason_counts: dict[str, int] = {}
+            stop_reason_counts: dict[str, int] = {}
+            raw_response_lengths = []
+            finish_reasons = []
+            stop_reasons = []
+            has_eos_flags = []
             local_rank = -1
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 local_rank = int(torch.distributed.get_rank())
+            if debug_generation and diversify_sampling_seed:
+                logger.warning(
+                    "Rollout sampling seed override: rank=%s base_seed=%s num_prompts=%s",
+                    local_rank,
+                    per_rank_sampling_seed,
+                    len(vllm_inputs),
+                )
+            eos_tokens = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
+            eos_tokens = [int(token) for token in eos_tokens if token is not None]
+            eos_token_set = set(eos_tokens)
             for output in outputs:
                 req_id = str(getattr(output, "request_id", ""))
+                prompt_output_idx = len(request_ids)
+                prompt_debug_idx = None
+                repeat_debug_idx = None
+                if debug_generation:
+                    if "rollout_debug_prompt_idx" in non_tensor_batch:
+                        prompt_debug_idx = int(non_tensor_batch["rollout_debug_prompt_idx"][prompt_output_idx])
+                    if "rollout_debug_repeat_idx" in non_tensor_batch:
+                        repeat_debug_idx = int(non_tensor_batch["rollout_debug_repeat_idx"][prompt_output_idx])
                 for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
+                    sample_output = output.outputs[sample_id]
+                    response_ids = sample_output.token_ids
                     response.append(response_ids)
                     request_ids.append(req_id)
                     rollout_ranks.append(local_rank)
+                    if debug_generation:
+                        debug_prompt_indices.append(
+                            prompt_debug_idx if prompt_debug_idx is not None else prompt_output_idx
+                        )
+                        debug_repeat_indices.append(
+                            repeat_debug_idx if repeat_debug_idx is not None else sample_id
+                        )
+                    if debug_generation:
+                        response_len = len(response_ids)
+                        raw_response_lengths.append(response_len)
+                        finish_reason = str(getattr(sample_output, "finish_reason", None))
+                        stop_reason = str(getattr(sample_output, "stop_reason", None))
+                        finish_reasons.append(finish_reason)
+                        stop_reasons.append(stop_reason)
+                        finish_reason_counts[finish_reason] = finish_reason_counts.get(finish_reason, 0) + 1
+                        stop_reason_counts[stop_reason] = stop_reason_counts.get(stop_reason, 0) + 1
+                        has_eos = any(token in eos_token_set for token in response_ids)
+                        has_eos_flags.append(has_eos)
+                        if len(debug_records) < int(os.environ.get("VLLM_ROLLOUT_DEBUG_GENERATION_SAMPLES", "4")):
+                            debug_records.append(
+                                {
+                                    "request_id": req_id,
+                                    "prompt_idx": prompt_debug_idx,
+                                    "repeat_idx": repeat_debug_idx,
+                                    "sample_id": sample_id,
+                                    "length": response_len,
+                                    "finish_reason": finish_reason,
+                                    "stop_reason": stop_reason,
+                                    "has_eos": has_eos,
+                                    "last_tokens": list(response_ids[-8:]),
+                                }
+                            )
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
+
+            if debug_generation:
+                if raw_response_lengths:
+                    length_array = np.asarray(raw_response_lengths, dtype=np.int64)
+                    length_summary = {
+                        "count": int(length_array.size),
+                        "min": int(length_array.min()),
+                        "mean": float(length_array.mean()),
+                        "p50": int(np.percentile(length_array, 50)),
+                        "p90": int(np.percentile(length_array, 90)),
+                        "p95": int(np.percentile(length_array, 95)),
+                        "max": int(length_array.max()),
+                        "ge_10000": int(np.sum(length_array >= 10000)),
+                        "ge_max_minus_1": int(np.sum(length_array >= int(self.config.response_length) - 1)),
+                    }
+                else:
+                    length_summary = {"count": 0}
+                logger.warning(
+                    "Rollout generation debug: rank=%s eos_tokens=%s length_summary=%s "
+                    "finish_reason_counts=%s stop_reason_counts=%s samples=%s",
+                    local_rank,
+                    eos_tokens,
+                    length_summary,
+                    finish_reason_counts,
+                    stop_reason_counts,
+                    debug_records,
+                )
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
@@ -655,6 +975,13 @@ class vLLMRollout(BaseRollout):
                     len(request_ids),
                     num_responses,
                 )
+            if debug_generation and len(raw_response_lengths) == num_responses:
+                non_tensor_batch["rollout_debug_prompt_idx"] = np.array(debug_prompt_indices, dtype=np.int64)
+                non_tensor_batch["rollout_debug_repeat_idx"] = np.array(debug_repeat_indices, dtype=np.int64)
+                non_tensor_batch["vllm_raw_response_len"] = np.array(raw_response_lengths, dtype=np.int64)
+                non_tensor_batch["vllm_finish_reason"] = np.array(finish_reasons, dtype=object)
+                non_tensor_batch["vllm_stop_reason"] = np.array(stop_reasons, dtype=object)
+                non_tensor_batch["vllm_has_eos"] = np.array(has_eos_flags, dtype=np.bool_)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
@@ -690,27 +1017,182 @@ class vLLMRollout(BaseRollout):
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
+    def get_record(self):
+        return moe_stats.snapshot_pattern()
+
+    def flush_record(self):
+        return moe_stats.reset_epoch()
+
+    def init_cache_engine(self):
+        """Rebuild vLLM V1 KV cache after manual free_cache_engine()."""
+        _rollout_memory_probe("init_cache_engine_before")
+        worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
+        model_runner = worker.model_runner
+        if getattr(model_runner, "kv_caches", None):
+            _rollout_memory_probe("init_cache_engine_skip_existing")
+            return
+
+        engine_core_client = self.inference_engine.llm_engine.engine_core
+        engine_core = getattr(engine_core_client, "engine_core", None)
+        kv_cache_configs = getattr(engine_core, "kv_cache_configs", None)
+        if kv_cache_configs is None:
+            raise RuntimeError(
+                "Cannot manually reinitialize KV cache because EngineCore "
+                "does not expose kv_cache_configs."
+            )
+
+        # qwen3's newer vLLM-Ascend model runner reinitializes attention
+        # metadata builders inside initialize_kv_cache(). The old verl
+        # phase-switch path only dropped KV tensors, so clear these builders
+        # before asking the runner to allocate fresh cache tensors.
+        if getattr(model_runner, "attn_groups", None):
+            if not getattr(self, "_manual_attn_groups_reset_logged", False):
+                logger.info(
+                    "Manual rollout KV rebuild clears existing attention "
+                    "backend groups before initialize_from_config."
+                )
+                self._manual_attn_groups_reset_logged = True
+            model_runner.attn_groups = []
+
+        engine_core.model_executor.initialize_from_config(kv_cache_configs)
+        self.inference_engine.llm_engine.reset_prefix_cache()
+        _rollout_memory_probe("init_cache_engine_after")
+
+    def onload_model_weights(self):
+        """Allocate fresh NPU parameter storage before rollout weight update."""
+        if not self.cpu_model:
+            return
+        _rollout_memory_probe("onload_model_weights_before")
+
+        moe_load_shapes = _moe_load_layout_shapes(self.model)
+        if moe_load_shapes and not getattr(
+            self, "_manual_moe_load_layout_logged", False
+        ):
+            logger.info(
+                "Manual rollout weight onload will restore %s split-MoE "
+                "parameters to loader layout before load_weights.",
+                len(moe_load_shapes),
+            )
+            self._manual_moe_load_layout_logged = True
+
+        self.gpu_buffers = {}
+        for name, param in self.model.named_parameters():
+            load_shape = moe_load_shapes.get(name)
+            if load_shape is None:
+                self.gpu_buffers[name] = torch.empty_like(
+                    param, device=self.model_device
+                )
+            else:
+                self.gpu_buffers[name] = torch.empty(
+                    load_shape, dtype=param.dtype, device=self.model_device
+                )
+        for name, param in self.model.named_parameters():
+            param.data = self.gpu_buffers[name]
+        _rollout_memory_probe("onload_model_weights_after")
+
+    def offload_model_weights(self):
+        """Drop rollout parameter storage; weights are fully reloaded next step."""
+        if not self.cpu_model:
+            return
+        _rollout_memory_probe("offload_model_weights_before")
+
+        for name, param in self.model.named_parameters():
+            cpu_param = self.cpu_model.get(name)
+            if cpu_param is None or tuple(cpu_param.shape) != tuple(param.shape):
+                cpu_param = torch.empty_like(param, device="cpu")
+                self.cpu_model[name] = cpu_param
+            param.data = cpu_param
+
+        self.gpu_buffers = None
+        gc.collect()
+        torch.npu.empty_cache()
+        _rollout_memory_probe("offload_model_weights_after")
+
+    def free_cache_engine(self):
+        """Release KV cache tensors in the old rollout style."""
+        _rollout_memory_probe("free_cache_engine_before")
+        self.inference_engine.llm_engine.reset_prefix_cache()
+
+        worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
+        model_runner = worker.model_runner
+        ctx = model_runner.vllm_config.compilation_config.static_forward_context
+        try:
+            from vllm.v1.attention.backend import AttentionType
+        except ImportError:
+            from vllm.attention.layer import AttentionType
+
+        pipeline_parallel_size = (
+            self.inference_engine.llm_engine.vllm_config.parallel_config.pipeline_parallel_size
+        )
+        for layer_name in ctx:
+            attn_type = getattr(ctx[layer_name], "attn_type", None)
+            if attn_type in (AttentionType.DECODER, AttentionType.ENCODER_DECODER):
+                ctx[layer_name].kv_cache = [
+                    torch.tensor([]) for _ in range(pipeline_parallel_size)
+                ]
+            attn_impl = getattr(ctx[layer_name], "impl", None)
+            if attn_impl is not None and hasattr(attn_impl, "key_cache"):
+                attn_impl.key_cache = None
+                attn_impl.value_cache = None
+
+        model_runner.kv_caches = []
+        model_runner.kv_connector_output = None
+        # New vLLM-Ascend attention groups own metadata builders in addition to
+        # the forward-context Attention modules. Drop them at release time so
+        # they cannot keep per-step tensors alive until the next KV rebuild.
+        if getattr(model_runner, "attn_groups", None):
+            model_runner.attn_groups = []
+
+        layers = getattr(getattr(self.model, "model", None), "layers", [])
+        start_layer = getattr(getattr(self.model, "model", None), "start_layer", 0)
+        end_layer = getattr(getattr(self.model, "model", None), "end_layer", len(layers))
+        for i in range(start_layer, end_layer):
+            self_attn = getattr(layers[i], "self_attn", None)
+            for attn_attr in ("attn", "mla_attn"):
+                attn = getattr(self_attn, attn_attr, None)
+                attn_impl = getattr(attn, "impl", None)
+                if attn_impl is not None and hasattr(attn_impl, "key_cache"):
+                    attn_impl.key_cache = None
+                    attn_impl.value_cache = None
+
+        gc.collect()
+        torch.npu.empty_cache()
+        _rollout_memory_probe("free_cache_engine_after")
+
     async def resume(self, tags: list[str]):
         """Resume rollout weights or kv cache in GPU memory.
 
         Args:
             tags: weights or kv_cache.
         """
+        if self.manual_free_cache_engine:
+            if "weights" in tags:
+                self.onload_model_weights()
+            if "kv_cache" in tags:
+                self.init_cache_engine()
+            return
+
         if not self.config.free_cache_engine:
             return
 
-        if "weights" in tags:
-            self.onload_model_weights()
-        elif "kv_cache" in tags:
-            self.init_cache_engine()
+        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+            self.inference_engine.wake_up(tags=tags)
+        else:
+            self.inference_engine.wake_up()
 
     async def release(self):
         """Release weights and kv cache in GPU memory."""
+        self.inference_engine.reset_prefix_cache()
+
+        if self.manual_free_cache_engine:
+            self.free_cache_engine()
+            self.offload_model_weights()
+            return
+
         if not self.config.free_cache_engine:
             return
 
-        self.free_cache_engine()
-        self.offload_model_weights()
+        self.inference_engine.sleep(level=self.sleep_level)
 
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update the weights of the rollout model.
@@ -718,18 +1200,29 @@ class vLLMRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
-        filtered_weights: list[tuple[str, torch.Tensor]] = []
+        filter_empty_weight_shards = os.environ.get(
+            "VLLM_ROLLOUT_FILTER_EMPTY_WEIGHT_SHARDS", "1"
+        ).lower() in ("1", "true", "yes", "on")
         skipped = 0
         skipped_names: list[str] = []
-        for name, weight in weights:
-            if isinstance(weight, torch.Tensor) and weight.numel() == 0:
-                skipped += 1
-                if len(skipped_names) < 8:
-                    skipped_names.append(name)
-                continue
-            filtered_weights.append((name, weight))
-        if skipped > 0 and not getattr(self, "_empty_weight_update_warned",
-                                       False):
+
+        def iter_non_empty_weights():
+            nonlocal skipped
+            for name, weight in weights:
+                if (
+                    filter_empty_weight_shards
+                    and isinstance(weight, torch.Tensor)
+                    and weight.numel() == 0
+                ):
+                    skipped += 1
+                    if len(skipped_names) < 8:
+                        skipped_names.append(name)
+                    continue
+                yield name, weight
+
+        def maybe_log_skipped_weights():
+            if skipped <= 0 or getattr(self, "_empty_weight_update_warned", False):
+                return
             logger.warning(
                 "Skip %s empty rollout weight shards during update_weights. sample_names=%s",
                 skipped,
@@ -737,38 +1230,70 @@ class vLLMRollout(BaseRollout):
             )
             self._empty_weight_update_warned = True
 
-        weights = filtered_weights
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
+            filtered_weights = list(iter_non_empty_weights())
+            maybe_log_skipped_weights()
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
             lora_reqest = TensorLoRARequest(
                 lora_name=f"{lora_int_id}",
                 lora_int_id=lora_int_id,
                 lora_path="simon_lora_path",
                 peft_config=asdict(peft_config),
-                lora_tensors=dict(weights),
+                lora_tensors=dict(filtered_weights),
             )
             self.inference_engine.llm_engine.add_lora(lora_reqest)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            logger.info(f"vLLM load weights, loaded_params: {len(filtered_weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+            from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
+            model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+            model = model_runner.get_model()
             patch_vllm_moe_model_weight_loader(model)
-        if (self.elastic_execution_mode in (1, 2)
-                and self.elastic_init_redundancy_expert > 0
-                and not getattr(self, "_lossless_weight_update_sync_logged", False)):
-            logger.info(
-                "Elastic execution mode=%s enables rollout.update_weights with redundant experts.",
-                self.elastic_execution_mode)
-            self._lossless_weight_update_sync_logged = True
-        model.load_weights(weights)
-        ###new wj
-    def get_record(self):
-        return moe_stats.snapshot_pattern()
-    
-    def flush_record(self):
-        return moe_stats.reset_epoch()
+            pool_enabled = (
+                self.config.free_cache_engine
+                and not self.manual_free_cache_engine
+                and is_npu_available
+            )
+            _rollout_memory_probe("update_weights_before_load")
+            with _maybe_use_rollout_weight_pool(pool_enabled):
+                model.load_weights(iter_non_empty_weights())
+                maybe_log_skipped_weights()
+                _rollout_memory_probe("update_weights_after_load_before_process")
+
+                model_config = model_runner.vllm_config.model_config
+                device_config = model_runner.vllm_config.device_config
+                load_config = model_runner.vllm_config.load_config
+                load_device = (
+                    device_config.device if load_config.device is None else load_config.device
+                )
+                target_device = torch.device(load_device)
+                process_weights_after_loading(model, model_config, target_device)
+                _rollout_memory_probe("update_weights_after_process")
+                cleared_aclgraphs = _invalidate_rollout_aclgraphs(
+                    model_runner, "update_weights_after_process"
+                )
+                if cleared_aclgraphs:
+                    self._needs_rollout_aclgraph_recapture = True
+                _capture_rollout_graphs_after_weight_load(
+                    model_runner, "update_weights_after_process"
+                )
+                if self.manual_free_cache_engine and self.gpu_buffers is not None:
+                    # Split-MoE post-processing can replace param.data with
+                    # execution-layout tensors.  The temporary loader-layout
+                    # buffers are no longer part of the live model at that
+                    # point, so keeping them referenced doubles part of the
+                    # MoE footprint until rollout release.
+                    self.gpu_buffers = None
+                    gc.collect()
+                    if is_npu_available:
+                        torch.npu.empty_cache()
+                    _rollout_memory_probe("update_weights_after_drop_loader_buffers")
+            gc.collect()
+            if is_npu_available:
+                torch.npu.empty_cache()
+            _rollout_memory_probe("update_weights_after_empty_cache")
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -805,10 +1330,10 @@ class vLLMAsyncRollout(BaseRollout):
         )
 
         # https://github.com/vllm-project/vllm/issues/25171
-        if config.layered_summon or config.expert_parallel_size > 1:
-            self.sleep_level = 1
-        else:
-            self.sleep_level = VLLM_SLEEP_LEVEL
+        self.sleep_level = _resolve_rollout_sleep_level(
+            1 if config.layered_summon or config.expert_parallel_size > 1 else VLLM_SLEEP_LEVEL,
+            bool(config.layered_summon),
+        )
 
     def _init_zeromq(self) -> str:
         tensor_parallel_size = self.config.tensor_model_parallel_size
@@ -921,7 +1446,10 @@ class vLLMAsyncRollout(BaseRollout):
 
             model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+            with _maybe_use_rollout_weight_pool(
+                self.config.free_cache_engine and is_npu_available
+            ):
+                model.load_weights(weights)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""

@@ -193,3 +193,33 @@ inline uint32_t sgmv_shrink_half(uint32_t blockDim, void* hold, void* stream, vo
 }
 
 #endif
+
+#ifndef HEADER_ACLRTLAUNCH_MLA_PREPROCESS_HKERNEL_H_
+#define HEADER_ACLRTLAUNCH_MLA_PREPROCESS_HKERNEL_H_
+
+
+
+extern "C" uint32_t aclrtlaunch_mla_preprocess(uint32_t blockDim, void* stream, void* hiddenState, void* quantScale1, void* quantOffset1, void* wdqkv, void* bias1, void* gamma2, void* beta2, void* quantScale2, void* quantOffset2, void* gamma3, void* sin1, void* cos1, void* sin2, void* cos2, void* keycache, void* slotMapping, void* wuq, void* bias2, void* wuk, void* descale1, void* descale2, void* ctkvScale, void* qnopeScale, void* q, void* keycacheOut, void* q2, void* keycacheOut2, void* innerOut, void* workspace, void* tiling);
+
+inline uint32_t mla_preprocess(uint32_t blockDim, void* hold, void* stream, void* hiddenState, void* quantScale1, void* quantOffset1, void* wdqkv, void* bias1, void* gamma2, void* beta2, void* quantScale2, void* quantOffset2, void* gamma3, void* sin1, void* cos1, void* sin2, void* cos2, void* keycache, void* slotMapping, void* wuq, void* bias2, void* wuk, void* descale1, void* descale2, void* ctkvScale, void* qnopeScale, void* q, void* keycacheOut, void* q2, void* keycacheOut2, void* innerOut, void* workspace, void* tiling)
+{
+    (void)hold;
+    return aclrtlaunch_mla_preprocess(blockDim, stream, hiddenState, quantScale1, quantOffset1, wdqkv, bias1, gamma2, beta2, quantScale2, quantOffset2, gamma3, sin1, cos1, sin2, cos2, keycache, slotMapping, wuq, bias2, wuk, descale1, descale2, ctkvScale, qnopeScale, q, keycacheOut, q2, keycacheOut2, innerOut, workspace, tiling);
+}
+
+#endif
+
+#ifndef HEADER_ACLRTLAUNCH_BATCH_MATMUL_TRANSPOSE_HKERNEL_H_
+#define HEADER_ACLRTLAUNCH_BATCH_MATMUL_TRANSPOSE_HKERNEL_H_
+
+
+
+extern "C" uint32_t aclrtlaunch_batch_matmul_transpose(uint32_t blockDim, void* stream, void* gm_a, void* gm_b, void* gm_c, void* gm_tiling_data);
+
+inline uint32_t batch_matmul_transpose(uint32_t blockDim, void* hold, void* stream, void* gm_a, void* gm_b, void* gm_c, void* gm_tiling_data)
+{
+    (void)hold;
+    return aclrtlaunch_batch_matmul_transpose(blockDim, stream, gm_a, gm_b, gm_c, gm_tiling_data);
+}
+
+#endif

@@ -29,10 +29,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import typing
 
 import torch
 import torch.distributed as dist
+
+
+@contextlib.contextmanager
+def _optional_cuda_nvtx_range(message: str):
+    """Use CUDA NVTX when available, but never require it on NPU builds."""
+    pushed = False
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.nvtx.range_push(message)
+            pushed = True
+        except RuntimeError as exc:
+            if "NVTX functions not installed" not in str(exc):
+                raise
+    try:
+        yield
+    finally:
+        if pushed:
+            torch.cuda.nvtx.range_pop()
 
 
 class LinearCrossEntropy(torch.autograd.Function):
@@ -63,7 +82,7 @@ class LinearCrossEntropy(torch.autograd.Function):
 
         assert isinstance(temperature, float), f"temperature must be a float, but got {type(temperature)}"
         assert isinstance(reduction, str), f"reduction must be a str, but got {type(reduction)}"
-        with torch.cuda.nvtx.range("LinearCrossEntropy-forward"):
+        with _optional_cuda_nvtx_range("LinearCrossEntropy-forward"):
             from . import kernels
 
             REDUCTION = kernels.get_entropy_reduction_enum_number(reduction.lower())
@@ -90,7 +109,7 @@ class LinearCrossEntropy(torch.autograd.Function):
     def backward(ctx, dlogprobs: torch.Tensor, dentropy: torch.Tensor) -> list[torch.Tensor]:
         from . import kernels
 
-        with torch.cuda.nvtx.range("LinearCrossEntropy-backward"):
+        with _optional_cuda_nvtx_range("LinearCrossEntropy-backward"):
             (hidden, weight, labels, _maximum, _accumulate, _entropy_b) = ctx.saved_tensors
             REDUCTION = ctx.REDUCTION
             dist_process_group = ctx.dist_process_group

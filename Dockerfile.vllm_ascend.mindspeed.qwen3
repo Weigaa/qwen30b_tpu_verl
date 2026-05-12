@@ -12,23 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM quay.io/ascend/cann:8.3.rc1-a3-openeuler24.03-py3.11
+FROM quay.io/ascend/cann:8.5.0-a3-openeuler24.03-py3.11
 
 ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-ARG COMPILE_CUSTOM_KERNELS=1
+ARG MOONCAKE_TAG="v0.3.7.post2"
+ARG SOC_VERSION="ascend910_9391"
 
-# Define enviroments
-ENV DEBIAN_FRONTED=noninteractive
-ENV COMPILE_CUSTOM_KERNELS=${COMPILE_CUSTOM_KERNELS}
-
-RUN yum install -y net-tools
-
-WORKDIR /workspace
+ENV SOC_VERSION=$SOC_VERSION \
+    TASK_QUEUE_ENABLE=1 \
+    OMP_NUM_THREADS=1
 
 RUN pip config set global.index-url ${PIP_INDEX_URL}
 
-# Install torch and torch-npu
-RUN python3 -m pip install torch==2.7.1 torch-npu==2.7.1rc1
+WORKDIR /workspace
+
+SHELL ["/bin/bash", "-c"]
 
 # veRL
 RUN git clone https://github.com/volcengine/verl.git && \
@@ -48,22 +46,39 @@ RUN git clone https://gitcode.com/ascend/MindSpeed.git && \
     git checkout f6688c61bcfe45243ee5eb34c6f013b1e06eca81 && \
     python3 -m pip install -r requirements.txt
 
-# Install vLLM
-RUN git clone https://github.com/vllm-project/vllm.git && \
-    cd vllm && \
-    git checkout v0.11.0
-
-# In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
-RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /workspace/vllm/ --extra-index https://download.pytorch.org/whl/cpu/ && \
-    python3 -m pip uninstall -y triton && \
-    python3 -m pip cache purge
-
 # Install vllm-ascend
 RUN git clone https://github.com/vllm-project/vllm-ascend.git && \
     cd vllm-ascend && \
-    git checkout v0.11.0rc0
+    git checkout v0.14.0rc1 && \
+    git submodule update --init --recursive
+    test -f /workspace/vllm-ascend/tools/mooncake_installer.sh
 
-# Append `libascebd_hal.so` path (devlib) to LD_LIBRARY_PATH
+# Install Mooncake
+RUN yum update -y && \
+    yum install -y git vim wget net-tools gcc gcc-c++ make cmake numactl-devel jemalloc && \
+    git clone --depth 1 --branch ${MOONCAKE_TAG} https://github.com/kvcache-ai/Mooncake /workspace/Mooncake && \
+    cp /workspace/vllm-ascend/tools/mooncake_installer.sh /workspace/Mooncake/ && \
+    ARCH=$(uname -m) && \
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/${ARCH}-linux/devlib:/usr/local/Ascend/ascend-toolkit/latest/${ARCH}-linux/lib64:$LD_LIBRARY_PATH && \
+    export CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:/usr/include/c++/12:/usr/include/c++/12/${ARCH}-openEuler-linux && \
+    cd /workspace/Mooncake && \
+    bash mooncake_installer.sh -y && \
+    mkdir -p build && cd build && cmake .. -DUSE_ASCEND_DIRECT=ON && \
+    make -j$(nproc) && make install && \
+    rm -fr /workspace/Mooncake/build && \
+    rm -rf /var/cache/yum/*
+
+# Install vLLM
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_TAG=v0.14.1
+RUN git clone --depth 1 $VLLM_REPO --branch $VLLM_TAG /workspace/vllm
+# In x86, triton will be installed by vllm. But in Ascend, triton doesn't work correctly. we need to uninstall it.
+RUN VLLM_TARGET_DEVICE="empty" python3 -m pip install -e /workspace/vllm/[audio] --extra-index https://download.pytorch.org/whl/cpu/ && \
+    python3 -m pip uninstall -y triton && \
+    python3 -m pip cache purge
+
+# Build vllm-ascend
 RUN export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi && \
     source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
     source /usr/local/Ascend/nnal/atb/set_env.sh && \
@@ -71,5 +86,16 @@ RUN export PIP_EXTRA_INDEX_URL=https://mirrors.huaweicloud.com/ascend/repos/pypi
     export CPLUS_INCLUDE_PATH=$CPLUS_INCLUDE_PATH:/usr/include/c++/12:/usr/include/c++/12/`uname -i`-openEuler-linux && \
     python3 -m pip install -v -e /workspace/vllm-ascend/ --exists-action=i --extra-index https://download.pytorch.org/whl/cpu/ && \
     python3 -m pip cache purge
+
+# Install clang (for triton-ascend)
+RUN yum update -y && \
+    yum install -y clang && \
+    rm -rf /var/cache/yum/*
+
+# Install modelscope (for fast download) and ray (for multinode)
+RUN python3 -m pip install modelscope 'ray>=2.47.1,<=2.48.0' 'protobuf>3.20.0' && \
+    python3 -m pip cache purge
+
+RUN echo "export LD_PRELOAD=/usr/lib64/libjemalloc.so.2:$LD_PRELOAD" >> ~/.bashrc
 
 CMD ["/bin/bash"]

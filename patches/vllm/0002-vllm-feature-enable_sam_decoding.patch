@@ -1,0 +1,42 @@
+From 3fb1b50679df8d73215b3e268695e7ad9557d90a Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Mon, 26 Jan 2026 19:50:53 +0800
+Subject: [PATCH] enable sam decoding in vllm
+
+---
+ llm_rl/qwen3/vllm/config/speculative.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/llm_rl/qwen3/vllm/config/speculative.py b/llm_rl/qwen3/vllm/config/speculative.py
+index cba00da..cd4cced 100644
+--- a/llm_rl/qwen3/vllm/config/speculative.py
++++ b/llm_rl/qwen3/vllm/config/speculative.py
+@@ -46,6 +46,7 @@ SpeculativeMethod = Literal[
+     "mlp_speculator",
+     "draft_model",
+     "suffix",
++    "sam",
+     EagleModelTypes,
+ ]
+ 
+@@ -274,6 +275,8 @@ class SpeculativeConfig:
+                 self.model = "ngram"
+             elif self.method == "suffix":
+                 self.model = "suffix"
++            elif self.method == "sam":
++                self.model = "sam"
+             else:
+                 raise ValueError(
+                     "num_speculative_tokens was provided but without speculative model."
+@@ -286,7 +289,7 @@ class SpeculativeConfig:
+         ):
+             self.method = "ngram"
+ 
+-        if self.method in ("ngram", "[ngram]"):
++        if self.method in ("ngram", "[ngram]", "sam"):
+             # Unified to "ngram" internally
+             self.method = "ngram"
+             # Set default values if not provided
+-- 
+2.45.1.windows.1
+

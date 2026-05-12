@@ -1,12 +1,12 @@
 set -ex
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_NPU_ALLOC_CONF="garbage_collection_threshold:0.6,max_split_size_mb:24"
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/asdsip/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
 
 export HYDRA_FULL_ERROR=1
 #export ASCEND_LAUNCH_BLOCKING=1         
@@ -28,9 +28,10 @@ export HCCL_OP_EXPANSION_MODE=AIV
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ENABLE_MC2=1                     # 910C开启
 export VLLM_DP_SIZE=16                        # world_size // rollout.tp_size
+export VLLM_ASCEND_ENABLE_NZ=0
 export HCCL_BUFFSIZE=800
 
-export TASK_QUEUE_ENABLE=2
+export TASK_QUEUE_ENABLE=1
 
 export VLLM_ENABLE_FIX_ROUTE=0    
 export VLLM_MODEL_EXECUTE_TIME_OBSERVE=0     # decode prefill的耗时打印
@@ -52,7 +53,7 @@ export HCCL_CONNECT_TIMEOUT=7200
 
 # Unified output root for checkpoints / rollout dumps / draft dumps / logs.
 OUTPUT_ROOT=${OUTPUT_ROOT:-/workspace/cann-recipes-train/llm_rl/qwen3}
-OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-save4eagle3}
+OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-save4analyse_ingraphmode}
 OUTPUT_DIR="${OUTPUT_ROOT}/${OUTPUT_SUBDIR}"
 ROLL_OUT_DIR="${OUTPUT_DIR}/rollout_data"
 ROLL_LEN_DIR="${OUTPUT_DIR}/rollout_length"
@@ -107,8 +108,8 @@ HOME=$(pwd)
 MODEL_PATH=${MODEL_PATH:-"/home/data/Qwen3-30B-A3B"}
 CONFIG_DIR=${CONFIG_DIR:-"${HOME}/verl/trainer/config"}
 DISTCP_PATH="/home/data/Qwen3-30B-A3B_megatron"
-TRAIN_FILE=${TRAIN_FILE:-"/workspace/data/deepscaler/train.parquet"}
-TEST_FILE=${TEST_FILE:-"/workspace/data/deepscaler/test.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"/data/deepscaler/train.parquet"}
+TEST_FILE=${TEST_FILE:-"/data/deepscaler/test.parquet"}
     
 
 time=$(date +%Y%m%d%H%M%S)
@@ -156,7 +157,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=1024 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=17408 \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_num_seqs=32 \
     actor_rollout_ref.rollout.n=16 \

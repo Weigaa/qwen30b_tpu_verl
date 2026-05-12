@@ -13,13 +13,21 @@
 # limitations under the License.
 
 #!/bin/bash
-cp -r /workspace/verl/verl ./
-cp -r /workspace/verl/recipe/r1_ascend ./
-cp /workspace/verl/scripts/converter_hf_to_mcore.py ./
-cp /workspace/verl/recipe/dapo/config/* ./verl/trainer/config/
-cp /workspace/verl/recipe/dapo/*py ./verl/trainer/
-mkdir "megatron"
-cp -r /workspace/Megatron-LM/megatron/core ./megatron/core
-cp -r /workspace/MindSpeed/mindspeed ./
-cp -r /workspace/vllm/vllm ./
-cp -r /workspace/vllm-ascend/vllm_ascend ./
+set -ex
+
+FRAMEWORK_ROOT=${QWEN3_FRAMEWORK_ROOT:-/workspace}
+
+rm -rf ./verl ./r1_ascend ./converter_hf_to_mcore.py ./megatron ./mindspeed ./vllm ./vllm_ascend
+
+cp -r "${FRAMEWORK_ROOT}/verl/verl" ./
+cp -r "${FRAMEWORK_ROOT}/verl/recipe/r1_ascend" ./
+cp "${FRAMEWORK_ROOT}/verl/scripts/converter_hf_to_mcore.py" ./
+cp "${FRAMEWORK_ROOT}/verl/recipe/dapo/config/"* ./verl/trainer/config/
+cp "${FRAMEWORK_ROOT}/verl/recipe/dapo/"*py ./verl/trainer/
+mkdir -p ./megatron
+cp -r "${FRAMEWORK_ROOT}/Megatron-LM/megatron/core" ./megatron/core
+cp -r "${FRAMEWORK_ROOT}/MindSpeed/mindspeed" ./
+cp -r "${FRAMEWORK_ROOT}/vllm/vllm" ./
+cp -r "${FRAMEWORK_ROOT}/vllm-ascend/vllm_ascend" ./
+
+ls -l

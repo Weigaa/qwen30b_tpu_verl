@@ -138,24 +138,21 @@ class RLHFDataset(Dataset):
         total = len(self.dataframe)
         print(f"dataset len: {total}")
 
-        # 1) 按比例采样（dataset_fraction），直接取前 sample_size 个
         dataset_fraction = float(self.config.get("dataset_fraction", 1.0))
         shuffle = bool(self.config.get("shuffle", False))
         seed_val = self.config.get("seed", None)
         if dataset_fraction < 1.0:
             sample_size = int(total * dataset_fraction)
-            # 直接取前 sample_size 个样本以保证可复现（不打乱）
             self.dataframe = self.dataframe.select(range(sample_size))
             total = len(self.dataframe)
-            #如果要只取中间样本，打开下面的代码，但可能会导致结果不稳定（尤其是当样本数较少时），不建议使用
-            if total >= 64:
-                #取中间的第32-64个样本更好地复现缩容
-                self.dataframe = self.dataframe.select(range(32, 64))
+            #专用取中间batch
+            # if total >= 64:
+            #     # Keep the same deterministic middle-window behavior as the
+            #     # previous training branch for shrink-related experiments.
+            #     self.dataframe = self.dataframe.select(range(32, 64))
+            #     total = len(self.dataframe)
             print(f"Sampled dataset len: {total} (fraction: {dataset_fraction})")
 
-        # 2) 按最大样本数裁剪（max_samples），可选择是否随机（shuffle）并支持 seed
-        #    这里在 dataset_fraction 之后再应用 max_samples（作为上限）
-        # 期望的属性： self.max_samples (int), self.shuffle (bool), self.seed (int or None)
         try:
             max_samples = int(self.config.get("max_samples", -1))
         except Exception:
@@ -168,20 +165,17 @@ class RLHFDataset(Dataset):
             total = len(self.dataframe)
             if max_samples < total:
                 if shuffle:
-                    # np.random.default_rng requires None -> no-arg, so handle accordingly
-                    if seed_val is None:
-                        rng = np.random.default_rng()
-                    else:
-                        rng = np.random.default_rng(seed_val)
-                    indices = rng.choice(total, size=max_samples, replace=False)
-                    indices = indices.tolist()
+                    rng = np.random.default_rng() if seed_val is None else np.random.default_rng(seed_val)
+                    indices = rng.choice(total, size=max_samples, replace=False).tolist()
                 else:
-                    # 直接取前 max_samples 个
                     indices = list(range(max_samples))
                 self.dataframe = self.dataframe.select(indices)
-                print(f"selected {len(self.dataframe)} samples (max_samples: {max_samples}) out of previous {total}")
-        self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+                print(
+                    f"selected {len(self.dataframe)} samples (max_samples: {max_samples}) "
+                    f"out of previous {total}"
+                )
 
+        self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
@@ -411,8 +405,8 @@ class RLHFDataset(Dataset):
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
         row_dict["index"] = index
-        # Stable per-row id for curriculum samplers that need to aggregate
-        # rollout stats back to dataset rows across epochs.
+        # Stable per-row id for curriculum samplers that aggregate rollout
+        # stats back to dataset rows across epochs.
         row_dict["dataset_item_idx"] = item
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs

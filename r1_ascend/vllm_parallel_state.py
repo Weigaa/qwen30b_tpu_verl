@@ -16,6 +16,7 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm.config import VllmConfig, set_current_vllm_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -88,7 +89,8 @@ def init_parallel_state(tensor_parallel_size):
     backend = "hccl"
     init_distributed_environment(world_size, rank, distributed_init_method, local_rank, backend)
 
-    initialize_model_parallel(tensor_parallel_size)
+    with set_current_vllm_config(VllmConfig()):
+        initialize_model_parallel(tensor_parallel_size)
     logger.info(
         f"[DEBUG]: RANK[{rank}]: TP group: {vllm_ps._TP.ranks}\n"
         f"[DEBUG]: RANK[{rank}]: PP group: {vllm_ps._PP.ranks}\n"

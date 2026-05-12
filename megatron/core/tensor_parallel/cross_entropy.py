@@ -46,10 +46,8 @@ class VocabParallelCrossEntropy:
 
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
-        masked_target = target - vocab_start_index
-        # Avoid boolean-index assignment on Ascend. It lowers through
-        # NonZero/IndexPut AICPU kernels and can fail for long rollout sequences.
-        masked_target = torch.where(target_mask, torch.zeros_like(masked_target), masked_target)
+        masked_target = target.clone() - vocab_start_index
+        masked_target[target_mask] = 0
 
         # Get predicted-logits = logits[target].
         # For Simplicity, we convert logits to a 2-D tensor with size
@@ -61,7 +59,7 @@ class VocabParallelCrossEntropy:
         predicted_logits_1d = logits_2d[arange_1d, masked_target_1d]
         predicted_logits_1d = predicted_logits_1d.clone().contiguous()
         predicted_logits = predicted_logits_1d.view_as(target)
-        predicted_logits = torch.where(target_mask, torch.zeros_like(predicted_logits), predicted_logits)
+        predicted_logits[target_mask] = 0.0
 
         exp_logits = vocab_parallel_logits
         torch.exp(vocab_parallel_logits, out=exp_logits)

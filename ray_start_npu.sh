@@ -17,21 +17,21 @@ ray stop --force
 
 # torch
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_NPU_ALLOC_CONF="garbage_collection_threshold:0.6,max_split_size_mb:24"
 # torch-npu
-export TASK_QUEUE_ENABLE=2
+export TASK_QUEUE_ENABLE=1
 
 # CANN
 # The default CANN installation path. If your installation directory differs, please adjust the paths accordingly. 
 export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
-ASCEND_PROCESS_LOG_PATH__BACKUP=$ASCEND_PROCESS_LOG_PATH
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/asdsip/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
-export ASCEND_PROCESS_LOG_PATH=$ASCEND_PROCESS_LOG_PATH__BACKUP
+export ASCEND_CUSTOM_OPP_PATH=./vllm_ascend/_cann_ops_custom/vendors/vllm-ascend:${ASCEND_CUSTOM_OPP_PATH}
+export LD_LIBRARY_PATH=./vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/op_api/lib/:${LD_LIBRARY_PATH}
 
 export ASCEND_LAUNCH_BLOCKING=0             # debug usage, which seriously affects performance after use, but the error stack is accurate
 export ASCEND_GLOBAL_EVENT_ENABLE=0         # whether to display the Ascend EVENT log; 1 is for display
@@ -44,35 +44,35 @@ export HYDRA_FULL_ERROR=1                   # display the accurate error stack
 export RAY_DEDUP_LOGS=0                     # 0: disable ray's log folding 1: enable ray's log folding
 
 # HCCL
-export HCCL_CONNECT_TIMEOUT=900
-export HCCL_EXEC_TIMEOUT=900
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=7200
 export HCCL_IF_BASE_PORT=64021
-export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_BUFFSIZE=300
 export HCCL_HOST_SOCKET_PORT_RANGE="auto"
+export HCCL_ASYNC_ERROR_HANDLING=0
 
 # vLLM
 export VLLM_USE_V1=1
 export VLLM_LOGGING_LEVEL=INFO
-export VLLM_DP_SIZE=2                   # [TODO] configure the DP size of vLLM based on actual training configration
 
 # vLLM-Ascend
 # under the configuration of the vLLM log level of INFO, enable this configuration, print the time of prefill and decode
 export VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE=0
+export VLLM_ASCEND_ENABLE_NZ=0
 
 export PYTHONUNBUFFERED=x
 
 ulimit -n 32768
 mkdir logs
 
-NNODES=1                           # [TODO] number of nodes
+NNODES=8                           # [TODO] number of nodes
 NPUS_PER_NODE=16                   # the number of npus for each node
-MASTER_ADDR="127.0.0.1"   # [TODO] modify it to correspond to the IP of the master node
-SOCKET_IFNAME="lo"  # [TODO] use `ifconfig` to check and modify it to the communication network card of the current node.
+MASTER_ADDR="IP FOR MASTER NODE"   # [TODO] modify it to correspond to the IP of the master node
+SOCKET_IFNAME="SOCKET IFNAME FOR CURRENT NODE"  # [TODO] use `ifconfig` to check and modify it to the communication network card of the current node.
 # obtain the current node IP
 CURRENT_IP=$(ifconfig $SOCKET_IFNAME | grep -Eo 'inet (addr:)?([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $NF}')
 
-export MASTER_PORT=29445
+export MASTER_PORT=29444
 
 export TP_SOCKET_IFNAME=$SOCKET_IFNAME
 export HCCL_SOCKET_IFNAME=$SOCKET_IFNAME
@@ -105,15 +105,11 @@ python -c "import mindspeed; from mindspeed.op_builder import MatmulAddOpBuilder
 python -c "import mindspeed; from mindspeed.op_builder import GroupMatmulAddOpBuilder; GroupMatmulAddOpBuilder().load()" &
 wait $(jobs -rp)
 
+
 if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
   # the master node starts
-  echo "I am master node."
-  echo "Starting Ray head node on $CURRENT_IP ..."
   ray start --head --port $MASTER_PORT --dashboard-host=0.0.0.0 --node-ip-address=$CURRENT_IP --dashboard-port=8260 --resources='{"NPU": '$NPUS_PER_NODE'}'
-  if [ $? -ne 0 ]; then
-    echo "Ray head failed to start! Please check logs under /tmp/ray or stderr."
-    exit 1
-  fi
+
   while true; do
       ray_status_output=$(ray status)
       npu_count=$(echo "$ray_status_output" | grep -oP '(?<=/)\d+\.\d+(?=\s*NPU)' | head -n 1)
@@ -149,7 +145,4 @@ else
   done
 fi
 
-# sleep 999999
-echo "Train script finished, stopping Ray and exiting launcher..."
-ray stop --force || true
-exit 0
+sleep 999999

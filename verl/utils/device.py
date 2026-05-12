@@ -93,3 +93,5 @@ def set_expandable_segments(enable: bool) -> None:
     """
     if is_cuda_available:
         torch.cuda.memory._set_allocator_settings(f"expandable_segments:{enable}")
+    if is_npu_available:
+        torch.npu.memory._set_allocator_settings(f"expandable_segments:{enable}")

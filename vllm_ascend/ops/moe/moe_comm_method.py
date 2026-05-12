@@ -15,11 +15,13 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
+import logging
+import os
 from abc import ABC, abstractmethod
+from collections import Counter
 from typing import Any, Dict, Optional
 
 import torch
-import os
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
@@ -35,7 +37,53 @@ from vllm_ascend.ops.moe.token_dispatcher import (TokenDispatcherWithAll2AllV,
                                                   TokenDispatcherWithMC2,
                                                   TokenDispatcherWithMoge)
 
+logger = logging.getLogger(__name__)
+
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
+_chunk_debug_total = 0
+_chunk_debug_summary = Counter()
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+def _maybe_log_chunk_plan(*, num_tokens: int, max_tokens: int,
+                          chunk_moe_size: int,
+                          moe_comm_type: MoECommType | None) -> None:
+    if not _env_flag("VLLM_ASCEND_MOE_CHUNK_DEBUG"):
+        return
+
+    global _chunk_debug_total
+    _chunk_debug_total += 1
+    chunks = (max_tokens + chunk_moe_size - 1) // chunk_moe_size
+    real_chunks = (num_tokens + chunk_moe_size - 1) // chunk_moe_size
+    dummy_chunks = max(chunks - real_chunks, 0)
+    comm_name = "None" if moe_comm_type is None else moe_comm_type.name
+    _chunk_debug_summary[(comm_name, chunks, dummy_chunks)] += 1
+
+    interval = int(os.getenv("VLLM_ASCEND_MOE_CHUNK_DEBUG_INTERVAL", "1024"))
+    if _chunk_debug_total <= 32 or (
+            interval > 0 and _chunk_debug_total % interval == 0):
+        summary = ", ".join(
+            f"{comm}/chunks={chunk}/dummy={dummy}:{count}"
+            for (comm, chunk, dummy), count in sorted(
+                _chunk_debug_summary.items()))
+        logger.info(
+            "MoE chunk plan pid=%s call=%d local_tokens=%s max_tokens=%s "
+            "chunk_size=%s chunks=%s real_chunks=%s dummy_chunks=%s "
+            "comm=%s summary={%s}",
+            os.getpid(),
+            _chunk_debug_total,
+            num_tokens,
+            max_tokens,
+            chunk_moe_size,
+            chunks,
+            real_chunks,
+            dummy_chunks,
+            comm_name,
+            summary,
+        )
 
 
 def get_moe_comm_method(
@@ -137,6 +185,12 @@ class MoECommMethod(ABC):
         tp_size = get_tensor_model_parallel_world_size()
         max_tokens = (ctx.max_tokens_across_dp + tp_size - 1) // tp_size
         num_tokens = hidden_states.size(0)
+        _maybe_log_chunk_plan(
+            num_tokens=num_tokens,
+            max_tokens=max_tokens,
+            chunk_moe_size=chunk_moe_size,
+            moe_comm_type=getattr(ctx, "moe_comm_type", None),
+        )
         effective_mc2_mask = self.mc2_mask if mc2_mask is None else mc2_mask
         if (effective_mc2_mask is not None
                 and effective_mc2_mask.shape[0] != hidden_states.shape[0]):
@@ -145,7 +199,7 @@ class MoECommMethod(ABC):
                 f"hidden_tokens={hidden_states.shape[0]} "
                 f"mask_tokens={effective_mc2_mask.shape[0]}")
 
-        if max_tokens < chunk_moe_size:
+        if max_tokens <= chunk_moe_size:
             results = self.token_dispatcher.token_dispatch(
                 hidden_states=hidden_states,
                 topk_weights=topk_weights,

@@ -22,10 +22,11 @@ TEST_FILE=${TEST_FILE:-"${HOME}/data/dapo_math/aime-2024.parquet"}
 
 # configs
 NODES=2
-GPU_MEMORY_UTILIZATION=0.8
+GPU_MEMORY_UTILIZATION=0.87
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=34816
 MAX_NUM_SEQS=128
+CUDAGRAPH_SIZES='[16,32,64,128]'
 
 INFER_TP=8
 INFER_DP=$((NODES * 16 / INFER_TP))
@@ -110,8 +111,9 @@ python3 -m verl.trainer.main_dapo --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${INFER_TP} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
+    actor_rollout_ref.rollout.cudagraph_capture_sizes=${CUDAGRAPH_SIZES} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS} \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.temperature=0.9 \

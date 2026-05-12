@@ -210,6 +210,7 @@ class vLLMHttpServer:
             "trust_remote_code": True,
             "max_model_len": self.config.max_model_len,
             "max_num_seqs": self.config.max_num_seqs,
+            "async_scheduling": self.config.async_scheduling,
             "enable_chunked_prefill": self.config.enable_chunked_prefill,
             "max_num_batched_tokens": self.config.max_num_batched_tokens,
             "enable_prefix_caching": self.config.enable_prefix_caching,

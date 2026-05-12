@@ -27,6 +27,7 @@ GPU_MEMORY_UTILIZATION=0.85
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=34816
 MAX_NUM_SEQS=64
+CUDAGRAPH_SIZES='[8,16,32,64]'
 
 INFER_TP=4
 INFER_DP=$((NODES * 16 / INFER_TP))
@@ -56,6 +57,7 @@ rollout_is_mode=truncate    # truncate mode
 rollout_is_veto_threshold=null  # No veto
 
 loss_agg_mode="token-mean"
+
 
 python3 -m verl.trainer.main_dapo --config-path="${CONFIG_DIR}" \
     --config-name='dapo_megatron_trainer.yaml'\
@@ -113,6 +115,7 @@ python3 -m verl.trainer.main_dapo --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${INFER_TP} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
+    actor_rollout_ref.rollout.cudagraph_capture_sizes=${CUDAGRAPH_SIZES} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))   \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False   \
@@ -164,4 +167,6 @@ python3 -m verl.trainer.main_dapo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_zero_memory='level1' \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.gemm_gradient_accumulation_fusion=True $@
+    +actor_rollout_ref.actor.megatron.override_transformer_config.gemm_gradient_accumulation_fusion=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=sam \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=3 $@

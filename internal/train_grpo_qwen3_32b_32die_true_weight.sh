@@ -22,10 +22,11 @@ TEST_FILE=${TEST_FILE:-"${HOME}/data/deepscaler/valid.parquet"}
 
 # configs
 NODES=2
-GPU_MEMORY_UTILIZATION=0.85
+GPU_MEMORY_UTILIZATION=0.87
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=34816
 MAX_NUM_SEQS=128
+CUDAGRAPH_SIZES='[16,32,64,128]'
 
 INFER_TP=8
 INFER_DP=$((NODES * 16 / INFER_TP))
@@ -37,6 +38,7 @@ TRAIN_CP=$((NODES * 16 / TRAIN_TP / TRAIN_PP))
 TRAIN_BATCH_SIZE=32
 GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE))
 MAX_TOKEN_LEN_PER_GPU=$(((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH) / TRAIN_CP))
+
 
 python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     --config-name='ppo_megatron_trainer.yaml' \
@@ -76,8 +78,9 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${INFER_TP} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
+    actor_rollout_ref.rollout.cudagraph_capture_sizes=${CUDAGRAPH_SIZES} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.max_num_seqs=${MAX_NUM_SEQS} \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.temperature=0.9 \

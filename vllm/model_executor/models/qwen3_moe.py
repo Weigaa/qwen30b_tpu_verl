@@ -22,80 +22,93 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
+
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from torch import nn
 
-from vllm.attention import Attention
+from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import (get_ep_group, get_pp_group,
-                              get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_gather)
+from vllm.distributed import (
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
-                                               QKVParallelLinear,
-                                               ReplicatedLinear,
-                                               RowParallelLinear)
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, maybe_remap_kv_scale_name)
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
-from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
-                    is_pp_missing_parameter,
-                    make_empty_intermediate_tensors_factory, make_layers,
-                    maybe_prefix)
-#新增
-from vllm.forward_context import get_forward_context
-from vllm.utils.moe_stats import moe_stats
-from vllm.distributed.parallel_state import get_ep_group
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-import torch.distributed as dist
-import time
+from .interfaces import MixtureOfExperts, SupportsEagle3, SupportsLoRA, SupportsPP
+from .utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    extract_layer_index,
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+    maybe_prefix,
+)
 
 logger = init_logger(__name__)
 
 
 class Qwen3MoeMLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
+            hidden_size,
+            [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj")
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           quant_config=quant_config,
-                                           reduce_results=reduce_results,
-                                           prefix=f"{prefix}.down_proj")
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            prefix=f"{prefix}.down_proj",
+        )
         if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+            )
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -106,7 +119,6 @@ class Qwen3MoeMLP(nn.Module):
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -119,9 +131,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.prefix = prefix
+
         self.ep_group = get_ep_group().device_group
-        self.ep_rank = self.ep_group.rank()
+        self.ep_rank = get_ep_group().rank_in_group
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
 
@@ -130,7 +142,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}.")
+                f"the number of experts {config.num_experts}."
+            )
 
         # Load balancing settings.
         vllm_config = get_current_vllm_config()
@@ -139,97 +152,41 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         self.n_logical_experts = self.n_routed_experts
         self.n_redundant_experts = eplb_config.num_redundant_experts
-        self.n_physical_experts = (self.n_logical_experts +
-                                   self.n_redundant_experts)
+        self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
 
-        self.physical_expert_start = (self.ep_rank *
-                                      self.n_local_physical_experts)
-        self.physical_expert_end = (self.physical_expert_start +
-                                    self.n_local_physical_experts)
+        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
+        self.physical_expert_end = (
+            self.physical_expert_start + self.n_local_physical_experts
+        )
 
-        self.experts = FusedMoE(num_experts=self.n_routed_experts,
-                                top_k=config.num_experts_per_tok,
-                                hidden_size=config.hidden_size,
-                                intermediate_size=config.moe_intermediate_size,
-                                reduce_results=True,
-                                renormalize=config.norm_topk_prob,
-                                quant_config=quant_config,
-                                prefix=f"{prefix}.experts",
-                                enable_eplb=self.enable_eplb,
-                                num_redundant_experts=self.n_redundant_experts,
-                                is_sequence_parallel=self.is_sequence_parallel)
+        self.experts = FusedMoE(
+            num_experts=self.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=True,
+            renormalize=config.norm_topk_prob,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+            enable_eplb=self.enable_eplb,
+            num_redundant_experts=self.n_redundant_experts,
+            is_sequence_parallel=self.is_sequence_parallel,
+            routing_method_type=RoutingMethodType.Renormalize,
+        )
 
-        self.gate = ReplicatedLinear(config.hidden_size,
-                                     config.num_experts,
-                                     bias=False,
-                                     quant_config=quant_config,
-                                     prefix=f"{prefix}.gate")
-        #新增统计
-        self.ep_sig_total_cnt = 0     # 总调用次数
-        self.ep_sig_same_cnt = 0      # 所有 rank token 完全相同的次数
-        self.ep_sig_diff_cnt = 0      # 至少有一个 rank 不同的次数
-    def compute_topk(
-        self,
-        router_logits: torch.Tensor,
-        k: int = 8,
-    ):
-        # 计算每个 token 的 top-k 专家
-        k = min(k, router_logits.shape[-1])
-        _, topk_ids = torch.topk(router_logits, k=k, dim=-1)      # [T, k] (long)
-        topk_ids = topk_ids.to(torch.int32)
-
-        return topk_ids
-    
-    def _ep_same_input_guard(self, topk_ids: torch.Tensor, layer_idx: int, note: str = ""):
-        """最小扰动版：用 topk_ids 做轻量签名，检测各 EP rank 是否处理相同 token。"""
-        ep_group = get_ep_group().device_group
-        world = ep_group.size()
-        if world <= 1:
-            return
-
-        # 计算一个极轻的整数签名： [T, sum(topk), sum(col_weighted_topk)]
-        # 说明：T不同或topk内容不同都会导致签名不同；碰撞概率很低，足够排查问题。
-        if topk_ids.ndim == 1:
-            topk_ids = topk_ids.view(1, -1)
-        T, K = topk_ids.shape
-        tki = topk_ids.to(dtype=torch.int64)
-        col = torch.arange(1, K + 1, device=tki.device, dtype=torch.int64)  # 1..K
-        sig = torch.stack([
-            torch.tensor(T, device=tki.device, dtype=torch.int64),
-            tki.sum(dtype=torch.int64),
-            (tki * col).sum(dtype=torch.int64),
-        ])
-
-        # 在 EP 组内收集并比较
-        gathered = [torch.empty_like(sig) for _ in range(world)]
-        dist.all_gather(gathered, sig, group=ep_group)
-
-        # 若所有签名完全相同，则基本可判定“各 EP 正在处理相同的一批 token”
-        all_same = all(torch.equal(gathered[0], g) for g in gathered[1:])
-        if all_same:
-            if ep_group.rank() == 0:
-                self.ep_sig_total_cnt += 1
-                self.ep_sig_same_cnt += 1
-                # for i in range(0, world):
-                #     print(f"rank,{i},[EP WARNING] layer={layer_idx} world={world} -> all EP ranks share identical signature "
-                #         f"{gathered[i].detach().cpu().tolist()} {note}")
-        else:
-            if ep_group.rank() == 0: 
-                self.ep_sig_total_cnt += 1
-                self.ep_sig_diff_cnt += 1
-                # for i in range(0, world):
-                #     print(f"rank,{i},#### layer={layer_idx} world={world} -> EP ranks share different signature "
-                #         f"{gathered[i].detach().cpu().tolist()} {note}")
-        if self.ep_sig_total_cnt % 1000 == 0:
-            if ep_group.rank() == 0:
-                print("same ratio is", self.ep_sig_same_cnt / self.ep_sig_total_cnt)
-                print("diff ratio is", self.ep_sig_diff_cnt / self.ep_sig_total_cnt)
-
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate",
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.dim(
-        ) <= 2, "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
+        assert hidden_states.dim() <= 2, (
+            "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
+        )
         is_input_1d = hidden_states.dim() == 1
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -239,47 +196,35 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        #graph和eager模式NPU都没有走到这个方法
-        # add record
-        topk_ids = self.compute_topk(router_logits)
-        self.layer_idx = extract_layer_index(self.prefix)
-        # moe_stats.record_layer_topk(self.layer_idx, topk_ids)
-        # self._ep_same_input_guard(topk_ids, self.layer_idx, note=f"(run={getattr(self,'total_run',-1)})")
-        # moe_stats.record(
-        #     layer_idx=extract_layer_index(self.prefix),
-        #     topk_ids=topk_ids,
-        #     num_experts=128,
-        # )
-        final_hidden_states = self.experts(hidden_states=hidden_states,
-                                           router_logits=router_logits)
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
-                final_hidden_states, 0)
+                final_hidden_states, 0
+            )
             final_hidden_states = final_hidden_states[:num_tokens]
 
         # return to 1d if input is 1d
-        return final_hidden_states.squeeze(0) if is_input_1d else \
-            final_hidden_states
+        return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
 
 
 class Qwen3MoeAttention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[dict[str, Any]] = None,
+        rope_parameters: dict[str, Any],
         max_position_embeddings: int = 8192,
-        head_dim: Optional[int] = None,
+        head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
+        dual_chunk_attention_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -301,30 +246,31 @@ class Qwen3MoeAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.dual_chunk_attention_config = dual_chunk_attention_config
 
-        self.qkv_proj = QKVParallelLinear(hidden_size,
-                                          self.head_dim,
-                                          self.total_num_heads,
-                                          self.total_num_kv_heads,
-                                          bias=qkv_bias,
-                                          quant_config=quant_config,
-                                          prefix=f"{prefix}.qkv_proj")
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=qkv_bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
+        )
 
-        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
-                                        hidden_size,
-                                        bias=False,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
+        )
 
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=rope_parameters,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = Attention(
@@ -338,7 +284,9 @@ class Qwen3MoeAttention(nn.Module):
             **{
                 "layer_idx": extract_layer_index(prefix),
                 "dual_chunk_attention_config": dual_chunk_attention_config,
-            } if dual_chunk_attention_config else {},
+            }
+            if dual_chunk_attention_config
+            else {},
         )
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -352,13 +300,11 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
-                           self.head_dim)
+        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
         q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim,
-                           self.head_dim)
+        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         q, k = self.rotary_emb(positions, q, k)
@@ -368,7 +314,6 @@ class Qwen3MoeAttention(nn.Module):
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
-
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
@@ -377,23 +322,19 @@ class Qwen3MoeDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
-        dual_chunk_attention_config = getattr(config,
-                                              "dual_chunk_attention_config",
-                                              None)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        dual_chunk_attention_config = getattr(
+            config, "dual_chunk_attention_config", None
+        )
         self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_parameters=config.rope_parameters,
             max_position_embeddings=max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', False),
-            head_dim=getattr(config, 'head_dim', None),
+            qkv_bias=getattr(config, "attention_bias", False),
+            head_dim=getattr(config, "head_dim", None),
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
@@ -402,69 +343,53 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
-        mlp_only_layers = ([] if not hasattr(config, "mlp_only_layers") else
-                           config.mlp_only_layers)
+        mlp_only_layers = (
+            [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
+        )
         if (layer_idx not in mlp_only_layers) and (
-                config.num_experts > 0 and
-            (layer_idx + 1) % config.decoder_sparse_step == 0):
-            self.mlp = Qwen3MoeSparseMoeBlock(vllm_config=vllm_config,
-                                              prefix=f"{prefix}.mlp")
+            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
+        ):
+            self.mlp = Qwen3MoeSparseMoeBlock(
+                vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+            )
         else:
-            self.mlp = Qwen3MoeMLP(hidden_size=config.hidden_size,
-                                   intermediate_size=config.intermediate_size,
-                                   hidden_act=config.hidden_act,
-                                   quant_config=quant_config,
-                                   prefix=f"{prefix}.mlp")
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
+            self.mlp = Qwen3MoeMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        is_dummy: Optional[bool] = False,
+        residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # is_dummy = False # 强制关闭
-        if is_dummy:
-            # print("doing dummy eagle train here to overlap self attn")
-            if residual is None:
-                residual = hidden_states
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         else:
-            # if hidden_states.shape[0] == 32:
-            #     self._attn_start.record()
-            # Self Attention
-            if residual is None:
-                residual = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-            else:
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states, residual)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-            hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        # Fully Connected
-        # if hidden_states.shape[0] == 32:
-        #     self._attn_end.record()
-        hidden_states = self.mlp(hidden_states, is_dummy)
-        # if hidden_states.shape[0] == 32:
-        #     self._attn_end_moe.record()
-        #     self._attn_end_moe.synchronize()
-        #     attn_ms = self._attn_start.elapsed_time(self._attn_end)
-        #     moe_ms = self._attn_end.elapsed_time(self._attn_end_moe)
-        #     print("rank", self.ep_group.rank(), "layer_idx", self.layer_idx, "self attn ms:", attn_ms, "moe ms:", moe_ms)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
 
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
 @support_torch_compile
 class Qwen3MoeModel(nn.Module):
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -477,98 +402,83 @@ class Qwen3MoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.config = config
+        self.quant_config = quant_config
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             quant_config=quant_config,
-            prefix=f"{prefix}.embed_tokens")
+            prefix=f"{prefix}.embed_tokens",
+        )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config,
-                                                prefix=prefix),
+            lambda prefix: Qwen3MoeDecoderLayer(vllm_config=vllm_config, prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size))
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
+        # Track layers for auxiliary hidden state outputs (EAGLE3)
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        is_dummy: Optional[bool] = False,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self.embed_input_ids(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual, is_dummy=is_dummy)
+
+        aux_hidden_states = []
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
+            # Collect auxiliary hidden states if specified
+            if layer_idx in self.aux_hidden_state_layers:
+                aux_hidden_state = (
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+                aux_hidden_states.append(aux_hidden_state)
+            hidden_states, residual = layer(positions, hidden_states, residual)
+
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        # Return auxiliary hidden states if collected
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return FusedMoE.make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.num_experts,
-            num_redundant_experts=self.num_redundant_experts)
+            num_redundant_experts=self.num_redundant_experts,
+        )
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
-        def _lossless_log_moe_load_snapshot(stage: str) -> None:
-            try:
-                ep_rank = get_ep_group().rank_in_group
-            except Exception:
-                ep_rank = -1
-
-            sample = None
-            for param_name, param in self.named_parameters():
-                if (param_name.endswith("mlp.experts.w13_weight")
-                        or param_name.endswith("mlp.experts.w2_weight")):
-                    head = []
-                    try:
-                        num_rows = min(4, param.shape[0]) if param.ndim >= 1 else 0
-                        for row_idx in range(num_rows):
-                            head.append(
-                                (row_idx,
-                                 round(
-                                     float(param[row_idx].float().abs().mean().item()),
-                                     6)))
-                    except Exception as exc:
-                        head = [("error", str(exc))]
-                    sample = {
-                        "param_name": param_name,
-                        "param_id": id(param),
-                        "ptr": int(param.data.data_ptr()),
-                        "shape": tuple(param.shape),
-                        "device": str(param.device),
-                        "head": head,
-                    }
-                    break
-
-            pass  # debug log removed
-
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -579,28 +489,37 @@ class Qwen3MoeModel(nn.Module):
         ]
 
         # Skip loading extra parameters for GPTQ/modelopt models.
-        ignore_suffixes = (".bias", "_bias", ".k_scale", "_k_scale",
-                           ".v_scale", "_v_scale", ".weight_scale",
-                           "_weight_scale", ".input_scale", "_input_scale")
+        ignore_suffixes = (
+            ".bias",
+            "_bias",
+            ".k_scale",
+            "_k_scale",
+            ".v_scale",
+            "_v_scale",
+            ".weight_scale",
+            "_weight_scale",
+            ".input_scale",
+            "_input_scale",
+        )
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
-        lossless_reload_modules: list[tuple[nn.Module, object]] = []
-        _lossless_log_moe_load_snapshot("enter")
-        for module in self.modules():
-            quant_method = getattr(module, "quant_method", None)
-            invalidate_runtime = getattr(quant_method,
-                                         "invalidate_lossless_runtime_state_for_reload",
-                                         None)
-            if callable(invalidate_runtime):
-                invalidated = invalidate_runtime(
-                    layer=module, reason="Qwen3MoeModel.load_weights")
-                if invalidated:
-                    lossless_reload_modules.append((module, quant_method))
-        # print("vllm moe expert_params_mapping is", expert_params_mapping)
         for name, loaded_weight in weights:
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+            if self.quant_config is not None and (
+                scale_name := self.quant_config.get_cache_scale(name)
+            ):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                assert loaded_weight.numel() == 1, (
+                    f"KV scale numel {loaded_weight.numel()} != 1"
+                )
+                loaded_weight = loaded_weight.squeeze()
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
@@ -630,8 +549,7 @@ class Qwen3MoeModel(nn.Module):
                     continue
 
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if weight_loader == default_weight_loader:
                     weight_loader(param, loaded_weight)
                 else:
@@ -656,28 +574,27 @@ class Qwen3MoeModel(nn.Module):
                         continue
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name_mapped.endswith(
-                            ignore_suffixes
-                    ) and name_mapped not in params_dict:
+                    if (
+                        name_mapped.endswith(ignore_suffixes)
+                        and name_mapped not in params_dict
+                    ):
                         continue
 
                     param = params_dict[name_mapped]
                     # We should ask the weight loader to return success or not
                     # here since otherwise we may skip experts with other
                     # available replicas.
-                    weight_loader = typing.cast(Callable[..., bool],
-                                                param.weight_loader)
-                    #print("moe weight_loader is", weight_loader)
-                    # self.ep_group = get_ep_group().device_group
-                    # if self.ep_group.rank() == 0:
-                    #     print("name is", name, "param_name is", param_name)
-                    #     print("ep_rank is ", self.ep_group.rank(), "load_weight is", loaded_weight, "name_mapped", name_mapped, "shard_id", shard_id, "expert_id", expert_id)
-                    success = weight_loader(param,
-                                            loaded_weight,
-                                            name_mapped,
-                                            shard_id=shard_id,
-                                            expert_id=expert_id,
-                                            return_success=True)
+                    weight_loader = typing.cast(
+                        Callable[..., bool], param.weight_loader
+                    )
+                    success = weight_loader(
+                        param,
+                        loaded_weight,
+                        name_mapped,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
                     if success:
                         name = name_mapped
                         break
@@ -689,8 +606,7 @@ class Qwen3MoeModel(nn.Module):
                         continue
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
-                    if name.endswith(
-                            ignore_suffixes) and name not in params_dict:
+                    if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
                     # Skip layers on other devices.
                     if is_pp_missing_parameter(name, self):
@@ -698,7 +614,8 @@ class Qwen3MoeModel(nn.Module):
                     # Remapping the name of FP8 kv-scale.
                     if name.endswith("kv_scale"):
                         remapped_kv_scale_name = name.replace(
-                            ".kv_scale", ".attn.kv_scale")
+                            ".kv_scale", ".attn.kv_scale"
+                        )
                         if remapped_kv_scale_name not in params_dict:
                             logger.warning_once(
                                 "Found kv scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv-scale is not loaded.",  # noqa: E501
@@ -709,34 +626,23 @@ class Qwen3MoeModel(nn.Module):
                         else:
                             name = remapped_kv_scale_name
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader",
-                                            default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
-
-        for module, quant_method in lossless_reload_modules:
-            process_after_reload = getattr(quant_method,
-                                           "process_weights_after_loading",
-                                           None)
-            if callable(process_after_reload):
-                process_after_reload(module)
-
-        _lossless_log_moe_load_snapshot("exit")
         return loaded_params
 
 
-class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
-                          MixtureOfExperts):
+class Qwen3MoeForCausalLM(
+    nn.Module, SupportsPP, SupportsLoRA, SupportsEagle3, MixtureOfExperts
+):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
             "k_proj",
             "v_proj",
-        ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
+        ]
     }
 
     fall_back_to_pt_during_load = False
@@ -747,22 +653,29 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen3MoeModel(vllm_config=vllm_config,
-                                   prefix=maybe_prefix(prefix, "model"))
-        self.lm_head = ParallelLMHead(config.vocab_size,
-                                      config.hidden_size,
-                                      quant_config=quant_config,
-                                      prefix=maybe_prefix(prefix, "lm_head"))
+        # Only perform the following mapping when Qwen3MoeMLP exists
+        if getattr(config, "mlp_only_layers", []):
+            self.packed_modules_mapping["gate_up_proj"] = ["gate_proj", "up_proj"]
+        self.model = Qwen3MoeModel(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
+        )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors)
+            self.model.make_empty_intermediate_tensors
+        )
 
         # Set MoE hyperparameters
         self.expert_weights = []
 
-        self.moe_layers: list[FusedMoE] = []
+        self.moe_layers = []
         example_layer = None
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
@@ -785,22 +698,6 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         self.num_routed_experts = example_layer.n_routed_experts
         self.num_redundant_experts = example_layer.n_redundant_experts
 
-    def set_eplb_state(
-        self,
-        expert_load_view: torch.Tensor,
-        logical_to_physical_map: torch.Tensor,
-        logical_replica_count: torch.Tensor,
-    ) -> None:
-        for layer_idx, layer in enumerate(self.moe_layers):
-            # Register the expert weights.
-            self.expert_weights.append(layer.get_expert_weights())
-            layer.set_eplb_state(
-                moe_layer_idx=layer_idx,
-                expert_load_view=expert_load_view,
-                logical_to_physical_map=logical_to_physical_map,
-                logical_replica_count=logical_replica_count,
-            )
-
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,
@@ -809,8 +706,7 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
         assert self.num_local_physical_experts == num_local_physical_experts
         self.num_physical_experts = num_physical_experts
         self.num_local_physical_experts = num_local_physical_experts
-        self.num_redundant_experts = (num_physical_experts -
-                                      self.num_logical_experts)
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
         for layer in self.model.layers:
             if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
                 moe = layer.mlp
@@ -819,30 +715,38 @@ class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA,
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        is_dummy: Optional[bool] = False,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, intermediate_tensors,
-                                   inputs_embeds, is_dummy=is_dummy)
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        hidden_states = self.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
         return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is not None and logits.shape[-1] > self.config.vocab_size:
+            logits[..., self.config.vocab_size:] = float("-inf")
         return logits
 
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 

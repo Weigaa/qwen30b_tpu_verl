@@ -1,0 +1,97 @@
+From 1a2c5352fc82805355369752ec3aca0c5277c9fb Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Thu, 20 Nov 2025 20:00:15 +0800
+Subject: [PATCH] Modify model converter
+
+---
+ llm_rl/qwen3/converter_hf_to_mcore.py | 60 +++++++++++++++++++------
+ 1 file changed, 46 insertions(+), 14 deletions(-)
+
+diff --git a/llm_rl/qwen3/converter_hf_to_mcore.py b/llm_rl/qwen3/converter_hf_to_mcore.py
+index 6e7cdf2..b6c7ed6 100644
+--- a/llm_rl/qwen3/converter_hf_to_mcore.py
++++ b/llm_rl/qwen3/converter_hf_to_mcore.py
+@@ -177,19 +177,40 @@ def convert_checkpoint_from_transformers_to_megatron(
+         numel += safe_copy(hf_layer.mlp.gate.weight, layer.mlp.router.weight)
+ 
+         for idx, hf_expert in enumerate(hf_layer.mlp.experts):
+-            num_experts = len(hf_layer.mlp.experts)
+-            num_local_experts = num_experts // ep_size
+-            expert_idx_start = ep_rank * num_local_experts
+-            expert_idx_end = (ep_rank + 1) * num_local_experts
+-            if idx < expert_idx_start or idx >= expert_idx_end:
+-                continue
+-            local_expert_idx = idx - expert_idx_start
+-
+-            fc1_weight = torch.cat([hf_expert.gate_proj.weight, hf_expert.up_proj.weight])
+-            numel += safe_copy(fc1_weight, layer.mlp.experts.linear_fc1._parameters[f"weight{local_expert_idx}"])
+-            numel += safe_copy(
+-                hf_expert.down_proj.weight, layer.mlp.experts.linear_fc2._parameters[f"weight{local_expert_idx}"]
+-            )
++            if os.getenv('USE_ALLTOALL_OVERLAP', '0') == '1':
++                num_experts = len(hf_layer.mlp.experts)
++                num_local_experts = num_experts // ep_size
++                expert_idx_start = ep_rank * num_local_experts
++                expert_idx_end = (ep_rank + 1) * num_local_experts
++                if idx < expert_idx_start or idx >= expert_idx_end:
++                    continue
++                hidden_size = hf_expert.gate_proj.weight.shape[1]
++
++                fc1_weight = torch.cat([
++                    hf_expert.gate_proj.weight.transpose(0, 1).contiguous(),
++                    hf_expert.up_proj.weight.transpose(0, 1).contiguous()
++                ], dim=1)
++                true_npu_weight1 = layer.mlp.experts.weight1.view(num_local_experts, hidden_size, -1) # true w1 shape during forward is [num_experts, hidden_size, inter_size * 2]
++                local_expert_idx = idx - expert_idx_start
++                numel += safe_copy(fc1_weight, true_npu_weight1[local_expert_idx])
++                fc2_weight = hf_expert.down_proj.weight.transpose(0, 1).contiguous()
++                true_npu_weight2 = layer.mlp.experts.weight2.view(num_local_experts, -1, hidden_size) # true w2 shape during forward is [num_experts, inter_size, hidden_size]
++                numel_w2 = safe_copy(fc2_weight, true_npu_weight2[local_expert_idx])
++                numel += numel_w2
++            else:
++                num_experts = len(hf_layer.mlp.experts)
++                num_local_experts = num_experts // ep_size
++                expert_idx_start = ep_rank * num_local_experts
++                expert_idx_end = (ep_rank + 1) * num_local_experts
++                if idx < expert_idx_start or idx >= expert_idx_end:
++                    continue
++                local_expert_idx = idx - expert_idx_start
++
++                fc1_weight = torch.cat([hf_expert.gate_proj.weight, hf_expert.up_proj.weight])
++                numel += safe_copy(fc1_weight, layer.mlp.experts.linear_fc1._parameters[f"weight{local_expert_idx}"])
++                numel += safe_copy(
++                    hf_expert.down_proj.weight, layer.mlp.experts.linear_fc2._parameters[f"weight{local_expert_idx}"]
++                )
+ 
+         if has_share_expert:
+             numel += safe_copy(hf_layer.mlp.shared_expert_gate.weight, layer.mlp.shared_experts.gate_weight)
+@@ -482,7 +503,17 @@ def convert_hf_to_mcore(
+     if repatch:
+         if hf_config.architectures[0] == "DeepseekV3ForCausalLM":
+             config_repatch = dict(multi_head_latent_attention=True)
+-            repatch(config_repatch)
++        elif hf_config.architectures[0] == "Qwen3MoeForCausalLM":
++            config_repatch = dict(
++                use_flash_attn=True,
++                moe_alltoall_overlap_comm=False,
++                moe_token_dispatcher_type='alltoall',
++                use_fused_rotary_pos_emb=True,
++                use_fused_swiglu=True
++            )
++        if os.getenv('USE_ALLTOALL_OVERLAP', '0') == '1':
++            config_repatch['moe_alltoall_overlap_comm'] = True
++        repatch(config_repatch)
+ 
+     if world_size > 1 and not support_distributed_convert(hf_config):
+         raise NotImplementedError(f"distributed conversion is not supported for {hf_config.architectures} yet.")
+@@ -497,6 +528,7 @@ def convert_hf_to_mcore(
+         num_layers_in_last_pipeline_stage=pipeline_shards[-1] if len(pipeline_shards) > 2 else None,
+     )
+     tfconfig.use_cpu_initialization = use_cpu_initialization
++    tfconfig.moe_grouped_gemm = True
+     tie_word_embeddings = getattr(hf_config, "tie_word_embeddings", False)
+ 
+     # init megatron model
+-- 
+2.50.1.windows.1
+

@@ -22,8 +22,19 @@ def register():
     return "vllm_ascend.platform.NPUPlatform"
 
 
-def register_model():
-    import vllm_ascend.patch.worker.patch_common.patch_attention_selector  # noqa
+def register_connector():
+    from vllm_ascend.distributed.kv_transfer import register_connector
 
-    from .models import register_model
-    register_model()
+    register_connector()
+
+
+def register_model_loader():
+    from .model_loader.netloader import register_netloader
+
+    register_netloader()
+
+
+def register_service_profiling():
+    from .profiling_config import generate_service_profiling_config
+
+    generate_service_profiling_config()

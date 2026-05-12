@@ -21,9 +21,8 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import logging
 import os
-import uuid
 import time
-import matplotlib.pyplot as plt
+import uuid
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -60,19 +59,22 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
-from vllm.utils.moe_stats import (merge_moe_pattern_records,
-                                  strip_prompt_token_from_worker_records,
-                                  write_moe_pattern_csvs,
-                                  write_prompt_token_epoch_artifact_from_worker_records)
-
-#新增开始
-import json
-#新增结束
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from vllm.utils.moe_stats import (
+    merge_moe_pattern_records,
+    strip_prompt_token_from_worker_records,
+    write_moe_pattern_csvs,
+    write_prompt_token_epoch_artifact_from_worker_records,
+)
 
-logger = logging.getLogger(__name__)
+_stats_logger = logging.getLogger(__name__)
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 
 @dataclass
@@ -353,7 +355,6 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
-
         self.rollout_early_stop_enable = os.getenv("VLLM_ROLLOUT_EARLY_STOP_ENABLE", "1").lower() in (
             "1",
             "true",
@@ -366,8 +367,7 @@ class RayPPOTrainer:
     def _restore_rollout_elastic_parallel_groups_if_needed(self) -> None:
         if self.async_rollout_mode:
             return
-        restore_fn = getattr(self.actor_rollout_wg,
-                             "restore_rollout_elastic_parallel_groups", None)
+        restore_fn = getattr(self.actor_rollout_wg, "restore_rollout_elastic_parallel_groups", None)
         if restore_fn is None:
             return
         restore_fn()
@@ -378,7 +378,6 @@ class RayPPOTrainer:
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
-        from torch.utils.data import Subset
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(
@@ -388,19 +387,6 @@ class RayPPOTrainer:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
-
-        # Keep a fixed prompt set per epoch: floor train samples to batch-size multiple.
-        batch_size = int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size))
-        aligned_size = (len(train_dataset) // batch_size) * batch_size
-        if aligned_size <= 0:
-            raise ValueError(f"Train dataset too small after alignment: len={len(train_dataset)}, batch_size={batch_size}")
-        if aligned_size < len(train_dataset):
-            print(f"[DataAlign] floor train dataset to batch multiple: {len(train_dataset)} -> {aligned_size}")
-            train_dataset = Subset(train_dataset, range(aligned_size))
-            # main_ppo may pass in a sampler created from the unaligned dataset.
-            # Reset it so we rebuild a sampler that matches the trimmed dataset.
-            train_sampler = None
-
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:
@@ -505,19 +491,11 @@ class RayPPOTrainer:
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            for field in ("request_id", "rollout_rank"):
-                if field in batch.non_tensor_batch:
-                    values = batch.non_tensor_batch[field]
-                    if hasattr(values, "tolist"):
-                        values = values.tolist()
-                    reward_extra_infos_to_dump.setdefault(field, values)
-            # Keep token-level fields for offline draft training reconstruction.
-            for field in ("prompts", "responses", "response_mask"):
-                if field in batch.batch:
-                    values = batch.batch[field]
-                    if isinstance(values, torch.Tensor):
-                        values = values.detach().cpu().tolist()
-                    reward_extra_infos_to_dump.setdefault(field, values)
+            if "request_id" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump.setdefault(
+                    "request_id",
+                    batch.non_tensor_batch["request_id"].tolist(),
+                )
 
             self._dump_generations(
                 inputs=inputs,
@@ -528,24 +506,79 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _plot_length(self, response_mask, dump_path):
+    def _dump_rollout_length_stats(self, batch: DataProto, timing_raw: dict, dump_path: str, epoch: int) -> None:
+        """Dump per-step rollout length raw values, summary stats and a histogram plot."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.png")
-        
-        response_length = response_mask.sum(dim=-1).numpy()
-        response_length_weight = np.zeros_like(response_length) + 1 / len(response_length)
-        plt.hist(response_length, bins=25, color='skyblue', weights=response_length_weight)
-        plt.title('Length distribution of rollout')
-        plt.xlabel('Length')
-        plt.ylabel('Frequency')
-        plt.savefig(filename)
-        plt.close()
-        
+
+        response_mask = batch.batch["response_mask"].detach().cpu()
+        response_length = response_mask.sum(dim=-1).numpy().astype(np.int64)
+
+        max_response_length = batch.batch["responses"].shape[-1]
+        prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].detach().cpu()
+        prompt_length = prompt_mask.sum(dim=-1).numpy().astype(np.int64)
+
+        response_weights = np.zeros_like(response_length, dtype=np.float64) + 1.0 / max(len(response_length), 1)
+
+        histogram_path = os.path.join(dump_path, f"{self.global_steps}.png")
+        if plt is not None:
+            plt.hist(response_length, bins=25, color="skyblue", weights=response_weights)
+            plt.title("Length distribution of rollout")
+            plt.xlabel("Length")
+            plt.ylabel("Frequency")
+            plt.savefig(histogram_path)
+            plt.close()
+        else:
+            _stats_logger.warning("Skip rollout length histogram because `matplotlib` is not installed.")
+
         length_file = os.path.join(dump_path, f"length_{self.global_steps}.txt")
-        n = len(response_length)
         with open(length_file, "w") as f:
-            for i in range(n):
-                f.write(str(response_length[i]) + "\n")
+            for value in response_length:
+                f.write(f"{int(value)}\n")
+
+        def _summary(arr: np.ndarray) -> dict[str, float]:
+            return {
+                "mean": float(np.mean(arr)),
+                "min": float(np.min(arr)),
+                "max": float(np.max(arr)),
+                "median": float(np.median(arr)),
+                "p90": float(np.percentile(arr, 90)),
+                "p95": float(np.percentile(arr, 95)),
+                "p99": float(np.percentile(arr, 99)),
+            }
+
+        timing_summary = {}
+        for key, value in timing_raw.items():
+            if isinstance(value, bool):
+                timing_summary[key] = value
+            else:
+                try:
+                    timing_summary[key] = float(value)
+                except (TypeError, ValueError):
+                    timing_summary[key] = value
+
+        stats = {
+            "global_step": int(self.global_steps),
+            "epoch": int(epoch),
+            "num_samples": int(len(response_length)),
+            "response_length": _summary(response_length),
+            "prompt_length": _summary(prompt_length),
+            "timing_raw": timing_summary,
+            "histogram_path": histogram_path if plt is not None else None,
+            "length_file": length_file,
+        }
+
+        stats_file = os.path.join(dump_path, f"stats_{self.global_steps}.json")
+        with open(stats_file, "w") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+
+        timing_jsonl = os.path.join(dump_path, "step_timing.jsonl")
+        with open(timing_jsonl, "a") as f:
+            f.write(json.dumps(stats, ensure_ascii=False) + "\n")
+
+        print(
+            f"Dumped rollout length stats to {stats_file} and per-step timing to {timing_jsonl}",
+            flush=True,
+        )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -622,6 +655,84 @@ class RayPPOTrainer:
         if cap >= hard_cap:
             return None
         return cap
+
+    def _maybe_build_rollout_length_balance_order(self, batch: DataProto) -> Optional[torch.Tensor]:
+        """Balance repeated prompt blocks across rollout DP ranks.
+
+        With n=16, each rollout rank usually receives two contiguous prompt
+        blocks. Length-aware sampling groups similar samples, but contiguous
+        splitting can still put two long prompts on the same rank. Reordering
+        prompt blocks before repeat keeps prefix-cache locality while reducing
+        the max per-rank generation tail; the caller restores output order
+        before unioning with the original batch.
+        """
+        enabled = os.getenv("VLLM_ROLLOUT_LENGTH_BALANCE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not enabled:
+            return None
+
+        batch_size = int(batch.batch.batch_size[0])
+        if batch_size <= 1:
+            return None
+
+        rollout_world_size = getattr(self.actor_rollout_wg, "world_size", None)
+        if rollout_world_size is None:
+            rollout_world_size = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+        tp_size = int(self.config.actor_rollout_ref.rollout.get("tensor_model_parallel_size", 1))
+        rollout_dp_size = max(1, int(rollout_world_size) // max(1, tp_size))
+        if rollout_dp_size <= 1:
+            return None
+
+        lengths = None
+        sampler = self.train_dataloader.sampler
+        length_est = getattr(sampler, "_length_estimate", None)
+        sample_ids = None
+        for key in ("dataset_item_idx", "index"):
+            if key in batch.non_tensor_batch:
+                sample_ids = batch.non_tensor_batch[key]
+                break
+        if length_est is not None and sample_ids is not None:
+            sample_ids = np.asarray(sample_ids, dtype=np.int64)
+            valid = (sample_ids >= 0) & (sample_ids < len(length_est))
+            if np.any(valid):
+                lengths = np.asarray(batch.batch["attention_mask"].sum(dim=-1).detach().cpu(), dtype=np.float64)
+                lengths[valid] += np.asarray(length_est[sample_ids[valid]], dtype=np.float64)
+
+        if lengths is None:
+            lengths = np.asarray(batch.batch["attention_mask"].sum(dim=-1).detach().cpu(), dtype=np.float64)
+
+        if lengths.size != batch_size or not np.all(np.isfinite(lengths)):
+            return None
+
+        max_blocks_per_rank = int(np.ceil(batch_size / rollout_dp_size))
+        rank_loads = [0.0 for _ in range(rollout_dp_size)]
+        rank_items: list[list[int]] = [[] for _ in range(rollout_dp_size)]
+
+        for idx in np.argsort(-lengths, kind="stable"):
+            candidates = [r for r in range(rollout_dp_size) if len(rank_items[r]) < max_blocks_per_rank]
+            if not candidates:
+                break
+            rank = min(candidates, key=lambda r: (rank_loads[r], len(rank_items[r]), r))
+            rank_items[rank].append(int(idx))
+            rank_loads[rank] += float(lengths[idx])
+
+        order = [idx for items in rank_items for idx in items]
+        if len(order) != batch_size or order == list(range(batch_size)):
+            return None
+
+        non_empty_loads = [load for load, items in zip(rank_loads, rank_items) if items]
+        if non_empty_loads:
+            metrics_msg = (
+                "Rollout length balance enabled: prompt_blocks=%s dp=%s "
+                "load_min=%.1f load_max=%.1f"
+            )
+            _stats_logger.info(metrics_msg, batch_size, rollout_dp_size, min(non_empty_loads), max(non_empty_loads))
+
+        return torch.tensor(order, dtype=torch.long)
 
     def _validate(self):
         data_source_lst = []
@@ -1091,21 +1202,13 @@ class RayPPOTrainer:
         if int(merged_record.get("num_experts", 0)) <= 0:
             return
         phase_start = time.perf_counter()
-        write_moe_pattern_csvs(
-            merged_record,
-            output_dir=output_dir,
-            prefix="cumulative",
-        )
+        write_moe_pattern_csvs(merged_record, output_dir=output_dir, prefix="cumulative")
         cumulative_write_s = time.perf_counter() - phase_start
         phase_start = time.perf_counter()
-        write_moe_pattern_csvs(
-            merged_record,
-            output_dir=output_dir,
-            prefix=f"epoch_{int(epoch):04d}",
-        )
+        write_moe_pattern_csvs(merged_record, output_dir=output_dir, prefix=f"epoch_{int(epoch):04d}")
         epoch_write_s = time.perf_counter() - phase_start
         total_s = time.perf_counter() - dump_start
-        logger.info(
+        _stats_logger.info(
             "MoE stats dump timing: epoch=%s get_record_ms=%.3f merge_ms=%.3f "
             "prompt_token_artifact_ms=%.3f write_cumulative_ms=%.3f "
             "write_epoch_ms=%.3f total_ms=%.3f artifact=%s",
@@ -1118,7 +1221,6 @@ class RayPPOTrainer:
             total_s * 1000.0,
             prompt_token_artifact_path,
         )
-        print(f"MoE pattern CSVs written to {output_dir} for epoch={epoch}.")
 
     def fit(self):
         """
@@ -1131,7 +1233,7 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
-        tracker = Tracking(
+        logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
@@ -1149,7 +1251,7 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            tracker.log(data=val_metrics, step=self.global_steps)
+            logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1173,11 +1275,7 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        if hasattr(self, "actor_rollout_wg") and self.actor_rollout_wg is not None:
-            self.actor_rollout_wg.flush_record()
-
         for epoch in range(self.config.trainer.total_epochs):
-            beginning_epoch_time = time.time()
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
@@ -1196,24 +1294,87 @@ class RayPPOTrainer:
                 )
 
                 response_cap = self._maybe_compute_rollout_response_cap(batch)
+                data_rebalance = os.getenv("VLLM_ROLLOUT_DATA_REBALANCE", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+                if (
+                    data_rebalance
+                    and self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO
+                    and int(self.config.actor_rollout_ref.rollout.n) > 1
+                ):
+                    _stats_logger.warning(
+                        "VLLM_ROLLOUT_DATA_REBALANCE is disabled for GRPO with rollout.n=%s "
+                        "because splitting one prompt's samples across rollout ranks can make "
+                        "the GRPO group semantically invalid.",
+                        self.config.actor_rollout_ref.rollout.n,
+                    )
+                    data_rebalance = False
+                debug_rollout_generation = os.getenv("VLLM_ROLLOUT_DEBUG_GENERATION", "0").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+                graph_spread_repeats = (
+                    os.getenv("VLLM_ROLLOUT_GRAPH_SPREAD_REPEATS", "0").lower()
+                    in ("1", "true", "yes", "on")
+                    and self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO
+                    and int(self.config.actor_rollout_ref.rollout.n) > 1
+                )
+                length_balance_order = None if data_rebalance else self._maybe_build_rollout_length_balance_order(batch)
+                length_balance_restore_indices = None
+                spread_repeat_restore_indices = None
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch.meta_info["epoch"] = epoch
 
-                # data_rebalance = self.config.actor_rollout_ref.rollout.data_rebalance if hasattr(
-                #     self.config.actor_rollout_ref.rollout, 'data_rebalance') else True
-                #data_balance 本身有bug，临时关闭
-                data_rebalance = False
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n,
-                                             interleave=not data_rebalance)
+                if length_balance_order is not None:
+                    gen_batch.reorder(length_balance_order)
+
+                repeat_times = int(self.config.actor_rollout_ref.rollout.n)
+                if debug_rollout_generation:
+                    # These ids make graph/resampler bugs visible after repeat,
+                    # rollout-rank sharding, and final GRPO group restoration.
+                    prompt_count = int(gen_batch.batch.batch_size[0])
+                    gen_batch.non_tensor_batch["rollout_debug_prompt_idx"] = np.arange(
+                        prompt_count, dtype=np.int64
+                    )
+                spread_repeats = data_rebalance or graph_spread_repeats
+                gen_batch = gen_batch.repeat(
+                    repeat_times=repeat_times,
+                    interleave=not spread_repeats,
+                )
+                if debug_rollout_generation:
+                    if spread_repeats:
+                        gen_batch.non_tensor_batch["rollout_debug_repeat_idx"] = np.repeat(
+                            np.arange(repeat_times, dtype=np.int64),
+                            prompt_count,
+                        )
+                    else:
+                        gen_batch.non_tensor_batch["rollout_debug_repeat_idx"] = np.tile(
+                            np.arange(repeat_times, dtype=np.int64),
+                            prompt_count,
+                        ).reshape(prompt_count, repeat_times).reshape(-1)
+                metrics["rollout/data_rebalance"] = int(data_rebalance)
+                metrics["rollout/graph_spread_repeats"] = int(graph_spread_repeats)
+                metrics["rollout/length_balance"] = int(length_balance_order is not None)
                 if response_cap is not None:
                     gen_batch.meta_info["response_max_tokens_cap"] = int(response_cap)
                     metrics["rollout/response_max_tokens_cap"] = int(response_cap)
-                if data_rebalance:
-                    interleave_indices = torch.arange(gen_batch.batch.batch_size[0]).view(
-                        -1, batch.batch.batch_size[0]).transpose(1, 0).reshape(-1)
+                if spread_repeats:
+                    if length_balance_order is not None:
+                        repeated_source_indices = length_balance_order.repeat(repeat_times)
+                    else:
+                        repeated_source_indices = torch.arange(batch.batch.batch_size[0]).repeat(repeat_times)
+                    spread_repeat_restore_indices = torch.argsort(repeated_source_indices, stable=True)
+                elif length_balance_order is not None:
+                    repeated_source_indices = length_balance_order.repeat_interleave(repeat_times)
+                    length_balance_restore_indices = torch.argsort(repeated_source_indices, stable=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1226,8 +1387,10 @@ class RayPPOTrainer:
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
 
-                        if data_rebalance:
-                            gen_batch_output.reorder(interleave_indices)
+                        if spread_repeat_restore_indices is not None:
+                            gen_batch_output.reorder(spread_repeat_restore_indices)
+                        elif length_balance_restore_indices is not None:
+                            gen_batch_output.reorder(length_balance_restore_indices)
                         
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -1272,17 +1435,97 @@ class RayPPOTrainer:
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                    ######
-                    # 仅做rollouts阶段
                     end_gen_time = time.time()
                     batch_time = end_gen_time - beginning_gen_time
                     rollout_tokens_per_sec = (
                         sum(batch.meta_info["global_token_num"]) / batch_time if batch_time > 0 else float("inf")
                     )
-                    logger.info("global_token_num: %s", batch.meta_info["global_token_num"])
-                    logger.info("rollout_output_time_s: %.6f", batch_time)
-                    logger.info("rollouts speed tokens/s: %.6f", rollout_tokens_per_sec)
-                    ######
+                    _stats_logger.info("global_token_num: %s", batch.meta_info["global_token_num"])
+                    _stats_logger.info("rollout_output_time_s: %.6f", batch_time)
+                    _stats_logger.info("rollouts speed tokens/s: %.6f", rollout_tokens_per_sec)
+                    metrics["rollout/rollout_output_time_s"] = batch_time
+                    metrics["rollout/rollout_tokens_per_sec"] = rollout_tokens_per_sec
+
+                    if os.getenv("VLLM_ROLLOUT_DEBUG_ABORT_AFTER_GENERATE", "0").lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    ):
+                        response_mask = batch.batch.get("response_mask", None)
+                        if response_mask is not None:
+                            response_lengths = response_mask.sum(dim=-1).detach().cpu().numpy()
+                            _stats_logger.warning(
+                                "Rollout debug abort after generate: response_len_count=%s "
+                                "min=%s mean=%.3f p50=%s p90=%s p95=%s max=%s",
+                                int(response_lengths.size),
+                                int(response_lengths.min()) if response_lengths.size else None,
+                                float(response_lengths.mean()) if response_lengths.size else 0.0,
+                                int(np.percentile(response_lengths, 50)) if response_lengths.size else None,
+                                int(np.percentile(response_lengths, 90)) if response_lengths.size else None,
+                                int(np.percentile(response_lengths, 95)) if response_lengths.size else None,
+                                int(response_lengths.max()) if response_lengths.size else None,
+                            )
+                        for key in (
+                            "rollout_debug_prompt_idx",
+                            "rollout_debug_repeat_idx",
+                            "request_id",
+                            "rollout_rank",
+                            "vllm_raw_response_len",
+                            "vllm_finish_reason",
+                            "vllm_stop_reason",
+                            "vllm_has_eos",
+                        ):
+                            if key in batch.non_tensor_batch:
+                                values = batch.non_tensor_batch[key]
+                                preview = values[: min(32, len(values))].tolist()
+                                _stats_logger.warning(
+                                    "Rollout debug abort after generate: %s preview=%s",
+                                    key,
+                                    preview,
+                                )
+                        debug_keys = (
+                            "rollout_debug_prompt_idx",
+                            "rollout_debug_repeat_idx",
+                            "rollout_rank",
+                            "vllm_raw_response_len",
+                            "vllm_finish_reason",
+                            "vllm_has_eos",
+                        )
+                        if all(key in batch.non_tensor_batch for key in debug_keys):
+                            prompt_ids = batch.non_tensor_batch["rollout_debug_prompt_idx"]
+                            repeat_ids = batch.non_tensor_batch["rollout_debug_repeat_idx"]
+                            ranks = batch.non_tensor_batch["rollout_rank"]
+                            raw_lens = batch.non_tensor_batch["vllm_raw_response_len"]
+                            finishes = batch.non_tensor_batch["vllm_finish_reason"]
+                            has_eos = batch.non_tensor_batch["vllm_has_eos"]
+                            max_groups = int(os.getenv("VLLM_ROLLOUT_DEBUG_GROUPS", "8"))
+                            group_lines = []
+                            for prompt_id in sorted(np.unique(prompt_ids).tolist())[:max_groups]:
+                                mask = prompt_ids == prompt_id
+                                order = np.argsort(repeat_ids[mask], kind="stable")
+                                group_lines.append(
+                                    {
+                                        "prompt": int(prompt_id),
+                                        "repeat": repeat_ids[mask][order].astype(int).tolist(),
+                                        "rank": ranks[mask][order].astype(int).tolist(),
+                                        "len": raw_lens[mask][order].astype(int).tolist(),
+                                        "finish": finishes[mask][order].tolist(),
+                                        "has_eos": has_eos[mask][order].astype(bool).tolist(),
+                                    }
+                                )
+                            _stats_logger.warning(
+                                "Rollout debug abort after generate: grouped_preview=%s",
+                                group_lines,
+                            )
+                        _stats_logger.warning(
+                            "VLLM_ROLLOUT_DEBUG_ABORT_AFTER_GENERATE=1: "
+                            "stop trainer cleanly after rollout diagnostics."
+                        )
+                        progress_bar.update(1)
+                        progress_bar.close()
+                        return
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1395,18 +1638,9 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-                    
-                    # Log response length
                     rollout_length_dir = self.config.trainer.get("rollout_length_dir", None)
                     if rollout_length_dir:
-                        response_masks = batch.batch["response_mask"]
-                        self._plot_length(
-                            response_mask=response_masks,
-                            dump_path=rollout_length_dir,
-                        )
-
-                    # if self.config.actor_rollout_ref.rollout.use_history_spec_decode:
-                    #     ray.get(ray_history_spec_tasks)
+                        self._dump_rollout_length_stats(batch=batch, timing_raw=timing_raw, dump_path=rollout_length_dir, epoch=epoch)
 
                 # validate
                 if (
@@ -1477,7 +1711,7 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
-                tracker.log(data=metrics, step=self.global_steps)
+                logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
@@ -1493,9 +1727,6 @@ class RayPPOTrainer:
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
-                    end_epoch_time = time.time()
-                    epoch_duration = end_epoch_time - beginning_epoch_time
-                    print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")
                     self._dump_moe_pattern_csvs(epoch)
                     return
 
@@ -1504,23 +1735,5 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
-            end_epoch_time = time.time()
-            epoch_duration = end_epoch_time - beginning_epoch_time
-            print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")
+
             self._dump_moe_pattern_csvs(epoch)
-            save_epoch_freq = int(self.config.trainer.get("save_epoch_freq", 0))
-            if save_epoch_freq > 0 and (epoch + 1) % save_epoch_freq == 0:
-                # global_steps has already advanced to the next step id.
-                save_step = max(1, self.global_steps - 1)
-                origin_step = self.global_steps
-                self.global_steps = save_step
-                print(
-                    "Saving epoch checkpoint: "
-                    f"epoch={epoch + 1}, step={save_step}"
-                )
-                self._save_checkpoint()
-                self.global_steps = origin_step
-            # # ... 一轮生成/训练（该轮内统计已自动累计）...
-            # epoch_stats = self.actor_rollout_wg.get_record()  # 得到 {prompt_id: {layer_idx: [per-expert prob sums]}}
-            # with open(f"moe_step_{epoch}.json", "w") as f:
-            #     json.dump(epoch_stats, f)

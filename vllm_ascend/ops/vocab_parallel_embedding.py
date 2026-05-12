@@ -20,7 +20,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
-from vllm.distributed import divide, tensor_model_parallel_all_reduce
+from vllm.distributed import divide
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import (
@@ -30,8 +30,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding, pad_vocab_size)
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
-from vllm_ascend.utils import lmhead_tp_enable
+from vllm_ascend.distributed.parallel_state import (get_embed_tp_group,
+                                                    get_lmhead_tp_group)
+from vllm_ascend.utils import embedding_tp_enable, lmhead_tp_enable
 
 
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
@@ -50,9 +51,12 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
                  quant_config: Optional[QuantizationConfig] = None,
                  prefix: str = ""):
         nn.Module.__init__(self)
-
-        if lmhead_tp_enable() and prefix.find("lm_head") != -1:
+        self.forward_type = None
+        if lmhead_tp_enable() and "head" in prefix:
             self.comm_group = get_lmhead_tp_group()
+        elif embedding_tp_enable() and "embed_tokens" in prefix:
+            self.comm_group = get_embed_tp_group()
+            self.forward_type = "embed_tp"
         else:
             self.comm_group = get_tp_group()
 
@@ -146,6 +150,28 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         return input_, ~vocab_mask
 
     def forward(self, input_):
+        if self.forward_type == "embed_tp":
+            return self._forward_embed_tp(input_)
+        else:
+            return self._forward_origin(input_)
+
+    def _forward_embed_tp(self, input_):
+        complete_input = self.comm_group.all_gather(input_, dim=0)
+        masked_input, input_mask = self._get_masked_input_and_mask(
+            complete_input, self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index)
+        # Get the embeddings.
+        output_parallel = self.quant_method.embedding(self,
+                                                      masked_input.long())
+        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        output = self.comm_group.reduce_scatter(output_parallel, dim=0)
+        output = output.view(input_.shape[0], -1)
+        return output
+
+    def _forward_origin(self, input_):
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = self._get_masked_input_and_mask(
@@ -163,7 +189,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
+        output = torch.ops.vllm.maybe_pad_and_reduce(output_parallel)
         return output
 
 
@@ -253,16 +279,3 @@ class AscendLogitsProcessor(LogitsProcessor):
             logits = logits[..., :self.org_vocab_size]
 
         return logits
-
-    def forward(
-        self,
-        lm_head: VocabParallelEmbedding,
-        hidden_states: torch.Tensor,
-        # keep this for version compatibility
-        sampling_metadata=None,  # type: ignore
-        embedding_bias: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
-        return LogitsProcessor.forward(self,
-                                       lm_head,
-                                       hidden_states,
-                                       embedding_bias=embedding_bias)

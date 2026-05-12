@@ -41,7 +41,8 @@ from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, GiB_bytes
+from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
@@ -95,7 +96,7 @@ class NPUWorker(WorkerBase):
         # init ascend config and soc version
         init_ascend_config(vllm_config)
         init_ascend_soc_version()
-        if get_ascend_config().use_sfa:
+        if getattr(get_ascend_config(), "use_sfa", False):
             # Direct import instead of using try_register_lib to ensure proper error handling when
             # custom_ops is necessary but not available (e.g., in DeepSeek v3.2 deployments)
             # yapf: disable
@@ -822,6 +823,12 @@ class NPUWorker(WorkerBase):
         output.kv_connector_output = kv_connector_output
         return output
 
+    @torch.inference_mode()
+    def sample_tokens(
+        self, grammar_output: "GrammarOutput"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        return self.model_runner.sample_tokens(grammar_output)
+
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
@@ -838,6 +845,15 @@ class NPUWorker(WorkerBase):
     def compile_or_warm_up_model(self) -> None:
         # Note: need to adapt for graph mode.
         self.model_runner.eplb_warmup()
+        if os.getenv("VLLM_ROLLOUT_DELAY_GRAPH_CAPTURE_UNTIL_WEIGHT_LOAD",
+                     "0").lower() in ("1", "true", "yes", "on"):
+            logger.warning(
+                "VLLM_ROLLOUT_DELAY_GRAPH_CAPTURE_UNTIL_WEIGHT_LOAD=1: "
+                "skip init-time graph warmup/capture; RL rollout will capture "
+                "after real weights are loaded and post-processed.")
+            self._warm_up_atb()
+            NPUPlatform.seed_everything(self.model_config.seed)
+            return
         warmup_sizes = (self.vllm_config.compilation_config.compile_sizes
                         or []).copy()
         if not self.model_config.enforce_eager:
@@ -1296,8 +1312,6 @@ class NPUWorker(WorkerBase):
                             "w2_abs_mean": float(
                                 sample_w2.float().abs().mean().item()),
                         }
-                mapping_mismatch = 0
-                if new_log2phy_cpu is not None:
                     if use_hybrid_cpu_swap:
                         resident_capacity = int(
                             module.lossless_hybrid_resident_capacity)

@@ -1,0 +1,51 @@
+From 9cc690dd9e6bee142fc0c1e7ab5fc7882550c495 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Tue, 30 Dec 2025 17:46:15 +0800
+Subject: [PATCH] bugfix for loading moe models
+
+---
+ .../rollout/vllm_rollout/vllm_rollout_spmd.py  | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index 40613f1f..9a002de9 100644
+--- a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -123,6 +123,11 @@ class vLLMRollout(BaseRollout):
+         )
+         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+ 
++        # If VLLM_DP_SIZE is configured, the DP communication domain needs to be explicitly initialized.
++        if int(os.environ.get("VLLM_DP_SIZE", "1")) > 1:
++            from r1_ascend.vllm_parallel_state import init_parallel_state
++            init_parallel_state(tensor_parallel_size)
++
+         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+         if not rope_scaling_config:
+             max_position_embeddings = None
+@@ -451,11 +456,22 @@ class vLLMRollout(BaseRollout):
+             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+         else:
+             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
++            from vllm.model_executor.model_loader.utils import process_weights_after_loading
+ 
+-            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
++            model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
++            model = model_runner.get_model()
+             patch_vllm_moe_model_weight_loader(model)
+             model.load_weights(weights)
+ 
++            model_config = model_runner.vllm_config.model_config
++            device_config = model_runner.vllm_config.device_config
++            load_config = model_runner.vllm_config.load_config
++            load_device = (
++                device_config.device if load_config.device is None else load_config.device
++            )
++            target_device = torch.device(load_device)
++            process_weights_after_loading(model, model_config, target_device)
++
+ 
+ # https://github.com/vllm-project/vllm/issues/13175
+ def _monkey_patch_compute_logits(model, vocab_size: int):
+-- 
+2.45.1.windows.1

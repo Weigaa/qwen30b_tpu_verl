@@ -315,15 +315,16 @@ class FileSystemWriterAsync(FileSystemWriter):
         try:
             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
             with open(file_name, "wb") as stream:
+                from torch.distributed.checkpoint.filesystem import SerializationFormat
                 for write_item, data in bytes_data:
                     local_results.append(
-                        _write_item(*transform_list, stream, data, write_item, storage_key)
+                        _write_item(*transform_list, stream, data, write_item, storage_key, SerializationFormat.TORCH_SAVE)
                     )
 
                 for write_item, tensor in tensor_data:
                     assert tensor.is_cpu
                     local_results.append(
-                        _write_item(*transform_list, stream, tensor, write_item, storage_key)
+                        _write_item(*transform_list, stream, tensor, write_item, storage_key, SerializationFormat.TORCH_SAVE)
                     )
 
                 if use_fsync:

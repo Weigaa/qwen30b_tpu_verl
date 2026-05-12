@@ -39,9 +39,7 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
-    print("[main] Before run_ppo", flush=True)
     run_ppo(config)
-    print("[main] After run_ppo, program should exit soon", flush=True)
 
 
 # Define a function to run the PPO-like training process
@@ -84,9 +82,7 @@ def run_ppo(config) -> None:
         runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
     else:
         runner = TaskRunner.remote()
-    print("[main_ppo] Before ray.get(runner.run.remote)", flush=True)
     ray.get(runner.run.remote(config))
-    print("[main_ppo] After ray.get, about to exit run_ppo()", flush=True)
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
@@ -318,9 +314,7 @@ class TaskRunner:
         trainer.init_workers()
 
         # Start the training process.
-        print("[TaskRunner] Before trainer.fit()", flush=True)
         trainer.fit()
-        print("[TaskRunner] After trainer.fit(), about to finish run()", flush=True)
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):

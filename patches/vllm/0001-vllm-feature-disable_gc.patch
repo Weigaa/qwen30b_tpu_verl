@@ -13,14 +13,14 @@ index 862f383..da97046 100644
 --- a/llm_rl/qwen3/vllm/entrypoints/llm.py
 +++ b/llm_rl/qwen3/vllm/entrypoints/llm.py
 @@ -6,6 +6,7 @@ from collections.abc import Sequence
- from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
+ from typing import TYPE_CHECKING, Any, cast
  
  import cloudpickle
 +import gc
  import torch.nn as nn
  from pydantic import ValidationError
  from tqdm.auto import tqdm
-@@ -1597,7 +1598,10 @@ class LLM:
+@@ -1761,7 +1762,10 @@ class LLM:
          total_in_toks = 0
          total_out_toks = 0
          while self.llm_engine.has_unfinished_requests():

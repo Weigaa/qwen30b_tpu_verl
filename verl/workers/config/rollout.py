@@ -131,6 +131,7 @@ class RolloutConfig(BaseConfig):
 
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
+    async_scheduling: Optional[bool] = None
 
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size: Optional[int] = None

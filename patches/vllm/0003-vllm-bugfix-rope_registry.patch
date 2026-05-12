@@ -1,0 +1,25 @@
+From 0c17c27789cf55a4a3622aacf0bdb1172597fbd8 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Mon, 2 Feb 2026 10:04:37 +0800
+Subject: [PATCH] bugfix ROPE registry
+
+---
+ .../qwen3/vllm/model_executor/layers/rotary_embedding/common.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/llm_rl/qwen3/vllm/model_executor/layers/rotary_embedding/common.py b/llm_rl/qwen3/vllm/model_executor/layers/rotary_embedding/common.py
+index 34de1da..96364aa 100644
+--- a/llm_rl/qwen3/vllm/model_executor/layers/rotary_embedding/common.py
++++ b/llm_rl/qwen3/vllm/model_executor/layers/rotary_embedding/common.py
+@@ -134,7 +134,7 @@ class ApplyRotaryEmb(CustomOp):
+         self.enable_fp32_compute = enable_fp32_compute
+ 
+         self.apply_rotary_emb_flash_attn = None
+-        if find_spec("flash_attn") is not None:
++        if find_spec("flash_attn") is not None and not hasattr(torch, "npu"):
+             from flash_attn.ops.triton.rotary import apply_rotary
+ 
+             self.apply_rotary_emb_flash_attn = apply_rotary
+-- 
+2.45.1.windows.1
+

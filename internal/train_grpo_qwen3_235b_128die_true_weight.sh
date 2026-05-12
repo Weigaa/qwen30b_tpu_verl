@@ -23,10 +23,11 @@ TEST_FILE=${TEST_FILE:-"${HOME}/data/deepscaler/valid.parquet"}
 
 # configs
 NODES=8
-GPU_MEMORY_UTILIZATION=0.87
+GPU_MEMORY_UTILIZATION=0.85
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=32768
 MAX_NUM_SEQS=256
+CUDAGRAPH_SIZES='[32,64,128,256]'
 
 INFER_TP=4
 INFER_DP=$((NODES * 16 / INFER_TP))
@@ -38,6 +39,7 @@ TRAIN_EP=$((NODES * 16 / TRAIN_PP))
 
 TRAIN_BATCH_SIZE=512
 MAX_TOKEN_LEN_PER_GPU=$(((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH) / TRAIN_CP))
+
 
 python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     --config-name='ppo_megatron_trainer.yaml'\
@@ -79,6 +81,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${INFER_TP} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
+    actor_rollout_ref.rollout.cudagraph_capture_sizes=${CUDAGRAPH_SIZES} \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))   \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False   \
@@ -125,4 +128,6 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_zero_memory='level1' \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.gemm_gradient_accumulation_fusion=True $@
+    +actor_rollout_ref.actor.megatron.override_transformer_config.gemm_gradient_accumulation_fusion=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method=sam \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens=3 $@

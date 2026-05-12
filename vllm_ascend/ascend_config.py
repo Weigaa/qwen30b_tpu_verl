@@ -13,18 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+import os
+from typing import TYPE_CHECKING
 
 from vllm.logger import logger
+from vllm.utils.math_utils import cdiv
 
-TORCHAIR_MODEL_LIST = ["deepseek", "pangu", "kimi_k2", "qwen"]
+import vllm_ascend.envs as envs_ascend
 
-
-def _check_torchair_supported(model_type: str):
-    for supported_model in TORCHAIR_MODEL_LIST:
-        if supported_model in model_type.lower():
-            return True
-    return False
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 class AscendConfig:
@@ -32,166 +30,366 @@ class AscendConfig:
     Configuration Object for additional_config from vllm.configs.
     """
 
-    def __init__(self, vllm_config):
+    def __init__(self, vllm_config: "VllmConfig"):
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
-        self.is_deepseek_sfa = vllm_config.model_config is not None and vllm_config.model_config.is_deepseek_mla and vllm_config.model_config.hf_text_config.model_type == "deepseek_v32"
-        self.use_sfa = self.is_deepseek_sfa
+        model_config = getattr(vllm_config, "model_config", None)
+        hf_text_config = getattr(model_config, "hf_text_config", None)
+        model_type = getattr(hf_text_config, "model_type", None)
+        self.is_deepseek_sfa = bool(
+            model_config is not None
+            and getattr(model_config, "is_deepseek_mla", False)
+            and model_type == "deepseek_v32"
+        )
+        self.use_sfa = additional_config.get("use_sfa", self.is_deepseek_sfa)
 
-        torchair_graph_config = additional_config.get("torchair_graph_config",
-                                                      {})
-        self.torchair_graph_config = TorchairGraphConfig(torchair_graph_config)
+        xlite_graph_config = additional_config.get("xlite_graph_config", {})
+        self.xlite_graph_config = XliteGraphConfig(xlite_graph_config, vllm_config)
 
-        ascend_scheduler_config = additional_config.get(
-            "ascend_scheduler_config", {})
-        self.ascend_scheduler_config = AscendSchedulerConfig(
-            ascend_scheduler_config)
-        # Todo: Once https://github.com/vllm-project/vllm/issues/22246 is merged in vllm. Remove this config
-        self.expert_map_path = additional_config.get("expert_map_path", None)
-        self.expert_map_record_path = additional_config.get(
-            "expert_map_record_path",
-            None)  # Provide path to export expert map
-        self.elastic_moe_mode = additional_config.get("elastic_moe_mode",
-                                                      "lossy").lower()
+        ascend_compilation_config = additional_config.get("ascend_compilation_config", {})
+        self.ascend_compilation_config = AscendCompilationConfig(**ascend_compilation_config)
+
+        ascend_fusion_config = additional_config.get("ascend_fusion_config", {})
+        self.ascend_fusion_config = AscendFusionConfig(**ascend_fusion_config)
+
+        finegrained_tp_config = additional_config.get("finegrained_tp_config", {})
+        self.finegrained_tp_config = FinegrainedTPConfig(finegrained_tp_config, vllm_config)
+
+        eplb_config = additional_config.get("eplb_config", {})
+        self.eplb_config = EplbConfig(eplb_config)
+        self.dynamic_eplb = self.eplb_config.dynamic_eplb
+        self.expert_map_path = self.eplb_config.expert_map_path
+        self.elastic_execution_mode = additional_config.get(
+            "elastic_execution_mode",
+            envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE,
+        )
+        self.elastic_moe_mode = additional_config.get(
+            "elastic_moe_mode",
+            envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE,
+        )
         if self.elastic_moe_mode not in ("lossy", "lossless"):
             raise ValueError(
-                f"Unsupported elastic_moe_mode={self.elastic_moe_mode}")
-        self.init_redundancy_expert = additional_config.get(
-            "init_redundancy_expert", 0)
-        self.dynamic_eplb = additional_config.get("dynamic_eplb", False)
-        self.num_iterations_eplb_update = additional_config.get(
-            "num_iterations_eplb_update", 400)
-        self.gate_eplb = additional_config.get("gate_eplb", False)
-        self.num_wait_worker_iterations = additional_config.get(
-            "num_wait_worker_iterations", 30)
-        self.chunked_prefill_for_mla = additional_config.get(
-            "chunked_prefill_for_mla", False)
-        self.enable_shared_expert_dp = additional_config.get(
-            "enable_shared_expert_dp", False
-        ) and not self.torchair_graph_config.enabled and vllm_config.parallel_config.enable_expert_parallel
-        self.multistream_overlap_shared_expert = additional_config.get(
-            "multistream_overlap_shared_expert", False)
-        self.enable_prefetch = additional_config.get("enable_prefetch", False)
-        self.lmhead_tensor_parallel_size = additional_config.get(
-            "lmhead_tensor_parallel_size", None)
-        if self.lmhead_tensor_parallel_size is not None:
-            logger.info(
-                f"Enable lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size} in pure DP scenario"
+                f"Unsupported elastic_moe_mode={self.elastic_moe_mode}"
             )
-            if vllm_config.parallel_config.tensor_parallel_size != 1:
-                raise AssertionError(
-                    "lmhead_tensor_parallel_size is only supported in the pure DP scenario"
-                )
-        self.oproj_tensor_parallel_size = additional_config.get(
-            "oproj_tensor_parallel_size", None)
-        if self.oproj_tensor_parallel_size is not None:
-            logger.info(
-                f"Enable oproj_tensor_parallel_size={self.oproj_tensor_parallel_size} in pure DP scenario"
+        self.init_redundancy_expert = int(
+            additional_config.get(
+                "init_redundancy_expert",
+                envs_ascend.VLLM_ASCEND_INIT_REDUNDANCY_EXPERT,
             )
-            if vllm_config.parallel_config.tensor_parallel_size != 1:
-                raise AssertionError(
-                    "oproj_tensor_parallel_size is only supported in the pure DP scenario"
+        )
+
+        # Dump / PrecisionDebugger configuration
+        self.dump_config_path = additional_config.get("dump_config_path", None)
+
+        weight_prefetch_config = additional_config.get("weight_prefetch_config", {})
+        self.weight_prefetch_config = WeightPrefetchConfig(weight_prefetch_config)
+        self.layer_sharding = additional_config.get("layer_sharding", None)
+        logger.info_once(
+            f"Linear layer sharding enabled with config: {self.layer_sharding}. "
+            "Note: This feature works optimally with FLASHCOMM2 and DSA-CP enabled; "
+            "using it without these features may result in significant performance degradation."
+        )
+
+        self.enable_shared_expert_dp = (
+            additional_config.get("enable_shared_expert_dp", False)
+            and vllm_config.parallel_config.enable_expert_parallel
+        )
+        from vllm_ascend.utils import enable_sp
+
+        if self.enable_shared_expert_dp:
+            assert enable_sp(vllm_config=vllm_config, enable_shared_expert_dp=True)
+
+        if vllm_config.parallel_config.prefill_context_parallel_size > 1 and enable_sp(vllm_config=vllm_config):
+            tp_pcp_size = (
+                vllm_config.parallel_config.tensor_parallel_size
+                * vllm_config.parallel_config.prefill_context_parallel_size
+            )
+            if vllm_config.scheduler_config.max_num_batched_tokens % tp_pcp_size != 0:
+                vllm_config.scheduler_config.max_num_batched_tokens = (
+                    cdiv(vllm_config.scheduler_config.max_num_batched_tokens, tp_pcp_size) * tp_pcp_size
                 )
-            if not self.torchair_graph_config.enabled:
-                raise AssertionError(
-                    "oproj_tensor_parallel_size is only supported in graph mode"
+                logger.warning_once(
+                    f"When using FLASHCOMM1, the max_num_batched_tokens should be divisible"
+                    f"by tp_size * pcp_size ({tp_pcp_size}). It has been adjusted to"
+                    f"{vllm_config.scheduler_config.max_num_batched_tokens}."
                 )
+        self.multistream_overlap_shared_expert = additional_config.get("multistream_overlap_shared_expert", False)
+        self.multistream_overlap_gate = additional_config.get("multistream_overlap_gate", False)
+        self.recompute_scheduler_enable = additional_config.get("recompute_scheduler_enable", False)
+        self.enable_cpu_binding = additional_config.get("enable_cpu_binding", False)
+
+        self.pd_tp_ratio = 1
+        self.pd_head_ratio = 1
+        self.num_head_replica = 1
+        if vllm_config.kv_transfer_config is not None and not vllm_config.model_config.is_deepseek_mla:
+            prefill_tp_size = vllm_config.kv_transfer_config.get_from_extra_config("prefill", {"tp_size": 1})["tp_size"]
+            decode_tp_size = vllm_config.kv_transfer_config.get_from_extra_config("decode", {"tp_size": 1})["tp_size"]
+            assert prefill_tp_size % decode_tp_size == 0, "Prefill TP size must be divisible by Decode TP size."
+            self.pd_tp_ratio = prefill_tp_size // decode_tp_size
+            if self.pd_tp_ratio > 1:
+                try:
+                    # only support Qwen model now
+                    # TODO: use a more robust method to get kv_head_num
+                    num_kv_head = vllm_config.model_config.hf_text_config.num_key_value_heads
+                    self.num_head_replica = prefill_tp_size // num_kv_head if prefill_tp_size >= num_kv_head else 1
+                    prefill_tp_size = min(prefill_tp_size, num_kv_head)
+                    decode_tp_size = min(decode_tp_size, num_kv_head)
+                    self.pd_head_ratio = prefill_tp_size // decode_tp_size
+                except Exception:
+                    raise ValueError(
+                        "The text_config extracted from the model config does not have "
+                        "`num_key_value_heads` attribute. This indicates a mismatch "
+                        "between the model config and vLLM's expectations. Please "
+                        "ensure that the model config is compatible with vLLM."
+                    )
+
+            if self.pd_tp_ratio == 0:
+                raise AssertionError("Only support P node tp size lagger then D node tp size")
+        self.SLO_limits_for_dynamic_batch = additional_config.get("SLO_limits_for_dynamic_batch", -1)
+        from vllm_ascend.utils import get_flashcomm2_config_and_validate
+
+        self.flashcomm2_oproj_tensor_parallel_size = get_flashcomm2_config_and_validate(self, vllm_config)
+        npugraph_ex_config = additional_config.get("npugraph_ex_config", {})
+        self.npugraph_ex_config = NpugraphExConfig(**npugraph_ex_config)
+        # We find that _npu_paged_attention still performs better than
+        # npu_fused_infer_attention_score in some cases. We allow to execute
+        # _npu_paged_attention in this cases. This should be removed once
+        # npu_fused_infer_attention_score performs better on all scenarios.
+        self.pa_shape_list = additional_config.get("pa_shape_list", [])
+
+        self.enable_async_exponential = bool(additional_config.get("enable_async_exponential", False))
+
+        self.enable_kv_nz = additional_config.get("enable_kv_nz", False)
+        if self.enable_kv_nz:
+            use_sparse = hasattr(vllm_config.model_config.hf_text_config, "index_topk")
+            if not vllm_config.model_config.is_deepseek_mla or use_sparse:
+                raise RuntimeError("enable_kv_nz is only supported for mla currently.")
+            if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
+                raise NotImplementedError(
+                    "enable_kv_nz is only supported in pd scenario and can only be used in D node."
+                )
+
+
+class FinegrainedTPConfig:
+    """
+    Configuration Object for finegrained_tp_config from additional_config
+    """
+
+    def __init__(self, finegrained_tp_config: dict, vllm_config):
+        self.oproj_tensor_parallel_size = finegrained_tp_config.get("oproj_tensor_parallel_size", 0)
+        self.lmhead_tensor_parallel_size = finegrained_tp_config.get("lmhead_tensor_parallel_size", 0)
+        self.embedding_tensor_parallel_size = finegrained_tp_config.get("embedding_tensor_parallel_size", 0)
+        self.mlp_tensor_parallel_size = finegrained_tp_config.get("mlp_tensor_parallel_size", 0)
+
+        enabled_configs = []
+        if self.oproj_tensor_parallel_size > 0:
+            enabled_configs.append(f"oproj_tensor_parallel_size={self.oproj_tensor_parallel_size}")
+            # dummy_run does not run the entire attention module in eager mode,
+            # so the o_proj tp split can only be used in graph mode.
+            if vllm_config.model_config.enforce_eager is True:
+                raise AssertionError("oproj_tensor_parallel_size is only supported in graph mode")
             if vllm_config.kv_transfer_config is None or not vllm_config.kv_transfer_config.is_kv_consumer:
                 raise AssertionError(
                     "oproj_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
                 )
+        if self.lmhead_tensor_parallel_size > 0:
+            enabled_configs.append(f"lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size}")
+        if self.embedding_tensor_parallel_size > 0:
+            enabled_configs.append(f"embedding_tensor_parallel_size={self.embedding_tensor_parallel_size}")
+        if self.mlp_tensor_parallel_size > 0:
+            enabled_configs.append(f"mlp_tensor_parallel_size={self.mlp_tensor_parallel_size}")
+        module_tp_sizes = [
+            self.oproj_tensor_parallel_size,
+            self.lmhead_tensor_parallel_size,
+            self.embedding_tensor_parallel_size,
+            self.mlp_tensor_parallel_size,
+        ]
+        for module_tp_size in module_tp_sizes:
+            if module_tp_size > 0 and vllm_config.parallel_config.data_parallel_size % module_tp_size != 0:
+                raise AssertionError("module tp sizes must divide data_parallel_size")
+        if any(size > 0 for size in module_tp_sizes) and enabled_configs:
+            logger.info(f"finegrained_tp_config enabled: {', '.join(enabled_configs)}")
 
 
-class TorchairGraphConfig:
+class AscendCompilationConfig:
     """
-    Configuration Object for torchair_graph_config from additional_config
-    """
+    Configuration for controlling the behavior of Ascend graph optimization.
 
-    def __init__(self, torchair_graph_config):
-        self.enabled = torchair_graph_config.get("enabled", False)
-        self.mode = torchair_graph_config.get("mode", '')
-        self.use_cached_graph = torchair_graph_config.get(
-            "use_cached_graph", False)
-        self.use_cached_kv_cache_bytes = torchair_graph_config.get(
-            "use_cached_kv_cache_bytes", False)
-        self.graph_batch_sizes = torchair_graph_config.get(
-            "graph_batch_sizes", [])
-        self.graph_batch_sizes_init = torchair_graph_config.get(
-            "graph_batch_sizes_init", False)
-        self.enable_multistream_mla = torchair_graph_config.get(
-            "enable_multistream_mla", False)
-        self.enable_zero_tp_to_ep = torchair_graph_config.get(
-            "enable_zero_tp_to_ep", False)
-        self.enable_view_optimize = torchair_graph_config.get(
-            "enable_view_optimize", True)
-        self.enable_frozen_parameter = torchair_graph_config.get(
-            "enable_frozen_parameter", True)
-        self.enable_kv_nz = torchair_graph_config.get("enable_kv_nz", False)
-
-        if not isinstance(self.graph_batch_sizes, list):
-            raise TypeError("graph_batch_sizes must be list[int]")
-        if self.graph_batch_sizes_init and len(self.graph_batch_sizes) > 0:
-            raise ValueError(
-                "graph_batch_sizes_init is only valid when graph_batch_sizes is empty"
-            )
-        if not self.enabled:
-            if self.mode:
-                raise RuntimeError(
-                    "mode is valid only when Torchair graph mode is enabled")
-            if self.use_cached_graph:
-                raise RuntimeError(
-                    "use_cached_graph is valid only when Torchair graph mode is enabled"
-                )
-            if self.use_cached_kv_cache_bytes:
-                raise RuntimeError(
-                    "use_cached_kv_cache_bytes is valid only when Torchair graph mode is enabled"
-                )
-            if self.graph_batch_sizes:
-                raise RuntimeError(
-                    "graph_batch_sizes is valid only when Torchair graph mode is enabled"
-                )
-            if self.graph_batch_sizes_init:
-                raise RuntimeError(
-                    "graph_batch_sizes_init is valid only when Torchair graph mode is enabled"
-                )
-            if self.enable_multistream_mla:
-                raise RuntimeError(
-                    "enable_multistream_mla is valid only when Torchair graph mode is enabled"
-                )
-            if self.enable_zero_tp_to_ep:
-                raise RuntimeError(
-                    "enable_zero_tp_to_ep is valid only when Torchair graph mode is enabled"
-                )
-            if self.enable_kv_nz:
-                raise RuntimeError(
-                    "enable_kv_nz is valid only when Torchair graph mode is enabled"
-                )
-        if self.use_cached_kv_cache_bytes and not self.use_cached_graph:
-            raise RuntimeError(
-                "use_cached_kv_cache_bytes is valid only when Torchair graph mode and use_cached_graph are enabled"
-            )
-
-
-class AscendSchedulerConfig:
-    """
-    Configuration Object for ascend_scheduler_config from additional_config
+    This class provides a way to configure graph fusion optimizations.
+    These configurations directly impact the performance and behavior of models
+    deployed on Ascend platforms.
     """
 
-    def __init__(self, ascend_scheduler_config: dict):
-        self.enabled = ascend_scheduler_config.get("enabled", False)
-        # Ascend scheduler is based on vllm v0 scheduler, so we should support
-        # all vllm v0 scheduler configs as well.
-        for k, v in ascend_scheduler_config.items():
-            if not hasattr(self, k):
-                setattr(self, k, v)
+    def __init__(
+        self, fuse_norm_quant: bool = True, fuse_qknorm_rope: bool = True, fuse_allreduce_rms: bool = False, **kwargs
+    ):
+        """
+        Initialize the configuration.
+
+        Args:
+            fuse_norm_quant (bool): Whether to enable norm and quant fusion optimization.
+                When set to True, the system will optimize norm and quant operations.
+                Default: True
+            fuse_qknorm_rope (bool): Whether to enable qknorm and rope fusion optimization.
+                Default: True
+            fuse_allreduce_rms (bool): Whether to enable allreduce and addrmsnorm fusion optimization.
+                Default: False
+            **kwargs: Additional optional parameters for forward compatibility and configuration extension.
+        """
+        self.fuse_norm_quant = fuse_norm_quant
+        self.fuse_qknorm_rope = fuse_qknorm_rope
+        self.fuse_allreduce_rms = fuse_allreduce_rms
 
 
-_ASCEND_CONFIG: Optional[AscendConfig] = None
+class AscendFusionConfig:
+    """
+    Configuration for controlling whether to use a fused operator gmmswigluquant.
+    """
+
+    def __init__(self, fusion_ops_gmmswigluquant: bool = True, **kwargs):
+        """
+        Initialize the configuration.
+
+        Args:
+            fusion_ops_gmmswigluquant (bool): Whether to use a fused operator gmmswigluquant.
+                When set to True, the system will use a fused operator gmmswigluquant.
+                Default: True
+            **kwargs: Additional optional parameters for forward compatibility and configuration extension.
+        """
+        self.fusion_ops_gmmswigluquant = fusion_ops_gmmswigluquant
+
+
+class NpugraphExConfig:
+    """
+    Configuration for controlling the behavior of npugraph_ex backend.
+
+    This class provides a way to configure whether to use the npugraph_ex backend and static kernel.
+    These configurations can directly impact the performance and behavior of models deployed on Ascend platforms.
+    """
+
+    def __init__(self, enable: bool = False, enable_static_kernel: bool = False, **kwargs):
+        """
+        Initialize the configuration.
+
+        Args:
+            enable (bool): Whether to enable npugraph_ex backend.
+                When set to True, the Fx graph generated by Dymano will be
+                optimized and compiled by the npugraph_ex backend.
+                Default: False
+            enable_static_kernel (bool): Whether to enable static kernel.
+                Static kernel is suitable for scenarios with purely static shapes
+                or minimal shape changes, and can improve network performance.
+                When set to True, when during graph capture, it will compile operator
+                binary files with the corresponding shapes based on the current batch_size,
+                which usually takes some time.
+                Default: False
+            **kwargs: Additional optional parameters for forward compatibility and configuration extension.
+        """
+        self.enable = enable
+        self.enable_static_kernel = enable_static_kernel
+
+
+class XliteGraphConfig:
+    """
+    Configuration Object for xlite_graph_config from additional_config
+    """
+
+    def __init__(self, xlite_graph_config, vllm_config):
+        self.enabled = xlite_graph_config.get("enabled", False)
+        self.full_mode = xlite_graph_config.get("full_mode", False)
+        if self.enabled:
+            if bool(vllm_config.speculative_config):
+                raise RuntimeError(
+                    "Xlite graph mode is not compatible with speculative decoding. Please disable speculative decoding."
+                )
+            if vllm_config.parallel_config.pipeline_parallel_size > 1:
+                raise RuntimeError(
+                    "Xlite graph mode is not compatible with pipeline parallelism. "
+                    "Please set pipeline_parallel_size to 1."
+                )
+            if vllm_config.cache_config.block_size != 128:
+                raise RuntimeError(
+                    "Xlite graph mode is only compatible with block_size of 128. Please set block_size to 128."
+                )
+
+
+class WeightPrefetchConfig:
+    """
+    Configuration Object for weight_prefetch_config from additional_config
+    """
+
+    prefetch_ratio: dict = {
+        "attn": {
+            "qkv": 1.0,
+            "o": 1.0,
+        },
+        "moe": {"gate_up": 0.8},
+    }
+
+    def __init__(self, weight_prefetch_config: dict):
+        self.enabled = weight_prefetch_config.get("enabled", False)
+        self.prefetch_ratio = weight_prefetch_config.get("prefetch_ratio", self.prefetch_ratio)
+
+
+class EplbConfig:
+    """
+    Configuration Object for xlite_graph_config from additional_config
+    """
+
+    _defaults = {
+        "dynamic_eplb": False,
+        "expert_map_path": None,
+        "expert_heat_collection_interval": 400,
+        "algorithm_execution_interval": 30,
+        "expert_map_record_path": None,
+        "num_redundant_experts": 0,
+        "eplb_policy_type": 1,
+    }
+
+    def __init__(self, user_config: dict | None = None):
+        if user_config is None:
+            user_config = {}
+        self.config = self._defaults.copy()
+        if user_config and isinstance(user_config, dict):
+            for key, value in user_config.items():
+                if key in self.config:
+                    self.config[key] = value
+                else:
+                    raise ValueError(f"Config has no attribute '{key}'")
+
+        self._validate_config()
+
+    def __getattr__(self, key):
+        if key in self.config:
+            return self.config[key]
+        raise AttributeError(f"Config has no attribute '{key}'")
+
+    def _validate_config(self):
+        if self.expert_map_path is not None:
+            if self.expert_map_path[-5:] != ".json":
+                raise TypeError("The expert_map is not json.")
+            if not os.path.exists(self.expert_map_path):
+                raise ValueError("The expert_map is not exist.")
+        if self.expert_map_record_path is not None:
+            self.config["dynamic_eplb"] = True
+            if self.expert_map_record_path[-5:] != ".json":
+                raise TypeError("The expert_map_record_path is not json.")
+            dirname = os.path.dirname(self.expert_map_record_path)
+            os.makedirs(dirname, exist_ok=True)
+        for key in ["expert_heat_collection_interval", "algorithm_execution_interval", "num_redundant_experts"]:
+            if not isinstance(self.config[key], int):
+                raise TypeError(f"{key} must be an integer")
+            if self.config[key] < 0:  # type: ignore
+                raise ValueError(f"{key} must greater than 0; got {self.config[key]} instead")
+        if self.eplb_policy_type not in [0, 1, 2, 3]:
+            raise ValueError("eplb_policy_type must in [0, 1, 2, 3]")
+
+
+_ASCEND_CONFIG: AscendConfig | None = None
 
 
 def init_ascend_config(vllm_config):
     additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
-    refresh = additional_config.get("refresh",
-                                    False) if additional_config else False
+    refresh = additional_config.get("refresh", False) if additional_config else False
     global _ASCEND_CONFIG
     if _ASCEND_CONFIG is not None and not refresh:
         return _ASCEND_CONFIG
@@ -207,43 +405,5 @@ def clear_ascend_config():
 def get_ascend_config():
     global _ASCEND_CONFIG
     if _ASCEND_CONFIG is None:
-        raise RuntimeError(
-            "Ascend config is not initialized. Please call init_ascend_config first."
-        )
+        raise RuntimeError("Ascend config is not initialized. Please call init_ascend_config first.")
     return _ASCEND_CONFIG
-
-
-def check_ascend_config(vllm_config, enforce_eager):
-    ascend_config = get_ascend_config()
-
-    # for eager mode
-    if enforce_eager:
-        # torchair_graph cannot be enabled with eager mode.
-        if ascend_config.torchair_graph_config.enabled:
-            raise RuntimeError(
-                "Can't enable graph mode and eager mode at the same time. Please set `enforce_eager=False` if you attempt to enable NPU graph mode."
-            )
-    # for graph mode
-    else:
-        # torchair_graph case
-        if ascend_config.torchair_graph_config.enabled:
-            # torchair_graph is supported for deepseek/pangu/qwen model only.
-            if vllm_config.model_config:
-                model_type = vllm_config.model_config.hf_config.model_type
-                if not _check_torchair_supported(model_type):
-                    raise NotImplementedError(
-                        "Torchair graph mode only works with following model types:"
-                        f"{TORCHAIR_MODEL_LIST}.")
-            if ascend_config.enable_shared_expert_dp:
-                logger.warning(
-                    "enable_shared_expert_dp is not supported for torchair graph mode currently, "
-                    "it has been disabled automatically.")
-        # aclgraph case
-        else:
-            if vllm_config.model_config:
-                model_type = vllm_config.model_config.hf_config.model_type
-                if "qwen" not in model_type:
-                    logger.warning(
-                        "ACL Graph is currently experimental. Please "
-                        "raise an issue on https://github.com/vllm-project/vllm-ascend/issues"
-                        " if you encourage any Error")

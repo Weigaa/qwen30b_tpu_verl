@@ -35,21 +35,41 @@ def _megatron_calc_layer_map(config):
     pp_size = mpu.get_pipeline_model_parallel_world_size()
     virtual_pp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
 
-    layer_map = dict()
-    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size
-    assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers
+    pipeline_layout = getattr(config, "pipeline_num_transformer_layers", None)
+    if pipeline_layout is not None:
+        normalized_layout = []
+        for pp_entry in pipeline_layout:
+            if hasattr(pp_entry, "__iter__") and not isinstance(pp_entry, (str, bytes)):
+                normalized_entry = [int(layer_count) for layer_count in pp_entry]
+            else:
+                normalized_entry = [int(pp_entry)]
+            normalized_layout.append(normalized_entry)
 
-    for pp_rank_idx in range(pp_size):
-        for virtual_pp_rank_idx in range(virtual_pp_size):
-            layer_offset = (
-                virtual_pp_rank_idx * (config.num_hidden_layers // virtual_pp_size) + pp_rank_idx * num_layers_per_model
+        assert len(normalized_layout) == pp_size, (
+            f"pipeline_num_transformer_layers size {len(normalized_layout)} != pipeline size {pp_size}"
+        )
+        for pp_entry in normalized_layout:
+            assert len(pp_entry) == virtual_pp_size, (
+                f"pipeline_num_transformer_layers entry {pp_entry} does not match virtual pipeline size "
+                f"{virtual_pp_size}"
             )
-            for layer_idx in range(num_layers_per_model):
-                layer_map[layer_offset + layer_idx] = (
-                    pp_rank_idx,
-                    virtual_pp_rank_idx,
-                    layer_idx,
-                )
+        assert sum(sum(pp_entry) for pp_entry in normalized_layout) == config.num_hidden_layers, (
+            "pipeline_num_transformer_layers does not sum to num_hidden_layers: "
+            f"{normalized_layout} vs {config.num_hidden_layers}"
+        )
+    else:
+        num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size
+        assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers
+        normalized_layout = [[num_layers_per_model for _ in range(virtual_pp_size)] for _ in range(pp_size)]
+
+    layer_map = dict()
+    layer_offset = 0
+    for virtual_pp_rank_idx in range(virtual_pp_size):
+        for pp_rank_idx in range(pp_size):
+            num_layers_this_model = normalized_layout[pp_rank_idx][virtual_pp_rank_idx]
+            for layer_idx in range(num_layers_this_model):
+                layer_map[layer_offset + layer_idx] = (pp_rank_idx, virtual_pp_rank_idx, layer_idx)
+            layer_offset += num_layers_this_model
     return layer_map
 
 
@@ -91,15 +111,24 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
         wrapped_models = list(wrapped_models)
 
     assert len(wrapped_models) == virtual_pp_size
-    num_layers_per_model = config.num_hidden_layers // pp_size // virtual_pp_size
-    assert num_layers_per_model * pp_size * virtual_pp_size == config.num_hidden_layers
 
     models = [None] * len(wrapped_models)
 
+    layer_map = None
     for i, wrapped_model in enumerate(wrapped_models):
         models[i] = unwrap_model(wrapped_model, (torchDDP, LocalDDP, Float16Module))
         gpt_model_module = _get_gpt_model(models[i])
-        assert len(gpt_model_module.decoder.layers) == num_layers_per_model
+        if layer_map is None:
+            layer_map = _megatron_calc_layer_map(gpt_model_module.config)
+        expected_local_layers = sum(
+            1
+            for dst_pp_rank, dst_virtual_pp_rank, _ in layer_map.values()
+            if dst_pp_rank == pp_rank and dst_virtual_pp_rank == i
+        )
+        assert len(gpt_model_module.decoder.layers) == expected_local_layers, (
+            "decoder layer count on current pipeline stage does not match pipeline layout: "
+            f"expected {expected_local_layers}, got {len(gpt_model_module.decoder.layers)}"
+        )
 
     def _broadcast_tensor(tensor, name) -> torch.Tensor:
         """broadcast tensor from rank0 across mp_group"""
@@ -392,8 +421,6 @@ def load_state_dict_to_megatron_gptmodel(state_dict, wrapped_models, config, par
 
         # Transformer layers
         # -------------------
-        layer_map = _megatron_calc_layer_map(config)
-
         for layer in range(config.num_hidden_layers):
             layer_name = f"model.layers.{layer}"
             print_rank_0(f"loading layer #{layer}, with layer_name model.layers.{layer}...")

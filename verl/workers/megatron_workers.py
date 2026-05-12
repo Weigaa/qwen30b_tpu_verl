@@ -17,7 +17,6 @@ The main entry point to run the PPO algorithm
 
 import asyncio
 import datetime
-import json
 import logging
 import os
 import time
@@ -84,6 +83,34 @@ init_rollout_rebalance()
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+
+def _rollout_phase_memory_log(stage: str, rank: int | None = None) -> None:
+    if os.environ.get("VLLM_ROLLOUT_PHASE_MEMORY_LOG", "0").lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    device = get_torch_device()
+    if not device.is_available():
+        return
+    try:
+        device.synchronize()
+    except Exception:
+        pass
+    prefix = f"rank={rank} " if rank is not None else ""
+    logger.info(
+        "rollout_phase_memory %sstage=%s allocated_gb=%.3f reserved_gb=%.3f "
+        "max_allocated_gb=%.3f max_reserved_gb=%.3f",
+        prefix,
+        stage,
+        device.memory_allocated() / (1024**3),
+        device.memory_reserved() / (1024**3),
+        device.max_memory_allocated() / (1024**3),
+        device.max_memory_reserved() / (1024**3),
+    )
+
 MindSpeedPatchesManager.patches_info['torch.compile'].remove_patch()
 TRUE_COMPILE = torch.compile
 DUMMY_COMPILE = dummy_compile
@@ -109,6 +136,43 @@ def set_random_seed(seed):
 
 
 class MegatronWorker(Worker):
+    def _maybe_apply_qwen3_moe_runtime_env(self):
+        """Fill ziyi-compatible rollout MoE env defaults when launchers omit them.
+
+        The ref_ziyi Qwen3-MoE scripts do not always spell out the rollout EP
+        envs in shell, but their worker populates them before vLLM init.  Keep
+        the same compatibility behavior here without overriding explicit
+        caller choices such as the qwen3 no-EP diagnostic path.
+        """
+        if getattr(self.hf_config, "model_type", None) != "qwen3_moe":
+            return
+
+        applied_envs = {}
+
+        if "USE_ALLTOALL_OVERLAP" not in os.environ:
+            os.environ["USE_ALLTOALL_OVERLAP"] = "1"
+            applied_envs["USE_ALLTOALL_OVERLAP"] = "1"
+
+        if "ALL_TO_ALL_RESHARD" not in os.environ:
+            os.environ["ALL_TO_ALL_RESHARD"] = "1"
+            applied_envs["ALL_TO_ALL_RESHARD"] = "1"
+
+        if self._is_rollout:
+            if "VLLM_ENABLE_EXPERT_PARALLEL" not in os.environ:
+                os.environ["VLLM_ENABLE_EXPERT_PARALLEL"] = "1"
+                applied_envs["VLLM_ENABLE_EXPERT_PARALLEL"] = "1"
+
+            if "VLLM_DP_SIZE" not in os.environ:
+                rollout_tp = max(1, int(self.config.rollout.tensor_model_parallel_size))
+                rollout_pp = max(1, int(self.config.rollout.pipeline_model_parallel_size))
+                infer_world_size = rollout_tp * rollout_pp
+                vllm_dp_size = max(1, self.world_size // infer_world_size)
+                os.environ["VLLM_DP_SIZE"] = str(vllm_dp_size)
+                applied_envs["VLLM_DP_SIZE"] = str(vllm_dp_size)
+
+        if applied_envs:
+            logger.info("Applied Qwen3-MoE rollout runtime env defaults: %s", applied_envs)
+
     def _init_hf_config_and_tf_config(
         self,
         model_path,
@@ -304,7 +368,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             "rollout": 4096,
             "ref": 8192,
         }
-        phase_port = str(int(self._base_hccl_if_base_port) + phase_offsets.get(phase, 0))
+        base_port = int(self._base_hccl_if_base_port)
+        max_valid_port = 65520
+        max_offset = max(phase_offsets.values())
+        safe_base_port = min(base_port, max_valid_port - max_offset)
+        if safe_base_port != base_port:
+            logger.warning(
+                "Adjust HCCL_IF_BASE_PORT from %s to %s so phased ports stay within [%s, %s]",
+                base_port,
+                safe_base_port,
+                1024,
+                max_valid_port,
+            )
+        phase_port = str(safe_base_port + phase_offsets.get(phase, 0))
         os.environ["HCCL_IF_BASE_PORT"] = phase_port
         logger.info("Use HCCL_IF_BASE_PORT=%s for %s init", phase_port, phase)
 
@@ -328,6 +404,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.config.model.get("trust_remote_code", False),
             self.config.actor.megatron.use_mbridge,
         )
+        self._maybe_apply_qwen3_moe_runtime_env()
         self.generation_config = get_generation_config(self.local_path)
 
         if self._is_actor or self._is_rollout:
@@ -348,8 +425,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             print(f"actor_module: {len(actor_module)}")
             if self.config.actor.load_weight:
                 if self.config.actor.megatron.use_dist_checkpointing:
+                    logger.info(
+                        "MegatronWorker.load actor_distcp begin rank=%s pid=%s hccl_if_base_port=%s path=%s",
+                        self.rank,
+                        os.getpid(),
+                        os.environ.get("HCCL_IF_BASE_PORT"),
+                        self.config.actor.megatron.dist_checkpointing_path,
+                    )
                     load_mcore_dist_weights(
                         actor_module, self.config.actor.megatron.dist_checkpointing_path, is_value_model=False
+                    )
+                    logger.info(
+                        "MegatronWorker.load actor_distcp end rank=%s pid=%s hccl_if_base_port=%s",
+                        self.rank,
+                        os.getpid(),
+                        os.environ.get("HCCL_IF_BASE_PORT"),
                     )
                 else:
                     if self.bridge is not None:
@@ -381,8 +471,24 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 assert self.config.actor.load_weight == self.config.ref.load_weight
                 print("load ref weight start")
                 if self.config.ref.megatron.use_dist_checkpointing:
+                    logger.info(
+                        "MegatronWorker.load ref_distcp begin rank=%s pid=%s hccl_if_base_port=%s path=%s",
+                        self.rank,
+                        os.getpid(),
+                        os.environ.get("HCCL_IF_BASE_PORT"),
+                        self.config.ref.megatron.dist_checkpointing_path,
+                    )
                     load_mcore_dist_weights(
-                        ref_module, self.config.ref.megatron.dist_checkpointing_path, is_value_model=False
+                        ref_module,
+                        self.config.ref.megatron.dist_checkpointing_path,
+                        is_value_model=False,
+                        disable_ckpt_mismatch_validation=True,
+                    )
+                    logger.info(
+                        "MegatronWorker.load ref_distcp end rank=%s pid=%s hccl_if_base_port=%s",
+                        self.rank,
+                        os.getpid(),
+                        os.environ.get("HCCL_IF_BASE_PORT"),
                     )
                 else:
                     if self.bridge is not None:
@@ -477,6 +583,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        logger.info(
+            "MegatronWorker.init_model start: role=%s rank=%s actor=%s rollout=%s ref=%s",
+            self.role,
+            self.rank,
+            self._is_actor,
+            self._is_rollout,
+            self._is_ref,
+        )
         if self.config.model.get("external_lib", None) is not None:
             # This is used to import external_lib into the huggingface systems
             import importlib
@@ -503,6 +617,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         log_gpu_memory_usage("Before init actor model and optimizer", logger=logger)
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
         if self._is_actor or self._is_rollout:
+            logger.info("MegatronWorker.init_model stage=actor_module_build rank=%s", self.rank)
             # we need the model for actor and rollout
             optim_config = self.config.actor.optim if self._is_actor else None
             (
@@ -524,8 +639,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self._is_offload_optimizer:
                 offload_megatron_optimizer(self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
+            logger.info("MegatronWorker.init_model stage=actor_module_done rank=%s", self.rank)
 
         if self._is_actor:
+            logger.info("MegatronWorker.init_model stage=actor_wrapper_build rank=%s", self.rank)
             self._set_hccl_if_base_port_for_phase("actor")
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = MegatronPPOActor(
@@ -537,13 +654,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 actor_optimizer=self.actor_optimizer,
             )
             log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
+            logger.info("MegatronWorker.init_model stage=actor_wrapper_done rank=%s", self.rank)
 
         if self._is_rollout:
+            logger.info("MegatronWorker.init_model stage=rollout_build rank=%s", self.rank)
             self._set_hccl_if_base_port_for_phase("rollout")
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
             log_gpu_memory_usage("After rollout init", logger=logger)
+            logger.info("MegatronWorker.init_model stage=rollout_done rank=%s", self.rank)
 
         if self._is_ref:
+            logger.info("MegatronWorker.init_model stage=ref_module_build rank=%s", self.rank)
             self._set_hccl_if_base_port_for_phase("ref")
             self.ref_module, self.ref_model_config = self._build_model_optimizer(
                 model_path=self.config.model.path,
@@ -552,6 +673,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 override_transformer_config=override_transformer_config,
             )
             log_gpu_memory_usage("After ref model init", logger=logger)
+            logger.info("MegatronWorker.init_model stage=ref_module_done rank=%s", self.rank)
             self.ref_policy = MegatronPPOActor(
                 config=self.config.ref,
                 model_config=self.ref_model_config,
@@ -563,6 +685,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self._ref_is_offload_param:
                 offload_megatron_model_to_cpu(self.ref_module)
                 log_gpu_memory_usage("After offload ref params during init", logger=logger)
+            logger.info("MegatronWorker.init_model stage=ref_wrapper_done rank=%s", self.rank)
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -587,13 +710,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             )
         get_torch_device().empty_cache()
         log_gpu_memory_usage("After init_model finish", logger=logger)
+        logger.info("MegatronWorker.init_model finish: role=%s rank=%s", self.role, self.rank)
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
+        _rollout_phase_memory_log("rollout_mode_after_initial_empty_cache", self.rank)
 
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
+            _rollout_phase_memory_log("rollout_mode_after_load_actor_params", self.rank)
         if self.bridge is not None:
             per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
         else:
@@ -609,12 +735,32 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
+            _rollout_phase_memory_log("rollout_mode_after_resume_weights", self.rank)
         await self.rollout.update_weights(per_tensor_param)
+        _rollout_phase_memory_log("rollout_mode_after_update_rollout_weights", self.rank)
+        # The Megatron exporter yields NPU tensors lazily. Drop the exhausted
+        # generator before rebuilding vLLM KV cache so no last-yielded tensor
+        # reference can survive across the phase switch.
+        del per_tensor_param
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
+            _rollout_phase_memory_log("rollout_mode_after_offload_actor_params", self.rank)
         aggressive_empty_cache(force_sync=True)
+        _rollout_phase_memory_log("rollout_mode_before_resume_kv_cache", self.rank)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
+            _rollout_phase_memory_log("rollout_mode_after_resume_kv_cache", self.rank)
+        if getattr(self.rollout, "_needs_rollout_aclgraph_recapture", False):
+            model_runner = getattr(self.rollout, "model_runner", None)
+            if model_runner is not None:
+                from verl.workers.rollout.vllm_rollout.vllm_rollout_spmd import (
+                    _recapture_rollout_aclgraphs,
+                )
+
+                _recapture_rollout_aclgraphs(
+                    model_runner, "rollout_mode_after_resume_kv_cache"
+                )
+            self.rollout._needs_rollout_aclgraph_recapture = False
 
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
@@ -626,13 +772,16 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self.rollout.eplb_end()
         if self.config.rollout.free_cache_engine:
             log_gpu_memory_usage("Before rollout offload", logger=logger)
+            _rollout_phase_memory_log("trainer_mode_before_rollout_release", self.rank)
             await self.rollout.release()
             log_gpu_memory_usage("After rollout offload", logger=logger)
+            _rollout_phase_memory_log("trainer_mode_after_rollout_release", self.rank)
 
         for model in self.actor.actor_module:
             model.train()
         # add empty cache after each compute
         aggressive_empty_cache(force_sync=True)
+        _rollout_phase_memory_log("trainer_mode_after_empty_cache", self.rank)
 
         # FIXME(@wuxibin): megatron+sglang failed with `expandable_segments:True` in ci,
         # can't reproduce it in dev environment, temporary disable it.
@@ -719,14 +868,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             output = self.rollout.generate_sequences(prompts=prompts)
 
         from vllm_ascend import envs as envs_ascend
-        elastic_shrink_enabled = (
-            envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK)
+
+        elastic_shrink_enabled = envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
         elastic_rollout_scaled = False
-        llm_engine = getattr(getattr(self.rollout, "inference_engine", None),
-                             "llm_engine", None)
+        llm_engine = getattr(getattr(self.rollout, "inference_engine", None), "llm_engine", None)
         if llm_engine is not None and elastic_shrink_enabled:
-            elastic_rollout_scaled = bool(
-                getattr(llm_engine, "elastic_ep_scaled_once", False))
+            elastic_rollout_scaled = bool(getattr(llm_engine, "elastic_ep_scaled_once", False))
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
@@ -734,7 +881,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self._is_actor and elastic_shrink_enabled and elastic_rollout_scaled:
             logger.info(
-                "Skip rollout generate barrier and timing reduce because elastic shrink happened in this generate.")
+                "Skip rollout generate barrier and timing reduce because elastic shrink happened in this generate."
+            )
             timing_generate = {
                 "generate_sequences": -1.0,
                 "generation_timing/max": -1.0,
@@ -767,15 +915,28 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def restore_rollout_elastic_parallel_groups(self):
         rollout_engine = getattr(self.rollout, "inference_engine", None)
         llm_engine = getattr(rollout_engine, "llm_engine", None)
-        if llm_engine is None or not hasattr(
-                llm_engine, "restore_elastic_parallel_groups_if_needed"):
+        if llm_engine is None or not hasattr(llm_engine, "restore_elastic_parallel_groups_if_needed"):
             return False
         logger.info(
             "Elastic parallel restore requested after rollout: rank=%s scaled_once=%s active_ranks=%s",
-            self.rank, getattr(llm_engine, "elastic_ep_scaled_once", False),
-            getattr(llm_engine, "elastic_ep_active_ranks", None))
+            self.rank,
+            getattr(llm_engine, "elastic_ep_scaled_once", False),
+            getattr(llm_engine, "elastic_ep_active_ranks", None),
+        )
         llm_engine.restore_elastic_parallel_groups_if_needed()
         return True
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_record(self):
+        if hasattr(self, "rollout") and hasattr(self.rollout, "get_record"):
+            return self.rollout.get_record()
+        return {}
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def flush_record(self):
+        if hasattr(self, "rollout") and hasattr(self.rollout, "flush_record"):
+            return self.rollout.flush_record()
+        return {}
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
@@ -813,8 +974,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         calculate_entropy = bool(getattr(self.actor.config, "entropy_coeff", 0) != 0)
-        output, entropys = self.actor.compute_log_prob(
-            data=data, calculate_entropy=calculate_entropy)
+        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
         tensors = {"old_log_probs": output}
         if calculate_entropy:
             tensors["entropys"] = entropys
@@ -856,15 +1016,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def get_record(self):
-        """Get MoE statistics record from rollout."""
-        if hasattr(self, 'rollout') and hasattr(self.rollout, 'get_record'):
-            return self.rollout.get_record()
-        return {}
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def flush_record(self):
-        return self.rollout.flush_record()
 
 
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):

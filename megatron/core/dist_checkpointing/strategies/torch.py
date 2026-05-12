@@ -84,6 +84,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 _metadata_fn: str = ".metadata"
+_LOAD_PROCESS_GROUP_CACHE: Dict[str, torch.distributed.ProcessGroup] = {}
 
 
 def register_default_torch_strategies():
@@ -97,6 +98,21 @@ def register_default_torch_strategies():
 
 
 logger = getLogger(__name__)
+
+
+def _get_load_process_group():
+    backend = os.getenv("VERL_DIST_CKPT_LOAD_PROCESS_GROUP", "").strip().lower()
+    if not backend or backend == "default":
+        return None
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
+    if backend in _LOAD_PROCESS_GROUP_CACHE:
+        return _LOAD_PROCESS_GROUP_CACHE[backend]
+    ranks = list(range(torch.distributed.get_world_size()))
+    pg = torch.distributed.new_group(ranks=ranks, backend=backend)
+    _LOAD_PROCESS_GROUP_CACHE[backend] = pg
+    logger.info("Created dist checkpoint load process group backend=%s world_size=%s", backend, len(ranks))
+    return pg
 
 
 def flatten_state_dict(
@@ -880,6 +896,24 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         }
 
         orig_sharded_state_dict = sharded_state_dict
+        flat_input_sd, _ = flatten_state_dict(sharded_state_dict)
+        input_extra_keys = sorted(k for k in flat_input_sd.keys() if "_extra_state" in k)
+        input_shobj_unique_keys = sorted(
+            sh_base.unique_key
+            for sh_base in flat_input_sd.values()
+            if isinstance(sh_base, ShardedObject) and "_extra_state" in sh_base.key
+        )
+        input_expert_unique_keys = [
+            k for k in input_shobj_unique_keys if ".mlp.experts." in k or ".experts.experts." in k
+        ]
+        print(
+            f"[TorchDistLoadShardedStrategy.load] input_extra_keys={len(input_extra_keys)} "
+            f"input_shobj_extra={len(input_shobj_unique_keys)} "
+            f"input_expert_shobj_extra={len(input_expert_unique_keys)} "
+            f"sample_input={input_extra_keys[:3]} "
+            f"sample_input_unique={input_shobj_unique_keys[:3]}",
+            flush=True,
+        )
         # MCore state dict to PyT Distributed compatible
         (sharded_state_dict, flat_mapping, rename_mapping) = (
             _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
@@ -887,11 +921,23 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         pyt_state_dict = mcore_to_pyt_state_dict(
             sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
         )
+        pyt_extra_keys = sorted(k for k in pyt_state_dict.keys() if "_extra_state/shard_" in k)
         # Load PyT Distributed format
         fsr = CachedMetadataFileSystemReader(checkpoint_dir)
+        metadata = fsr.read_metadata()
+        metadata_keys = set(metadata.state_dict_metadata.keys())
+        missing_pyt_keys = [k for k in pyt_extra_keys if k not in metadata_keys]
+        print(
+            f"[TorchDistLoadShardedStrategy.load] pyt_extra_keys={len(pyt_extra_keys)} "
+            f"missing_vs_metadata={len(missing_pyt_keys)} "
+            f"sample_pyt={pyt_extra_keys[:3]} sample_missing={missing_pyt_keys[:3]}",
+            flush=True,
+        )
         checkpoint.load_state_dict(
             pyt_state_dict,
             fsr,
+            process_group=_get_load_process_group(),
+            no_dist=os.getenv("VERL_DIST_CKPT_LOAD_NO_DIST", "0") == "1",
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,

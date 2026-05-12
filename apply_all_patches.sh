@@ -28,7 +28,7 @@ while IFS= read -r PATCH_FILE; do
     
     echo -n "Applying $PATCH_REL_PATH ... "
 
-    git apply --ignore-whitespace "$PATCH_REL_PATH"
+    git apply -v --ignore-whitespace "$PATCH_REL_PATH"
 
     if [ $? -ne 0 ]; then
         echo "[FAIL]: $PATCH_REL_PATH" >&2

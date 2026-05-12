@@ -142,15 +142,6 @@ class McoreToHFWeightConverterQwen2Moe(McoreToHFWeightConverterDense):
             expert_id = name.split("weight")[-1]
             convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
             assert len(params) == 1
-        elif "mlp.experts.weight1" in name:  # split gate_proj and up_proj
-            num_moe_experts = int(len(params) / 2)
-            for expert_id in range(num_moe_experts):
-                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight")
-                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight")
-        elif "mlp.experts.weight2" in name:
-            num_moe_experts = len(params)
-            for expert_id in range(num_moe_experts):
-                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
         else:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
         return convert_names, params
