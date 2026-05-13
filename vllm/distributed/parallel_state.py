@@ -24,6 +24,7 @@ If you only need to use the distributed environment without model/pipeline
 """
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -212,22 +213,41 @@ class GroupCoordinator:
 
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
+        self._owns_process_groups = True
 
         self_device_group = None
         self_cpu_group = None
+        world_group = _WORLD
+        reuse_world_group = (
+            os.getenv("VLLM_REUSE_WORLD_GROUP_FOR_FULL_MODEL_PARALLEL",
+                      "0").strip().lower() in ("1", "true", "yes", "on")
+            and world_group is not None and len(group_ranks) == 1
+            and group_ranks[0] == list(range(torch.distributed.get_world_size()))
+        )
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend)
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self_device_group = device_group
-                self_cpu_group = cpu_group
+        if reuse_world_group:
+            self.ranks = list(group_ranks[0])
+            self.world_size = len(self.ranks)
+            self.rank_in_group = self.ranks.index(self.rank)
+            self_device_group = world_group.device_group
+            self_cpu_group = world_group.cpu_group
+            self._owns_process_groups = False
+            logger.info("Reusing world process groups for %s group ranks=%s",
+                        group_name, self.ranks)
+
+        if not reuse_world_group:
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend)
+                # a group with `gloo` backend, to allow direct coordination between
+                # processes through the CPU.
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self_device_group = device_group
+                    self_cpu_group = cpu_group
 
         assert self_cpu_group is not None
         assert self_device_group is not None
@@ -854,14 +874,18 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
-        if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
-            del self.device_group
-        if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
-            del self.cpu_group
         if self.device_communicator is not None:
             self.device_communicator.destroy()
+        if self._owns_process_groups and hasattr(self, "device_group"):
+            torch.distributed.destroy_process_group(self.device_group)
+            del self.device_group
+        elif hasattr(self, "device_group"):
+            del self.device_group
+        if self._owns_process_groups and hasattr(self, "cpu_group"):
+            torch.distributed.destroy_process_group(self.cpu_group)
+            del self.cpu_group
+        elif hasattr(self, "cpu_group"):
+            del self.cpu_group
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 

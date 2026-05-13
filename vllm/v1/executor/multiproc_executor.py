@@ -34,7 +34,7 @@ from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.cache import worker_receiver_cache_from_config
 from vllm.utils import (_maybe_force_spawn, decorate_logs,
-                        get_distributed_init_method, get_loopback_ip,
+                        get_distributed_init_method, get_ip, get_loopback_ip,
                         get_mp_context, get_open_port, set_process_title)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
@@ -44,6 +44,41 @@ from vllm.v1.outputs import (AsyncModelRunnerOutput, DraftTokenIds,
 from vllm.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _set_worker_rank_envs(rank: int, local_rank: int, world_size: int) -> None:
+    """Set launcher-style rank envs for backends that consult os.environ.
+
+    vLLM's multiproc executor passes rank/local_rank directly to
+    init_process_group, which is enough for most backends. Some Ascend/HCCL
+    paths still report RankID:-1 unless the torchrun-style envs are present in
+    the worker process. Keep this opt-in so the default executor behavior is
+    unchanged outside the elastic sidecar TP/EP path.
+    """
+    if not _env_flag("VLLM_MULTIPROC_SET_WORKER_RANK_ENVS"):
+        return
+
+    env_values = {
+        "RANK": rank,
+        "WORLD_SIZE": world_size,
+        "LOCAL_RANK": local_rank,
+        "LOCAL_WORLD_SIZE": world_size,
+        "RANK_ID": rank,
+        "RANK_SIZE": world_size,
+        "DEVICE_ID": local_rank,
+        "ASCEND_DEVICE_ID": local_rank,
+        "NPU_CALCULATE_DEVICE": local_rank,
+    }
+    for name, value in env_values.items():
+        os.environ[name] = str(value)
+    logger.info(
+        "Set multiproc worker rank envs: rank=%d local_rank=%d world_size=%d",
+        rank, local_rank, world_size)
 
 
 class MultiprocExecutor(Executor):
@@ -71,10 +106,22 @@ class MultiprocExecutor(Executor):
         set_multiprocessing_worker_envs()
 
         # Multiprocessing-based executor does not support multi-node setting.
-        # Since it only works for single node, we can use the loopback address
-        # get_loopback_ip() for communication.
+        # Since it only works for single node, vLLM normally uses loopback.
+        #
+        # Ascend/HCCL can bind real device-side ports during TP/EP group init.
+        # The elastic sidecar can opt in to the host IP path so TP>1 workers
+        # do not all race on loopback-bound HCCL ports.
+        distributed_host_ip = os.getenv(
+            "VLLM_MULTIPROC_DISTRIBUTED_HOST_IP", "").strip()
+        if not distributed_host_ip:
+            use_host_ip = os.getenv(
+                "VLLM_MULTIPROC_USE_HOST_IP",
+                "0").strip().lower() in ("1", "true", "yes", "on")
+            distributed_host_ip = get_ip() if use_host_ip else get_loopback_ip()
         distributed_init_method = get_distributed_init_method(
-            get_loopback_ip(), get_open_port())
+            distributed_host_ip, get_open_port())
+        logger.info("Multiproc executor distributed init host=%s",
+                    distributed_host_ip)
 
         # Initialize worker and set up message queues for SchedulerOutputs
         # and ModelRunnerOutputs
@@ -525,6 +572,14 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """ Worker initialization and execution loops.
         This runs a background process """
+
+        vllm_config = kwargs.get("vllm_config")
+        if vllm_config is not None:
+            _set_worker_rank_envs(
+                rank=int(kwargs["rank"]),
+                local_rank=int(kwargs["local_rank"]),
+                world_size=int(vllm_config.parallel_config.world_size),
+            )
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker

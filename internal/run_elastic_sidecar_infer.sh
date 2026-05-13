@@ -29,11 +29,38 @@ TS=$(date +%Y%m%d%H%M%S)
 
 : "${VERL_SIDECAR_MODEL_PATH:?VERL_SIDECAR_MODEL_PATH must point to the sidecar inference model}"
 : "${VERL_SIDECAR_NPU_DEVICES:?VERL_SIDECAR_NPU_DEVICES must be set by the shrink watcher or manually for direct use}"
+
+detect_sidecar_host_ip() {
+    python3 - <<'PY'
+import socket
+
+def detect() -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # UDP connect does not require the address to be reachable; it only
+        # asks the kernel which local address would be used.
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+    finally:
+        sock.close()
+
+print(detect())
+PY
+}
+
 VERL_SIDECAR_MASTER_PORT=${VERL_SIDECAR_MASTER_PORT:-24300}
-VERL_SIDECAR_MASTER_ADDR=${VERL_SIDECAR_MASTER_ADDR:-127.0.0.1}
+VERL_SIDECAR_MASTER_ADDR=${VERL_SIDECAR_MASTER_ADDR:-$(detect_sidecar_host_ip)}
 VERL_SIDECAR_HCCL_IF_BASE_PORT=${VERL_SIDECAR_HCCL_IF_BASE_PORT:-52000}
+VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED=${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED:-0}
 VERL_SIDECAR_MASTER_PORT_STRIDE=${VERL_SIDECAR_MASTER_PORT_STRIDE:-32}
-VERL_SIDECAR_HCCL_PORT_STRIDE=${VERL_SIDECAR_HCCL_PORT_STRIDE:-1024}
+VERL_SIDECAR_HCCL_PORT_STRIDE=${VERL_SIDECAR_HCCL_PORT_STRIDE:-2048}
+VERL_SIDECAR_HCCL_PORT_WINDOW=${VERL_SIDECAR_HCCL_PORT_WINDOW:-64}
+VERL_SIDECAR_FORCE_HOST_IP_FOR_TP=${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP:-1}
 VERL_SIDECAR_LOG_FILE=${VERL_SIDECAR_LOG_FILE:-"${ROOT_DIR}/sidecar_infer_${TS}.log"}
 VERL_SIDECAR_OUTPUT_FILE=${VERL_SIDECAR_OUTPUT_FILE:-"${ROOT_DIR}/sidecar_infer_${TS}.jsonl"}
 VERL_SIDECAR_MAX_SECONDS=${VERL_SIDECAR_MAX_SECONDS:-0}
@@ -160,6 +187,65 @@ print(f"VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE={int(effective)}")
 PY
 )
 eval "${SIDECAR_EP_PLAN}"
+if [[ "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}" == "1" ]]; then
+    if [[ "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "1" \
+        && "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "true" \
+        && "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "yes" \
+        && "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "on" ]]; then
+        VERL_SIDECAR_HCCL_IF_BASE_PORT=$(python3 - \
+            "${VERL_SIDECAR_MASTER_ADDR}" \
+            "${VERL_SIDECAR_REPLICA_COUNT}" \
+            "${VERL_SIDECAR_HCCL_PORT_STRIDE}" \
+            "${VERL_SIDECAR_HCCL_PORT_WINDOW}" <<'PY'
+import socket
+import sys
+
+host, replica_count_arg, stride_arg, window_arg = sys.argv[1:5]
+replica_count = int(replica_count_arg)
+stride = int(stride_arg)
+window = int(window_arg)
+if window <= 0:
+    raise SystemExit(f"Invalid HCCL port window: {window}")
+
+def range_is_free(base: int) -> bool:
+    sockets = []
+    try:
+        for index in range(replica_count):
+            group_base = base + index * stride
+            # HCCL can allocate from both host and NPU socket ranges. Reserve
+            # two adjacent windows per replica so concurrent sidecar shards do
+            # not fall back into the same default port pool.
+            if group_base + 2 * window - 1 > 65535:
+                return False
+            for offset in range(2 * window):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Bind all interfaces to catch conflicts from either 0.0.0.0
+                # or the concrete sidecar host IP.
+                sock.bind(("", group_base + offset))
+                sockets.append(sock)
+        return True
+    except OSError:
+        return False
+    finally:
+        for sock in sockets:
+            sock.close()
+
+for base in range(30000, 62000):
+    if range_is_free(base):
+        print(base)
+        break
+else:
+    raise SystemExit("No free HCCL base port range found for sidecar TP/EP")
+PY
+        )
+    fi
+    max_master_port=$((VERL_SIDECAR_MASTER_PORT + (VERL_SIDECAR_REPLICA_COUNT - 1) * VERL_SIDECAR_MASTER_PORT_STRIDE))
+    max_hccl_port=$((VERL_SIDECAR_HCCL_IF_BASE_PORT + (VERL_SIDECAR_REPLICA_COUNT - 1) * VERL_SIDECAR_HCCL_PORT_STRIDE + 2 * VERL_SIDECAR_HCCL_PORT_WINDOW - 1))
+    if [[ "${max_master_port}" -gt 65535 || "${max_hccl_port}" -gt 65535 ]]; then
+        echo "Sidecar TP/EP port range exceeds 65535: master ${VERL_SIDECAR_MASTER_PORT}-${max_master_port}, HCCL ${VERL_SIDECAR_HCCL_IF_BASE_PORT}-${max_hccl_port}. Lower *_BASE_PORT or *_PORT_STRIDE." >&2
+        exit 2
+    fi
+fi
 VERL_SIDECAR_GPU_MEMORY_UTILIZATION=${VERL_SIDECAR_GPU_MEMORY_UTILIZATION:-0.90}
 VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-2048}
 VERL_SIDECAR_MAX_NUM_SEQS=${VERL_SIDECAR_MAX_NUM_SEQS:-128}
@@ -227,6 +313,9 @@ export VERL_SIDECAR_PRIMARY_DEVICE_GROUP
 export VERL_SIDECAR_MASTER_ADDR
 export VERL_SIDECAR_MASTER_PORT_STRIDE
 export VERL_SIDECAR_HCCL_PORT_STRIDE
+export VERL_SIDECAR_HCCL_PORT_WINDOW
+export VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED
+export VERL_SIDECAR_FORCE_HOST_IP_FOR_TP
 export VERL_SIDECAR_PARALLEL_MODE
 export VERL_SIDECAR_TENSOR_PARALLEL_SIZE
 export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL
@@ -260,6 +349,17 @@ export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export VLLM_LOGGING_LEVEL="${VERL_SIDECAR_VLLM_LOGGING_LEVEL:-INFO}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export VLLM_ENABLE_EXPERT_PARALLEL="${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}"
+if [[ "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "0" \
+    && "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "false" \
+    && "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "no" \
+    && "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "off" \
+    && ( "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}" == "1" ) ]]; then
+    export VLLM_HOST_IP="${VERL_SIDECAR_MASTER_ADDR}"
+    export VLLM_MULTIPROC_DISTRIBUTED_HOST_IP="${VERL_SIDECAR_MASTER_ADDR}"
+    export VLLM_MULTIPROC_USE_HOST_IP=1
+    export VLLM_MULTIPROC_SET_WORKER_RANK_ENVS=1
+    export VLLM_REUSE_WORLD_GROUP_FOR_FULL_MODEL_PARALLEL=1
+fi
 
 # The sidecar is launched from a training process tree, so make sure vLLM TP
 # does not inherit training/Ray distributed rank metadata.
@@ -1019,7 +1119,18 @@ print(json.dumps({
     "model_path": model_path,
     "devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES", ""),
     "master_port": os.environ.get("MASTER_PORT", ""),
+    "master_addr": os.environ.get("MASTER_ADDR", ""),
     "hccl_if_base_port": os.environ.get("HCCL_IF_BASE_PORT", ""),
+    "hccl_host_socket_port_range": os.environ.get("HCCL_HOST_SOCKET_PORT_RANGE", ""),
+    "hccl_npu_socket_port_range": os.environ.get("HCCL_NPU_SOCKET_PORT_RANGE", ""),
+    "sidecar_hccl_if_base_port_fixed": os.environ.get("VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED", ""),
+    "sidecar_hccl_port_stride": os.environ.get("VERL_SIDECAR_HCCL_PORT_STRIDE", ""),
+    "sidecar_hccl_port_window": os.environ.get("VERL_SIDECAR_HCCL_PORT_WINDOW", ""),
+    "vllm_host_ip": os.environ.get("VLLM_HOST_IP", ""),
+    "vllm_multiproc_distributed_host_ip": os.environ.get("VLLM_MULTIPROC_DISTRIBUTED_HOST_IP", ""),
+    "vllm_multiproc_use_host_ip": os.environ.get("VLLM_MULTIPROC_USE_HOST_IP", ""),
+    "vllm_multiproc_set_worker_rank_envs": os.environ.get("VLLM_MULTIPROC_SET_WORKER_RANK_ENVS", ""),
+    "vllm_reuse_world_group_for_full_model_parallel": os.environ.get("VLLM_REUSE_WORLD_GROUP_FOR_FULL_MODEL_PARALLEL", ""),
     "num_prompts": len(initial_records),
     "total_prompts": len(records),
     "completed_prompts": len(completed_ids),
@@ -1262,10 +1373,17 @@ PY
     echo "sidecar_device_groups=${VERL_SIDECAR_DEVICE_GROUPS}"
     echo "sidecar_unused_devices=${VERL_SIDECAR_UNUSED_DEVICES}"
     echo "sidecar_master_addr=${VERL_SIDECAR_MASTER_ADDR}"
+    echo "sidecar_force_host_ip_for_tp=${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP}"
+    echo "sidecar_vllm_host_ip=${VLLM_HOST_IP:-}"
+    echo "sidecar_vllm_multiproc_host_ip=${VLLM_MULTIPROC_DISTRIBUTED_HOST_IP:-}"
+    echo "sidecar_vllm_reuse_world_group=${VLLM_REUSE_WORLD_GROUP_FOR_FULL_MODEL_PARALLEL:-}"
     echo "sidecar_master_port_base=${VERL_SIDECAR_MASTER_PORT}"
     echo "sidecar_master_port_stride=${VERL_SIDECAR_MASTER_PORT_STRIDE}"
     echo "sidecar_hccl_if_base_port=${VERL_SIDECAR_HCCL_IF_BASE_PORT}"
+    echo "sidecar_hccl_if_base_port_fixed=${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED}"
     echo "sidecar_hccl_port_stride=${VERL_SIDECAR_HCCL_PORT_STRIDE}"
+    echo "sidecar_hccl_port_window=${VERL_SIDECAR_HCCL_PORT_WINDOW}"
+    echo "sidecar_vllm_set_worker_rank_envs=${VLLM_MULTIPROC_SET_WORKER_RANK_ENVS:-}"
     echo "sidecar_ep_allowed=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL}"
     echo "sidecar_model_is_moe=${VERL_SIDECAR_MODEL_IS_MOE}"
     echo "sidecar_model_is_moe_reason=${VERL_SIDECAR_MODEL_IS_MOE_REASON}"
@@ -1295,8 +1413,10 @@ PY
                 export VERL_SIDECAR_OUTPUT_FILE="${shard_output}"
                 export MASTER_PORT=$((VERL_SIDECAR_MASTER_PORT + shard_index * VERL_SIDECAR_MASTER_PORT_STRIDE))
                 export HCCL_IF_BASE_PORT=$((VERL_SIDECAR_HCCL_IF_BASE_PORT + shard_index * VERL_SIDECAR_HCCL_PORT_STRIDE))
+                export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_IF_BASE_PORT}-$((HCCL_IF_BASE_PORT + VERL_SIDECAR_HCCL_PORT_WINDOW - 1))"
+                export HCCL_NPU_SOCKET_PORT_RANGE="$((HCCL_IF_BASE_PORT + VERL_SIDECAR_HCCL_PORT_WINDOW))-$((HCCL_IF_BASE_PORT + 2 * VERL_SIDECAR_HCCL_PORT_WINDOW - 1))"
                 export VLLM_DP_MASTER_PORT="${MASTER_PORT}"
-                echo "sidecar_shard_start_time=$(date +%s.%N) shard=${shard_index} device_group=${device_group} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} master_port=${MASTER_PORT} hccl_if_base_port=${HCCL_IF_BASE_PORT} output=${shard_output}"
+                echo "sidecar_shard_start_time=$(date +%s.%N) shard=${shard_index} device_group=${device_group} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} master_port=${MASTER_PORT} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${shard_output}"
                 if [[ "${VERL_SIDECAR_MAX_SECONDS}" != "0" ]]; then
                     timeout --kill-after=10s "${VERL_SIDECAR_MAX_SECONDS}s" python3 -u "${PY_SCRIPT}" 2>&1
                     shard_rc=$?
