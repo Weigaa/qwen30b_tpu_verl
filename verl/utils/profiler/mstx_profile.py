@@ -128,18 +128,23 @@ def get_npu_profiler(
     if role:
         profile_save_path = os.path.join(profile_save_path, role)
 
+    marker_only = contents is not None and "mstx" in contents
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
         profiler_level=level,
         export_type=torch_npu.profiler.ExportType.Text,
         data_simplification=True,
-        msprof_tx=True,
+        # msprof_tx records framework op ranges and can generate hundreds of GB
+        # over a full rollout. For marker-only profiling, keep only explicit
+        # MSTX ranges.
+        msprof_tx=not marker_only,
+        mstx=marker_only,
     )
 
     activites = []
-    if contents is None or "npu" in contents:
+    if not marker_only and (contents is None or "npu" in contents):
         activites.append(torch_npu.profiler.ProfilerActivity.NPU)
-    if contents is None or "cpu" in contents:
+    if not marker_only and (contents is None or "cpu" in contents):
         activites.append(torch_npu.profiler.ProfilerActivity.CPU)
 
     prof = torch_npu.profiler.profile(

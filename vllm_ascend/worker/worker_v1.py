@@ -20,6 +20,8 @@
 import copy
 import os
 import time
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional, Union
 
 import torch
@@ -130,6 +132,7 @@ class NPUWorker(WorkerBase):
             init_cached_hf_modules()
 
         self.profiler = self._init_profiler()
+        self._elastic_op_profile_context: Optional[dict] = None
         if sleep_mode_enabled():
             # Buffers saved before sleep
             self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -796,8 +799,9 @@ class NPUWorker(WorkerBase):
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=get_tp_group()))
 
-        output = self.model_runner.execute_model(scheduler_output,
-                                                 intermediate_tensors)
+        with self._maybe_elastic_op_profile("live"):
+            output = self.model_runner.execute_model(scheduler_output,
+                                                     intermediate_tensors)
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput)):
             return output
 
@@ -952,7 +956,100 @@ class NPUWorker(WorkerBase):
         return self.model_runner.pin_lora(lora_id)
 
     def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(1)
+        with self._maybe_elastic_op_profile("dummy"):
+            self.model_runner._dummy_run(1)
+
+    def set_elastic_op_profile_context(self, context: Optional[dict]) -> None:
+        """Arm a one-shot op profiler for the next live or dummy step."""
+        self._elastic_op_profile_context = context
+
+    def _elastic_op_profile_rank_enabled(self) -> bool:
+        ranks = os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_RANKS", "all").strip()
+        if not ranks or ranks.lower() == "all":
+            return True
+        try:
+            allowed = {int(item) for item in ranks.split(",") if item.strip()}
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_ASCEND_BUCKET_OP_PROFILE_RANKS=%s; profiling all ranks",
+                ranks)
+            return True
+        return int(self.rank) in allowed
+
+    @contextmanager
+    def _maybe_elastic_op_profile(self, kind: str):
+        context = self._elastic_op_profile_context
+        self._elastic_op_profile_context = None
+        root = os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_DIR", "")
+        if (not context or not root
+                or not self._elastic_op_profile_rank_enabled()):
+            yield
+            return
+
+        bucket = context.get("bucket", "unknown")
+        step = context.get("step", "unknown")
+        active_count = context.get("active_count", "unknown")
+        compute_world_size = context.get("compute_world_size", "unknown")
+        profile_dir = (Path(root) / f"bucket_{bucket}" /
+                       f"rank_{self.rank}_{kind}_step_{step}")
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "elastic_op_profile_meta.txt").write_text(
+            "\n".join([
+                f"rank={self.rank}",
+                f"local_rank={self.local_rank}",
+                f"kind={kind}",
+                f"bucket={bucket}",
+                f"step={step}",
+                f"active_count={active_count}",
+                f"compute_world_size={compute_world_size}",
+                f"active_ranks={context.get('active_ranks')}",
+            ]) + "\n",
+            encoding="utf-8")
+
+        level_name = os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_LEVEL", "level0")
+        if level_name == "level_none":
+            level = torch_npu.profiler.ProfilerLevel.Level_none
+        elif level_name == "level1":
+            level = torch_npu.profiler.ProfilerLevel.Level1
+        elif level_name == "level2":
+            level = torch_npu.profiler.ProfilerLevel.Level2
+        else:
+            level = torch_npu.profiler.ProfilerLevel.Level0
+
+        analysis = os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_ANALYSIS",
+                             "1").lower() not in ("0", "false", "no", "off")
+        sync = os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_SYNC",
+                         "1").lower() not in ("0", "false", "no", "off")
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            profiler_level=level,
+            msprof_tx=False,
+            aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+            l2_cache=False,
+            op_attr=False,
+            data_simplification=True,
+            record_op_args=False,
+            gc_detect_threshold=None,
+        )
+        with torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                with_stack=False,
+                profile_memory=False,
+                with_modules=False,
+                record_shapes=False,
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    str(profile_dir), analyse_flag=analysis),
+                experimental_config=experimental_config) as prof:
+            yield
+            if sync:
+                torch.npu.synchronize()
+            prof.step()
+        logger.info(
+            "Elastic op profile captured: rank=%s kind=%s bucket=%s step=%s dir=%s",
+            self.rank, kind, bucket, step, profile_dir)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""

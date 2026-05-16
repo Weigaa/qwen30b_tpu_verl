@@ -76,15 +76,17 @@ if [[ "${VERL_SIDECAR_DEVICE_COUNT}" == "0" ]]; then
     exit 2
 fi
 VERL_SIDECAR_PARALLEL_MODE=${VERL_SIDECAR_PARALLEL_MODE:-dp}
+VERL_SIDECAR_DATA_PARALLEL_SIZE=${VERL_SIDECAR_DATA_PARALLEL_SIZE:-${VERL_SIDECAR_DP_SIZE:-1}}
 SIDECAR_PARALLEL_PLAN=$(python3 - \
     "${VERL_SIDECAR_NPU_DEVICES}" \
     "${VERL_SIDECAR_PARALLEL_MODE}" \
     "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-}" \
-    "${VERL_SIDECAR_REPLICA_COUNT:-}" <<'PY'
+    "${VERL_SIDECAR_REPLICA_COUNT:-}" \
+    "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" <<'PY'
 import shlex
 import sys
 
-devices_arg, mode, tp_arg, replica_arg = sys.argv[1:5]
+devices_arg, mode, tp_arg, replica_arg, dp_arg = sys.argv[1:6]
 devices = [item.strip() for item in devices_arg.split(",") if item.strip()]
 device_count = len(devices)
 mode = (mode or "dp").strip().lower()
@@ -103,30 +105,39 @@ else:
 if tp_size <= 0:
     raise SystemExit(f"Invalid VERL_SIDECAR_TENSOR_PARALLEL_SIZE={tp_size}")
 
+dp_size = int(dp_arg) if dp_arg.strip() else 1
+if dp_size <= 0:
+    raise SystemExit(f"Invalid VERL_SIDECAR_DATA_PARALLEL_SIZE={dp_size}")
+group_size = tp_size * dp_size
+if group_size <= 0:
+    raise SystemExit(f"Invalid sidecar group size: tp={tp_size}, dp={dp_size}")
+
 if replica_arg.strip():
     replica_count = int(replica_arg)
     if replica_count <= 0:
         raise SystemExit(f"Invalid VERL_SIDECAR_REPLICA_COUNT={replica_count}")
-    used_devices = replica_count * tp_size
+    used_devices = replica_count * group_size
     if used_devices > device_count:
         raise SystemExit(
             "VERL_SIDECAR_REPLICA_COUNT * VERL_SIDECAR_TENSOR_PARALLEL_SIZE "
-            f"exceeds available devices: {replica_count} * {tp_size} > {device_count}")
+            "* VERL_SIDECAR_DATA_PARALLEL_SIZE exceeds available devices: "
+            f"{replica_count} * {tp_size} * {dp_size} > {device_count}")
 else:
-    if device_count % tp_size != 0:
+    if device_count % group_size != 0:
         raise SystemExit(
-            f"Device count {device_count} is not divisible by tensor parallel "
-            f"size {tp_size}; set VERL_SIDECAR_REPLICA_COUNT explicitly if "
-            "you intentionally want to leave some devices unused.")
-    replica_count = device_count // tp_size
+            f"Device count {device_count} is not divisible by sidecar group "
+            f"size tp*dp={tp_size}*{dp_size}; set VERL_SIDECAR_REPLICA_COUNT "
+            "explicitly if you intentionally want to leave some devices unused.")
+    replica_count = device_count // group_size
     used_devices = device_count
 
 groups = [
-    ",".join(devices[start:start + tp_size])
-    for start in range(0, used_devices, tp_size)
+    ",".join(devices[start:start + group_size])
+    for start in range(0, used_devices, group_size)
 ]
 unused = devices[used_devices:]
 print(f"VERL_SIDECAR_TENSOR_PARALLEL_SIZE={tp_size}")
+print(f"VERL_SIDECAR_DATA_PARALLEL_SIZE={dp_size}")
 print(f"VERL_SIDECAR_REPLICA_COUNT={replica_count}")
 print("VERL_SIDECAR_DEVICE_GROUPS=" + shlex.quote(";".join(groups)))
 print("VERL_SIDECAR_UNUSED_DEVICES=" + shlex.quote(",".join(unused)))
@@ -187,7 +198,7 @@ print(f"VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE={int(effective)}")
 PY
 )
 eval "${SIDECAR_EP_PLAN}"
-if [[ "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}" == "1" ]]; then
+if [[ "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}" == "1" ]]; then
     if [[ "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "1" \
         && "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "true" \
         && "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "yes" \
@@ -297,6 +308,8 @@ export ASCEND_RT_VISIBLE_DEVICES="${VERL_SIDECAR_NPU_DEVICES}"
 export MASTER_ADDR="${VERL_SIDECAR_MASTER_ADDR}"
 export MASTER_PORT="${VERL_SIDECAR_MASTER_PORT}"
 export HCCL_IF_BASE_PORT="${VERL_SIDECAR_HCCL_IF_BASE_PORT}"
+export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_IF_BASE_PORT}-$((HCCL_IF_BASE_PORT + VERL_SIDECAR_HCCL_PORT_WINDOW - 1))"
+export HCCL_NPU_SOCKET_PORT_RANGE="$((HCCL_IF_BASE_PORT + VERL_SIDECAR_HCCL_PORT_WINDOW))-$((HCCL_IF_BASE_PORT + 2 * VERL_SIDECAR_HCCL_PORT_WINDOW - 1))"
 export VLLM_DP_MASTER_PORT="${VERL_SIDECAR_MASTER_PORT}"
 export VERL_SIDECAR_LOG_FILE
 export VERL_SIDECAR_OUTPUT_FILE
@@ -318,6 +331,7 @@ export VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED
 export VERL_SIDECAR_FORCE_HOST_IP_FOR_TP
 export VERL_SIDECAR_PARALLEL_MODE
 export VERL_SIDECAR_TENSOR_PARALLEL_SIZE
+export VERL_SIDECAR_DATA_PARALLEL_SIZE
 export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL
 export VERL_SIDECAR_MODEL_IS_MOE
 export VERL_SIDECAR_MODEL_IS_MOE_REASON
@@ -344,7 +358,7 @@ export VERL_SIDECAR_DATA_SPLIT="${VERL_SIDECAR_DATA_SPLIT:-train}"
 export VERL_SIDECAR_USE_SHORT_DATA="${VERL_SIDECAR_USE_SHORT_DATA:-0}"
 export VERL_SIDECAR_ENFORCE_EAGER="${VERL_SIDECAR_ENFORCE_EAGER:-1}"
 # Do not inherit the training rollout DP=16 into the sidecar unless explicitly requested.
-export VLLM_DP_SIZE="${VERL_SIDECAR_DP_SIZE:-1}"
+export VLLM_DP_SIZE="${VERL_SIDECAR_DATA_PARALLEL_SIZE}"
 export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export VLLM_LOGGING_LEVEL="${VERL_SIDECAR_VLLM_LOGGING_LEVEL:-INFO}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
@@ -353,7 +367,7 @@ if [[ "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "0" \
     && "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "false" \
     && "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "no" \
     && "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "off" \
-    && ( "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}" == "1" ) ]]; then
+    && ( "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}" == "1" ) ]]; then
     export VLLM_HOST_IP="${VERL_SIDECAR_MASTER_ADDR}"
     export VLLM_MULTIPROC_DISTRIBUTED_HOST_IP="${VERL_SIDECAR_MASTER_ADDR}"
     export VLLM_MULTIPROC_USE_HOST_IP=1
@@ -1114,6 +1128,15 @@ max_model_len = os.environ.get("VERL_SIDECAR_MAX_MODEL_LEN", "").strip()
 if max_model_len:
     engine_kwargs["max_model_len"] = int(max_model_len)
 
+data_parallel_size = int(os.environ.get("VERL_SIDECAR_DATA_PARALLEL_SIZE", "1"))
+if data_parallel_size > 1:
+    engine_kwargs["data_parallel_size"] = data_parallel_size
+    engine_kwargs["data_parallel_backend"] = os.environ.get(
+        "VERL_SIDECAR_DATA_PARALLEL_BACKEND", "mp")
+    data_parallel_rpc_port = os.environ.get("VERL_SIDECAR_DATA_PARALLEL_RPC_PORT", "").strip()
+    if data_parallel_rpc_port:
+        engine_kwargs["data_parallel_rpc_port"] = int(data_parallel_rpc_port)
+
 print(json.dumps({
     "event": "sidecar_load_start",
     "model_path": model_path,
@@ -1170,6 +1193,18 @@ sampling_params = SamplingParams(
     top_p=float(os.environ.get("VERL_SIDECAR_TOP_P", "1.0")),
     max_tokens=int(os.environ.get("VERL_SIDECAR_MAX_TOKENS", "1024")),
 )
+print(json.dumps({
+    "event": "sidecar_sampling_params",
+    "n": int(os.environ.get("VERL_SIDECAR_N", "1")),
+    "temperature": float(os.environ.get("VERL_SIDECAR_TEMPERATURE", "0.0")),
+    "top_p": float(os.environ.get("VERL_SIDECAR_TOP_P", "1.0")),
+    "max_tokens": int(os.environ.get("VERL_SIDECAR_MAX_TOKENS", "1024")),
+    "max_model_len": engine_kwargs.get("max_model_len"),
+    "max_num_seqs": engine_kwargs.get("max_num_seqs"),
+    "max_num_batched_tokens": engine_kwargs.get("max_num_batched_tokens"),
+    "shard_index": shard_index,
+    "num_shards": num_shards,
+}, ensure_ascii=False), flush=True)
 
 iteration = 0
 total_requests = 0
@@ -1370,6 +1405,7 @@ PY
     echo "sidecar_replica_count=${VERL_SIDECAR_REPLICA_COUNT}"
     echo "sidecar_parallel_mode=${VERL_SIDECAR_PARALLEL_MODE}"
     echo "sidecar_tensor_parallel_size=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}"
+    echo "sidecar_data_parallel_size=${VERL_SIDECAR_DATA_PARALLEL_SIZE}"
     echo "sidecar_device_groups=${VERL_SIDECAR_DEVICE_GROUPS}"
     echo "sidecar_unused_devices=${VERL_SIDECAR_UNUSED_DEVICES}"
     echo "sidecar_master_addr=${VERL_SIDECAR_MASTER_ADDR}"
@@ -1380,6 +1416,8 @@ PY
     echo "sidecar_master_port_base=${VERL_SIDECAR_MASTER_PORT}"
     echo "sidecar_master_port_stride=${VERL_SIDECAR_MASTER_PORT_STRIDE}"
     echo "sidecar_hccl_if_base_port=${VERL_SIDECAR_HCCL_IF_BASE_PORT}"
+    echo "sidecar_hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE}"
+    echo "sidecar_hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE}"
     echo "sidecar_hccl_if_base_port_fixed=${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED}"
     echo "sidecar_hccl_port_stride=${VERL_SIDECAR_HCCL_PORT_STRIDE}"
     echo "sidecar_hccl_port_window=${VERL_SIDECAR_HCCL_PORT_WINDOW}"
@@ -1448,12 +1486,14 @@ PY
         export ASCEND_RT_VISIBLE_DEVICES="${VERL_SIDECAR_PRIMARY_DEVICE_GROUP}"
         export VERL_SIDECAR_SHARD_INDEX=0
         export VERL_SIDECAR_NUM_SHARDS=1
+        echo "sidecar_shard_start_time=$(date +%s.%N) shard=0 device_group=${VERL_SIDECAR_PRIMARY_DEVICE_GROUP} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} dp=${VERL_SIDECAR_DATA_PARALLEL_SIZE} master_port=${MASTER_PORT} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${VERL_SIDECAR_OUTPUT_FILE}"
         timeout --kill-after=10s "${VERL_SIDECAR_MAX_SECONDS}s" python3 -u "${PY_SCRIPT}" 2>&1
         rc=$?
     else
         export ASCEND_RT_VISIBLE_DEVICES="${VERL_SIDECAR_PRIMARY_DEVICE_GROUP}"
         export VERL_SIDECAR_SHARD_INDEX=0
         export VERL_SIDECAR_NUM_SHARDS=1
+        echo "sidecar_shard_start_time=$(date +%s.%N) shard=0 device_group=${VERL_SIDECAR_PRIMARY_DEVICE_GROUP} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} dp=${VERL_SIDECAR_DATA_PARALLEL_SIZE} master_port=${MASTER_PORT} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${VERL_SIDECAR_OUTPUT_FILE}"
         python3 -u "${PY_SCRIPT}" 2>&1
         rc=$?
     fi

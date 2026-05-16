@@ -180,7 +180,7 @@ fi
 logfile="${HOME}/wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}${elastic_suffix}.txt"
 
 export VERL_SIDECAR_ENABLE=${VERL_SIDECAR_ENABLE:-1}
-export VERL_SIDECAR_MODEL_PATH=${VERL_SIDECAR_MODEL_PATH:-"/home/data/pangu-pro-moe-model"}
+export VERL_SIDECAR_MODEL_PATH=${VERL_SIDECAR_MODEL_PATH:-"/home/sharedata/models/pangu-pro-moe-model"}
 export VERL_SIDECAR_PROMPTS_FILE=${VERL_SIDECAR_PROMPTS_FILE:-"/home/qiuzy/verl_dev/data/gsm8k"}
 # Only keep non-default sidecar knobs here. Defaults live in
 # internal/run_elastic_sidecar_infer.sh.

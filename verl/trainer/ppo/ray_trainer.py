@@ -1221,8 +1221,25 @@ class RayPPOTrainer:
                     # generate a batch
                     beginning_gen_time = time.time()
                     with marked_timer("gen", timing_raw, color="red"):
+                        rollout_only_profile = (
+                            os.getenv("VLLM_ASCEND_DUMMY_WASTE_PROFILE_ROLLOUT_ONLY", "0")
+                            .lower() in ("1", "true", "yes", "on"))
                         if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            if rollout_only_profile:
+                                logger.info(
+                                    "Starting rollout-only dummy waste NPU profile: step=%s",
+                                    self.global_steps)
+                                self.actor_rollout_wg.start_profile(
+                                    role="dummy_waste_rollout",
+                                    profile_step=self.global_steps)
+                            try:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            finally:
+                                if rollout_only_profile:
+                                    logger.info(
+                                        "Stopping rollout-only dummy waste NPU profile: step=%s",
+                                        self.global_steps)
+                                    self.actor_rollout_wg.stop_profile()
                             self._restore_rollout_elastic_parallel_groups_if_needed()
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)

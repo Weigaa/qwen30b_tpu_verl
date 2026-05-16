@@ -18,6 +18,7 @@
 import gc
 import os
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from typing import Any, Callable, Optional
 
 import torch
@@ -70,6 +71,36 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         return max(minimum, int(os.getenv(name, str(default))))
     except (TypeError, ValueError):
         return max(minimum, default)
+
+
+@contextmanager
+def _dummy_profile_range(message: str):
+    if not _env_flag("VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS", "0"):
+        yield
+        return
+    range_id = None
+    try:
+        from torch_npu.npu import mstx
+        range_id = mstx.range_start(message=message)
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            mstx.range_end(range_id)
+        except Exception:
+            pass
+
+
+def _profile_rank() -> int:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return -1
 
 
 def _parse_layer_filter(value: str) -> Optional[set[int]]:
@@ -3119,6 +3150,58 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             debug_info["pre_topk_unique"] = int(
                 torch.unique(flat_topk_ids).numel()) if flat_topk_ids.numel() > 0 else 0
         logical_topk_ids = topk_ids
+        dummy_waste_timing = getattr(get_forward_context(),
+                                     "dummy_waste_timing", None)
+        dummy_profile_markers_enabled = (
+            bool(is_dummy)
+            and _env_flag("VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS", "0"))
+        dummy_selection_stats_enabled = _env_flag(
+            "VLLM_ASCEND_DUMMY_WASTE_SELECTION_STATS", "0")
+        dummy_selection_enabled = (
+            isinstance(dummy_waste_timing, dict)
+            and _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING", "0")
+            and dummy_selection_stats_enabled)
+        selected_topk_count = 0
+        selected_token_count = 0
+        selected_expert_count = 0
+        if dummy_selection_enabled:
+            try:
+                local_expert_map = expert_map
+                if local_expert_map is None:
+                    local_expert_map = getattr(layer, "expert_map", None)
+                if local_expert_map is not None and local_expert_map.numel() > 0:
+                    if local_expert_map.device != logical_topk_ids.device:
+                        local_expert_map = local_expert_map.to(
+                            device=logical_topk_ids.device)
+                    valid_ids = (
+                        (logical_topk_ids >= 0)
+                        & (logical_topk_ids < int(local_expert_map.numel())))
+                    safe_ids = logical_topk_ids.clamp(
+                        min=0, max=int(local_expert_map.numel()) - 1)
+                    local_slots = local_expert_map[safe_ids]
+                    selected_mask = valid_ids & (local_slots >= 0)
+                    selected_topk_count = int(
+                        torch.count_nonzero(selected_mask).item())
+                    if selected_mask.ndim > 1:
+                        selected_token_count = int(
+                            torch.count_nonzero(
+                                torch.any(selected_mask, dim=-1)).item())
+                    else:
+                        selected_token_count = selected_topk_count
+                    if selected_topk_count > 0:
+                        selected_expert_count = int(
+                            torch.unique(logical_topk_ids[selected_mask]).numel()
+                            .item())
+            except Exception:
+                logger.exception(
+                    "Failed to compute dummy local MoE selection stats")
+            if isinstance(dummy_waste_timing, dict):
+                dummy_waste_timing["_current_moe_selected_topk"] = (
+                    selected_topk_count)
+                dummy_waste_timing["_current_moe_selected_tokens"] = (
+                    selected_token_count)
+                dummy_waste_timing["_current_moe_selected_experts"] = (
+                    selected_expert_count)
         if (log2phy is not None
                 and moe_comm_method.__class__.__name__ != "AlltoAllCommImpl"):
             old_topk_ids = topk_ids
@@ -3643,18 +3726,24 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     )
                 return final_hidden_states
 
-        return self._execute_single_wave(
-            layer=layer,
-            hidden_states=x,
-            logical_topk_ids=logical_topk_ids,
-            topk_weights=topk_weights,
-            row_idx=row_idx,
-            global_num_experts=global_num_experts,
-            shared_experts=shared_experts,
-            log2phy=log2phy,
-            mc2_mask=None,
-            enable_force_load_balance=enable_force_load_balance,
-            kwargs=kwargs)
+        marker_ctx = nullcontext()
+        if dummy_profile_markers_enabled:
+            marker_ctx = _dummy_profile_range(
+                f"vllm_dummy_moe_compute rank={_profile_rank()} "
+                f"layer={layer_idx}")
+        with marker_ctx:
+            return self._execute_single_wave(
+                layer=layer,
+                hidden_states=x,
+                logical_topk_ids=logical_topk_ids,
+                topk_weights=topk_weights,
+                row_idx=row_idx,
+                global_num_experts=global_num_experts,
+                shared_experts=shared_experts,
+                log2phy=log2phy,
+                mc2_mask=None,
+                enable_force_load_balance=enable_force_load_balance,
+                kwargs=kwargs)
 
 
 class AscendFusedMoE(FusedMoE):
@@ -5883,6 +5972,24 @@ class AscendFusedMoE(FusedMoE):
                 self._hybrid_effective_comm_logged_key = current_key
 
         try:
+            dummy_waste_timing = getattr(forward_context,
+                                         "dummy_waste_timing", None)
+            dummy_moe_timing_enabled = (
+                isinstance(dummy_waste_timing, dict)
+                and _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING", "0"))
+            dummy_moe_start = 0.0
+            if dummy_moe_timing_enabled:
+                dummy_selection_stats_enabled = _env_flag(
+                    "VLLM_ASCEND_DUMMY_WASTE_SELECTION_STATS", "0")
+                dummy_waste_timing["_current_moe_selected_topk"] = 0
+                dummy_waste_timing["_current_moe_selected_tokens"] = 0
+                dummy_waste_timing["_current_moe_selected_experts"] = 0
+                if _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC", "0"):
+                    try:
+                        torch.npu.synchronize()
+                    except Exception:
+                        pass
+                dummy_moe_start = time.perf_counter()
             hidden_states, router_logits = forward_context.moe_comm_method.prepare(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -5938,6 +6045,71 @@ class AscendFusedMoE(FusedMoE):
             final_hidden_states = forward_context.moe_comm_method.finalize(
                 hidden_states=e_hidden_states,
                 reduce_results=(not self.all_reduce_merge))
+            if dummy_moe_timing_enabled:
+                dummy_moe_wall_ms = (
+                    time.perf_counter() - dummy_moe_start) * 1e3
+                dummy_moe_sync_wall_ms = 0.0
+                post_sync_overhead_ms = 0.0
+                if _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC", "0"):
+                    sync_start = time.perf_counter()
+                    try:
+                        torch.npu.synchronize()
+                    except Exception:
+                        pass
+                    dummy_moe_sync_wall_ms = (
+                        time.perf_counter() - dummy_moe_start) * 1e3
+                    post_sync_overhead_ms = (
+                        time.perf_counter() - sync_start) * 1e3
+                    # Keep the explicit post-op sync overhead visible for
+                    # debugging without folding it into the default wall metric.
+                dummy_waste_timing["moe_post_sync_overhead_ms"] = (
+                        dummy_waste_timing.get(
+                            "moe_post_sync_overhead_ms", 0.0)
+                        + post_sync_overhead_ms)
+                selected_topk_count = int(
+                    dummy_waste_timing.pop("_current_moe_selected_topk", 0))
+                selected_token_count = int(
+                    dummy_waste_timing.pop("_current_moe_selected_tokens", 0))
+                selected_expert_count = int(
+                    dummy_waste_timing.pop("_current_moe_selected_experts", 0))
+                selected_layer = (
+                    selected_topk_count > 0
+                    or not dummy_selection_stats_enabled)
+                dummy_waste_timing["moe_wall_ms"] = (
+                    dummy_waste_timing.get("moe_wall_ms", 0.0)
+                    + dummy_moe_wall_ms)
+                dummy_waste_timing["moe_total_sync_wall_ms"] = (
+                    dummy_waste_timing.get("moe_total_sync_wall_ms", 0.0)
+                    + dummy_moe_sync_wall_ms)
+                if selected_layer:
+                    dummy_waste_timing["moe_sync_wall_ms"] = (
+                        dummy_waste_timing.get("moe_sync_wall_ms", 0.0)
+                        + dummy_moe_sync_wall_ms)
+                    dummy_waste_timing["moe_selected_layers"] = (
+                        int(dummy_waste_timing.get("moe_selected_layers", 0))
+                        + 1)
+                    dummy_waste_timing["moe_selected_topk"] = (
+                        int(dummy_waste_timing.get("moe_selected_topk", 0))
+                        + selected_topk_count)
+                    dummy_waste_timing["moe_selected_tokens"] = (
+                        int(dummy_waste_timing.get("moe_selected_tokens", 0))
+                        + selected_token_count)
+                    dummy_waste_timing["moe_selected_experts"] = (
+                        int(dummy_waste_timing.get("moe_selected_experts", 0))
+                        + selected_expert_count)
+                else:
+                    dummy_waste_timing["moe_unselected_layers"] = (
+                        int(dummy_waste_timing.get("moe_unselected_layers", 0))
+                        + 1)
+                    dummy_waste_timing["moe_unselected_sync_wall_ms"] = (
+                        dummy_waste_timing.get(
+                            "moe_unselected_sync_wall_ms", 0.0)
+                        + dummy_moe_sync_wall_ms)
+                dummy_waste_timing["moe_layers"] = (
+                    int(dummy_waste_timing.get("moe_layers", 0)) + 1)
+                dummy_waste_timing["moe_tokens"] = (
+                    int(dummy_waste_timing.get("moe_tokens", 0))
+                    + int(hidden_states.shape[0]))
             if debug_enabled:
                 self.elastic_debug_budget = max(0, self.elastic_debug_budget - 1)
 

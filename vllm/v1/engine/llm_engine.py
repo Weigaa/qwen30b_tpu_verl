@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import time
 from collections.abc import Mapping
 from copy import copy
@@ -167,6 +168,35 @@ class LLMEngine:
         #new code here
         self.dummy_times = 0
         self.total_step_times = 0
+        self._elastic_util_log = os.getenv(
+            "VLLM_ASCEND_ELASTIC_UTIL_LOG", "0").lower() not in (
+                "0", "false", "no", "off")
+        self._elastic_util_bucket_steps = max(
+            1, int(os.getenv("VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS", "500")))
+        self._elastic_util_next_step = self._elastic_util_bucket_steps
+        self._elastic_util_local_output_tokens = 0
+        self._elastic_util_start_time = time.perf_counter()
+        self._elastic_op_profile_enabled = os.getenv(
+            "VLLM_ASCEND_BUCKET_OP_PROFILE", "0").lower() not in (
+                "0", "false", "no", "off")
+        self._elastic_op_profile_interval = max(
+            1,
+            int(
+                os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_INTERVAL_STEPS",
+                          str(self._elastic_util_bucket_steps))))
+        self._elastic_op_profile_start = int(
+            os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_START_STEP", "0"))
+        self._elastic_op_profile_end = int(
+            os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_END_STEP", "0"))
+        profile_buckets = os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_BUCKETS",
+                                    "").strip()
+        if profile_buckets:
+            self._elastic_op_profile_buckets = {
+                int(item)
+                for item in profile_buckets.split(",") if item.strip()
+            }
+        else:
+            self._elastic_op_profile_buckets = None
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
         self._logged_mc2_delay = False
@@ -311,6 +341,113 @@ class LLMEngine:
                 min_compute_group_size, original_dp_world_size)
             return False
         return True
+
+    def _maybe_log_elastic_util_bucket(self, local_new_tokens: int = 0) -> None:
+        if not getattr(self, "_elastic_util_log", False):
+            return
+        self._elastic_util_local_output_tokens += int(local_new_tokens)
+        step = int(getattr(self, "total_step_times", 0))
+        next_step = int(getattr(self, "_elastic_util_next_step", 500))
+        if step < next_step:
+            return
+
+        while step >= next_step:
+            bucket_step = next_step
+            next_step += int(getattr(self, "_elastic_util_bucket_steps", 500))
+        self._elastic_util_next_step = next_step
+
+        active_ranks = self.elastic_ep_runtime_active_ranks
+        if active_ranks is None:
+            active_ranks = self.elastic_ep_active_ranks
+        if active_ranks is not None:
+            active_count = len(active_ranks)
+            active_ranks_for_log = list(active_ranks)
+        else:
+            active_count = None
+            active_ranks_for_log = None
+
+        if self.elastic_ep_active_ranks is not None:
+            compute_world_size = len(self.elastic_ep_active_ranks)
+        elif isinstance(self.elastic_original_dp_world_size, int):
+            compute_world_size = self.elastic_original_dp_world_size
+        elif self.dp_group is not None:
+            compute_world_size = torch.distributed.get_world_size(
+                group=self.dp_group)
+        else:
+            compute_world_size = int(getattr(
+                self.vllm_config.parallel_config, "data_parallel_size", 1))
+
+        if active_count is None:
+            active_count = compute_world_size
+        util = (float(active_count) / float(compute_world_size)
+                if compute_world_size > 0 else 0.0)
+        try:
+            global_rank = torch.distributed.get_rank()
+        except Exception:
+            global_rank = 0
+        elapsed_s = time.perf_counter() - getattr(
+            self, "_elastic_util_start_time", time.perf_counter())
+        logger.info(
+            "Elastic decode util bucket: global_rank=%s step_bucket=%s step=%s active_count=%s compute_world_size=%s util=%.6f active_ranks=%s scaled_once=%s local_output_tokens=%s elapsed_s=%.3f",
+            global_rank, bucket_step, step, active_count, compute_world_size,
+            util, active_ranks_for_log, self.elastic_ep_scaled_once,
+            self._elastic_util_local_output_tokens, elapsed_s)
+
+    def _active_rank_context(self) -> tuple[int, int, Optional[list[int]]]:
+        active_ranks = self.elastic_ep_runtime_active_ranks
+        if active_ranks is None:
+            active_ranks = self.elastic_ep_active_ranks
+        active_ranks_for_log = list(active_ranks) if active_ranks is not None else None
+
+        if self.elastic_ep_active_ranks is not None:
+            compute_world_size = len(self.elastic_ep_active_ranks)
+        elif isinstance(self.elastic_original_dp_world_size, int):
+            compute_world_size = self.elastic_original_dp_world_size
+        elif self.dp_group is not None:
+            compute_world_size = torch.distributed.get_world_size(
+                group=self.dp_group)
+        else:
+            compute_world_size = int(
+                getattr(self.vllm_config.parallel_config,
+                        "data_parallel_size", 1))
+        active_count = (len(active_ranks)
+                        if active_ranks is not None else compute_world_size)
+        return active_count, compute_world_size, active_ranks_for_log
+
+    def _maybe_arm_elastic_op_profile(self, kind: str) -> None:
+        if not getattr(self, "_elastic_op_profile_enabled", False):
+            return
+        step = int(getattr(self, "total_step_times", 0))
+        buckets = getattr(self, "_elastic_op_profile_buckets", None)
+        if buckets is not None:
+            if step not in buckets:
+                return
+            bucket = step
+        else:
+            start = int(getattr(self, "_elastic_op_profile_start", 0))
+            end = int(getattr(self, "_elastic_op_profile_end", 0))
+            interval = int(getattr(self, "_elastic_op_profile_interval", 500))
+            if step <= 0 or (start and step < start) or (end and step > end):
+                return
+            if step % interval != 0:
+                return
+            bucket = step
+
+        active_count, compute_world_size, active_ranks = (
+            self._active_rank_context())
+        context = {
+            "bucket": bucket,
+            "step": step,
+            "kind": kind,
+            "active_count": active_count,
+            "compute_world_size": compute_world_size,
+            "active_ranks": active_ranks,
+        }
+        self.engine_core.collective_rpc("set_elastic_op_profile_context",
+                                        args=(context, ))
+        logger.info(
+            "Elastic op profile armed: step_bucket=%s step=%s kind=%s active_count=%s compute_world_size=%s active_ranks=%s",
+            bucket, step, kind, active_count, compute_world_size, active_ranks)
 
     def has_unfinished_requests_dp(self, has_unfinished: bool) -> bool:
         active_global_ranks = self._get_active_dp_global_ranks(has_unfinished)
@@ -555,7 +692,9 @@ class LLMEngine:
             #record dummy_run time
             # print("rank", torch.distributed.get_rank(group=self.dp_group), "executed dummy batch")
             # begin_time = time.time()
+            self._maybe_arm_elastic_op_profile("dummy")
             self.engine_core.execute_dummy_batch()
+            self._maybe_log_elastic_util_bucket(local_new_tokens=0)
             # end=time.time()
             # self.dummy_times += 1
             # print("rank", torch.distributed.get_rank(group=self.dp_group), "dummy_times:", self.dummy_times)
@@ -567,6 +706,7 @@ class LLMEngine:
         if not getattr(self, "_elastic_first_live_step_entered", False):
             logger.info("Elastic first live step: entering engine_core.get_output")
             self._elastic_first_live_step_entered = True
+        self._maybe_arm_elastic_op_profile("live")
         outputs = self.engine_core.get_output()
         if (getattr(self, "_elastic_first_live_step_entered", False)
                 and not getattr(self, "_elastic_first_live_step_returned", False)):
@@ -575,10 +715,14 @@ class LLMEngine:
 
         # 2) Process EngineCoreOutputs.
         iteration_stats = IterationStats() if self.log_stats else None
+        local_new_tokens = 0
+        for output in outputs.outputs:
+            local_new_tokens += len(getattr(output, "new_token_ids", ()) or ())
         processed_outputs = self.output_processor.process_outputs(
             outputs.outputs,
             engine_core_timestamp=outputs.timestamp,
             iteration_stats=iteration_stats)
+        self._maybe_log_elastic_util_bucket(local_new_tokens=local_new_tokens)
 
         # 3) Abort any reqs that finished due to stop strings.
         self.engine_core.abort_requests(processed_outputs.reqs_to_abort)

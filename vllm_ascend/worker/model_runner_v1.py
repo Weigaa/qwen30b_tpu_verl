@@ -155,6 +155,49 @@ else:
 from vllm.utils.moe_stats import moe_stats
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _dummy_waste_rank() -> int:
+    if dist.is_available() and dist.is_initialized():
+        try:
+            return int(dist.get_rank())
+        except Exception:
+            pass
+    return -1
+
+
+def _dummy_waste_sync() -> None:
+    if not _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC", "0"):
+        return
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+
+
+@contextmanager
+def _dummy_profile_range(message: str):
+    if not _env_flag("VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS", "0"):
+        yield
+        return
+    range_id = None
+    try:
+        from torch_npu.npu import mstx
+        range_id = mstx.range_start(message=message)
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            mstx.range_end(range_id)
+        except Exception:
+            pass
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.npu.Stream
@@ -2659,6 +2702,28 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         #     print("rank", self.dp_rank, "before num_tokens {},After sync dummy run num_tokens {}, num_tokens_across_dp {}, with_prefill {}".format(before_num_tokens, num_tokens, num_tokens_across_dp, with_prefill))
         
         moe_comm_type = self._select_moe_comm_method(num_tokens, with_prefill)
+        dummy_waste_timing_enabled = (
+            _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING", "0")
+            and (_env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE", "0")
+                 or not self.in_profile_run))
+        dummy_waste_timing = None
+        dummy_wall_start = 0.0
+        if dummy_waste_timing_enabled:
+            _dummy_waste_sync()
+            dummy_wall_start = time.perf_counter()
+            dummy_waste_timing = {
+                "moe_wall_ms": 0.0,
+                "moe_sync_wall_ms": 0.0,
+                "moe_total_sync_wall_ms": 0.0,
+                "moe_unselected_sync_wall_ms": 0.0,
+                "moe_layers": 0,
+                "moe_selected_layers": 0,
+                "moe_unselected_layers": 0,
+                "moe_selected_topk": 0,
+                "moe_selected_tokens": 0,
+                "moe_selected_experts": 0,
+                "moe_tokens": 0,
+            }
 
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.seperate_routine(). This means that we are using
@@ -2803,12 +2868,22 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     prefetch_stream=self.prefetch_stream,
                     moe_prefetch_stream=self.moe_prefetch_stream,
                     model_instance=self.model):
-                hidden_states = self._generate_dummy_run_hidden_states(
-                    with_prefill, is_torchair_compile, input_ids, positions,
-                    attn_metadata, num_tokens, intermediate_tensors,
-                    inputs_embeds, is_long_tail)
-                if need_dummy_logits:
-                    dummy_compute_logits(hidden_states)
+                if dummy_waste_timing_enabled:
+                    forward_context = get_forward_context()
+                    setattr(forward_context, "dummy_waste_timing",
+                            dummy_waste_timing)
+                marker = (
+                    f"vllm_dummy_forward rank={_dummy_waste_rank()} "
+                    f"dp_rank={self.dp_rank} local_tokens={before_num_tokens} "
+                    f"synced_tokens={num_tokens} prefill={int(with_prefill)} "
+                    f"long_tail={int(is_long_tail)}")
+                with _dummy_profile_range(marker):
+                    hidden_states = self._generate_dummy_run_hidden_states(
+                        with_prefill, is_torchair_compile, input_ids, positions,
+                        attn_metadata, num_tokens, intermediate_tensors,
+                        inputs_embeds, is_long_tail)
+                    if need_dummy_logits:
+                        dummy_compute_logits(hidden_states)
 
             if self.drafter:
                 self.drafter.dummy_run(
@@ -2824,6 +2899,60 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if not self.in_profile_run and self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
                 self.eplb_updator.forward_end()
+            if dummy_waste_timing_enabled:
+                _dummy_waste_sync()
+                dummy_wall_ms = (time.perf_counter() - dummy_wall_start) * 1e3
+                moe_wall_ms = float(dummy_waste_timing.get("moe_wall_ms", 0.0))
+                moe_sync_wall_ms = float(
+                    dummy_waste_timing.get("moe_sync_wall_ms", 0.0))
+                moe_total_sync_wall_ms = float(
+                    dummy_waste_timing.get("moe_total_sync_wall_ms", 0.0))
+                moe_unselected_sync_wall_ms = float(
+                    dummy_waste_timing.get("moe_unselected_sync_wall_ms", 0.0))
+                # sync_wall is more conservative when enabled; wall is useful
+                # when collecting low-overhead samples.
+                moe_effective_ms = (moe_sync_wall_ms
+                                    if moe_sync_wall_ms > 0.0 else moe_wall_ms)
+                wasted_ms = max(0.0, dummy_wall_ms - moe_effective_ms)
+                logger.info(
+                    "Dummy waste timing: rank=%s dp_rank=%s num_tokens_before=%s "
+                    "num_tokens_synced=%s with_prefill=%s local_with_prefill=%s "
+                    "is_long_tail=%s need_allreduce=%s in_profile_run=%s "
+                    "moe_comm_type=%s dummy_wall_ms=%.3f "
+                    "dummy_moe_wall_ms=%.3f dummy_moe_sync_wall_ms=%.3f "
+                    "dummy_moe_total_sync_wall_ms=%.3f "
+                    "dummy_moe_unselected_sync_wall_ms=%.3f "
+                    "dummy_moe_effective_ms=%.3f dummy_wasted_ms=%.3f "
+                    "dummy_moe_layers=%s dummy_moe_selected_layers=%s "
+                    "dummy_moe_unselected_layers=%s "
+                    "dummy_moe_selected_topk=%s "
+                    "dummy_moe_selected_tokens=%s "
+                    "dummy_moe_selected_experts=%s dummy_moe_tokens=%s",
+                    _dummy_waste_rank(),
+                    self.dp_rank,
+                    before_num_tokens,
+                    num_tokens,
+                    with_prefill,
+                    local_with_prefill,
+                    is_long_tail,
+                    self.need_allreduce,
+                    self.in_profile_run,
+                    moe_comm_type,
+                    dummy_wall_ms,
+                    moe_wall_ms,
+                    moe_sync_wall_ms,
+                    moe_total_sync_wall_ms,
+                    moe_unselected_sync_wall_ms,
+                    moe_effective_ms,
+                    wasted_ms,
+                    int(dummy_waste_timing.get("moe_layers", 0)),
+                    int(dummy_waste_timing.get("moe_selected_layers", 0)),
+                    int(dummy_waste_timing.get("moe_unselected_layers", 0)),
+                    int(dummy_waste_timing.get("moe_selected_topk", 0)),
+                    int(dummy_waste_timing.get("moe_selected_tokens", 0)),
+                    int(dummy_waste_timing.get("moe_selected_experts", 0)),
+                    int(dummy_waste_timing.get("moe_tokens", 0)),
+                )
             return hidden_states
 
     @contextmanager

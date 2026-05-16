@@ -111,7 +111,7 @@ export VLLM_ASCEND_DRAFT_ASYNC_TRAIN=0
 #    - mode=3 不依赖冗余专家；运行时 expert double buffer 固定为 128 expert slots
 #    - VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS 在 mode=3 下只保留
 #      primary prefix 语义，不再决定运行时 buffer 容量
-export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE:-1}
+export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE:-0}
 # 弹性缩容的最小计算组:
 #   1  -> 允许在 2-rank 阶段后进入 single-rank no-EP tail
 #   2/4/8/16 -> 最多缩到该 floor 结束，不再进入 1-rank tail
@@ -173,7 +173,21 @@ export VLLM_ASCEND_MODE3_TIMING_LAYERS=${VLLM_ASCEND_MODE3_TIMING_LAYERS:-all}
 export VLLM_MOE_PATTERN_STATS=${VLLM_MOE_PATTERN_STATS:-0}  # 1: enable MoE pattern stats collection, 0: disable
 export VLLM_MOE_STATS=${VLLM_MOE_PATTERN_STATS}
 export VLLM_MOE_STATS_DIR=${VLLM_MOE_STATS_DIR:-./moe_stats}
-echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS}"
+# Per-rank dummy waste accounting for baseline runs. Each dummy run emits one
+# parseable line:
+#   Dummy waste timing: rank=... dummy_wall_ms=... dummy_moe_selected_layers=... dummy_moe_effective_ms=... dummy_wasted_ms=...
+# Aggregate by rank as:
+#   wasted_time = sum(dummy_wasted_ms)
+#   effective_time = rollout_wall_time - sum(dummy_wall_ms) + sum(dummy_moe_effective_ms)
+# dummy_moe_effective_ms only includes MoE layers whose selected experts hit
+# the local rank; dummy attention and unselected MoE layers are counted wasted.
+export VLLM_ASCEND_DUMMY_WASTE_TIMING=${VLLM_ASCEND_DUMMY_WASTE_TIMING:-0}
+export VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC:-0}
+export VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE:-0}
+export VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS:-0}
+export VLLM_ASCEND_ELASTIC_UTIL_LOG=${VLLM_ASCEND_ELASTIC_UTIL_LOG:-0}
+export VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS:-500}
+echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} dummy_waste_timing=${VLLM_ASCEND_DUMMY_WASTE_TIMING} dummy_waste_sync=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC} dummy_waste_profile=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE} dummy_waste_markers=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS} elastic_util_log=${VLLM_ASCEND_ELASTIC_UTIL_LOG} elastic_util_bucket_steps=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS}"
 #模拟样本缩短规则
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
@@ -209,7 +223,7 @@ if [ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" != "0" ]; then
 fi
 logfile="${HOME}/wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}${elastic_suffix}.txt"
 
-export VERL_SIDECAR_ENABLE=${VERL_SIDECAR_ENABLE:-1}
+export VERL_SIDECAR_ENABLE=${VERL_SIDECAR_ENABLE:-0}
 export VERL_SIDECAR_MODEL_PATH=${VERL_SIDECAR_MODEL_PATH:-"/home/data/Qwen2.5-1.5B-Instruct"}
 export VERL_SIDECAR_PROMPTS_FILE=${VERL_SIDECAR_PROMPTS_FILE:-"/home/qiuzy/verl_dev/data/gsm8k"}
 export VERL_SIDECAR_DATA_SPLIT=${VERL_SIDECAR_DATA_SPLIT:-train}

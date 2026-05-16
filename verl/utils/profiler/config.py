@@ -78,7 +78,7 @@ class TorchMemoryToolConfig(BaseConfig):
 class NPUToolConfig(NsightToolConfig):
     """NPU profiler too; config."""
 
-    # options: npu, cpu, memory, shapes, module, stack
+    # options: npu, cpu, mstx, memory, shapes, module, stack
     contents: list[str] = field(default_factory=list)
 
     # Collection level, optional values: level_none, level0, level1, level2.
@@ -93,8 +93,8 @@ class NPUToolConfig(NsightToolConfig):
         assert isinstance(self.level, str), f"Profiler level must be of type str, got {type(self.level)}"
         assert isinstance(self.analysis, bool), f"Profiler analysis must be of type bool, got {type(self.analysis)}"
         for content in self.contents:
-            assert content in ["npu", "cpu", "memory", "shapes", "module", "stack"], (
-                f"Profiler contents only supports npu, cpu, memory, shapes, module, stack, but gets {content}"
+            assert content in ["npu", "cpu", "mstx", "memory", "shapes", "module", "stack"], (
+                f"Profiler contents only supports npu, cpu, mstx, memory, shapes, module, stack, but gets {content}"
             )
         assert self.level in ["level_none", "level0", "level1", "level2"], (
             f"Profiler level only supports level0, 1, 2, and level_none, but gets {self.level}"
