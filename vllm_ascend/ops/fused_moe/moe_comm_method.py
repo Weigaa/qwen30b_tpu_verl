@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from collections import Counter
 from dataclasses import dataclass
@@ -41,16 +42,99 @@ logger = logging.getLogger(__name__)
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
 _chunk_debug_total = 0
 _chunk_debug_summary = Counter()
+_stage_debug_total = 0
+_stage_debug_seen = 0
+_stage_debug_summary = Counter()
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
 
 
+_CHUNK_DEBUG_ENABLED = _env_flag("VLLM_ASCEND_MOE_CHUNK_DEBUG")
+_CHUNK_DEBUG_INTERVAL = int(os.getenv("VLLM_ASCEND_MOE_CHUNK_DEBUG_INTERVAL",
+                                      "1024"))
+_STAGE_DEBUG_ENABLED = _env_flag("VLLM_ASCEND_MOE_STAGE_DEBUG")
+_STAGE_DEBUG_INTERVAL = int(os.getenv("VLLM_ASCEND_MOE_STAGE_DEBUG_INTERVAL",
+                                      "1024"))
+_SIMPLE_MC2_ENABLED = _env_flag("VLLM_ASCEND_FUSED_MOE_SIMPLE_MC2")
+_TENSOR_FASTPATH_ENABLED = _env_flag("VLLM_ASCEND_FUSED_MOE_TENSOR_FASTPATH")
+
+
+def _maybe_new_timing_event() -> torch.npu.Event | None:
+    try:
+        return torch.npu.Event(enable_timing=True)
+    except TypeError:
+        return torch.npu.Event()
+
+
+def _should_capture_stage_timing() -> bool:
+    if not _STAGE_DEBUG_ENABLED:
+        return False
+    global _stage_debug_seen
+    _stage_debug_seen += 1
+    return _stage_debug_seen <= 32 or (
+        _STAGE_DEBUG_INTERVAL > 0
+        and _stage_debug_seen % _STAGE_DEBUG_INTERVAL == 0
+    )
+
+
+if _STAGE_DEBUG_ENABLED:
+    # In compiled-eager runs Dynamo can otherwise constant-fold the first True
+    # decision and keep recording NPU events every decode step. Keep the
+    # profiling gate dynamic when the debug knob is explicitly enabled.
+    _should_capture_stage_timing = torch._dynamo.disable(
+        _should_capture_stage_timing)
+
+
+def _record_event() -> torch.npu.Event | None:
+    event = _maybe_new_timing_event()
+    if event is not None:
+        torch.npu.current_stream().record_event(event)
+    return event
+
+
+def _elapsed_ms(start_event: torch.npu.Event,
+                end_event: torch.npu.Event) -> float:
+    end_event.synchronize()
+    return float(start_event.elapsed_time(end_event))
+
+
+def _maybe_log_stage_timing(*, num_tokens: int,
+                            moe_comm_type: MoECommType | None,
+                            dispatch_ms: float,
+                            mlp_ms: float,
+                            combine_ms: float,
+                            total_ms: float) -> None:
+    global _stage_debug_total
+    _stage_debug_total += 1
+    comm_name = "None" if moe_comm_type is None else moe_comm_type.name
+    token_bucket = 1 << (max(num_tokens, 1) - 1).bit_length()
+    _stage_debug_summary[(comm_name, token_bucket)] += 1
+
+    summary = ", ".join(
+        f"{comm}/tokens<={bucket}:{count}"
+        for (comm, bucket), count in sorted(_stage_debug_summary.items()))
+    logger.info(
+        "MoE stage timing pid=%s call=%d comm=%s tokens=%s "
+        "dispatch_ms=%.3f mlp_ms=%.3f combine_ms=%.3f total_ms=%.3f "
+        "summary={%s}",
+        os.getpid(),
+        _stage_debug_total,
+        comm_name,
+        num_tokens,
+        dispatch_ms,
+        mlp_ms,
+        combine_ms,
+        total_ms,
+        summary,
+    )
+
+
 def _maybe_log_chunk_plan(*, num_tokens: int, max_tokens: int,
                           chunk_moe_size: int,
                           moe_comm_type: MoECommType | None) -> None:
-    if not _env_flag("VLLM_ASCEND_MOE_CHUNK_DEBUG"):
+    if not _CHUNK_DEBUG_ENABLED:
         return
 
     global _chunk_debug_total
@@ -61,9 +145,9 @@ def _maybe_log_chunk_plan(*, num_tokens: int, max_tokens: int,
     comm_name = "None" if moe_comm_type is None else moe_comm_type.name
     _chunk_debug_summary[(comm_name, chunks, dummy_chunks)] += 1
 
-    interval = int(os.getenv("VLLM_ASCEND_MOE_CHUNK_DEBUG_INTERVAL", "1024"))
-    if _chunk_debug_total <= 32 or (
-            interval > 0 and _chunk_debug_total % interval == 0):
+    if _chunk_debug_total <= 32 or (_CHUNK_DEBUG_INTERVAL > 0
+                                    and _chunk_debug_total %
+                                    _CHUNK_DEBUG_INTERVAL == 0):
         summary = ", ".join(
             f"{comm}/chunks={chunk}/dummy={dummy}:{count}"
             for (comm, chunk, dummy), count in sorted(
@@ -96,6 +180,7 @@ def chunk_moe_decorator(fused_experts_func):
         hidden_states = get_arg('hidden_states', kwargs)
         topk_weights = get_arg('topk_weights', kwargs)
         topk_ids = get_arg('topk_ids', kwargs)
+        mc2_mask = get_arg('mc2_mask', kwargs)
 
         chunk_start_index = 0
         ctx = get_forward_context()
@@ -103,18 +188,20 @@ def chunk_moe_decorator(fused_experts_func):
         tp_size = get_tensor_model_parallel_world_size()
         max_tokens = (ctx.max_tokens_across_dp + tp_size - 1) // tp_size
 
-        _maybe_log_chunk_plan(
-            num_tokens=hidden_states.size(0),
-            max_tokens=max_tokens,
-            chunk_moe_size=chunk_moe_size,
-            moe_comm_type=getattr(ctx, "moe_comm_type", None),
-        )
+        if _CHUNK_DEBUG_ENABLED:
+            _maybe_log_chunk_plan(
+                num_tokens=hidden_states.size(0),
+                max_tokens=max_tokens,
+                chunk_moe_size=chunk_moe_size,
+                moe_comm_type=getattr(ctx, "moe_comm_type", None),
+            )
 
         if max_tokens <= chunk_moe_size:
             return fused_experts_func(
                 hidden_states=hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                mc2_mask=mc2_mask,
                 *args,
                 **kwargs
             )
@@ -132,14 +219,19 @@ def chunk_moe_decorator(fused_experts_func):
             chunk_hidden_states = hidden_states[chunk_start:chunk_end]
             chunk_topk_ids = topk_ids[chunk_start:chunk_end]
             chunk_topk_weights = topk_weights[chunk_start:chunk_end]
+            chunk_mc2_mask = None
+            if mc2_mask is not None:
+                chunk_mc2_mask = mc2_mask[chunk_start:chunk_end]
             update_kwargs = dict(**kwargs)
             if update_kwargs.get('shared_experts'):
                 update_kwargs['shared_experts'] = update_kwargs['shared_experts'][chunk_start:chunk_end]
-            
+
             res = fused_experts_func(
                 hidden_states=chunk_hidden_states,
                 topk_weights=chunk_topk_weights,
                 topk_ids=chunk_topk_ids,
+                mc2_mask=chunk_mc2_mask,
+                _force_result_object=True,
                 *args,
                 **update_kwargs
             )
@@ -261,7 +353,8 @@ class MoECommMethod(ABC):
             dynamic_eplb: bool = False,
             mc2_mask: torch.Tensor = None,
             record_events: bool = False,
-            pertoken_scale: Optional[torch.Tensor] = None):
+            pertoken_scale: Optional[torch.Tensor] = None,
+            _force_result_object: bool = False):
         # Check constraints
         assert hidden_states.dtype in [
             torch.float32, torch.float16, torch.bfloat16, torch.int8
@@ -278,6 +371,79 @@ class MoECommMethod(ABC):
         if log2phy is not None:
             topk_ids = log2phy[topk_ids]
 
+        capture_stage_timing = False
+        if _STAGE_DEBUG_ENABLED:
+            capture_stage_timing = _should_capture_stage_timing()
+        stage_start_evt = _record_event() if capture_stage_timing else None
+        if (_SIMPLE_MC2_ENABLED
+                and isinstance(self.token_dispatcher, TokenDispatcherWithMC2)):
+            dispatch_results = self.token_dispatcher.token_dispatch_stateful(
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+                global_redundant_expert_num=self.moe_config.
+                global_redundant_expert_num,
+                mc2_mask=mc2_mask,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                with_quant=use_int8_w8a8 or use_int4_w4a8,
+                dynamic_eplb=dynamic_eplb,
+                pertoken_scale=pertoken_scale)
+            after_dispatch_evt = _record_event() if capture_stage_timing else None
+
+            dispatch_hidden_states, dynamic_scale, group_list, group_list_type, topk_scales = dispatch_results
+            mlp_output = unified_apply_mlp(
+                hidden_states=dispatch_hidden_states,
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                group_list=group_list,
+                dynamic_scale=dynamic_scale,
+                group_list_type=group_list_type,
+                w1_scale_bias=w1_scale_bias,
+                w2_scale_bias=w2_scale_bias,
+                w1_offset=w1_offset,
+                w2_offset=w2_offset,
+                topk_scales=topk_scales,
+                with_quant=use_int8_w8a8 or use_int4_w4a8 or use_int4_w4a16,
+                fusion=use_int8_w8a8 and self.use_fusion_ops,
+                need_trans=need_trans,
+                dynamic_eplb=dynamic_eplb)
+            after_mlp_evt = _record_event() if capture_stage_timing else None
+
+            before_combine_evt = (
+                torch.npu.current_stream().record_event()
+                if record_events else None
+            )
+            routed_out = self.token_dispatcher.token_combine_stateful(
+                hidden_states=mlp_output)
+            after_combine_evt = _record_event() if capture_stage_timing else None
+
+            if (stage_start_evt is not None and after_dispatch_evt is not None
+                    and after_mlp_evt is not None and after_combine_evt is not None):
+                _maybe_log_stage_timing(
+                    num_tokens=hidden_states.size(0),
+                    moe_comm_type=getattr(get_forward_context(),
+                                          "moe_comm_type", None),
+                    dispatch_ms=_elapsed_ms(stage_start_evt,
+                                            after_dispatch_evt),
+                    mlp_ms=_elapsed_ms(after_dispatch_evt, after_mlp_evt),
+                    combine_ms=_elapsed_ms(after_mlp_evt, after_combine_evt),
+                    total_ms=_elapsed_ms(stage_start_evt, after_combine_evt),
+                )
+
+            if (_TENSOR_FASTPATH_ENABLED and not _force_result_object
+                    and not record_events and not dynamic_eplb):
+                return routed_out
+
+            return FusedExpertsResult(
+                routed_out=routed_out,
+                before_dispatch_evt=before_dispatch_evt,
+                before_combine_evt=before_combine_evt,
+                group_list_type=group_list_type,
+                expert_tokens=group_list)
+
         dispatch_results = self.token_dispatcher.token_dispatch(
             hidden_states=hidden_states,
             topk_weights=topk_weights,
@@ -290,6 +456,7 @@ class MoECommMethod(ABC):
             with_quant=use_int8_w8a8 or use_int4_w4a8,
             dynamic_eplb=dynamic_eplb,
             pertoken_scale=pertoken_scale)
+        after_dispatch_evt = _record_event() if capture_stage_timing else None
 
         mlp_output = unified_apply_mlp(
             hidden_states=dispatch_results.hidden_states,
@@ -309,6 +476,7 @@ class MoECommMethod(ABC):
             fusion=use_int8_w8a8 and self.use_fusion_ops,
             need_trans=need_trans,
             dynamic_eplb=dynamic_eplb)
+        after_mlp_evt = _record_event() if capture_stage_timing else None
 
         before_combine_evt = (
             torch.npu.current_stream().record_event()
@@ -317,6 +485,19 @@ class MoECommMethod(ABC):
         combine_results = self.token_dispatcher.token_combine(
             hidden_states=mlp_output,
             context_metadata=dispatch_results.context_metadata)
+        after_combine_evt = _record_event() if capture_stage_timing else None
+
+        if (stage_start_evt is not None and after_dispatch_evt is not None
+                and after_mlp_evt is not None and after_combine_evt is not None):
+            _maybe_log_stage_timing(
+                num_tokens=hidden_states.size(0),
+                moe_comm_type=getattr(get_forward_context(), "moe_comm_type",
+                                      None),
+                dispatch_ms=_elapsed_ms(stage_start_evt, after_dispatch_evt),
+                mlp_ms=_elapsed_ms(after_dispatch_evt, after_mlp_evt),
+                combine_ms=_elapsed_ms(after_mlp_evt, after_combine_evt),
+                total_ms=_elapsed_ms(stage_start_evt, after_combine_evt),
+            )
 
         return FusedExpertsResult(
             routed_out=combine_results.routed_out,
@@ -376,7 +557,12 @@ class MC2CommImpl(MoECommMethod):
     """
 
     def _get_token_dispatcher(self):
-        return TokenDispatcherWithMC2()
+        if _env_flag("VLLM_ASCEND_MC2_LEGACY_DISPATCHER_INIT"):
+            return TokenDispatcherWithMC2()
+        return TokenDispatcherWithMC2(
+            top_k=self.moe_config.experts_per_token,
+            num_experts=self.moe_config.num_experts,
+            num_local_experts=self.moe_config.num_local_experts)
 
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithMC2(self.moe_config)
@@ -413,7 +599,12 @@ class FusedMC2CommImpl(MoECommMethod):
     """
 
     def _get_token_dispatcher(self):
-        return TokenDispatcherWithMC2()
+        if _env_flag("VLLM_ASCEND_MC2_LEGACY_DISPATCHER_INIT"):
+            return TokenDispatcherWithMC2()
+        return TokenDispatcherWithMC2(
+            top_k=self.moe_config.experts_per_token,
+            num_experts=self.moe_config.num_experts,
+            num_local_experts=self.moe_config.num_local_experts)
 
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithMC2(self.moe_config)

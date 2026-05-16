@@ -14,11 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
 from typing import Callable, Optional
 
 import torch
+import torch_npu
 
 from vllm_ascend.utils import get_weight_prefetch_method
+
+_SOFTMAX_TOPK_ENABLED = os.getenv(
+    "VLLM_ASCEND_FUSED_MOE_SOFTMAX_TOPK", "0").lower() in (
+        "1", "true", "yes")
+_SOFTMAX_TOPK_FAILED = False
 
 
 def select_experts(hidden_states: torch.Tensor,
@@ -82,6 +89,16 @@ def select_experts(hidden_states: torch.Tensor,
             scoring_func=scoring_func,
             routed_scaling_factor=routed_scaling_factor,
             global_num_experts=global_num_experts)
+    elif _can_use_softmax_topk_fusion(use_grouped_topk,
+                                      custom_routing_function,
+                                      scoring_func,
+                                      e_score_correction_bias):
+        topk_weights, topk_ids = _select_experts_with_softmax_topk(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=top_k,
+            renormalize=renormalize,
+        )
     else:
         topk_weights, topk_ids = _native_select_experts(
             hidden_states=hidden_states,
@@ -97,6 +114,45 @@ def select_experts(hidden_states: torch.Tensor,
             global_num_experts=global_num_experts,
         )
     return topk_weights, topk_ids
+
+
+def _can_use_softmax_topk_fusion(
+        use_grouped_topk: bool,
+        custom_routing_function: Optional[Callable],
+        scoring_func: str,
+        e_score_correction_bias: Optional[torch.Tensor]) -> bool:
+    if not _SOFTMAX_TOPK_ENABLED or _SOFTMAX_TOPK_FAILED:
+        return False
+    return (not use_grouped_topk and custom_routing_function is None
+            and e_score_correction_bias is None and scoring_func == "softmax")
+
+
+def _select_experts_with_softmax_topk(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    global _SOFTMAX_TOPK_FAILED
+    try:
+        topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(
+            x=router_logits, finished=None, k=top_k)
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
+        topk_weights = topk_weights.to(hidden_states.dtype)
+        return topk_weights, topk_ids
+    except Exception:
+        _SOFTMAX_TOPK_FAILED = True
+        if os.getenv("VLLM_ASCEND_FUSED_MOE_SOFTMAX_TOPK_STRICT",
+                     "0").lower() in ("1", "true", "yes"):
+            raise
+        return _native_select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=False,
+            renormalize=renormalize,
+            scoring_func="softmax",
+        )
 
 
 def check_npu_moe_gating_top_k(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import inspect
+import os
 from collections.abc import Callable
 from functools import wraps
 
@@ -18,6 +19,14 @@ def maybe_transfer_kv_layer(func: Callable) -> Callable:
     On entry: waits for the KV layer from the connector.
     On exit: saves the KV layer to the connector.
     """
+    if os.getenv("VLLM_SKIP_KV_TRANSFER_DECORATOR", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return func
+
     # Import at runtime to avoid circular dependency
     from vllm.attention.layer import get_attention_context
 

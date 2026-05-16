@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
@@ -34,6 +35,15 @@ from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.moe.comm_utils import (_gather_along_first_dim,
                                             async_all_to_all)
 from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
+
+_SKIP_MC2_MASK_SHAPE_CHECK = os.getenv(
+    "VLLM_ASCEND_MOE_SKIP_MC2_MASK_SHAPE_CHECK",
+    os.getenv("VLLM_QWEN3_MOE_ASCEND_LEGACY_STACK", "0")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class MoETokenDispatcher(ABC):
@@ -190,7 +200,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                 raise RuntimeError(
                     "MC2 dispatch_v2 on A3 requires x_active_mask/mc2_mask.")
             mc2_mask = mc2_mask.to(device=hidden_states.device, dtype=torch.bool)
-            if mc2_mask.shape[0] != hidden_states.shape[0]:
+            if (not _SKIP_MC2_MASK_SHAPE_CHECK
+                    and mc2_mask.shape[0] != hidden_states.shape[0]):
                 raise RuntimeError(
                     "MC2 dispatch mask length mismatch: "
                     f"hidden_tokens={hidden_states.shape[0]} "

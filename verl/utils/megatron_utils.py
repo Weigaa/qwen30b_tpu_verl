@@ -19,6 +19,7 @@
 import gc
 import inspect
 import os
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +42,21 @@ from verl.utils.fs import local_mkdir_safe
 from verl.utils.model import normalize_model_name
 from verl.utils.torch_dtypes import PrecisionType
 from vllm.distributed.parallel_state import get_ep_group
+
+
+def _rollout_weight_export_timing_enabled() -> bool:
+    return os.environ.get("VLLM_ROLLOUT_STAGE_TIMING", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _log_rollout_weight_export_stage(stage: str, duration_s: float, **extra):
+    if not _rollout_weight_export_timing_enabled():
+        return
+    extras = " ".join(f"{key}={value}" for key, value in extra.items())
+    suffix = f" {extras}" if extras else ""
+    print(
+        f"rollout_weight_export_stage stage={stage} duration_s={duration_s:.6f}{suffix}",
+        flush=True,
+    )
 
 
 def get_model_config(model):
@@ -973,8 +989,21 @@ def per_tensor_generator(
             if os.getenv('ALL_TO_ALL_RESHARD', '0') == '0':
                 ep_params = [torch.empty_like(broad_pp_tensor) for _ in range(ep_size)]
                 torch.distributed.all_gather(ep_params, broad_pp_tensor, group=etmp_group)
+                merge_params = default_tp_concat_fn(
+                    layer_name_mapping,
+                    cur_name,
+                    broad_pp_tensor,
+                    ep_params,
+                    model_config,
+                    convert_qkv_gate_up_by_simple_split
+                )
+                converted_names, converted_params = weight_converter.convert_param(cur_name, merge_params)
+
+                yield from zip(converted_names, converted_params)
+                continue
             else:
                 # EP param reshard method based on AllToAllV, efficient in both memory usage and communication performance
+                export_stage_t0 = time.perf_counter()
                 ep_params = ep_param_reshard_by_alltoallv(
                     param_name=cur_name,
                     ep_param_train=broad_pp_tensor,
@@ -982,18 +1011,81 @@ def per_tensor_generator(
                     weight1_key_name="mlp.experts.weight1",
                     weight2_key_name="mlp.experts.weight2"
                 )
-            merge_params = default_tp_concat_fn(
-                layer_name_mapping,
-                cur_name,
-                broad_pp_tensor,
-                ep_params,
-                model_config,
-                convert_qkv_gate_up_by_simple_split
-            )
-            converted_names, converted_params = weight_converter.convert_param(cur_name, merge_params)
+                _log_rollout_weight_export_stage(
+                    "ep_alltoallv_reshard",
+                    time.perf_counter() - export_stage_t0,
+                    name=cur_name,
+                    non_empty=len(ep_params),
+                )
 
-            yield from zip(converted_names, converted_params)
-            continue
+                export_stage_t0 = time.perf_counter()
+                if "mlp.experts.weight1" in cur_name:
+                    if len(ep_params) != 1:
+                        raise RuntimeError(
+                            f"Expected one local expert weight1 shard after AllToAllV, got {len(ep_params)} for {cur_name}"
+                        )
+                    local_expert_params = ep_params[0]
+                    layer_number = cur_name.split(".")[2]
+                    if os.getenv("VLLM_ROLLOUT_FAST_WEIGHT_LOAD", "0") == "1":
+                        yield (
+                            f"model.layers.{layer_number}.mlp.experts._local_w13_weight",
+                            local_expert_params.detach(),
+                        )
+                        emitted = 1
+                    else:
+                        rollout_ep_group = get_ep_group().device_group
+                        rollout_ep_size = torch.distributed.get_world_size(rollout_ep_group)
+                        ep_rank_rollout = torch.distributed.get_rank(group=rollout_ep_group)
+                        num_experts = weight_converter.mcore_config.num_moe_experts
+                        num_experts_rollout = num_experts // rollout_ep_size
+                        for local_idx in range(num_experts_rollout):
+                            expert_id = ep_rank_rollout * num_experts_rollout + local_idx
+                            gate, up = torch.chunk(local_expert_params[local_idx], chunks=2, dim=0)
+                            yield f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight", gate
+                            yield f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight", up
+                        emitted = num_experts_rollout * 2
+                    _log_rollout_weight_export_stage(
+                        "ep_emit_local_weight1",
+                        time.perf_counter() - export_stage_t0,
+                        name=cur_name,
+                        emitted=emitted,
+                    )
+                elif "mlp.experts.weight2" in cur_name:
+                    if len(ep_params) != 1:
+                        raise RuntimeError(
+                            f"Expected one local expert weight2 shard after AllToAllV, got {len(ep_params)} for {cur_name}"
+                        )
+                    local_expert_params = ep_params[0]
+                    layer_number = cur_name.split(".")[2]
+                    if os.getenv("VLLM_ROLLOUT_FAST_WEIGHT_LOAD", "0") == "1":
+                        yield (
+                            f"model.layers.{layer_number}.mlp.experts._local_w2_weight",
+                            local_expert_params.detach(),
+                        )
+                        emitted = 1
+                    else:
+                        rollout_ep_group = get_ep_group().device_group
+                        rollout_ep_size = torch.distributed.get_world_size(rollout_ep_group)
+                        ep_rank_rollout = torch.distributed.get_rank(group=rollout_ep_group)
+                        num_experts = weight_converter.mcore_config.num_moe_experts
+                        num_experts_rollout = num_experts // rollout_ep_size
+                        for local_idx in range(num_experts_rollout):
+                            expert_id = ep_rank_rollout * num_experts_rollout + local_idx
+                            yield (
+                                f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight",
+                                local_expert_params[local_idx],
+                            )
+                        emitted = num_experts_rollout
+                    _log_rollout_weight_export_stage(
+                        "ep_emit_local_weight2",
+                        time.perf_counter() - export_stage_t0,
+                        name=cur_name,
+                        emitted=emitted,
+                    )
+                else:
+                    raise NotImplementedError(f"Weight {cur_name} not supported in fast EP local emission yet!")
+
+                continue
 
         # tp all gather
         if tp_utils.is_tensor_parallel_param(broad_pp_tensor):

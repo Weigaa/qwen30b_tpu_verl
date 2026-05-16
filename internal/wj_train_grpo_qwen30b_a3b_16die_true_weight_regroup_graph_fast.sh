@@ -56,6 +56,10 @@ export VLLM_ROLLOUT_EAGER_OLDREF_ALIGN=0
 export VLLM_ENABLE_GRAPH_MODE=1
 export ROLLOUT_ENFORCE_EAGER=False
 export VLLM_ASCEND_EAGER_COMPILE=0
+# Graph still needs bundled graph-only OPPs such as AddRmsNormBias, but the
+# bundled MoE dispatch/combine kernels are slower than the system CANN versions.
+# The base script defaults to the filtered local OPP package when available.
+export VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP=${VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP:-1}
 export VLLM_ASCEND_FORCE_CUDAGRAPH_NONE=0
 export VLLM_ASCEND_FORCE_COMPILE_WITHOUT_ACLGRAPH=0
 export VLLM_ASCEND_ALLOW_LAZY_ACLGRAPH_CAPTURE=0

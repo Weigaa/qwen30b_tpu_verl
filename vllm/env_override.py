@@ -24,6 +24,93 @@ os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 torch._inductor.config.compile_threads = 1
 
 # ===================================================
+# torch 2.9 Inductor get_gpu_type monkeypatch for NPU
+# ===================================================
+# Some Inductor post-grad passes still assume the runtime device is one of the
+# built-in GPU backends (cuda/mps/xpu/mtia) and assert inside
+# torch._inductor.utils.get_gpu_type(). On Ascend NPU this crashes the
+# otherwise-useful native inductor eager-compile experiments before codegen
+# reaches model-specific kernels. For NPU we conservatively fall back to
+# "cuda", which is only used here as a generic accelerator tag by constructor
+# moving / partition heuristics.
+
+
+def get_gpu_type_patched() -> str:
+    import torch._inductor.utils as inductor_utils
+
+    avail_gpus = [x for x in inductor_utils.GPU_TYPES if getattr(torch, x).is_available()]
+    if len(avail_gpus) <= 1:
+        return "cuda" if len(avail_gpus) == 0 else avail_gpus[0]
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "cuda"
+
+    raise AssertionError(f"Multiple accelerator backends are visible: {avail_gpus}")
+
+
+torch._inductor.utils.get_gpu_type = get_gpu_type_patched
+try:
+    import torch._inductor.fx_passes.post_grad as _post_grad
+
+    _post_grad.get_gpu_type = get_gpu_type_patched
+except Exception:
+    # post_grad may not be imported yet in some processes; patching the source
+    # module above remains useful, and later imports can still observe it.
+    pass
+
+# Native torch inductor may query Triton/CUDA capability while compiling for
+# NPU and crash when the CUDA device properties are placeholder values. For the
+# explicit Ascend inductor experiment, keep that path conservative: no Triton
+# codegen/autotune metadata on NPU.
+if os.environ.get("VLLM_ASCEND_EAGER_COMPILE_USE_INDUCTOR", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    try:
+        import functools
+        import torch.utils._triton as _torch_triton_utils
+
+        @functools.cache
+        def _has_triton_disabled_for_npu() -> bool:
+            return False
+
+        _torch_triton_utils.has_triton = _has_triton_disabled_for_npu
+        try:
+            import torch._inductor.runtime.autotune_cache as _autotune_cache
+
+            _autotune_cache.has_triton = _has_triton_disabled_for_npu
+        except Exception:
+            pass
+    except Exception:
+        logger.exception("Failed to patch torch.utils._triton.has_triton for NPU")
+
+    if os.environ.get("VLLM_ASCEND_INDUCTOR_AUTOTUNE_AT_COMPILE_TIME", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        # torch_npu's NPU cpp-wrapper path otherwise performs a first-pass
+        # real-input execution during codegen. For qwen3 rollout shapes that
+        # path can trip NPU Triton vector-core faults before we ever reach a
+        # generation step, so keep this behind an explicit experiment flag.
+        try:
+            import torch._inductor.config as _inductor_config
+
+            _inductor_config.triton.autotune_at_compile_time = True
+            logger.warning(
+                "VLLM_ASCEND_INDUCTOR_AUTOTUNE_AT_COMPILE_TIME=1: forcing "
+                "torch._inductor.config.triton.autotune_at_compile_time=True "
+                "for native inductor NPU smoke tests."
+            )
+        except Exception:
+            logger.exception(
+                "Failed to set torch inductor autotune_at_compile_time for NPU"
+            )
+
+# ===================================================
 # torch 2.9 Inductor PythonWrapperCodegen monkeypatch
 # ===================================================
 # This change monkeypatches memory_plan_reuse in pytorch 2.9.0 to work around
@@ -358,6 +445,19 @@ def _update_scheduler_patched(self) -> None:
 
     Scheduler.should_partition = should_partition_patched
     Scheduler.get_graph_partition_signature = get_graph_partition_signature_patched
+
+    # Native torch inductor on torch_npu is still unstable in combo-kernel
+    # scheduling/codegen for qwen3 eager rollout shapes. Keep the experiment on
+    # a simpler scheduler path so we can validate plain inductor first.
+    if os.environ.get("VLLM_ASCEND_EAGER_COMPILE_USE_INDUCTOR", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        config.combo_kernels = False
+        config.benchmark_combo_kernel = False
+        config.combo_kernels_autotune = 0
 
     with config.patch("triton.store_cubin", False):
         self.scheduler = Scheduler(self.operations)

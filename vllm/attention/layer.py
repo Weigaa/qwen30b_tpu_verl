@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer."""
 
+import os
 from typing import cast
 
 import torch
@@ -45,6 +46,43 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+try:
+    _TAG_CUDAGRAPH_UNSAFE = (torch._C.Tag.cudagraph_unsafe,)
+except AttributeError:
+    _TAG_CUDAGRAPH_UNSAFE = ()  # type: ignore[assignment]
+_USE_CUDAGRAPH_UNSAFE_ATTENTION_TAG = os.getenv(
+    "VLLM_ASCEND_USE_CUDAGRAPH_UNSAFE_ATTENTION_TAG", "0"
+).lower() in {"1", "true", "yes", "on"}
+_ATTENTION_CUSTOM_OP_TAGS = (
+    _TAG_CUDAGRAPH_UNSAFE if _USE_CUDAGRAPH_UNSAFE_ATTENTION_TAG else ()
+)
+
+_USE_NESTED_ASCEND_ATTENTION_OP = os.getenv(
+    "VLLM_ASCEND_USE_NESTED_ATTENTION_OP", "0"
+).lower() in {"1", "true", "yes", "on"}
+_USE_ASCEND_ATTENTION_OP = os.getenv(
+    "VLLM_ASCEND_USE_ASCEND_ATTENTION_OP", "0"
+).lower() in {"1", "true", "yes", "on"}
+_FORCE_DIRECT_ATTENTION_IMPL = os.getenv(
+    "VLLM_ASCEND_FORCE_DIRECT_ATTENTION_IMPL", "0"
+).lower() in {"1", "true", "yes", "on"}
+_FORCE_DIRECT_DECODE_ATTENTION_IMPL = os.getenv(
+    "VLLM_ASCEND_FORCE_DIRECT_DECODE_ATTENTION_IMPL", "0"
+).lower() in {"1", "true", "yes", "on"}
+_FORCE_DIRECT_PREFILL_ATTENTION_IMPL = os.getenv(
+    "VLLM_ASCEND_FORCE_DIRECT_PREFILL_ATTENTION_IMPL", "0"
+).lower() in {"1", "true", "yes", "on"}
+_ZERO_ATTENTION_OUTPUT = os.getenv(
+    "VLLM_ASCEND_ZERO_ATTENTION_OUTPUT", "0"
+).lower() in {"1", "true", "yes", "on"}
+_LEAN_ASCEND_ATTENTION_FORWARD = os.getenv(
+    "VLLM_ASCEND_LEAN_ATTENTION_FORWARD", "0"
+).lower() in {"1", "true", "yes", "on"}
+
+
+def _is_decode_only_metadata(attn_metadata: object) -> bool:
+    state = getattr(attn_metadata, "attn_state", None)
+    return getattr(state, "name", None) == "DecodeOnly"
 
 
 def should_load_quant_weights(quant_method: QuantizeMethodBase | None) -> bool:
@@ -355,6 +393,38 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.impl.supports_quant_query_input:
                 query, _ = self.query_quant(query, self._q_scale)
 
+        if (
+            _LEAN_ASCEND_ATTENTION_FORWARD
+            and self.use_output
+            and output_shape is None
+            and not self.use_direct_call
+            and not _FORCE_DIRECT_ATTENTION_IMPL
+            and not _FORCE_DIRECT_DECODE_ATTENTION_IMPL
+            and not _USE_ASCEND_ATTENTION_OP
+            and self.query_quant is None
+            and self.head_size_v == self.head_size
+        ):
+            # Qwen3 eager hot path: preserve the opaque attention custom-op
+            # boundary and KV side-effect semantics, but avoid the v0.14 generic
+            # output-shape and optional dispatch branches for the common
+            # unquantized decoder-attention case.
+            output = (
+                torch.zeros_like(query)
+                if _ZERO_ATTENTION_OUTPUT
+                else torch.empty_like(query)
+            )
+            hidden_size = output.shape[-1]
+            query = query.view(-1, self.num_heads, self.head_size)
+            output = output.view(-1, self.num_heads, self.head_size)
+            if key is not None:
+                key = key.view(-1, self.num_kv_heads, self.head_size)
+            if value is not None:
+                value = value.view(-1, self.num_kv_heads, self.head_size)
+            torch.ops.vllm.unified_attention_with_output(
+                query, key, value, output, self.layer_name
+            )
+            return output.view(-1, hidden_size)
+
         if self.use_output:
             if output_shape is None:
                 # Handle both 2D [num_tokens, hidden] and
@@ -364,7 +434,11 @@ class Attention(nn.Module, AttentionLayerBase):
                     (num_tokens, self.num_heads * self.head_size_v)
                 )
             output_shape = output_shape if output_shape is not None else query.shape
-            output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+            output = (
+                torch.zeros(output_shape, dtype=output_dtype, device=query.device)
+                if _ZERO_ATTENTION_OUTPUT
+                else torch.empty(output_shape, dtype=output_dtype, device=query.device)
+            )
             hidden_size = output_shape[-1]
             # Reshape the query, key, and value tensors.
             # NOTE(woosuk): We do this outside the custom op to minimize the
@@ -375,7 +449,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 key = key.view(-1, self.num_kv_heads, self.head_size)
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size_v)
-            if self.use_direct_call:
+            if self.use_direct_call or _FORCE_DIRECT_ATTENTION_IMPL:
                 forward_context: ForwardContext = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 if isinstance(attn_metadata, dict):
@@ -384,13 +458,57 @@ class Attention(nn.Module, AttentionLayerBase):
                 self.impl.forward(
                     self, query, key, value, self_kv_cache, attn_metadata, output=output
                 )
+            elif _FORCE_DIRECT_PREFILL_ATTENTION_IMPL:
+                forward_context = get_forward_context()
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                if _is_decode_only_metadata(attn_metadata):
+                    torch.ops.vllm.unified_attention_with_output(
+                        query, key, value, output, self.layer_name
+                    )
+                else:
+                    self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                    self.impl.forward(
+                        self,
+                        query,
+                        key,
+                        value,
+                        self_kv_cache,
+                        attn_metadata,
+                        output=output,
+                    )
+            elif _FORCE_DIRECT_DECODE_ATTENTION_IMPL:
+                forward_context = get_forward_context()
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                if _is_decode_only_metadata(attn_metadata):
+                    self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                    self.impl.forward(
+                        self,
+                        query,
+                        key,
+                        value,
+                        self_kv_cache,
+                        attn_metadata,
+                        output=output,
+                    )
+                else:
+                    torch.ops.vllm.unified_attention_with_output(
+                        query, key, value, output, self.layer_name
+                    )
+            elif _USE_ASCEND_ATTENTION_OP:
+                torch.ops.vllm.unified_ascend_attention_with_output(
+                    query, key, value, output, self.layer_name
+                )
             else:
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name
                 )
             return output.view(-1, hidden_size)
         else:
-            if self.use_direct_call:
+            if self.use_direct_call or _FORCE_DIRECT_ATTENTION_IMPL:
                 forward_context = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 if isinstance(attn_metadata, dict):
@@ -612,7 +730,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self_kv_cache = self.kv_cache[forward_context.virtual_engine]
 
             if self.attn_backend.accept_output_buffer:
-                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+                output = (
+                    torch.zeros(output_shape, dtype=q.dtype, device=q.device)
+                    if _ZERO_ATTENTION_OUTPUT
+                    else torch.empty(output_shape, dtype=q.dtype, device=q.device)
+                )
                 self.impl.forward(
                     self,
                     q,
@@ -629,7 +751,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
         else:
             if self.attn_backend.accept_output_buffer:
-                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+                output = (
+                    torch.zeros(output_shape, dtype=q.dtype, device=q.device)
+                    if _ZERO_ATTENTION_OUTPUT
+                    else torch.empty(output_shape, dtype=q.dtype, device=q.device)
+                )
                 torch.ops.vllm.unified_mla_attention_with_output(
                     q,
                     kv_c_normed,
@@ -789,6 +915,7 @@ direct_register_custom_op(
     op_name="unified_attention",
     op_func=unified_attention,
     fake_impl=unified_attention_fake,
+    tags=_ATTENTION_CUSTOM_OP_TAGS,
 )
 
 
@@ -803,6 +930,18 @@ def unified_attention_with_output(
     output_block_scale: torch.Tensor | None = None,
 ) -> None:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
+
+    if _USE_NESTED_ASCEND_ATTENTION_OP:
+        torch.ops.vllm.unified_ascend_attention_with_output(
+            query,
+            key,
+            value,
+            output,
+            layer_name,
+            output_scale,
+            output_block_scale,
+        )
+        return
 
     self.impl.forward(
         self,
@@ -834,6 +973,7 @@ direct_register_custom_op(
     op_func=unified_attention_with_output,
     mutates_args=["output", "output_block_scale"],
     fake_impl=unified_attention_with_output_fake,
+    tags=_ATTENTION_CUSTOM_OP_TAGS,
 )
 
 

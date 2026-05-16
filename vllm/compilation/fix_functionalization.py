@@ -16,6 +16,17 @@ from .vllm_inductor_pass import VllmInductorPass
 logger = init_logger(__name__)
 
 
+def _optional_default_op(namespace: str, op_name: str):
+    op_namespace = getattr(torch.ops, namespace, None)
+    if op_namespace is None:
+        return None
+    try:
+        op = getattr(op_namespace, op_name)
+        return getattr(op, "default", None)
+    except AttributeError:
+        return None
+
+
 class FixFunctionalizationPass(VllmInductorPass):
     """
     This pass defunctionalizes certain nodes to avoid redundant tensor copies.
@@ -37,6 +48,28 @@ class FixFunctionalizationPass(VllmInductorPass):
 
         self.nodes_to_remove: list[torch.fx.Node] = []
         count = 0
+        rotary_embedding_op = _optional_default_op("_C", "rotary_embedding")
+        fused_add_rms_norm_op = _optional_default_op("_C", "fused_add_rms_norm")
+        fused_add_rms_norm_static_fp8_quant_op = _optional_default_op(
+            "_C", "fused_add_rms_norm_static_fp8_quant"
+        )
+        rms_norm_dynamic_per_token_quant_op = _optional_default_op(
+            "_C", "rms_norm_dynamic_per_token_quant"
+        )
+        rms_norm_op = _optional_default_op("_C", "rms_norm")
+        rms_norm_static_fp8_quant_op = _optional_default_op(
+            "_C", "rms_norm_static_fp8_quant"
+        )
+        flashinfer_allreduce_norm_op = _optional_default_op(
+            "vllm", "flashinfer_trtllm_fused_allreduce_norm"
+        )
+        silu_and_mul_op = _optional_default_op("_C", "silu_and_mul")
+        silu_and_mul_quant_op = _optional_default_op("_C", "silu_and_mul_quant")
+        silu_and_mul_nvfp4_quant_op = _optional_default_op(
+            "_C", "silu_and_mul_nvfp4_quant"
+        )
+        fused_qk_norm_rope_op = _optional_default_op("_C", "fused_qk_norm_rope")
+
         for node in graph.nodes:
             if not is_func(node, auto_functionalized):
                 continue  # Avoid deep if-elif nesting
@@ -44,7 +77,7 @@ class FixFunctionalizationPass(VllmInductorPass):
             kwargs = node.kwargs
             at_target = node.args[0]
 
-            if at_target == torch.ops._C.rotary_embedding.default:
+            if rotary_embedding_op is not None and at_target == rotary_embedding_op:
                 query = kwargs["query"]
                 key = kwargs["key"]
                 getitem_nodes = self.getitem_users(node)
@@ -88,25 +121,34 @@ class FixFunctionalizationPass(VllmInductorPass):
                     self.defunctionalize(graph, node, mutated_args)
 
             # rms_norm replacements avoid the most copies for LLaMa.
-            elif at_target == torch.ops._C.fused_add_rms_norm.default:
+            elif (
+                fused_add_rms_norm_op is not None
+                and at_target == fused_add_rms_norm_op
+            ):
                 mutated_args = {1: "input", 2: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
-            elif at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default:  # noqa: E501
+            elif (
+                fused_add_rms_norm_static_fp8_quant_op is not None
+                and at_target == fused_add_rms_norm_static_fp8_quant_op
+            ):
                 mutated_args = {1: "result", 2: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
-            elif at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default:  # noqa: E501
+            elif (
+                rms_norm_dynamic_per_token_quant_op is not None
+                and at_target == rms_norm_dynamic_per_token_quant_op
+            ):
                 mutated_args = {1: "result", 2: "scale", 3: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
-            elif at_target in [
-                torch.ops._C.rms_norm.default,
-                torch.ops._C.rms_norm_static_fp8_quant.default,
-            ]:
+            elif at_target in (
+                op
+                for op in (rms_norm_op, rms_norm_static_fp8_quant_op)
+                if op is not None
+            ):
                 mutated_args = {1: "result"}
                 self.defunctionalize(graph, node, mutated_args)
             elif (
-                hasattr(torch.ops.vllm, "flashinfer_trtllm_fused_allreduce_norm")
-                and at_target
-                == torch.ops.vllm.flashinfer_trtllm_fused_allreduce_norm.default
+                flashinfer_allreduce_norm_op is not None
+                and at_target == flashinfer_allreduce_norm_op
             ):
                 mutated_args = {
                     1: "allreduce_in",
@@ -119,19 +161,22 @@ class FixFunctionalizationPass(VllmInductorPass):
             # For some reason we need to specify the args for both
             # silu_and_mul and silu_and_mul_quant. The kwargs
             # pathway gets the wrong answer.
-            elif at_target == torch.ops._C.silu_and_mul.default:
+            elif silu_and_mul_op is not None and at_target == silu_and_mul_op:
                 mutated_args = {1: "result"}
                 self.defunctionalize(
                     graph, node, mutated_args, args=("result", "input")
                 )
-            elif at_target == torch.ops._C.silu_and_mul_quant.default:
+            elif (
+                silu_and_mul_quant_op is not None
+                and at_target == silu_and_mul_quant_op
+            ):
                 mutated_args = {1: "result"}
                 self.defunctionalize(
                     graph, node, mutated_args, args=("result", "input", "scale")
                 )
             elif (
-                hasattr(torch.ops._C, "silu_and_mul_nvfp4_quant")
-                and at_target == torch.ops._C.silu_and_mul_nvfp4_quant.default
+                silu_and_mul_nvfp4_quant_op is not None
+                and at_target == silu_and_mul_nvfp4_quant_op
             ):
                 mutated_args = {1: "result", 2: "result_block_scale"}
                 self.defunctionalize(
@@ -146,7 +191,10 @@ class FixFunctionalizationPass(VllmInductorPass):
                     ),
                 )
             # Defunctionalize fused_qk_norm_rope to remove higher-order wrapper.
-            elif at_target == torch.ops._C.fused_qk_norm_rope.default:
+            elif (
+                fused_qk_norm_rope_op is not None
+                and at_target == fused_qk_norm_rope_op
+            ):
                 mutated_args = {1: "qkv"}
                 args = (
                     "qkv",

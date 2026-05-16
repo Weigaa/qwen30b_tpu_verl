@@ -63,6 +63,10 @@ else:
 _CUSTOM_OP_REGISTERED = False
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
 def config_deprecated_logging():
     """Configure deprecated logging format, when used deprecated codes
     in vllm-ascend.
@@ -114,6 +118,10 @@ class NPUPlatform(Platform):
         It is a parameter of inductor_config used to register custom passes.
         Currently, we only use Inductor's 'pattern matcher' functionality, so we define our own pass_key.
         """
+        if _env_flag("VLLM_ASCEND_EAGER_COMPILE_USE_INDUCTOR"):
+            # Native torch inductor only understands the upstream vLLM hook.
+            # Keep the Ascend-specific key for the default AscendCompiler path.
+            return "post_grad_custom_post_pass"
         return COMPILATION_PASS_KEY
 
     @classmethod
@@ -122,6 +130,8 @@ class NPUPlatform(Platform):
         Get the pass manager class for this platform.
         It will be registered as a custom pass under the current_platform.pass_key.
         """
+        if _env_flag("VLLM_ASCEND_EAGER_COMPILE_USE_INDUCTOR"):
+            return "vllm.compilation.pass_manager.PostGradPassManager"
         npugraph_ex_config = get_ascend_config().npugraph_ex_config
         if npugraph_ex_config.enable:
             return "vllm_ascend.compilation.npu_graph_ex_pass_manager.NpuGraphEXPassManager"
@@ -208,12 +218,9 @@ class NPUPlatform(Platform):
         parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
 
-        def _env_enabled(name: str) -> bool:
-            return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
-
         pass_config = getattr(compilation_config, "pass_config", None)
         if pass_config is not None:
-            if _env_enabled("VLLM_ASCEND_DISABLE_GRAPH_FUSION"):
+            if _env_flag("VLLM_ASCEND_DISABLE_GRAPH_FUSION"):
                 logger.warning(
                     "VLLM_ASCEND_DISABLE_GRAPH_FUSION=1: disabling vLLM "
                     "generic graph fusion passes for correctness isolation."
@@ -223,19 +230,19 @@ class NPUPlatform(Platform):
                 pass_config.fuse_allreduce_rms = False
                 pass_config.enable_qk_norm_rope_fusion = False
             else:
-                if _env_enabled("VLLM_ASCEND_DISABLE_NORM_QUANT_FUSION"):
+                if _env_flag("VLLM_ASCEND_DISABLE_NORM_QUANT_FUSION"):
                     logger.warning(
                         "VLLM_ASCEND_DISABLE_NORM_QUANT_FUSION=1: disabling "
                         "vLLM generic norm/quant graph fusion."
                     )
                     pass_config.fuse_norm_quant = False
-                if _env_enabled("VLLM_ASCEND_DISABLE_QKNORM_ROPE_FUSION"):
+                if _env_flag("VLLM_ASCEND_DISABLE_QKNORM_ROPE_FUSION"):
                     logger.warning(
                         "VLLM_ASCEND_DISABLE_QKNORM_ROPE_FUSION=1: disabling "
                         "vLLM generic QKNorm/RoPE graph fusion."
                     )
                     pass_config.enable_qk_norm_rope_fusion = False
-                if _env_enabled("VLLM_ASCEND_DISABLE_ALLREDUCE_RMS_FUSION"):
+                if _env_flag("VLLM_ASCEND_DISABLE_ALLREDUCE_RMS_FUSION"):
                     logger.warning(
                         "VLLM_ASCEND_DISABLE_ALLREDUCE_RMS_FUSION=1: "
                         "disabling vLLM generic allreduce/RMSNorm graph fusion."
@@ -251,7 +258,7 @@ class NPUPlatform(Platform):
                 else ascend_compilation_config
             )
 
-            if _env_enabled("VLLM_ASCEND_DISABLE_GRAPH_FUSION"):
+            if _env_flag("VLLM_ASCEND_DISABLE_GRAPH_FUSION"):
                 logger.warning(
                     "VLLM_ASCEND_DISABLE_GRAPH_FUSION=1: disabling all Ascend graph fusion passes "
                     "for correctness isolation."
@@ -260,17 +267,17 @@ class NPUPlatform(Platform):
                 ascend_compilation_options["fuse_qknorm_rope"] = False
                 ascend_compilation_options["fuse_allreduce_rms"] = False
             else:
-                if _env_enabled("VLLM_ASCEND_DISABLE_NORM_QUANT_FUSION"):
+                if _env_flag("VLLM_ASCEND_DISABLE_NORM_QUANT_FUSION"):
                     logger.warning(
                         "VLLM_ASCEND_DISABLE_NORM_QUANT_FUSION=1: disabling norm/quant graph fusion."
                     )
                     ascend_compilation_options["fuse_norm_quant"] = False
-                if _env_enabled("VLLM_ASCEND_DISABLE_QKNORM_ROPE_FUSION"):
+                if _env_flag("VLLM_ASCEND_DISABLE_QKNORM_ROPE_FUSION"):
                     logger.warning(
                         "VLLM_ASCEND_DISABLE_QKNORM_ROPE_FUSION=1: disabling QKNorm/RoPE graph fusion."
                     )
                     ascend_compilation_options["fuse_qknorm_rope"] = False
-                if _env_enabled("VLLM_ASCEND_DISABLE_ALLREDUCE_RMS_FUSION"):
+                if _env_flag("VLLM_ASCEND_DISABLE_ALLREDUCE_RMS_FUSION"):
                     logger.warning(
                         "VLLM_ASCEND_DISABLE_ALLREDUCE_RMS_FUSION=1: disabling allreduce/RMSNorm graph fusion."
                     )
@@ -346,6 +353,79 @@ class NPUPlatform(Platform):
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
             if compilation_config.splitting_ops is None:
                 compilation_config.splitting_ops = []
+            eager_compile_range_splits = os.getenv(
+                "VLLM_ASCEND_EAGER_COMPILE_RANGE_SPLITS", ""
+            ).strip()
+            if eager_compile_range_splits:
+                split_points = []
+                for value in eager_compile_range_splits.split(","):
+                    value = value.strip()
+                    if not value:
+                        continue
+                    try:
+                        split_points.append(int(value))
+                    except ValueError:
+                        logger.warning(
+                            "Ignoring invalid VLLM_ASCEND_EAGER_COMPILE_RANGE_SPLITS "
+                            "entry %r; expected comma-separated integers.",
+                            value,
+                        )
+                if split_points:
+                    existing_points = compilation_config.compile_ranges_split_points or []
+                    compilation_config.compile_ranges_split_points = sorted(
+                        set(existing_points + split_points)
+                    )
+                    logger.warning(
+                        "VLLM_ASCEND_EAGER_COMPILE_RANGE_SPLITS=%s: using "
+                        "compile range split points %s for eager compile.",
+                        eager_compile_range_splits,
+                        compilation_config.compile_ranges_split_points,
+                    )
+            if _env_flag("VLLM_ASCEND_EAGER_COMPILE_ATTENTION_SPLIT"):
+                logger.warning(
+                    "VLLM_ASCEND_EAGER_COMPILE_ATTENTION_SPLIT=1: keeping "
+                    "attention ops as compile graph boundaries while still "
+                    "disabling cudagraph replay."
+                )
+                # The default eager-compile path initializes splitting_ops to
+                # an empty list, which tells set_splitting_ops_for_v1() not to
+                # add the standard attention boundaries. Reset it here so this
+                # diagnostic knob does what its name says.
+                compilation_config.splitting_ops = None
+                compilation_config.set_splitting_ops_for_v1(
+                    all2all_backend=vllm_config.parallel_config.all2all_backend,
+                    data_parallel_size=vllm_config.parallel_config.data_parallel_size,
+                )
+                if "vllm::mla_forward" not in compilation_config.splitting_ops:
+                    compilation_config.splitting_ops.extend(["vllm::mla_forward"])
+            if pass_config is not None and _env_flag("VLLM_ASCEND_EAGER_COMPILE_PASS_FUSION"):
+                logger.warning(
+                    "VLLM_ASCEND_EAGER_COMPILE_PASS_FUSION=1: enabling "
+                    "generic vLLM compile passes without cudagraph replay."
+                )
+                pass_config.eliminate_noops = True
+                pass_config.fuse_norm_quant = True
+                pass_config.fuse_act_quant = True
+            elif pass_config is not None and _env_flag("VLLM_ASCEND_EAGER_COMPILE_ELIMINATE_NOOPS"):
+                logger.warning(
+                    "VLLM_ASCEND_EAGER_COMPILE_ELIMINATE_NOOPS=1: enabling "
+                    "only vLLM eliminate-noops compile pass for eager rollout."
+                )
+                pass_config.eliminate_noops = True
+            if _env_flag("VLLM_ASCEND_EAGER_COMPILE_USE_INDUCTOR"):
+                logger.warning(
+                    "VLLM_ASCEND_EAGER_COMPILE_USE_INDUCTOR=1: using the "
+                    "native vLLM Inductor backend for eager-compile rollout "
+                    "instead of the Ascend fusion backend."
+                )
+                compilation_config.backend = "inductor"
+                # torch_npu's inductor combo-kernel path is still unstable for
+                # qwen3 eager rollout shapes. Disable it for this experiment so
+                # we exercise a plain inductor path first, instead of failing
+                # inside benchmark_fused_nodes / select_golden_varlist.
+                compilation_config.inductor_compile_config["combo_kernels"] = False
+                compilation_config.inductor_compile_config["benchmark_combo_kernel"] = False
+                compilation_config.inductor_compile_config["combo_kernels_autotune"] = 0
 
         compilation_config.cudagraph_num_of_warmups = 1
 
@@ -423,7 +503,7 @@ class NPUPlatform(Platform):
                 compilation_config.mode = CompilationMode.VLLM_COMPILE
             else:
                 compilation_config.mode = CompilationMode.NONE
-            ascend_config.npugraph_ex_config.enable = False
+                ascend_config.npugraph_ex_config.enable = False
         elif compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE:
             logger.info("PIECEWISE compilation enabled on NPU. use_inductor not supported - using only ACL Graph mode")
             assert compilation_config.mode == CompilationMode.VLLM_COMPILE, (
@@ -602,16 +682,56 @@ class NPUPlatform(Platform):
         global _CUSTOM_OP_REGISTERED
         if _CUSTOM_OP_REGISTERED:
             return
+        if os.getenv("VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP", "1") != "1":
+            logger.info(
+                "Skip local vllm-ascend custom OPP injection because "
+                "VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP=%s",
+                os.getenv("VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP"),
+            )
+            _CUSTOM_OP_REGISTERED = True
+            return
         CUR_DIR = os.path.dirname(os.path.realpath(__file__))
-        CUSTOM_OPP_PATH = os.path.join(CUR_DIR, "_cann_ops_custom", "vendors", "vllm-ascend")
+        filtered_custom_opp_path = os.path.join(
+            CUR_DIR, "_cann_ops_custom_moe_filtered", "vendors", "vllm-ascend")
+        full_custom_opp_path = os.path.join(
+            CUR_DIR, "_cann_ops_custom", "vendors", "vllm-ascend")
+        default_custom_opp_path = filtered_custom_opp_path
+        if not os.path.exists(default_custom_opp_path):
+            default_custom_opp_path = full_custom_opp_path
+        CUSTOM_OPP_PATH = os.getenv(
+            "VLLM_ASCEND_LOCAL_CUSTOM_OPP_PATH",
+            default_custom_opp_path,
+        )
         if os.path.exists(CUSTOM_OPP_PATH):
+            custom_op_api_lib = os.path.join(CUSTOM_OPP_PATH, "op_api", "lib")
+
+            def _remove_colon_path(env_name: str, path_to_remove: str) -> None:
+                paths = os.environ.get(env_name, "").split(":")
+                paths = [
+                    path for path in paths
+                    if path and path != path_to_remove
+                ]
+                os.environ[env_name] = ":".join(paths)
+
+            _remove_colon_path("LD_LIBRARY_PATH", custom_op_api_lib)
+            if CUSTOM_OPP_PATH != full_custom_opp_path:
+                filtered_custom_op_api_lib = os.path.join(
+                    filtered_custom_opp_path, "op_api", "lib")
+                full_custom_op_api_lib = os.path.join(
+                    full_custom_opp_path, "op_api", "lib")
+
+                _remove_colon_path("ASCEND_CUSTOM_OPP_PATH", filtered_custom_opp_path)
+                _remove_colon_path("ASCEND_CUSTOM_OPP_PATH", full_custom_opp_path)
+                _remove_colon_path("LD_LIBRARY_PATH", filtered_custom_op_api_lib)
+                _remove_colon_path("LD_LIBRARY_PATH", full_custom_op_api_lib)
             current_cust_opp_path = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
             if current_cust_opp_path:
                 os.environ["ASCEND_CUSTOM_OPP_PATH"] = f"{CUSTOM_OPP_PATH}:{current_cust_opp_path}"
             else:
                 os.environ["ASCEND_CUSTOM_OPP_PATH"] = CUSTOM_OPP_PATH
-            custom_op_api_lib = os.path.join(CUSTOM_OPP_PATH, "op_api", "lib")
-            if os.path.exists(custom_op_api_lib):
+            use_local_op_api = os.getenv(
+                "VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB", "0") == "1"
+            if use_local_op_api and os.path.exists(custom_op_api_lib):
                 current_ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
                 if current_ld_library_path:
                     os.environ["LD_LIBRARY_PATH"] = f"{custom_op_api_lib}:{current_ld_library_path}"
@@ -763,14 +883,28 @@ class NPUPlatform(Platform):
         # the performance may degrade due to the switching of
         # communication methods.
         mmrs_fusion = True
+        use_old_eager_forward_context = _env_flag("VLLM_ASCEND_EAGER_OLD_FORWARD_CONTEXT")
         if is_moe_model(vllm_config):
-            sp_enabled = enable_sp(vllm_config) and num_tokens is not None
+            if use_old_eager_forward_context:
+                sp_enabled = (
+                    enable_sp(vllm_config)
+                    and tp_world_size > 1
+                    and num_tokens is not None
+                    and num_tokens > 1000
+                )
+            else:
+                sp_enabled = enable_sp(vllm_config) and num_tokens is not None
             mmrs_fusion = False
         else:
             sp_enabled = enable_sp(vllm_config) and num_tokens is not None and num_tokens > 1000
 
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
-        flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
+        flashcomm_v2_enabled = (
+            not use_old_eager_forward_context
+            and flashcomm2_enable()
+            and tp_world_size > 1
+            and num_tokens is not None
+        )
         pad_size = 0
         if sp_enabled or flashcomm_v2_enabled:
             pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size

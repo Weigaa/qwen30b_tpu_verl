@@ -1526,6 +1526,36 @@ class RayPPOTrainer:
                         progress_bar.close()
                         return
 
+                    if os.getenv("VLLM_ROLLOUT_DEBUG_GENERATE_ONLY", "0").lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    ):
+                        metrics.update(
+                            {
+                                "training/global_step": self.global_steps,
+                                "training/epoch": epoch,
+                                "rollout/debug_generate_only": 1,
+                            }
+                        )
+                        for timing_key, timing_value in timing_raw.items():
+                            metrics[f"timing_s/{timing_key}"] = timing_value
+                        logger.log(data=metrics, step=self.global_steps)
+                        _stats_logger.warning(
+                            "VLLM_ROLLOUT_DEBUG_GENERATE_ONLY=1: "
+                            "skip reward/logprob/update after rollout generation for this step."
+                        )
+                        progress_bar.update(1)
+                        self.global_steps += 1
+                        if is_last_step:
+                            progress_bar.close()
+                            self._dump_moe_pattern_csvs(epoch)
+                            return
+                        if hasattr(self.train_dataset, "on_batch_end"):
+                            self.train_dataset.on_batch_end(batch=batch)
+                        continue
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():

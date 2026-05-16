@@ -18,8 +18,10 @@
 #
 
 import os
+import inspect
 import math
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -78,6 +80,36 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend import envs as envs_ascend
+
+
+def _debug_env_enabled(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _debug_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _decode_seq_len_bucket(max_seq_len: int) -> str:
+    if max_seq_len <= 1024:
+        return "<=1024"
+    if max_seq_len <= 2048:
+        return "1025-2048"
+    if max_seq_len <= 4096:
+        return "2049-4096"
+    if max_seq_len <= 8192:
+        return "4097-8192"
+    if max_seq_len <= 12288:
+        return "8193-12288"
+    return ">12288"
+
+
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
@@ -110,7 +142,7 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
-    MoECommType, get_mc2_tokens_capacity, select_moe_comm_method,
+    MoECommType, get_mc2_mask, get_mc2_tokens_capacity, select_moe_comm_method,
     set_ascend_forward_context, set_mc2_mask, set_mc2_tokens_capacity)
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -380,6 +412,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         # for cleancode , actually the three attrs is defined in gpu_model_runner
         self.execute_model_state: ExecuteModelState | None = None
+        self._model_forward_accepts_is_dummy: bool | None = None
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: IntermediateTensors | None = None
         self.reorder_batch_threshold: int | None = None
@@ -511,6 +544,33 @@ class NPUModelRunner(GPUModelRunner):
             self._last_synced_enable_dbo = enable_dbo
             return num_tokens, None, with_prefill
 
+        if os.getenv("VLLM_ASCEND_EAGER_METADATA_SYNC_DEVICE", "0") == "1":
+            num_tokens_tensor = torch.tensor([
+                num_tokens if i == self.dp_rank else 0 for i in range(self.dp_size)
+            ],
+                                             dtype=torch.int32,
+                                             device="npu")
+
+            flags_tensor = torch.tensor([int(with_prefill), int(not enable_dbo)],
+                                        dtype=torch.int32,
+                                        device="npu")
+
+            packed_tensor = torch.cat([num_tokens_tensor, flags_tensor])
+            dist.all_reduce(packed_tensor, group=get_dp_group().device_group)
+
+            num_tokens_across_dp = packed_tensor[:-2]
+            synced_flags = packed_tensor[-2:]
+            max_tokens_across_dp = torch.max(num_tokens_across_dp).item()
+            global_with_prefill = bool(synced_flags[0])
+            global_enable_dbo = not bool(synced_flags[1])
+            num_tokens_after_padding = torch.full((self.dp_size,),
+                                                  max_tokens_across_dp,
+                                                  device="npu",
+                                                  dtype=torch.int32)
+            self._last_synced_enable_dbo = global_enable_dbo
+
+            return max_tokens_across_dp, num_tokens_after_padding, global_with_prefill
+
         # Old mode-0 rollout required every DP rank to enter the same metadata
         # sync sequence. Keep that semantic, but use the CPU group here to avoid
         # tail-stage HCCL vector-core timeouts on the lightweight metadata all-reduce.
@@ -586,6 +646,24 @@ class NPUModelRunner(GPUModelRunner):
         if isinstance(self.model, ACLGraphWrapper):
             return self.model.unwrap()
         return self.model
+
+    def _model_forward_supports_is_dummy(self) -> bool:
+        if self._model_forward_accepts_is_dummy is not None:
+            return self._model_forward_accepts_is_dummy
+
+        model = self.get_model()
+        try:
+            signature = inspect.signature(model.forward)
+        except (TypeError, ValueError):
+            self._model_forward_accepts_is_dummy = False
+            return False
+
+        params = signature.parameters
+        self._model_forward_accepts_is_dummy = (
+            "is_dummy" in params or any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in params.values()))
+        return self._model_forward_accepts_is_dummy
 
     def _prepare_inputs(
         self,
@@ -1139,11 +1217,45 @@ class NPUModelRunner(GPUModelRunner):
                                              intermediate_tensors,
                                              inputs_embeds, model_kwargs):
         assert self.model is not None
+        debug_forward = _debug_env_enabled("VLLM_ASCEND_FORWARD_KIND_DEBUG")
+        if debug_forward:
+            try:
+                torch.npu.synchronize()
+            except Exception:
+                pass
+            forward_t0 = time.perf_counter()
         hidden_states = self.model(input_ids=input_ids,
                                    positions=positions,
                                    intermediate_tensors=intermediate_tensors,
                                    inputs_embeds=inputs_embeds,
                                    **model_kwargs)
+        if debug_forward:
+            try:
+                torch.npu.synchronize()
+            except Exception:
+                pass
+            forward_ms = (time.perf_counter() - forward_t0) * 1000.0
+            count = getattr(self, "_forward_kind_debug_count", 0) + 1
+            setattr(self, "_forward_kind_debug_count", count)
+            limit = int(os.getenv("VLLM_ASCEND_FORWARD_KIND_DEBUG_LIMIT", "64"))
+            interval = int(os.getenv("VLLM_ASCEND_FORWARD_KIND_DEBUG_INTERVAL",
+                                     "512"))
+            if count <= limit or (interval > 0 and count % interval == 0):
+                try:
+                    attn_state = getattr(getattr(self, "attn_state", None),
+                                         "name", str(getattr(self, "attn_state", None)))
+                except Exception:
+                    attn_state = "unknown"
+                logger.info(
+                    "forward_kind_debug kind=real call=%s rank=%s dp_rank=%s "
+                    "tokens=%s attn_state=%s elapsed_ms=%.3f",
+                    count,
+                    getattr(self, "rank", None),
+                    getattr(self, "dp_rank", None),
+                    num_input_tokens,
+                    attn_state,
+                    forward_ms,
+                )
 
         forward_context = get_forward_context()
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL \
@@ -1570,6 +1682,18 @@ class NPUModelRunner(GPUModelRunner):
                 head_dim=self.model_config.get_vocab_size(),
                 generators=self.input_batch.sampling_metadata.generators)
 
+        preselect_moe_comm = os.getenv(
+            "VLLM_ASCEND_PRESELECT_MOE_COMM", "0").lower() in (
+                "1", "true", "yes", "on")
+        moe_comm_type = None
+        reserved_mc2_mask = None
+        if preselect_moe_comm:
+            moe_comm_type = select_moe_comm_method(
+                num_input_tokens,
+                self.vllm_config,
+                with_prefill=self.with_prefill)
+            reserved_mc2_mask = get_mc2_mask()
+
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
             with set_ascend_forward_context(
@@ -1580,7 +1704,9 @@ class NPUModelRunner(GPUModelRunner):
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     num_actual_tokens=total_num_scheduled_tokens,
-                    model_instance=self.model):
+                    model_instance=self.model,
+                    moe_comm_type=moe_comm_type,
+                    reserved_mc2_mask=reserved_mc2_mask):
                 # qwen3-specific isolation knob.  Keep disabled by default so
                 # the PIECEWISE graph path matches upstream/ref_ziyi semantics;
                 # enable only when debugging stale attention metadata replay.
@@ -1784,17 +1910,131 @@ class NPUModelRunner(GPUModelRunner):
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
-            dr_str = [
-                f"[{tag}]:{duration:.2f}ms"
-                for tag, duration in durations.items()
-            ]
             captured_name = "Prefill"
             if self.attn_state == AscendAttentionState.DecodeOnly:
                 captured_name = "Decode"
             elif self.attn_state == AscendAttentionState.SpecDecoding:
                 captured_name = "SpecDecode"
-            logger.info(f"Current reqs:{self.input_batch.num_reqs} " +
-                        f"Profile execute duration [{captured_name}]:{' '.join(dr_str)}")
+            if (captured_name == "Decode"
+                    and _debug_env_enabled("VLLM_ASCEND_DECODE_LEN_PROFILE")):
+                num_reqs = int(self.input_batch.num_reqs)
+                if num_reqs > 0:
+                    seq_lens = self.seq_lens.np[:num_reqs]
+                    max_seq_len = int(np.max(seq_lens))
+                    avg_seq_len = float(np.mean(seq_lens))
+                else:
+                    max_seq_len = 0
+                    avg_seq_len = 0.0
+                bucket = _decode_seq_len_bucket(max_seq_len)
+                decode_len_accum = getattr(self, "_decode_len_profile_accum",
+                                           defaultdict(float))
+                decode_len_count = getattr(self, "_decode_len_profile_count",
+                                           defaultdict(int))
+                decode_len_reqs = getattr(self, "_decode_len_profile_reqs",
+                                          defaultdict(int))
+                decode_len_max_seq = getattr(
+                    self, "_decode_len_profile_max_seq", defaultdict(float))
+                decode_len_avg_seq = getattr(
+                    self, "_decode_len_profile_avg_seq", defaultdict(float))
+
+                decode_len_count[bucket] += 1
+                decode_len_reqs[bucket] += num_reqs
+                decode_len_max_seq[bucket] += float(max_seq_len)
+                decode_len_avg_seq[bucket] += avg_seq_len
+                for tag, duration in durations.items():
+                    decode_len_accum[(bucket, tag)] += float(duration)
+
+                setattr(self, "_decode_len_profile_accum", decode_len_accum)
+                setattr(self, "_decode_len_profile_count", decode_len_count)
+                setattr(self, "_decode_len_profile_reqs", decode_len_reqs)
+                setattr(self, "_decode_len_profile_max_seq",
+                        decode_len_max_seq)
+                setattr(self, "_decode_len_profile_avg_seq",
+                        decode_len_avg_seq)
+
+                interval = _debug_env_int(
+                    "VLLM_ASCEND_DECODE_LEN_PROFILE_INTERVAL", 200)
+                total_decode_len_steps = sum(decode_len_count.values())
+                if interval > 0 and total_decode_len_steps % interval == 0:
+                    if (getattr(self, "rank", 0) == 0
+                            or _debug_env_enabled(
+                                "VLLM_ASCEND_DECODE_LEN_PROFILE_ALL_RANKS")):
+                        parts = []
+                        for bucket_name in sorted(decode_len_count):
+                            count = max(decode_len_count[bucket_name], 1)
+                            metrics = []
+                            for tag in ("forward", "Sample", "prepare input",
+                                        "post process"):
+                                total = decode_len_accum.get(
+                                    (bucket_name, tag), 0.0)
+                                if total:
+                                    metrics.append(
+                                        f"{tag.replace(' ', '_')}={total / count:.2f}ms"
+                                    )
+                            avg_reqs = decode_len_reqs[bucket_name] / count
+                            avg_max_seq = decode_len_max_seq[
+                                bucket_name] / count
+                            avg_seq = decode_len_avg_seq[bucket_name] / count
+                            parts.append(
+                                f"bucket={bucket_name},n={count},avg_reqs={avg_reqs:.2f},"
+                                f"avg_max_seq={avg_max_seq:.1f},avg_seq={avg_seq:.1f},"
+                                + ",".join(metrics))
+                        logger.info("decode_len_profile steps=%s %s",
+                                    total_decode_len_steps, " | ".join(parts))
+            if os.getenv("VLLM_ASCEND_MODEL_EXECUTE_TIME_SUMMARY",
+                         "0").lower() in ("1", "true", "yes", "on"):
+                interval = int(os.getenv(
+                    "VLLM_ASCEND_MODEL_EXECUTE_TIME_SUMMARY_INTERVAL", "200"))
+                profile_accum = getattr(self, "_profile_duration_accum",
+                                        defaultdict(float))
+                profile_count = getattr(self, "_profile_duration_count",
+                                        defaultdict(int))
+                profile_reqs = getattr(self, "_profile_duration_reqs",
+                                       defaultdict(int))
+                profile_steps = getattr(self, "_profile_duration_steps",
+                                        defaultdict(int))
+                profile_steps[captured_name] += 1
+                profile_reqs[captured_name] += int(self.input_batch.num_reqs)
+                for tag, duration in durations.items():
+                    key = (captured_name, tag)
+                    profile_accum[key] += float(duration)
+                    profile_count[key] += 1
+                setattr(self, "_profile_duration_accum", profile_accum)
+                setattr(self, "_profile_duration_count", profile_count)
+                setattr(self, "_profile_duration_reqs", profile_reqs)
+                setattr(self, "_profile_duration_steps", profile_steps)
+                phase_steps = profile_steps[captured_name]
+                if interval > 0 and phase_steps % interval == 0:
+                    if (getattr(self, "rank", 0) != 0 and os.getenv(
+                            "VLLM_ASCEND_MODEL_EXECUTE_TIME_SUMMARY_ALL_RANKS",
+                            "0").lower() not in ("1", "true", "yes", "on")):
+                        return model_runner_output
+                    parts = []
+                    for (phase, tag), total in sorted(profile_accum.items()):
+                        if phase != captured_name:
+                            continue
+                        count = max(profile_count[(phase, tag)], 1)
+                        parts.append(
+                            f"[{tag}]:avg={total / count:.2f}ms,total={total:.2f}ms,n={count}"
+                        )
+                    avg_reqs = profile_reqs[captured_name] / max(
+                        phase_steps, 1)
+                    logger.info(
+                        "Profile execute duration summary [%s] steps=%s avg_reqs=%.2f %s",
+                        captured_name,
+                        phase_steps,
+                        avg_reqs,
+                        " ".join(parts),
+                    )
+            else:
+                dr_str = [
+                    f"[{tag}]:{duration:.2f}ms"
+                    for tag, duration in durations.items()
+                ]
+                logger.info(
+                    f"Current reqs:{self.input_batch.num_reqs} " +
+                    f"Profile execute duration [{captured_name}]:{' '.join(dr_str)}"
+                )
 
         if self.dynamic_eplb:
             self.eplb_updator.forward_end()
@@ -2091,11 +2331,49 @@ class NPUModelRunner(GPUModelRunner):
 
     def _generate_dummy_run_hidden_states(self, input_ids, positions,
                                           num_tokens, intermediate_tensors,
-                                          inputs_embeds):
-        hidden_states = self.model(input_ids=input_ids,
-                                   positions=positions,
-                                   intermediate_tensors=intermediate_tensors,
-                                   inputs_embeds=inputs_embeds)
+                                          inputs_embeds, is_profile=False):
+        debug_forward = _debug_env_enabled("VLLM_ASCEND_FORWARD_KIND_DEBUG")
+        if debug_forward:
+            try:
+                torch.npu.synchronize()
+            except Exception:
+                pass
+            forward_t0 = time.perf_counter()
+        model_kwargs = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "intermediate_tensors": intermediate_tensors,
+            "inputs_embeds": inputs_embeds,
+        }
+        if (_debug_env_enabled("VLLM_ASCEND_QWEN3_DUMMY_SKIP_ATTENTION")
+                and not is_profile
+                and self._model_forward_supports_is_dummy()):
+            model_kwargs["is_dummy"] = True
+        hidden_states = self.model(**model_kwargs)
+        if debug_forward:
+            try:
+                torch.npu.synchronize()
+            except Exception:
+                pass
+            forward_ms = (time.perf_counter() - forward_t0) * 1000.0
+            kind = "profile_dummy" if is_profile else "runtime_dummy"
+            attr_name = f"_forward_kind_debug_{kind}_count"
+            count = getattr(self, attr_name, 0) + 1
+            setattr(self, attr_name, count)
+            limit = int(os.getenv("VLLM_ASCEND_FORWARD_KIND_DEBUG_LIMIT", "64"))
+            interval = int(os.getenv("VLLM_ASCEND_FORWARD_KIND_DEBUG_INTERVAL",
+                                     "512"))
+            if count <= limit or (interval > 0 and count % interval == 0):
+                logger.info(
+                    "forward_kind_debug kind=%s call=%s rank=%s dp_rank=%s "
+                    "tokens=%s elapsed_ms=%.3f",
+                    kind,
+                    count,
+                    getattr(self, "rank", None),
+                    getattr(self, "dp_rank", None),
+                    num_tokens,
+                    forward_ms,
+                )
         forward_context = get_forward_context()
         assert forward_context is not None
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
@@ -2325,10 +2603,19 @@ class NPUModelRunner(GPUModelRunner):
                     num_actual_tokens=0,
                     aclgraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
-                    model_instance=self.model):
+                    model_instance=self.model,
+                    moe_comm_type=(select_moe_comm_method(
+                        num_tokens_padded,
+                        self.vllm_config,
+                        with_prefill=with_prefill) if os.getenv(
+                            "VLLM_ASCEND_PRESELECT_MOE_COMM", "0").lower()
+                        in ("1", "true", "yes", "on") else None),
+                    reserved_mc2_mask=(get_mc2_mask() if os.getenv(
+                        "VLLM_ASCEND_PRESELECT_MOE_COMM", "0").lower() in
+                                       ("1", "true", "yes", "on") else None)):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded,
-                    intermediate_tensors, inputs_embeds)
+                    intermediate_tensors, inputs_embeds, is_profile=is_profile)
                 dummy_compute_logits(hidden_states)
 
             if self.drafter:

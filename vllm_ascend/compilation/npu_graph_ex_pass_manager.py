@@ -16,10 +16,13 @@
 # limitations under the License.
 #
 
+import os
+from typing import Any
+
 from torch import fx as fx
 from vllm.compilation.inductor_pass import get_pass_context
-from vllm.compilation.vllm_inductor_pass import VllmInductorPass
 from vllm.config import VllmConfig
+from vllm.logger import logger
 
 
 class NpuGraphEXPassManager:
@@ -31,7 +34,7 @@ class NpuGraphEXPassManager:
     """
 
     def __init__(self):
-        self.passes: list[VllmInductorPass] = []
+        self.passes: list[Any] = []
 
     def __call__(self, graph: fx.Graph) -> fx.Graph:
         compile_range = get_pass_context().compile_range
@@ -39,13 +42,32 @@ class NpuGraphEXPassManager:
         for pass_ in self.passes:
             if pass_.is_applicable_for_range(compile_range):
                 pass_(graph)
-        graph.recompiler()
+        graph.recompile()
         return graph
 
-    def add(self, pass_: VllmInductorPass):
-        assert isinstance(pass_, VllmInductorPass)
+    def add(self, pass_: Any):
         self.passes.append(pass_)
 
     def configure(self, config: VllmConfig):
         # By default, we enable the graph fusion and quantization fusion pass.
         self.ascend_compilation_config: dict = config.additional_config.get("ascend_compilation_config", {})
+        # Keep norm/quant GraphEX fusion opt-in for now.  It has a broader
+        # correctness surface than qk-norm/rope and was not the bottleneck we
+        # are isolating in eager rollout.
+        enable_norm_quant = os.getenv(
+            "VLLM_ASCEND_NPUGRAPH_EX_ENABLE_NORM_QUANT_FUSION", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        if enable_norm_quant and self.ascend_compilation_config.get("fuse_norm_quant", True):
+            from .npugraph_ex_passes.graphex_norm_quant_fusion_pass import GraphEXAddRMSNormFusionPass
+
+            self.passes.append(GraphEXAddRMSNormFusionPass(config))
+
+        enable_qknorm_rope = os.getenv(
+            "VLLM_ASCEND_NPUGRAPH_EX_ENABLE_QKNORM_ROPE_FUSION", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        if enable_qknorm_rope and self.ascend_compilation_config.get("fuse_qknorm_rope", True):
+            from .npugraph_ex_passes.graphex_qknorm_rope_fusion_pass import GraphEXQKNormRopeFusionPass
+
+            self.passes.append(GraphEXQKNormRopeFusionPass(config))
+
+        logger.info("Configured %d npu_graph_ex fusion passes.", len(self.passes))

@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -24,6 +25,10 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormG
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 
 from vllm_ascend.utils import enable_custom_op
+
+_FORCE_TORCH_NPU_ADD_RMS_NORM = os.getenv(
+    "VLLM_ASCEND_FORCE_TORCH_NPU_ADD_RMS_NORM", "0"
+).lower() in {"1", "true", "yes", "on"}
 
 
 class AscendRMSNorm(RMSNorm):
@@ -53,7 +58,7 @@ class AscendRMSNorm(RMSNorm):
         import torch_npu
 
         if residual is not None:
-            if enable_custom_op():
+            if enable_custom_op() and not _FORCE_TORCH_NPU_ADD_RMS_NORM:
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
                     x, residual, self.weight, self.bias, self.variance_epsilon)
             else:
@@ -81,7 +86,7 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
 
         from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
         if residual is not None:
-            if enable_custom_op():
+            if enable_custom_op() and not _FORCE_TORCH_NPU_ADD_RMS_NORM:
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
                     x, residual, 1.0 + self.weight, None,
                     self.variance_epsilon)

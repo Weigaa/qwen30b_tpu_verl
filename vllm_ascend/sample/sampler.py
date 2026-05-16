@@ -1,6 +1,7 @@
 import os
 
 import torch
+import torch_npu
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 from vllm.v1.sample.sampler import Sampler
 
@@ -128,6 +129,20 @@ def _apply_top_k_top_p_pytorch(
     return logits
 
 
+def _apply_top_k_top_p_torch_npu(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    p: torch.Tensor,
+) -> torch.Tensor:
+    if p is None and k is None:
+        return logits
+    # Keep the old-stack fast path first when both constraints exist and the
+    # runtime supports the fused torch_npu op.
+    if p is not None and k is not None and 1 <= int(k.max()) <= 1024:
+        return torch_npu.npu_top_k_top_p(logits, p, k)
+    return _apply_top_k_top_p_pytorch(logits, k, p)
+
+
 def _apply_top_k_top_p_ascendc(
     logits: torch.Tensor,
     k: torch.Tensor,
@@ -137,9 +152,9 @@ def _apply_top_k_top_p_ascendc(
         return logits
     return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)
 
-# The Ascend custom ApplyTopKTopP kernel is not reliably available on all
-# runtime stacks used for RL rollouts. Prefer the PyTorch fallback unless a
-# caller explicitly opts in.
+# The old eager fast path preferred torch_npu.npu_top_k_top_p. Keep that as
+# the default hot path, use the custom AscendC op only when explicitly opted
+# in, and fall back to PyTorch otherwise.
 _USE_ASCEND_TOPK_TOPP_CUSTOM = bool(
     int(os.getenv("VLLM_ASCEND_USE_TOPK_TOPP_CUSTOM", "0"))
 )
@@ -147,5 +162,5 @@ apply_top_k_top_p = (
     _apply_top_k_top_p_ascendc
     if _USE_ASCEND_TOPK_TOPP_CUSTOM
     and get_ascend_device_type() in [AscendDeviceType.A2, AscendDeviceType.A3]
-    else _apply_top_k_top_p_pytorch
+    else _apply_top_k_top_p_torch_npu
 )

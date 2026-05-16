@@ -19,13 +19,14 @@ from typing import Callable, Optional
 
 import torch
 import torch_npu
-from vllm.config import CompilationLevel, get_current_vllm_config
+from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import (get_dp_group, get_ep_group, get_tp_group,
                               tensor_model_parallel_all_reduce)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map)
-from vllm.model_executor.layers.shared_fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe.shared_fused_moe import \
+    SharedFusedMoE
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import MoECommType
@@ -49,12 +50,15 @@ def unquantized_fused_moe_init_func(self, *args, **kwargs):
     # Once torch.randint_like is supported or removed, this flag can be removed.
     vllm_config = get_current_vllm_config()
     ascend_config = get_ascend_config()
-    if ascend_config.torchair_graph_config.enabled:
+    torchair_graph_config = getattr(ascend_config, "torchair_graph_config",
+                                    None)
+    if torchair_graph_config is not None and torchair_graph_config.enabled:
         self.use_aclgraph = False
     else:
-        self.use_aclgraph = (vllm_config.compilation_config.level
-                             == CompilationLevel.PIECEWISE
-                             and not vllm_config.model_config.enforce_eager)
+        self.use_aclgraph = (
+            getattr(vllm_config.compilation_config, "cudagraph_mode", None)
+            != CUDAGraphMode.NONE
+            and not vllm_config.model_config.enforce_eager)
     self.transpose = True
 
 
@@ -79,7 +83,8 @@ def forward_oot(
         enable_eplb: bool = False,
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None) -> torch.Tensor:
+        logical_replica_count: Optional[torch.Tensor] = None,
+        **kwargs) -> torch.Tensor:
 
     topk_weights, topk_ids, row_idx = select_experts(
         hidden_states=x,
@@ -103,7 +108,8 @@ def forward_oot(
                                          topk_ids=topk_ids,
                                          row_idx=row_idx,
                                          global_num_experts=global_num_experts,
-                                         expert_map=expert_map)
+                                         expert_map=expert_map,
+                                         need_trans=True)
 
 
 def process_weights_after_loading(self, layer):
@@ -132,11 +138,64 @@ def process_weights_after_loading(self, layer):
             layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
 
 
+class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+
+    def apply(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            use_grouped_topk: bool,
+            top_k: int,
+            router_logits: torch.Tensor,
+            renormalize: bool,
+            topk_group: Optional[int] = None,
+            num_expert_group: Optional[int] = None,
+            custom_routing_function: Optional[Callable] = None,
+            scoring_func: str = "softmax",
+            routed_scaling_factor: float = 1.0,
+            e_score_correction_bias: Optional[torch.Tensor] = None,
+            global_num_experts: int = -1,
+            expert_map: Optional[torch.Tensor] = None,
+            apply_router_weight_on_input: bool = False,
+            activation: str = "silu",
+            enable_eplb: bool = False,
+            expert_load_view: Optional[torch.Tensor] = None,
+            logical_to_physical_map: Optional[torch.Tensor] = None,
+            logical_replica_count: Optional[torch.Tensor] = None,
+            **kwargs) -> torch.Tensor:
+        del activation, enable_eplb, expert_load_view
+        del logical_to_physical_map, logical_replica_count
+        return forward_oot(
+            self,
+            layer=layer,
+            x=x,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            router_logits=router_logits,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            **kwargs)
+
+
 class AscendFusedMoE(FusedMoE):
     moe_counter = -1
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        if self.quant_config is None:
+            self.quant_method = AscendUnquantizedFusedMoEMethod(self.moe_config)
+        else:
+            self.quant_method = self.quant_config.get_quant_method(
+                self, self.layer_name)
+        assert self.quant_method is not None
 
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
@@ -154,23 +213,38 @@ class AscendFusedMoE(FusedMoE):
                                                     os.R_OK):
             self.expert_load_balancer = ExpertLoadBalancer(
                 self.expert_map_path, self.global_num_experts)
-            self.local_num_experts, self.expert_map = (
+            self.local_num_experts, expert_map = (
                 self.expert_load_balancer.get_rank_placement_map(
                     self.moe_instance_id, self.ep_rank))
+            self._set_expert_map(expert_map)
             self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
                 self.moe_instance_id, self.ep_rank).npu()
             self.global_redundant_expert_num = (
                 self.expert_load_balancer.get_global_redundant_expert_num())
         else:
             # init moe.
-            self.local_num_experts, self.expert_map = determine_expert_map(
-                self.ep_size, self.ep_rank, self.global_num_experts)
+            primary_mapping = determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=self.global_num_experts)
+            if len(primary_mapping) == 3:
+                self.local_num_experts, expert_map, self.log2phy = primary_mapping
+                self._set_expert_map(expert_map)
+            elif len(primary_mapping) == 2:
+                self.local_num_experts, expert_map = primary_mapping
+                self._set_expert_map(expert_map)
+                self.log2phy = determine_default_log2phy_map(
+                    self.global_num_experts, self.ep_size, self.ep_rank, 0)
+            else:
+                raise ValueError(
+                    f"Unexpected determine_expert_map return arity={len(primary_mapping)}")
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
                 self.global_redundant_expert_num = ascend_config.init_redundancy_expert
-                self.local_num_experts, self.expert_map = determine_default_expert_map(
+                self.local_num_experts, expert_map = determine_default_expert_map(
                     self.global_num_experts, self.ep_size, self.ep_rank,
                     self.global_redundant_expert_num)
+                self._set_expert_map(expert_map)
                 self.log2phy = determine_default_log2phy_map(
                     self.global_num_experts, self.ep_size, self.ep_rank,
                     self.global_redundant_expert_num)
@@ -182,8 +256,13 @@ class AscendFusedMoE(FusedMoE):
 
         setup_moe_comm_method(self.moe_config)
 
+    def _set_expert_map(self, expert_map):
+        # Current vLLM exposes expert_map as a read-only property backed by
+        # _expert_map, while older vllm-ascend wrote expert_map directly.
+        self._expert_map = expert_map
+
     def update_expert_map(self, new_expert_map):
-        self.expert_map = new_expert_map
+        self._set_expert_map(new_expert_map)
 
     def get_map(self):
         return self.expert_map
@@ -230,6 +309,7 @@ class AscendFusedMoE(FusedMoE):
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
             scoring_func=self.scoring_func,
+            routed_scaling_factor=self.routed_scaling_factor,
             e_score_correction_bias=self.e_score_correction_bias,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
@@ -312,9 +392,11 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
     def __init__(
         self,
         shared_experts: torch.nn.Module,
+        gate: Optional[torch.nn.Module] = None,
         use_overlapped: bool = True,
         **kwargs,
     ):
+        del gate
         AscendFusedMoE.__init__(self, **kwargs)
         self._shared_experts = shared_experts
         self.use_overlapped = use_overlapped

@@ -699,7 +699,10 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
         or envs_ascend.VLLM_ASCEND_USE_LEGACY_FUSED_MOE
     )
-    if use_legacy_fused_moe:
+    if envs_ascend.VLLM_ASCEND_USE_COMMON_FUSED_MOE:
+        from vllm_ascend.ops.common_fused_moe import (
+            AscendFusedMoE, AscendSharedFusedMoE)
+    elif use_legacy_fused_moe:
         from vllm_ascend.ops.fused_moe_legacy import AscendFusedMoE
         # The legacy eager MoE path is for Qwen-style routed experts and does
         # not define a SharedFusedMoE variant. Keep the newer shared-expert op

@@ -3,14 +3,52 @@ set -ex
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
-CUSTOM_OP_API_LIB="${CUSTOM_OPP_PATH}/op_api/lib"
-
-if [ -d "${CUSTOM_OPP_PATH}" ]; then
-    export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH:-}"
+FILTERED_CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom_moe_filtered/vendors/vllm-ascend"
+FULL_CUSTOM_OPP_PATH="${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom/vendors/vllm-ascend"
+DEFAULT_CUSTOM_OPP_PATH="${FILTERED_CUSTOM_OPP_PATH}"
+if [ ! -d "${DEFAULT_CUSTOM_OPP_PATH}" ]; then
+    DEFAULT_CUSTOM_OPP_PATH="${FULL_CUSTOM_OPP_PATH}"
 fi
-if [ -d "${CUSTOM_OP_API_LIB}" ]; then
-    export LD_LIBRARY_PATH="${CUSTOM_OP_API_LIB}:${LD_LIBRARY_PATH:-}"
+CUSTOM_OPP_PATH="${VLLM_ASCEND_LOCAL_CUSTOM_OPP_PATH:-${DEFAULT_CUSTOM_OPP_PATH}}"
+CUSTOM_OP_API_LIB="${CUSTOM_OPP_PATH}/op_api/lib"
+FILTERED_CUSTOM_OP_API_LIB="${FILTERED_CUSTOM_OPP_PATH}/op_api/lib"
+FULL_CUSTOM_OP_API_LIB="${FULL_CUSTOM_OPP_PATH}/op_api/lib"
+USE_LOCAL_CUSTOM_OP_API_LIB="${VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB:-0}"
+
+remove_colon_path() {
+    local var_name="$1"
+    local path_to_remove="$2"
+    local current_value="${!var_name:-}"
+    local new_value=""
+    local entry
+    IFS=':' read -r -a entries <<< "${current_value}"
+    for entry in "${entries[@]}"; do
+        if [ -z "${entry}" ] || [ "${entry}" = "${path_to_remove}" ]; then
+            continue
+        fi
+        if [ -z "${new_value}" ]; then
+            new_value="${entry}"
+        else
+            new_value="${new_value}:${entry}"
+        fi
+    done
+    export "${var_name}=${new_value}"
+}
+
+if [ "${VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP:-1}" = "1" ]; then
+    remove_colon_path LD_LIBRARY_PATH "${CUSTOM_OP_API_LIB}"
+    if [ "${CUSTOM_OPP_PATH}" != "${FULL_CUSTOM_OPP_PATH}" ]; then
+        remove_colon_path ASCEND_CUSTOM_OPP_PATH "${FILTERED_CUSTOM_OPP_PATH}"
+        remove_colon_path ASCEND_CUSTOM_OPP_PATH "${FULL_CUSTOM_OPP_PATH}"
+        remove_colon_path LD_LIBRARY_PATH "${FILTERED_CUSTOM_OP_API_LIB}"
+        remove_colon_path LD_LIBRARY_PATH "${FULL_CUSTOM_OP_API_LIB}"
+    fi
+    if [ -d "${CUSTOM_OPP_PATH}" ]; then
+        export ASCEND_CUSTOM_OPP_PATH="${CUSTOM_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH:-}"
+    fi
+    if [ "${USE_LOCAL_CUSTOM_OP_API_LIB}" = "1" ] && [ -d "${CUSTOM_OP_API_LIB}" ]; then
+        export LD_LIBRARY_PATH="${CUSTOM_OP_API_LIB}:${LD_LIBRARY_PATH:-}"
+    fi
 fi
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -65,7 +103,8 @@ export HCCL_BUFFSIZE=800
 export TASK_QUEUE_ENABLE=${VLLM_ROLLOUT_TASK_QUEUE_ENABLE:-2}
 
 export VLLM_ENABLE_FIX_ROUTE=0    
-export VLLM_MODEL_EXECUTE_TIME_OBSERVE=0     # decode prefill的耗时打印
+export VLLM_MODEL_EXECUTE_TIME_OBSERVE=${VLLM_MODEL_EXECUTE_TIME_OBSERVE:-0}     # decode prefill的耗时打印
+export VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE=${VLLM_ASCEND_MODEL_EXECUTE_TIME_OBSERVE:-${VLLM_MODEL_EXECUTE_TIME_OBSERVE}}
 
 #extra env in qwen3_235b_env.sh
 # Recipe features
@@ -370,14 +409,30 @@ set -x
     echo "[run] VLLM_ASCEND_NO_EP_KEEP_TP_ACROSS_DP=${VLLM_ASCEND_NO_EP_KEEP_TP_ACROSS_DP:-0}"
     echo "[run] ALL_TO_ALL_RESHARD=${ALL_TO_ALL_RESHARD}"
     echo "[run] USE_ALLTOALL_OVERLAP=${USE_ALLTOALL_OVERLAP}"
+    echo "[run] HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-}"
+    echo "[run] HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-}"
     echo "[run] VLLM_ASCEND_FORCE_ALLTOALL_MOE=${VLLM_ASCEND_FORCE_ALLTOALL_MOE}"
     echo "[run] VLLM_ASCEND_MC2_TOKENS_CAPACITY=${VLLM_ASCEND_MC2_TOKENS_CAPACITY}"
     echo "[run] VLLM_ASCEND_MC2_GLOBAL_BS=${VLLM_ASCEND_MC2_GLOBAL_BS}"
+    echo "[run] VLLM_ASCEND_MC2_DISABLE_DISPATCH_EXPERT_SCALES=${VLLM_ASCEND_MC2_DISABLE_DISPATCH_EXPERT_SCALES:-0}"
+    echo "[run] VLLM_ASCEND_ENABLE_FUSED_MC2=${VLLM_ASCEND_ENABLE_FUSED_MC2:-0}"
+    echo "[run] VLLM_ASCEND_FUSED_MOE_SIMPLE_MC2=${VLLM_ASCEND_FUSED_MOE_SIMPLE_MC2:-0}"
+    echo "[run] VLLM_ROLLOUT_FORCE_ELASTIC_MOE_POLICY=${VLLM_ROLLOUT_FORCE_ELASTIC_MOE_POLICY:-0}"
+    echo "[run] VLLM_ASCEND_ATTENTION_BLOCK_SIZE=${VLLM_ASCEND_ATTENTION_BLOCK_SIZE:-}"
+    echo "[run] VLLM_ASCEND_EAGER_METADATA_SYNC_DEVICE=${VLLM_ASCEND_EAGER_METADATA_SYNC_DEVICE:-0}"
+    echo "[run] VLLM_QWEN3_MOE_REDUCE_RESULTS=${VLLM_QWEN3_MOE_REDUCE_RESULTS:-1}"
+    echo "[run] VLLM_QWEN3_MOE_ASCEND_LEGACY_INIT=${VLLM_QWEN3_MOE_ASCEND_LEGACY_INIT:-0}"
     echo "[run] VLLM_ASCEND_FORCE_PAGED_ATTENTION_DECODE=${VLLM_ASCEND_FORCE_PAGED_ATTENTION_DECODE}"
     echo "[run] VLLM_ENABLE_GRAPH_MODE=${VLLM_ENABLE_GRAPH_MODE}"
     echo "[run] VLLM_CHUNK_MOE_SIZE=${VLLM_CHUNK_MOE_SIZE}"
     echo "[run] VLLM_EPOCH_LENGTH_REGROUP_DEFAULT_LENGTH=${VLLM_EPOCH_LENGTH_REGROUP_DEFAULT_LENGTH}"
     echo "[run] VLLM_ASCEND_EAGER_COMPILE=${VLLM_ASCEND_EAGER_COMPILE:-}"
+    echo "[run] VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP=${VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP:-1}"
+    echo "[run] VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB=${VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB:-0}"
+    echo "[run] VLLM_ASCEND_LOCAL_CUSTOM_OPP_PATH=${CUSTOM_OPP_PATH}"
+    echo "[run] VLLM_ASCEND_EAGER_COMPILE_PASS_FUSION=${VLLM_ASCEND_EAGER_COMPILE_PASS_FUSION:-0}"
+    echo "[run] VLLM_ASCEND_USE_TOPK_TOPP_CUSTOM=${VLLM_ASCEND_USE_TOPK_TOPP_CUSTOM:-0}"
+    echo "[run] VLLM_ROLLOUT_STAGE_DEBUG=${VLLM_ROLLOUT_STAGE_DEBUG:-0}"
     echo "[run] VLLM_ROLLOUT_USE_TQDM=${VLLM_ROLLOUT_USE_TQDM:-}"
     echo "[run] VLLM_ROLLOUT_GRAPH_WITH_RESAMPLER=${VLLM_ROLLOUT_GRAPH_WITH_RESAMPLER}"
     echo "[run] ROLLOUT_ENFORCE_EAGER=${ROLLOUT_ENFORCE_EAGER}"

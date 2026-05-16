@@ -17,6 +17,7 @@
 
 import logging
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
@@ -28,6 +29,7 @@ import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
     AttentionCGSupport,
@@ -74,6 +76,58 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid integer env %s=%r, using %s", name, value, default)
+        return default
+
+
+_ATTENTION_DEBUG_ENABLED = _env_flag("VLLM_ASCEND_ATTENTION_DEBUG")
+_ATTENTION_DEBUG_INTERVAL = int(os.getenv("VLLM_ASCEND_ATTENTION_DEBUG_INTERVAL", "512"))
+_ATTENTION_STAGE_DEBUG_ENABLED = _env_flag("VLLM_ASCEND_ATTENTION_STAGE_DEBUG")
+_ATTENTION_STAGE_DEBUG_INTERVAL = _env_int("VLLM_ASCEND_ATTENTION_STAGE_DEBUG_INTERVAL", 1024)
+_ATTENTION_STAGE_DEBUG_SKIP = _env_int("VLLM_ASCEND_ATTENTION_STAGE_DEBUG_SKIP", 0)
+_ATTENTION_STAGE_DEBUG_LIMIT = _env_int("VLLM_ASCEND_ATTENTION_STAGE_DEBUG_LIMIT", 0)
+_ATTENTION_WRAPPER_DEBUG_ENABLED = _env_flag("VLLM_ASCEND_ATTENTION_WRAPPER_DEBUG")
+_ATTENTION_WRAPPER_DEBUG_INTERVAL = _env_int("VLLM_ASCEND_ATTENTION_WRAPPER_DEBUG_INTERVAL", 1024)
+_ATTENTION_WRAPPER_DEBUG_SKIP = _env_int("VLLM_ASCEND_ATTENTION_WRAPPER_DEBUG_SKIP", 0)
+_ATTENTION_WRAPPER_DEBUG_LIMIT = _env_int("VLLM_ASCEND_ATTENTION_WRAPPER_DEBUG_LIMIT", 0)
+_ATTENTION_SYNC_DEBUG_ENABLED = _env_flag("VLLM_ASCEND_ATTENTION_SYNC_DEBUG")
+_ATTENTION_SYNC_DEBUG_INTERVAL = _env_int("VLLM_ASCEND_ATTENTION_SYNC_DEBUG_INTERVAL", 1024)
+_ATTENTION_SYNC_DEBUG_SKIP = _env_int("VLLM_ASCEND_ATTENTION_SYNC_DEBUG_SKIP", 0)
+_ATTENTION_SYNC_DEBUG_LIMIT = _env_int("VLLM_ASCEND_ATTENTION_SYNC_DEBUG_LIMIT", 0)
+_ATTENTION_FIA_DETAIL_DEBUG_ENABLED = _env_flag("VLLM_ASCEND_ATTENTION_FIA_DETAIL_DEBUG")
+_ATTENTION_FIA_DETAIL_DEBUG_INTERVAL = _env_int("VLLM_ASCEND_ATTENTION_FIA_DETAIL_DEBUG_INTERVAL", 1024)
+_ATTENTION_FIA_DETAIL_DEBUG_SKIP = _env_int("VLLM_ASCEND_ATTENTION_FIA_DETAIL_DEBUG_SKIP", 0)
+_ATTENTION_FIA_DETAIL_DEBUG_LIMIT = _env_int("VLLM_ASCEND_ATTENTION_FIA_DETAIL_DEBUG_LIMIT", 0)
+_ATTENTION_VALUE_CONTIGUOUS = _env_flag("VLLM_ASCEND_ATTENTION_VALUE_CONTIGUOUS")
+_ATTENTION_STAGE_DEBUG_STATE_FILTER = {
+    value.strip()
+    for value in os.getenv("VLLM_ASCEND_ATTENTION_STAGE_DEBUG_STATE_FILTER", "").split(",")
+    if value.strip()
+}
+_ATTENTION_STAGE_DEBUG_OP_FILTER = {
+    value.strip()
+    for value in os.getenv("VLLM_ASCEND_ATTENTION_STAGE_DEBUG_OP_FILTER", "").split(",")
+    if value.strip()
+}
+_FORCE_PAGED_ATTENTION_DECODE = _env_flag("VLLM_ASCEND_FORCE_PAGED_ATTENTION_DECODE")
+_DISABLE_FULL_GRAPH_FIA = _env_flag("VLLM_ASCEND_DISABLE_FULL_GRAPH_FIA")
+_DISABLE_FULL_GRAPH_PA = _env_flag("VLLM_ASCEND_DISABLE_FULL_GRAPH_PA")
+_attention_stage_debug_total = 0
+_attention_stage_debug_seen = 0
+_attention_stage_debug_matched = 0
+_attention_stage_debug_summary: Counter[tuple[str, str, str]] = Counter()
+_attention_wrapper_debug_matched = 0
+_attention_sync_debug_matched = 0
+_attention_fia_detail_debug_matched = 0
+
+
 def _token_bucket(num_tokens: int) -> str:
     if num_tokens <= 0:
         return "0"
@@ -99,7 +153,7 @@ def _maybe_log_attention_path(
     num_decodes: int,
     num_prefills: int,
 ) -> None:
-    if not _env_flag("VLLM_ASCEND_ATTENTION_DEBUG"):
+    if not _ATTENTION_DEBUG_ENABLED:
         return
     global _ATTENTION_DEBUG_TOTAL
     _ATTENTION_DEBUG_TOTAL += 1
@@ -107,9 +161,8 @@ def _maybe_log_attention_path(
     key = (attn_state.name, op_name, bucket)
     _ATTENTION_DEBUG_SUMMARY[key] += 1
 
-    interval = int(os.getenv("VLLM_ASCEND_ATTENTION_DEBUG_INTERVAL", "512"))
     if _ATTENTION_DEBUG_TOTAL <= 32 or (
-        interval > 0 and _ATTENTION_DEBUG_TOTAL % interval == 0
+        _ATTENTION_DEBUG_INTERVAL > 0 and _ATTENTION_DEBUG_TOTAL % _ATTENTION_DEBUG_INTERVAL == 0
     ):
         summary = ", ".join(
             f"{state}/{op}/{tok}:{count}"
@@ -127,6 +180,264 @@ def _maybe_log_attention_path(
             num_prefills,
             summary,
         )
+
+
+def _maybe_new_timing_event() -> torch.npu.Event | None:
+    try:
+        return torch.npu.Event(enable_timing=True)
+    except TypeError:
+        return torch.npu.Event()
+
+
+def _should_capture_attention_stage_timing(
+    attn_state=None,
+    op_name: str | None = None,
+) -> bool:
+    if not _ATTENTION_STAGE_DEBUG_ENABLED:
+        return False
+    state_name = getattr(attn_state, "name", "")
+    if _ATTENTION_STAGE_DEBUG_STATE_FILTER and state_name not in _ATTENTION_STAGE_DEBUG_STATE_FILTER:
+        return False
+    if _ATTENTION_STAGE_DEBUG_OP_FILTER and op_name not in _ATTENTION_STAGE_DEBUG_OP_FILTER:
+        return False
+
+    global _attention_stage_debug_seen, _attention_stage_debug_matched
+    _attention_stage_debug_seen += 1
+    _attention_stage_debug_matched += 1
+    if _ATTENTION_STAGE_DEBUG_LIMIT:
+        if _attention_stage_debug_matched > _ATTENTION_STAGE_DEBUG_SKIP + _ATTENTION_STAGE_DEBUG_LIMIT:
+            return False
+    if _attention_stage_debug_matched <= _ATTENTION_STAGE_DEBUG_SKIP:
+        return False
+    matched_after_skip = _attention_stage_debug_matched - _ATTENTION_STAGE_DEBUG_SKIP
+    return matched_after_skip <= 32 or (
+        _ATTENTION_STAGE_DEBUG_INTERVAL > 0
+        and matched_after_skip % _ATTENTION_STAGE_DEBUG_INTERVAL == 0
+    )
+
+
+if _ATTENTION_STAGE_DEBUG_ENABLED:
+    # Keep the profiling gate out of Dynamo graphs. Otherwise compiled-eager can
+    # treat an early True result as static and record/log every decode call.
+    _should_capture_attention_stage_timing = torch._dynamo.disable(
+        _should_capture_attention_stage_timing)
+
+
+def _should_capture_attention_wrapper_timing(attn_state=None) -> bool:
+    if not _ATTENTION_WRAPPER_DEBUG_ENABLED:
+        return False
+    state_name = getattr(attn_state, "name", "")
+    if _ATTENTION_STAGE_DEBUG_STATE_FILTER and state_name not in _ATTENTION_STAGE_DEBUG_STATE_FILTER:
+        return False
+
+    global _attention_wrapper_debug_matched
+    _attention_wrapper_debug_matched += 1
+    if _ATTENTION_WRAPPER_DEBUG_LIMIT:
+        if _attention_wrapper_debug_matched > _ATTENTION_WRAPPER_DEBUG_SKIP + _ATTENTION_WRAPPER_DEBUG_LIMIT:
+            return False
+    if _attention_wrapper_debug_matched <= _ATTENTION_WRAPPER_DEBUG_SKIP:
+        return False
+    matched_after_skip = _attention_wrapper_debug_matched - _ATTENTION_WRAPPER_DEBUG_SKIP
+    return matched_after_skip <= 32 or (
+        _ATTENTION_WRAPPER_DEBUG_INTERVAL > 0
+        and matched_after_skip % _ATTENTION_WRAPPER_DEBUG_INTERVAL == 0
+    )
+
+
+if _ATTENTION_WRAPPER_DEBUG_ENABLED:
+    _should_capture_attention_wrapper_timing = torch._dynamo.disable(
+        _should_capture_attention_wrapper_timing)
+
+
+def _should_capture_attention_sync_timing(attn_state=None) -> bool:
+    if not _ATTENTION_SYNC_DEBUG_ENABLED:
+        return False
+    state_name = getattr(attn_state, "name", "")
+    if _ATTENTION_STAGE_DEBUG_STATE_FILTER and state_name not in _ATTENTION_STAGE_DEBUG_STATE_FILTER:
+        return False
+
+    global _attention_sync_debug_matched
+    _attention_sync_debug_matched += 1
+    if _ATTENTION_SYNC_DEBUG_LIMIT:
+        if _attention_sync_debug_matched > _ATTENTION_SYNC_DEBUG_SKIP + _ATTENTION_SYNC_DEBUG_LIMIT:
+            return False
+    if _attention_sync_debug_matched <= _ATTENTION_SYNC_DEBUG_SKIP:
+        return False
+    matched_after_skip = _attention_sync_debug_matched - _ATTENTION_SYNC_DEBUG_SKIP
+    return matched_after_skip <= 32 or (
+        _ATTENTION_SYNC_DEBUG_INTERVAL > 0
+        and matched_after_skip % _ATTENTION_SYNC_DEBUG_INTERVAL == 0
+    )
+
+
+if _ATTENTION_SYNC_DEBUG_ENABLED:
+    # This intentionally creates a profiling-only synchronization boundary.
+    # Keep it out of compiled graphs and never enable it in production probes.
+    _should_capture_attention_sync_timing = torch._dynamo.disable(
+        _should_capture_attention_sync_timing)
+
+
+def _should_capture_attention_fia_detail_timing(attn_state=None) -> bool:
+    if not _ATTENTION_FIA_DETAIL_DEBUG_ENABLED:
+        return False
+    state_name = getattr(attn_state, "name", "")
+    if _ATTENTION_STAGE_DEBUG_STATE_FILTER and state_name not in _ATTENTION_STAGE_DEBUG_STATE_FILTER:
+        return False
+
+    global _attention_fia_detail_debug_matched
+    _attention_fia_detail_debug_matched += 1
+    if _ATTENTION_FIA_DETAIL_DEBUG_LIMIT:
+        if _attention_fia_detail_debug_matched > (
+            _ATTENTION_FIA_DETAIL_DEBUG_SKIP + _ATTENTION_FIA_DETAIL_DEBUG_LIMIT
+        ):
+            return False
+    if _attention_fia_detail_debug_matched <= _ATTENTION_FIA_DETAIL_DEBUG_SKIP:
+        return False
+    matched_after_skip = _attention_fia_detail_debug_matched - _ATTENTION_FIA_DETAIL_DEBUG_SKIP
+    return matched_after_skip <= 32 or (
+        _ATTENTION_FIA_DETAIL_DEBUG_INTERVAL > 0
+        and matched_after_skip % _ATTENTION_FIA_DETAIL_DEBUG_INTERVAL == 0
+    )
+
+
+if _ATTENTION_FIA_DETAIL_DEBUG_ENABLED:
+    _should_capture_attention_fia_detail_timing = torch._dynamo.disable(
+        _should_capture_attention_fia_detail_timing)
+
+
+def _record_event() -> torch.npu.Event | None:
+    event = _maybe_new_timing_event()
+    if event is not None:
+        torch.npu.current_stream().record_event(event)
+    return event
+
+
+def _elapsed_ms(start_event: torch.npu.Event, end_event: torch.npu.Event) -> float:
+    end_event.synchronize()
+    return float(start_event.elapsed_time(end_event))
+
+
+def _sync_perf_counter() -> float:
+    torch.npu.synchronize()
+    return time.perf_counter()
+
+
+def _maybe_log_attention_wrapper_timing(
+    attn_state,
+    num_tokens: int,
+    reshape_cache_ms: float,
+    forward_impl_ms: float,
+    total_ms: float,
+) -> None:
+    logger.info(
+        "Attention wrapper timing pid=%s state=%s tokens=%s "
+        "reshape_cache_ms=%.3f forward_impl_ms=%.3f total_ms=%.3f",
+        os.getpid(),
+        getattr(attn_state, "name", "None"),
+        num_tokens,
+        reshape_cache_ms,
+        forward_impl_ms,
+        total_ms,
+    )
+
+
+def _maybe_log_attention_sync_timing(
+    attn_state,
+    num_tokens: int,
+    reshape_sync_ms: float,
+    forward_impl_sync_ms: float,
+    total_sync_ms: float,
+) -> None:
+    logger.info(
+        "Attention sync-wall timing pid=%s state=%s tokens=%s "
+        "reshape_sync_ms=%.3f forward_impl_sync_ms=%.3f total_sync_ms=%.3f",
+        os.getpid(),
+        getattr(attn_state, "name", "None"),
+        num_tokens,
+        reshape_sync_ms,
+        forward_impl_sync_ms,
+        total_sync_ms,
+    )
+
+
+def _maybe_log_attention_stage_timing(
+    *,
+    attn_state: "AscendAttentionState",
+    op_name: str,
+    num_tokens: int,
+    op_ms: float,
+) -> None:
+    global _attention_stage_debug_total
+    _attention_stage_debug_total += 1
+    bucket = _token_bucket(num_tokens)
+    key = (attn_state.name, op_name, bucket)
+    _attention_stage_debug_summary[key] += 1
+
+    summary = ", ".join(
+        f"{state}/{op}/{tok}:{count}"
+        for (state, op, tok), count in _attention_stage_debug_summary.most_common(12)
+    )
+    logger.info(
+        "Attention stage timing pid=%s call=%d state=%s op=%s tokens=%s "
+        "op_ms=%.3f summary={%s}",
+        os.getpid(),
+        _attention_stage_debug_total,
+        attn_state.name,
+        op_name,
+        num_tokens,
+        op_ms,
+        summary,
+    )
+
+
+def _maybe_log_attention_fia_detail_timing(
+    *,
+    attn_state: "AscendAttentionState",
+    num_tokens: int,
+    get_params_ms: float,
+    pre_op_ms: float,
+    op_ms: float,
+    copy_ms: float,
+    total_ms: float,
+) -> None:
+    logger.info(
+        "Attention FIA detail timing pid=%s state=%s tokens=%s "
+        "get_params_ms=%.3f pre_op_ms=%.3f op_ms=%.3f "
+        "copy_ms=%.3f total_ms=%.3f",
+        os.getpid(),
+        attn_state.name,
+        num_tokens,
+        get_params_ms,
+        pre_op_ms,
+        op_ms,
+        copy_ms,
+        total_ms,
+    )
+
+
+def _maybe_log_attention_fia_sync_detail_timing(
+    *,
+    attn_state: "AscendAttentionState",
+    num_tokens: int,
+    get_params_ms: float,
+    pre_op_ms: float,
+    op_ms: float,
+    copy_ms: float,
+    total_ms: float,
+) -> None:
+    logger.info(
+        "Attention FIA sync detail timing pid=%s state=%s tokens=%s "
+        "get_params_sync_ms=%.3f pre_op_sync_ms=%.3f op_sync_ms=%.3f "
+        "copy_sync_ms=%.3f total_sync_ms=%.3f",
+        os.getpid(),
+        attn_state.name,
+        num_tokens,
+        get_params_ms,
+        pre_op_ms,
+        op_ms,
+        copy_ms,
+        total_ms,
+    )
 
 
 def _pad_attention_seq_params(
@@ -217,6 +528,9 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_block_size() -> list[int]:
+        block_size_override = os.getenv("VLLM_ASCEND_ATTENTION_BLOCK_SIZE")
+        if block_size_override:
+            return [int(block_size_override)]
         if envs_ascend.VLLM_ASCEND_USE_LEGACY_ATTENTION:
             return [64]
         return [128]
@@ -407,7 +721,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 self.model_config.dtype, self.model_config.hf_text_config.sliding_window
             )
 
-        # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         attn_metadata = AscendMetadata(
@@ -880,30 +1193,61 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ):
+        stage_start_evt = None
+        if _ATTENTION_STAGE_DEBUG_ENABLED and _should_capture_attention_stage_timing(
+                attn_metadata.attn_state, "fia"):
+            stage_start_evt = _record_event()
         forward_context: ForwardContext = get_forward_context()
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
-        if getattr(forward_context, "capturing", False) and not _env_flag("VLLM_ASCEND_DISABLE_FULL_GRAPH_FIA"):
+        if getattr(forward_context, "capturing", False) and not _DISABLE_FULL_GRAPH_FIA:
             attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
+            stage_end_evt = _record_event() if stage_start_evt is not None else None
+            if stage_start_evt is not None and stage_end_evt is not None:
+                _maybe_log_attention_stage_timing(
+                    attn_state=attn_metadata.attn_state,
+                    op_name="full_graph_fia",
+                    num_tokens=num_tokens,
+                    op_ms=_elapsed_ms(stage_start_evt, stage_end_evt),
+                )
             return output
         if (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and self.sliding_window is not None
             and attn_metadata.seq_lens.shape[0] == query.size(0)
         ):
-            return self._forward_fia_slidingwindow(query, attn_metadata, output)
+            output = self._forward_fia_slidingwindow(query, attn_metadata, output)
+            stage_end_evt = _record_event() if stage_start_evt is not None else None
+            if stage_start_evt is not None and stage_end_evt is not None:
+                _maybe_log_attention_stage_timing(
+                    attn_state=attn_metadata.attn_state,
+                    op_name="fia_slidingwindow",
+                    num_tokens=query.shape[0],
+                    op_ms=_elapsed_ms(stage_start_evt, stage_end_evt),
+            )
+            return output
+        capture_fia_detail = False
+        if _ATTENTION_FIA_DETAIL_DEBUG_ENABLED:
+            capture_fia_detail = _should_capture_attention_fia_detail_timing(
+                attn_metadata.attn_state)
+        detail_start_evt = _record_event() if capture_fia_detail else None
+        detail_start_sync = _sync_perf_counter() if capture_fia_detail else None
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+        detail_after_params_evt = _record_event() if capture_fia_detail else None
+        detail_after_params_sync = _sync_perf_counter() if capture_fia_detail else None
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
             and self.attn_type != AttentionType.ENCODER_DECODER
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
-        # Get workspace from cache or calculate it if not present.
+        detail_before_op_evt = _record_event() if capture_fia_detail else None
+        detail_before_op_sync = _sync_perf_counter() if capture_fia_detail else None
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query,
             key=key,
@@ -912,7 +1256,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             block_table=block_table,
             input_layout="TND",
             block_size=block_size,
-            actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+            actual_seq_lengths=actual_seq_lengths_q,
             actual_seq_lengths_kv=actual_seq_lengths_kv,
             num_key_value_heads=self.num_kv_heads,
             num_heads=self.num_heads,
@@ -920,8 +1264,54 @@ class AscendAttentionBackendImpl(AttentionImpl):
             sparse_mode=3,
         )
 
+        detail_after_op_evt = _record_event() if capture_fia_detail else None
+        detail_after_op_sync = _sync_perf_counter() if capture_fia_detail else None
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
+        detail_after_copy_evt = _record_event() if capture_fia_detail else None
+        detail_after_copy_sync = _sync_perf_counter() if capture_fia_detail else None
+        if (
+            capture_fia_detail
+            and detail_start_evt is not None
+            and detail_after_params_evt is not None
+            and detail_before_op_evt is not None
+            and detail_after_op_evt is not None
+            and detail_after_copy_evt is not None
+        ):
+            _maybe_log_attention_fia_detail_timing(
+                attn_state=attn_metadata.attn_state,
+                num_tokens=num_tokens,
+                get_params_ms=_elapsed_ms(detail_start_evt, detail_after_params_evt),
+                pre_op_ms=_elapsed_ms(detail_after_params_evt, detail_before_op_evt),
+                op_ms=_elapsed_ms(detail_before_op_evt, detail_after_op_evt),
+                copy_ms=_elapsed_ms(detail_after_op_evt, detail_after_copy_evt),
+                total_ms=_elapsed_ms(detail_start_evt, detail_after_copy_evt),
+            )
+        if (
+            capture_fia_detail
+            and detail_start_sync is not None
+            and detail_after_params_sync is not None
+            and detail_before_op_sync is not None
+            and detail_after_op_sync is not None
+            and detail_after_copy_sync is not None
+        ):
+            _maybe_log_attention_fia_sync_detail_timing(
+                attn_state=attn_metadata.attn_state,
+                num_tokens=num_tokens,
+                get_params_ms=(detail_after_params_sync - detail_start_sync) * 1000,
+                pre_op_ms=(detail_before_op_sync - detail_after_params_sync) * 1000,
+                op_ms=(detail_after_op_sync - detail_before_op_sync) * 1000,
+                copy_ms=(detail_after_copy_sync - detail_after_op_sync) * 1000,
+                total_ms=(detail_after_copy_sync - detail_start_sync) * 1000,
+            )
+        stage_end_evt = _record_event() if stage_start_evt is not None else None
+        if stage_start_evt is not None and stage_end_evt is not None:
+            _maybe_log_attention_stage_timing(
+                attn_state=attn_metadata.attn_state,
+                op_name="fia",
+                num_tokens=num_tokens,
+                op_ms=_elapsed_ms(stage_start_evt, stage_end_evt),
+            )
         return output
 
     def forward_paged_attention(
@@ -930,9 +1320,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        stage_start_evt = None
+        if _ATTENTION_STAGE_DEBUG_ENABLED and _should_capture_attention_stage_timing(
+                attn_metadata.attn_state, "paged_attention"):
+            stage_start_evt = _record_event()
         forward_context: ForwardContext = get_forward_context()
-        if forward_context.capturing and not _env_flag("VLLM_ASCEND_DISABLE_FULL_GRAPH_PA"):
-            return self.full_graph_pa(query, attn_metadata, output)
+        if forward_context.capturing and not _DISABLE_FULL_GRAPH_PA:
+            output = self.full_graph_pa(query, attn_metadata, output)
+            stage_end_evt = _record_event() if stage_start_evt is not None else None
+            if stage_start_evt is not None and stage_end_evt is not None:
+                _maybe_log_attention_stage_timing(
+                    attn_state=attn_metadata.attn_state,
+                    op_name="full_graph_paged_attention",
+                    num_tokens=query.shape[0],
+                    op_ms=_elapsed_ms(stage_start_evt, stage_end_evt),
+                )
+            return output
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -944,6 +1347,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             context_lens=attn_metadata.seq_lens,
             out=output,
         )
+        stage_end_evt = _record_event() if stage_start_evt is not None else None
+        if stage_start_evt is not None and stage_end_evt is not None:
+            _maybe_log_attention_stage_timing(
+                attn_state=attn_metadata.attn_state,
+                op_name="paged_attention",
+                num_tokens=query.shape[0],
+                op_ms=_elapsed_ms(stage_start_evt, stage_end_evt),
+            )
         return output
 
     def _forward_encoder_attention(
@@ -1157,28 +1568,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 op_name = "legacy_paged_attention_splitfuse"
             else:
                 op_name = "fia"
-            _maybe_log_attention_path(
-                attn_metadata.attn_state,
-                op_name,
-                query.shape[0],
-                attn_metadata.num_decodes,
-                attn_metadata.num_prefills,
-            )
+            if _ATTENTION_DEBUG_ENABLED:
+                _maybe_log_attention_path(
+                    attn_metadata.attn_state,
+                    op_name,
+                    query.shape[0],
+                    attn_metadata.num_decodes,
+                    attn_metadata.num_prefills,
+                )
             return self.forward_impl_legacy(query, key, value, attn_metadata, output)
         num_tokens = query.shape[0]
-        force_decode_pa = _env_flag("VLLM_ASCEND_FORCE_PAGED_ATTENTION_DECODE")
         use_decode_pa = (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and self.sliding_window is None
-            and (force_decode_pa or using_paged_attention(num_tokens, self.vllm_config))
+            and (_FORCE_PAGED_ATTENTION_DECODE or using_paged_attention(num_tokens, self.vllm_config))
         )
-        _maybe_log_attention_path(
-            attn_metadata.attn_state,
-            "paged_attention" if use_decode_pa else "fia",
-            num_tokens,
-            attn_metadata.num_decodes,
-            attn_metadata.num_prefills,
-        )
+        if _ATTENTION_DEBUG_ENABLED:
+            _maybe_log_attention_path(
+                attn_metadata.attn_state,
+                "paged_attention" if use_decode_pa else "fia",
+                num_tokens,
+                attn_metadata.num_decodes,
+                attn_metadata.num_prefills,
+            )
         if (
             use_decode_pa
         ):
@@ -1220,12 +1632,102 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens = query.shape[0]
         if attn_metadata is None:
             return output.fill_(0)
+
+        capture_wrapper_timing = False
+        if _ATTENTION_WRAPPER_DEBUG_ENABLED:
+            capture_wrapper_timing = _should_capture_attention_wrapper_timing(
+                getattr(attn_metadata, "attn_state", None))
+        capture_sync_timing = False
+        if _ATTENTION_SYNC_DEBUG_ENABLED:
+            capture_sync_timing = _should_capture_attention_sync_timing(
+                getattr(attn_metadata, "attn_state", None))
+        wrapper_start_evt = _record_event() if capture_wrapper_timing else None
+        sync_start = _sync_perf_counter() if capture_sync_timing else None
+        sync_after_reshape = None
+        reshape_end_evt = None
         if key is not None and value is not None:
+            if _ATTENTION_VALUE_CONTIGUOUS:
+                # Old eager made the V tensor contiguous before reshape/cache.
+                # Keep this as a diagnostic knob because it can affect NPU cache
+                # write/read layout without changing attention numerics.
+                value = value.contiguous()
             key, value = self.reshape_and_cache(key, value, kv_cache, attn_metadata)
+            sync_after_reshape = _sync_perf_counter() if capture_sync_timing else None
+            reshape_end_evt = _record_event() if capture_wrapper_timing else None
+        elif capture_wrapper_timing or capture_sync_timing:
+            sync_after_reshape = _sync_perf_counter() if capture_sync_timing else None
+            reshape_end_evt = _record_event()
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling":
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
         output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
+        if capture_wrapper_timing and wrapper_start_evt is not None and reshape_end_evt is not None:
+            wrapper_end_evt = _record_event()
+            _maybe_log_attention_wrapper_timing(
+                getattr(attn_metadata, "attn_state", None),
+                num_tokens,
+                _elapsed_ms(wrapper_start_evt, reshape_end_evt),
+                _elapsed_ms(reshape_end_evt, wrapper_end_evt),
+                _elapsed_ms(wrapper_start_evt, wrapper_end_evt),
+            )
+        if capture_sync_timing and sync_start is not None and sync_after_reshape is not None:
+            sync_end = _sync_perf_counter()
+            _maybe_log_attention_sync_timing(
+                getattr(attn_metadata, "attn_state", None),
+                num_tokens,
+                (sync_after_reshape - sync_start) * 1000,
+                (sync_end - sync_after_reshape) * 1000,
+                (sync_end - sync_start) * 1000,
+            )
         return output
+
+
+def unified_ascend_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+) -> None:
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if isinstance(attn_metadata, dict):
+        attn_metadata = attn_metadata[layer_name]
+    layer = forward_context.no_compile_layers[layer_name]
+    kv_cache = layer.kv_cache[forward_context.virtual_engine]
+    layer.impl.forward(
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=output,
+        output_scale=output_scale,
+        output_block_scale=output_block_scale,
+    )
+
+
+def unified_ascend_attention_with_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="unified_ascend_attention_with_output",
+    op_func=unified_ascend_attention_with_output,
+    mutates_args=["output", "output_block_scale"],
+    fake_impl=unified_ascend_attention_with_output_fake,
+    dispatch_key="PrivateUse1",
+)

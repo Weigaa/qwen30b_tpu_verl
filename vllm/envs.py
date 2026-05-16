@@ -1763,6 +1763,21 @@ def compile_factors() -> dict[str, object]:
 
         factors[factor] = normalize_value(raw)
 
+    # vLLM-Ascend may change the concrete custom-op provider through
+    # environment variables that are not part of upstream vLLM's env registry.
+    # The compiled graph can embed calls that are sensitive to those provider
+    # choices, so include them in the cache key. Otherwise switching from the
+    # bundled local OPP to the system CANN OPP can silently reuse stale compile
+    # artifacts from the previous provider and keep the slower runtime path.
+    ascend_custom_op_factors = [
+        "ASCEND_CUSTOM_OPP_PATH",
+        "VLLM_ASCEND_LOCAL_CUSTOM_OPP_PATH",
+        "VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP",
+        "VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB",
+    ]
+    for factor in ascend_custom_op_factors:
+        factors[factor] = normalize_value(os.getenv(factor))
+
     ray_noset_env_vars = [
         # Refer to
         # https://github.com/ray-project/ray/blob/c584b1ea97b00793d1def71eaf81537d70efba42/python/ray/_private/accelerators/nvidia_gpu.py#L11

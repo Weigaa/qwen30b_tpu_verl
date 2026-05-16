@@ -23,6 +23,8 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+import os
+import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -40,6 +42,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
@@ -77,6 +80,230 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+_LAYER_PROFILE_ENABLED = os.getenv(
+    "VLLM_QWEN3_MOE_LAYER_PROFILE",
+    os.getenv("VLLM_QWEN2_MOE_LAYER_PROFILE", "0"),
+) == "1"
+_LAYER_PROFILE_FIRST_N = int(
+    os.getenv(
+        "VLLM_QWEN3_MOE_LAYER_PROFILE_FIRST_N",
+        os.getenv("VLLM_QWEN2_MOE_LAYER_PROFILE_FIRST_N", "32"),
+    )
+)
+_LAYER_PROFILE_INTERVAL = int(
+    os.getenv(
+        "VLLM_QWEN3_MOE_LAYER_PROFILE_INTERVAL",
+        os.getenv("VLLM_QWEN2_MOE_LAYER_PROFILE_INTERVAL", "2048"),
+    )
+)
+_LAYER_PROFILE_COUNTERS: dict[str, int] = {}
+_SKIP_QK_NORM = os.getenv("VLLM_QWEN3_SKIP_QK_NORM", "0") in (
+    "1",
+    "true",
+    "True",
+)
+_USE_QKV_RMSNORM_ROPE = os.getenv("VLLM_QWEN3_USE_QKV_RMSNORM_ROPE", "0") in (
+    "1",
+    "true",
+    "True",
+)
+_USE_TORCH_NPU_QK_RMSNORM = os.getenv(
+    "VLLM_QWEN3_USE_TORCH_NPU_QK_RMSNORM", "0"
+) in ("1", "true", "True")
+_DUMMY_SKIP_ATTENTION = os.getenv(
+    "VLLM_ASCEND_QWEN3_DUMMY_SKIP_ATTENTION", "0"
+).lower() in ("1", "true", "yes", "on")
+_QKV_RMSNORM_ROPE_DISABLED = False
+_TORCH_NPU = None
+if _USE_TORCH_NPU_QK_RMSNORM:
+    try:
+        import torch_npu as _TORCH_NPU  # type: ignore[no-redef]
+    except Exception as exc:
+        logger.warning(
+            "VLLM_QWEN3_USE_TORCH_NPU_QK_RMSNORM=1 requested but torch_npu "
+            "could not be imported; falling back to vLLM RMSNorm: %s",
+            exc,
+        )
+
+_CLASS_PROBE_ENABLED = os.getenv("VLLM_QWEN3_EAGER_CLASS_PROBE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_CLASS_PROBE_DONE = False
+
+
+def _qualified_class_name(obj: Any) -> str:
+    if obj is None:
+        return "None"
+    cls = obj.__class__
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _forward_method_name(obj: Any) -> str:
+    method = getattr(obj, "_forward_method", None)
+    if method is None:
+        return "None"
+    return getattr(method, "__name__", repr(method))
+
+
+def _attr_class_name(obj: Any, attr: str) -> str:
+    if obj is None:
+        return "None"
+    return _qualified_class_name(getattr(obj, attr, None))
+
+
+def _maybe_log_qwen3_eager_class_probe(model: "Qwen3MoeForCausalLM") -> None:
+    """Log the real runtime classes selected by vLLM custom-op dispatch.
+
+    The qwen3 eager path is heavily affected by out-of-tree Ascend CustomOp
+    replacement.  Config logs only tell us that custom ops are enabled; this
+    probe records the actual instantiated classes once so perf investigations
+    can catch silent fallback to native vLLM classes.
+    """
+    global _CLASS_PROBE_DONE
+    if not _CLASS_PROBE_ENABLED or _CLASS_PROBE_DONE:
+        return
+    _CLASS_PROBE_DONE = True
+
+    sample_layer = None
+    for layer in model.model.layers:
+        if not isinstance(layer, PPMissingLayer):
+            sample_layer = layer
+            break
+    if sample_layer is None:
+        logger.warning("Qwen3Moe eager class probe found no local decoder layer")
+        return
+
+    sparse_layer = None
+    for layer in model.model.layers:
+        if not isinstance(layer, PPMissingLayer) and isinstance(
+            layer.mlp, Qwen3MoeSparseMoeBlock
+        ):
+            sparse_layer = layer
+            break
+    sparse_mlp = None if sparse_layer is None else sparse_layer.mlp
+    experts = None if sparse_mlp is None else sparse_mlp.experts
+    quant_method = None if experts is None else getattr(experts, "quant_method", None)
+    moe_config = None if experts is None else getattr(experts, "moe_config", None)
+    attn = sample_layer.self_attn
+    attn_impl = getattr(attn.attn, "impl", None)
+    attn_backend = getattr(attn.attn, "attn_backend", None)
+
+    try:
+        from vllm.model_executor.custom_op import CustomOp
+
+        oot_keys = ",".join(sorted(CustomOp.op_registry_oot.keys()))
+    except Exception as exc:
+        oot_keys = f"<unavailable:{exc}>"
+
+    logger.info(
+        "Qwen3Moe eager class probe model=%s embed=%s lm_head=%s "
+        "logits_processor=%s sample_layer=%s input_norm=%s post_norm=%s "
+        "attn=%s qkv=%s qkv_forward=%s o_proj=%s o_proj_forward=%s "
+        "qkv_custom_op=%s qkv_quant=%s o_proj_custom_op=%s o_proj_quant=%s "
+        "q_norm=%s q_norm_forward=%s k_norm=%s k_norm_forward=%s "
+        "rotary=%s rotary_forward=%s attn_layer=%s attn_backend=%s "
+        "attn_impl=%s mlp=%s gate=%s gate_forward=%s experts=%s "
+        "gate_custom_op=%s gate_quant=%s experts_quant=%s "
+        "experts_inner_quant=%s moe_use_ep=%s moe_reduce_results=%s "
+        "registered_oot_ops=%s",
+        _qualified_class_name(model),
+        _qualified_class_name(model.model.embed_tokens),
+        _qualified_class_name(model.lm_head),
+        _qualified_class_name(model.logits_processor),
+        _qualified_class_name(sample_layer),
+        _qualified_class_name(sample_layer.input_layernorm),
+        _qualified_class_name(sample_layer.post_attention_layernorm),
+        _qualified_class_name(attn),
+        _qualified_class_name(attn.qkv_proj),
+        _forward_method_name(attn.qkv_proj),
+        _qualified_class_name(attn.o_proj),
+        _forward_method_name(attn.o_proj),
+        _attr_class_name(attn.qkv_proj, "custom_op"),
+        _attr_class_name(attn.qkv_proj, "quant_method"),
+        _attr_class_name(attn.o_proj, "custom_op"),
+        _attr_class_name(attn.o_proj, "quant_method"),
+        _qualified_class_name(attn.q_norm),
+        _forward_method_name(attn.q_norm),
+        _qualified_class_name(attn.k_norm),
+        _forward_method_name(attn.k_norm),
+        _qualified_class_name(attn.rotary_emb),
+        _forward_method_name(attn.rotary_emb),
+        _qualified_class_name(attn.attn),
+        None if attn_backend is None else attn_backend.get_name(),
+        _qualified_class_name(attn_impl),
+        _qualified_class_name(sparse_mlp),
+        _qualified_class_name(None if sparse_mlp is None else sparse_mlp.gate),
+        _forward_method_name(None if sparse_mlp is None else sparse_mlp.gate),
+        _qualified_class_name(experts),
+        _attr_class_name(None if sparse_mlp is None else sparse_mlp.gate, "custom_op"),
+        _attr_class_name(None if sparse_mlp is None else sparse_mlp.gate, "quant_method"),
+        _qualified_class_name(quant_method),
+        _attr_class_name(quant_method, "quant_method"),
+        None if moe_config is None else getattr(moe_config, "use_ep", None),
+        None if experts is None else getattr(experts, "reduce_results", None),
+        oot_keys,
+    )
+
+
+def _profile_enabled() -> bool:
+    # Qwen3MoeModel is wrapped by torch.compile in compiled-eager mode.  Python
+    # timers/counters inside the traced forward become Dynamo graph inputs, so
+    # keep this layer-level profiler for non-compiled probe runs only.
+    return _LAYER_PROFILE_ENABLED and not torch._dynamo.is_compiling()
+
+
+def _profile_mark(name: str) -> tuple[int, bool]:
+    count = _LAYER_PROFILE_COUNTERS.get(name, 0) + 1
+    _LAYER_PROFILE_COUNTERS[name] = count
+    should_log = count <= _LAYER_PROFILE_FIRST_N or (
+        _LAYER_PROFILE_INTERVAL > 0 and count % _LAYER_PROFILE_INTERVAL == 0
+    )
+    return count, should_log
+
+
+def _profile_time() -> float:
+    if torch._dynamo.is_compiling():
+        return 0.0
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+    return time.perf_counter()
+
+
+def _qwen3_qk_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor | None:
+    if _TORCH_NPU is None:
+        return None
+    try:
+        return _TORCH_NPU.npu_rms_norm(x, weight, epsilon=eps)[0]
+    except Exception as exc:
+        logger.warning_once(
+            "Falling back to vLLM RMSNorm for Qwen3 q/k norm because "
+            "torch_npu.npu_rms_norm failed: %s",
+            exc,
+        )
+        return None
+
+
+def _profile_log(name: str, call: int, prefix: str, tokens: int, **values: float) -> None:
+    body = " ".join(f"{key}_ms={value * 1000.0:.3f}" for key, value in values.items())
+    logger.info(
+        "Qwen3Moe layer profile pid=%s name=%s call=%d prefix=%s tokens=%s %s",
+        os.getpid(),
+        name,
+        call,
+        prefix,
+        tokens,
+        body,
+    )
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -160,19 +387,59 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.physical_expert_start + self.n_local_physical_experts
         )
 
-        self.experts = FusedMoE(
+        use_ascend_legacy_init = os.getenv(
+            "VLLM_QWEN3_MOE_ASCEND_LEGACY_INIT", "0"
+        ) in ("1", "true", "True")
+        use_ascend_legacy_stack = os.getenv(
+            "VLLM_QWEN3_MOE_ASCEND_LEGACY_STACK", "0"
+        ) in ("1", "true", "True")
+        moe_cls = FusedMoE
+        moe_kwargs = {}
+        if use_ascend_legacy_stack:
+            from vllm_ascend.ops.fused_moe_legacy import AscendFusedMoE
+
+            moe_cls = AscendFusedMoE
+            moe_kwargs.update(layer_idx=extract_layer_index(prefix))
+            logger.info_once(
+                "Using old-style Ascend Qwen3Moe experts stack for eager "
+                "rollout profiling. Disable with "
+                "VLLM_QWEN3_MOE_ASCEND_LEGACY_STACK=0."
+            )
+        elif use_ascend_legacy_init:
+            from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+            moe_cls = AscendFusedMoE
+            logger.info_once(
+                "Using Ascend legacy-style Qwen3Moe experts init for eager "
+                "rollout profiling. Disable with "
+                "VLLM_QWEN3_MOE_ASCEND_LEGACY_INIT=0."
+            )
+        else:
+            moe_kwargs.update(
+                enable_eplb=self.enable_eplb,
+                num_redundant_experts=self.n_redundant_experts,
+                is_sequence_parallel=self.is_sequence_parallel,
+                routing_method_type=RoutingMethodType.Renormalize,
+            )
+
+        reduce_results_default = "0" if use_ascend_legacy_stack else "1"
+        self._use_ascend_legacy_stack = use_ascend_legacy_stack
+        self.experts = moe_cls(
             num_experts=self.n_routed_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
-            reduce_results=True,
+            # vLLM's generic Qwen3Moe path adds a maybe_all_reduce wrapper when
+            # this is True. On Ascend EP/MC2 rollout the communication method
+            # already returns complete local hidden states, so keep this
+            # tunable to match the older Ascend custom Qwen3Moe fast path.
+            reduce_results=os.getenv(
+                "VLLM_QWEN3_MOE_REDUCE_RESULTS", reduce_results_default)
+            not in ("0", "false", "False"),
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
-            enable_eplb=self.enable_eplb,
-            num_redundant_experts=self.n_redundant_experts,
-            is_sequence_parallel=self.is_sequence_parallel,
-            routing_method_type=RoutingMethodType.Renormalize,
+            **moe_kwargs,
         )
 
         self.gate = ReplicatedLinear(
@@ -182,6 +449,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )
+        self.prefix = prefix
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert hidden_states.dim() <= 2, (
@@ -194,17 +462,54 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        profile_call = 0
+        should_profile = False
+        if _profile_enabled():
+            profile_call, should_profile = _profile_mark("sparse_moe")
+            if should_profile:
+                tokens = int(hidden_states.shape[0])
+                t0 = _profile_time()
+
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if should_profile:
+            t1 = _profile_time()
+        if self._use_ascend_legacy_stack:
+            forward_context = get_forward_context()
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                is_prefill=getattr(forward_context, "with_prefill", False),
+                enable_force_load_balance=getattr(
+                    forward_context, "in_profile_run", False),
+                top_k=self.experts.top_k,
+                shared_experts=None,
+                is_dummy=False,
+            )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+        if should_profile:
+            t2 = _profile_time()
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
+        if should_profile:
+            t3 = _profile_time()
+            _profile_log(
+                "sparse_moe",
+                profile_call,
+                self.prefix,
+                tokens,
+                gate=t1 - t0,
+                experts=t2 - t1,
+                allgather=t3 - t2,
+                total=t3 - t0,
+            )
 
         # return to 1d if input is 1d
         return final_hidden_states.squeeze(0) if is_input_1d else final_hidden_states
@@ -291,25 +596,122 @@ class Qwen3MoeAttention(nn.Module):
 
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.prefix = prefix
+        if _SKIP_QK_NORM:
+            logger.warning_once(
+                "VLLM_QWEN3_SKIP_QK_NORM=1 is enabled. This is a "
+                "diagnostic-only performance probe that changes Qwen3 "
+                "attention numerics and must not be used for training."
+            )
+        if _USE_QKV_RMSNORM_ROPE:
+            logger.warning_once(
+                "VLLM_QWEN3_USE_QKV_RMSNORM_ROPE=1 is enabled. This opt-in "
+                "probe uses the narrow fused qkv split + q/k RMSNorm + RoPE "
+                "kernel in Qwen3 attention."
+            )
+        if _USE_TORCH_NPU_QK_RMSNORM:
+            logger.warning_once(
+                "VLLM_QWEN3_USE_TORCH_NPU_QK_RMSNORM=1 is enabled. This "
+                "opt-in probe replaces only Qwen3 q/k RMSNorm calls with "
+                "torch_npu.npu_rms_norm."
+            )
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        profile_call = 0
+        should_profile = False
+        if _profile_enabled():
+            profile_call, should_profile = _profile_mark("attention")
+            if should_profile:
+                tokens = int(hidden_states.shape[0])
+                t0 = _profile_time()
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
+        if should_profile:
+            t1 = _profile_time()
+        global _QKV_RMSNORM_ROPE_DISABLED
+        used_fused_qkv_rmsnorm_rope = False
+        if (
+            _USE_QKV_RMSNORM_ROPE
+            and not _SKIP_QK_NORM
+            and not _QKV_RMSNORM_ROPE_DISABLED
+            and self.head_dim == 128
+            and self.dual_chunk_attention_config is None
+        ):
+            try:
+                from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_slice
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+                cos, sin = get_cos_and_sin_slice()
+                if cos is None or sin is None:
+                    raise RuntimeError("Ascend RoPE cos/sin slice is not initialized")
+                q, k, v = torch.ops.vllm.qkv_rmsnorm_rope(
+                    input=qkv,
+                    sin=sin,
+                    cos=cos,
+                    q_weight=self.q_norm.weight,
+                    k_weight=self.k_norm.weight,
+                    q_hidden_size=self.q_size,
+                    kv_hidden_size=self.kv_size,
+                    head_dim=self.head_dim,
+                    eps=self.q_norm.variance_epsilon,
+                    q_bias=None,
+                    k_bias=None,
+                )
+                used_fused_qkv_rmsnorm_rope = True
+            except Exception as exc:
+                _QKV_RMSNORM_ROPE_DISABLED = True
+                logger.warning_once(
+                    "Disabling VLLM_QWEN3_USE_QKV_RMSNORM_ROPE after fused "
+                    "path failure: %s",
+                    exc,
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if not _SKIP_QK_NORM and not used_fused_qkv_rmsnorm_rope:
+            # Qwen3 adds per-head q/k RMSNorm before RoPE.  Keep an explicit
+            # diagnostic bypass so we can measure how much of the old-vs-new
+            # eager gap is architectural q/k normalization cost.
+            q_by_head = q.view(
+                *q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim
+            )
+            q_npu = _qwen3_qk_rms_norm(
+                q_by_head, self.q_norm.weight, self.q_norm.variance_epsilon
+            )
+            q_by_head = q_npu if q_npu is not None else self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+
+            k_by_head = k.view(
+                *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
+            )
+            k_npu = _qwen3_qk_rms_norm(
+                k_by_head, self.k_norm.weight, self.k_norm.variance_epsilon
+            )
+            k_by_head = k_npu if k_npu is not None else self.k_norm(k_by_head)
+            k = k_by_head.view(k.shape)
+        if not used_fused_qkv_rmsnorm_rope:
+            q, k = self.rotary_emb(positions, q, k)
+        if should_profile:
+            t2 = _profile_time()
         attn_output = self.attn(q, k, v)
+        if should_profile:
+            t3 = _profile_time()
         output, _ = self.o_proj(attn_output)
+        if should_profile:
+            t4 = _profile_time()
+            _profile_log(
+                "attention",
+                profile_call,
+                self.prefix,
+                tokens,
+                qkv=t1 - t0,
+                norm_rope=t2 - t1,
+                attn=t3 - t2,
+                o_proj=t4 - t3,
+                total=t4 - t0,
+            )
         return output
 
 
@@ -364,27 +766,62 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.prefix = prefix
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        is_dummy: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        profile_call = 0
+        should_profile = False
+        if _profile_enabled():
+            profile_call, should_profile = _profile_mark("decoder_layer")
+            if should_profile:
+                tokens = int(hidden_states.shape[0])
+                t0 = _profile_time()
+        if is_dummy and _DUMMY_SKIP_ATTENTION:
+            if residual is None:
+                residual = hidden_states
+            if should_profile:
+                t1 = t2 = t3 = _profile_time()
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
+            # Self Attention
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            if should_profile:
+                t1 = _profile_time()
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+            if should_profile:
+                t2 = _profile_time()
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            # Fully Connected
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            if should_profile:
+                t3 = _profile_time()
         hidden_states = self.mlp(hidden_states)
+        if should_profile:
+            t4 = _profile_time()
+            _profile_log(
+                "decoder_layer",
+                profile_call,
+                self.prefix,
+                tokens,
+                input_norm=t1 - t0,
+                attention=t2 - t1,
+                post_norm=t3 - t2,
+                mlp=t4 - t3,
+                total=t4 - t0,
+            )
         return hidden_states, residual
 
 
@@ -430,6 +867,7 @@ class Qwen3MoeModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        is_dummy: bool = False,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -453,7 +891,8 @@ class Qwen3MoeModel(nn.Module):
                     hidden_states + residual if residual is not None else hidden_states
                 )
                 aux_hidden_states.append(aux_hidden_state)
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, is_dummy=is_dummy)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -506,6 +945,70 @@ class Qwen3MoeModel(nn.Module):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         for name, loaded_weight in weights:
+            if os.getenv("VLLM_ROLLOUT_FAST_WEIGHT_LOAD", "0") == "1" and ".mlp.experts." in name:
+                parts = name.split(".")
+                if parts[0] == "model":
+                    parts = parts[1:]
+                # Fast path for RL weight reloads. The rollout exporter already
+                # emits local EP expert weights, so avoid scanning the full
+                # expert mapping table for every gate/up/down tensor.
+                if (
+                    len(parts) == 5
+                    and parts[0] == "layers"
+                    and parts[2] == "mlp"
+                    and parts[3] == "experts"
+                    and parts[4] in ("_local_w13_weight", "_local_w2_weight")
+                ):
+                    name_mapped = ".".join(parts[:4]) + (
+                        ".w13_weight" if parts[4] == "_local_w13_weight" else ".w2_weight"
+                    )
+                    if not is_pp_missing_parameter(name_mapped, self) and name_mapped in params_dict:
+                        params_dict[name_mapped].data.copy_(loaded_weight)
+                        loaded_params.add(name_mapped)
+                    continue
+                if not name.endswith(".weight"):
+                    # Non-standard expert tensors are handled above; remaining
+                    # fast-load candidates must be normal per-expert weights.
+                    pass
+                if (
+                    len(parts) >= 7
+                    and parts[0] == "layers"
+                    and parts[2] == "mlp"
+                    and parts[3] == "experts"
+                    and parts[5] in ("gate_proj", "up_proj", "down_proj")
+                ):
+                    expert_id = int(parts[4])
+                    if parts[5] == "gate_proj":
+                        name_mapped = ".".join(parts[:4]) + ".w13_weight"
+                        shard_id = "w1"
+                    elif parts[5] == "up_proj":
+                        name_mapped = ".".join(parts[:4]) + ".w13_weight"
+                        shard_id = "w3"
+                    else:
+                        name_mapped = ".".join(parts[:4]) + ".w2_weight"
+                        shard_id = "w2"
+
+                    if not is_pp_missing_parameter(name_mapped, self) and name_mapped in params_dict:
+                        param = params_dict[name_mapped]
+                        weight_loader = typing.cast(
+                            Callable[..., bool], param.weight_loader
+                        )
+                        success = weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            loaded_params.add(name_mapped)
+                            continue
+                        # Local-exported weights should normally be local to
+                        # this EP rank. If EPLB/remapping says otherwise, skip
+                        # exactly like the generic expert loader does.
+                        continue
+
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
@@ -697,6 +1200,7 @@ class Qwen3MoeForCausalLM(
         self.num_local_physical_experts = example_layer.n_local_physical_experts
         self.num_routed_experts = example_layer.n_routed_experts
         self.num_redundant_experts = example_layer.n_redundant_experts
+        _maybe_log_qwen3_eager_class_probe(self)
 
     def update_physical_experts_metadata(
         self,
@@ -731,10 +1235,10 @@ class Qwen3MoeForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        is_dummy: bool = False,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+                                   inputs_embeds, is_dummy=is_dummy)
         return hidden_states
 
     def compute_logits(

@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 
 from typing import Optional
+import os
 
 import torch
 import torch_npu
@@ -26,6 +27,14 @@ from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.utils import (AscendDeviceType, dispose_tensor,
                                enable_custom_op, get_ascend_device_type,
                                get_weight_prefetch_method)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+_MC2_LEGACY_SWIGLU_GROUP_INDEX = _env_flag(
+    "VLLM_ASCEND_MC2_LEGACY_SWIGLU_GROUP_INDEX")
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -151,7 +160,9 @@ def quant_apply_mlp(hidden_states: torch.Tensor,
                 bias=None,
                 quant_scale=None,
                 quant_offset=None,
-                group_index=cumsum_group_list(group_list, group_list_type, 1),
+                group_index=(group_list if _MC2_LEGACY_SWIGLU_GROUP_INDEX
+                             else cumsum_group_list(group_list,
+                                                    group_list_type, 1)),
                 activate_left=True,
                 quant_mode=1,
             )

@@ -20,6 +20,7 @@ import datetime
 import logging
 import os
 import time
+from contextlib import nullcontext
 from typing import Any, Optional
 
 import psutil
@@ -81,6 +82,12 @@ from patches.verl.features.rollout_optimize import init_rollout_rebalance
 init_rollout_rebalance()
 
 logger = logging.getLogger(__file__)
+_ROLLOUT_STAGE_DEBUG = os.getenv("VLLM_ROLLOUT_STAGE_DEBUG", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
@@ -714,41 +721,55 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        rollout_stage_timing = {} if _ROLLOUT_STAGE_DEBUG else None
+
+        def stage_timer(name: str):
+            if not _ROLLOUT_STAGE_DEBUG:
+                return nullcontext()
+            return simple_timer(name, rollout_stage_timing)
+
         aggressive_empty_cache(force_sync=True)
         _rollout_phase_memory_log("rollout_mode_after_initial_empty_cache", self.rank)
 
         if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
+            with stage_timer("rollout_mode_load_actor_params"):
+                load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
             _rollout_phase_memory_log("rollout_mode_after_load_actor_params", self.rank)
-        if self.bridge is not None:
-            per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
-        else:
-            per_tensor_param = per_tensor_generator(
-                self.actor.actor_module,
-                self.actor_model_config,
-                self.weight_converter,
-                self.tf_config,
-                self.layer_name_mapping,
-            )
+        with stage_timer("rollout_mode_export_weights"):
+            if self.bridge is not None:
+                per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
+            else:
+                per_tensor_param = per_tensor_generator(
+                    self.actor.actor_module,
+                    self.actor_model_config,
+                    self.weight_converter,
+                    self.tf_config,
+                    self.layer_name_mapping,
+                )
 
         set_expandable_segments(False)
 
         if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["weights"])
+            with stage_timer("rollout_mode_resume_weights"):
+                await self.rollout.resume(tags=["weights"])
             _rollout_phase_memory_log("rollout_mode_after_resume_weights", self.rank)
-        await self.rollout.update_weights(per_tensor_param)
+        with stage_timer("rollout_mode_update_weights"):
+            await self.rollout.update_weights(per_tensor_param)
         _rollout_phase_memory_log("rollout_mode_after_update_rollout_weights", self.rank)
         # The Megatron exporter yields NPU tensors lazily. Drop the exhausted
         # generator before rebuilding vLLM KV cache so no last-yielded tensor
         # reference can survive across the phase switch.
         del per_tensor_param
         if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor.actor_module)
+            with stage_timer("rollout_mode_offload_actor_params"):
+                offload_megatron_model_to_cpu(self.actor.actor_module)
             _rollout_phase_memory_log("rollout_mode_after_offload_actor_params", self.rank)
-        aggressive_empty_cache(force_sync=True)
+        with stage_timer("rollout_mode_empty_cache_before_kv"):
+            aggressive_empty_cache(force_sync=True)
         _rollout_phase_memory_log("rollout_mode_before_resume_kv_cache", self.rank)
         if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["kv_cache"])
+            with stage_timer("rollout_mode_resume_kv_cache"):
+                await self.rollout.resume(tags=["kv_cache"])
             _rollout_phase_memory_log("rollout_mode_after_resume_kv_cache", self.rank)
         if getattr(self.rollout, "_needs_rollout_aclgraph_recapture", False):
             model_runner = getattr(self.rollout, "model_runner", None)
@@ -757,15 +778,26 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     _recapture_rollout_aclgraphs,
                 )
 
-                _recapture_rollout_aclgraphs(
-                    model_runner, "rollout_mode_after_resume_kv_cache"
-                )
+                with stage_timer("rollout_mode_recapture_aclgraphs"):
+                    _recapture_rollout_aclgraphs(
+                        model_runner, "rollout_mode_after_resume_kv_cache"
+                    )
             self.rollout._needs_rollout_aclgraph_recapture = False
 
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
-        self.rollout.eplb_start()
+        with stage_timer("rollout_mode_eplb_start"):
+            self.rollout.eplb_start()
+        if _ROLLOUT_STAGE_DEBUG:
+            self._last_rollout_mode_stage_timing = rollout_stage_timing
+            logger.info(
+                "rollout_mode_stage_timing rank=%s timings=%s",
+                self.rank,
+                {k: round(v, 6) for k, v in rollout_stage_timing.items()},
+            )
+        else:
+            self._last_rollout_mode_stage_timing = None
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
@@ -855,17 +887,20 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             offload_megatron_optimizer(self.actor_optimizer)
 
         timing_generate = {}
+        rollout_mode_timing = {}
         if self._is_actor:  # For rollout only, we do not switch context.
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.rollout_mode())
+            with simple_timer("rollout_mode_before_generate", rollout_mode_timing):
+                loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
+        rollout_stage_timing = None
 
         from vllm_ascend import envs as envs_ascend
 
@@ -904,6 +939,21 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                     "generation_timing/topk_ratio": timing_generate_topk_ratio,
                     "generation_timing/reduced": True,
                 }
+            )
+        if _ROLLOUT_STAGE_DEBUG and rollout_mode_timing:
+            rollout_mode_timing = reduce_timing(rollout_mode_timing)
+            timing_generate.update(rollout_mode_timing)
+            rollout_stage_timing = getattr(self, "_last_rollout_mode_stage_timing", None)
+            if rollout_stage_timing:
+                logger.info(
+                    "rollout_mode_stage_timing_reduced rank=%s timings=%s",
+                    self.rank,
+                    {k: round(v, 6) for k, v in reduce_timing(rollout_stage_timing).items()},
+                )
+        if _ROLLOUT_STAGE_DEBUG and rollout_mode_timing and "generate_sequences" in timing_generate:
+            timing_generate["vllm_generate_only"] = (
+                timing_generate["generate_sequences"]
+                - rollout_mode_timing["rollout_mode_before_generate"]
             )
         output.meta_info["timing"] = timing_generate
         output = output.to("cpu")

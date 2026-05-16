@@ -25,6 +25,8 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
+import os
+import time
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -69,6 +71,42 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+_LAYER_PROFILE_ENABLED = os.getenv("VLLM_QWEN2_MOE_LAYER_PROFILE", "0") == "1"
+_LAYER_PROFILE_FIRST_N = int(os.getenv("VLLM_QWEN2_MOE_LAYER_PROFILE_FIRST_N", "32"))
+_LAYER_PROFILE_INTERVAL = int(os.getenv("VLLM_QWEN2_MOE_LAYER_PROFILE_INTERVAL", "2048"))
+_LAYER_PROFILE_COUNTERS: dict[str, int] = {}
+
+
+def _profile_mark(name: str) -> tuple[int, bool]:
+    count = _LAYER_PROFILE_COUNTERS.get(name, 0) + 1
+    _LAYER_PROFILE_COUNTERS[name] = count
+    should_log = count <= _LAYER_PROFILE_FIRST_N or (
+        _LAYER_PROFILE_INTERVAL > 0 and count % _LAYER_PROFILE_INTERVAL == 0
+    )
+    return count, should_log
+
+
+def _profile_time() -> float:
+    try:
+        torch.npu.synchronize()
+    except Exception:
+        pass
+    return time.perf_counter()
+
+
+def _profile_log(name: str, call: int, prefix: str, tokens: int, **values: float) -> None:
+    body = " ".join(f"{key}_ms={value * 1000.0:.3f}" for key, value in values.items())
+    logger.info(
+        "Qwen2Moe layer profile pid=%s name=%s call=%d prefix=%s tokens=%s %s",
+        os.getpid(),
+        name,
+        call,
+        prefix,
+        tokens,
+        body,
+    )
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -172,23 +210,50 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
         )
+        self.prefix = prefix
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
+        profile_call = 0
+        should_profile = False
+        if _LAYER_PROFILE_ENABLED:
+            profile_call, should_profile = _profile_mark("sparse_moe")
+            if should_profile:
+                tokens = int(hidden_states.shape[0])
+                t0 = _profile_time()
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        if should_profile:
+            t1 = _profile_time()
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
+        if should_profile:
+            t2 = _profile_time()
         if self.shared_expert is not None:
             final_hidden_states = final_hidden_states[0] + final_hidden_states[1]
+        if should_profile:
+            t3 = _profile_time()
         if self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(  # noqa E501
                 final_hidden_states
+            )
+        if should_profile:
+            t4 = _profile_time()
+            _profile_log(
+                "sparse_moe",
+                profile_call,
+                self.prefix,
+                tokens,
+                gate=t1 - t0,
+                experts=t2 - t1,
+                shared_add=t3 - t2,
+                allreduce=t4 - t3,
+                total=t4 - t0,
             )
 
         return final_hidden_states.view(orig_shape)
@@ -269,17 +334,44 @@ class Qwen2MoeAttention(nn.Module):
             if dual_chunk_attention_config
             else {},
         )
+        self.prefix = prefix
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        profile_call = 0
+        should_profile = False
+        if _LAYER_PROFILE_ENABLED:
+            profile_call, should_profile = _profile_mark("attention")
+            if should_profile:
+                tokens = int(hidden_states.shape[0])
+                t0 = _profile_time()
         qkv, _ = self.qkv_proj(hidden_states)
+        if should_profile:
+            t1 = _profile_time()
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+        if should_profile:
+            t2 = _profile_time()
         attn_output = self.attn(q, k, v)
+        if should_profile:
+            t3 = _profile_time()
         output, _ = self.o_proj(attn_output)
+        if should_profile:
+            t4 = _profile_time()
+            _profile_log(
+                "attention",
+                profile_call,
+                self.prefix,
+                tokens,
+                qkv=t1 - t0,
+                rope=t2 - t1,
+                attn=t3 - t2,
+                o_proj=t4 - t3,
+                total=t4 - t0,
+            )
         return output
 
 
@@ -333,6 +425,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.prefix = prefix
 
     def forward(
         self,
@@ -340,20 +433,46 @@ class Qwen2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        profile_call = 0
+        should_profile = False
+        if _LAYER_PROFILE_ENABLED:
+            profile_call, should_profile = _profile_mark("decoder_layer")
+            if should_profile:
+                tokens = int(hidden_states.shape[0])
+                t0 = _profile_time()
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if should_profile:
+            t1 = _profile_time()
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        if should_profile:
+            t2 = _profile_time()
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if should_profile:
+            t3 = _profile_time()
         hidden_states = self.mlp(hidden_states)
+        if should_profile:
+            t4 = _profile_time()
+            _profile_log(
+                "decoder_layer",
+                profile_call,
+                self.prefix,
+                tokens,
+                input_norm=t1 - t0,
+                attention=t2 - t1,
+                post_norm=t3 - t2,
+                mlp=t4 - t3,
+                total=t4 - t0,
+            )
         return hidden_states, residual
 
 

@@ -948,9 +948,14 @@ class DataProto:
                     return False
                 for key, val_a in a.items():
                     val_b = b[key]
-                    # generate_sequences in different meta_info may be slightly different;
-                    # allow a 10% tolerance for the generate_sequences field.
-                    if key == "generate_sequences" and isinstance(val_a, float) and isinstance(val_b, float):
+                    # Rollout timing keys can differ slightly across ranks due to
+                    # scheduler skew and async overlap. Keep concat tolerant for
+                    # these fields instead of requiring bitwise equality.
+                    if key in {
+                        "generate_sequences",
+                        "rollout_mode_before_generate",
+                        "vllm_generate_only",
+                    } and isinstance(val_a, float) and isinstance(val_b, float):
                         if not math.isclose(val_a, val_b, rel_tol=0.1):
                             return False
                     elif not meta_info_equal(val_a, val_b):

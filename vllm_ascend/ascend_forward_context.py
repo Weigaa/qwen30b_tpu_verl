@@ -27,6 +27,24 @@ from vllm_ascend.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _use_old_eager_forward_context() -> bool:
+    return os.getenv("VLLM_ASCEND_EAGER_OLD_FORWARD_CONTEXT", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _use_old_qwen3_moe_stack() -> bool:
+    return os.getenv("VLLM_QWEN3_MOE_ASCEND_LEGACY_STACK", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 class MoECommType(Enum):
     ALLGATHER = 0
     MC2 = 1
@@ -74,6 +92,8 @@ def set_ascend_forward_context(
     is_draft_model=False,
     prefetch_stream: torch.npu.Stream | None = None,
     moe_prefetch_stream: torch.npu.Stream | None = None,
+    moe_comm_type: MoECommType | None = None,
+    reserved_mc2_mask: torch.Tensor | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -93,17 +113,20 @@ def set_ascend_forward_context(
         if (
             envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
             or envs_ascend.VLLM_ASCEND_USE_LEGACY_FUSED_MOE
+            or envs_ascend.VLLM_ASCEND_USE_COMMON_FUSED_MOE
+            or _use_old_qwen3_moe_stack()
         ):
             from vllm_ascend.ops.moe.moe_comm_method import get_moe_comm_method
         else:
             from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
-        moe_comm_type = select_moe_comm_method(
-            num_tokens,
-            vllm_config,
-            is_draft_model,
-            with_prefill=with_prefill,
-        )
+        if moe_comm_type is None:
+            moe_comm_type = select_moe_comm_method(
+                num_tokens,
+                vllm_config,
+                is_draft_model,
+                with_prefill=with_prefill,
+            )
         forward_context.moe_comm_type = moe_comm_type
         forward_context.selected_moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
@@ -130,8 +153,17 @@ def set_ascend_forward_context(
 
         # main model and drafter model may have different architecture
         is_context_moe_model = is_drafter_moe_model(vllm_config) if is_draft_model else is_moe_model(vllm_config)
+        use_old_eager_forward_context = _use_old_eager_forward_context()
         if is_context_moe_model:
-            sp_enabled = enable_sp(vllm_config) and num_tokens is not None
+            if use_old_eager_forward_context:
+                sp_enabled = (
+                    enable_sp(vllm_config)
+                    and tp_world_size > 1
+                    and num_tokens is not None
+                    and num_tokens > 1000
+                )
+            else:
+                sp_enabled = enable_sp(vllm_config) and num_tokens is not None
             mmrs_fusion = False
         elif is_draft_model:
             # TODO: for dense drafter, `sp` is redundant and is not compatible with `dp` and `graph`.
@@ -144,7 +176,12 @@ def set_ascend_forward_context(
         forward_context.num_tokens = num_tokens
         forward_context.sp_enabled = sp_enabled
         # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
-        forward_context.flashcomm_v2_enabled = flashcomm2_enable() and tp_world_size > 1 and num_tokens is not None
+        forward_context.flashcomm_v2_enabled = (
+            not use_old_eager_forward_context
+            and flashcomm2_enable()
+            and tp_world_size > 1
+            and num_tokens is not None
+        )
 
         if forward_context.sp_enabled or forward_context.flashcomm_v2_enabled:
             pad_size = (tp_world_size - (num_tokens % tp_world_size)) % tp_world_size
@@ -165,7 +202,8 @@ def set_ascend_forward_context(
         # TODO(rjg-lyh): refactor mlp weight prefetch method
         # set for mlp weight prefetch
         prefetch_mlp_enabled = (
-            envs_ascend.VLLM_ASCEND_ENABLE_PREFETCH_MLP
+            (not use_old_eager_forward_context or bool(int(os.getenv("VLLM_ASCEND_ENABLE_DENSE_OPTIMIZE", "0"))))
+            and envs_ascend.VLLM_ASCEND_ENABLE_PREFETCH_MLP
             and forward_context.layer_idx is not None
             and num_tokens is not None
             and num_tokens < 500
@@ -198,7 +236,8 @@ def set_ascend_forward_context(
                 num_actual_tokens = num_tokens
             # NOTE: token num which need to pad to when mc2
             forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
-            reserved_mc2_mask = get_mc2_mask()
+            if reserved_mc2_mask is None:
+                reserved_mc2_mask = get_mc2_mask()
             if reserved_mc2_mask is not None:
                 mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
                 mc2_mask[:num_actual_tokens] = True

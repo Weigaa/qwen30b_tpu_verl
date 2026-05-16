@@ -123,6 +123,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
     def __init__(self, moe_config: FusedMoEConfig):
         super().__init__(moe_config)
         self._restore_tp_across_dp()
+        self._no_pad_fast_path = False
 
     def _restore_tp_across_dp(self):
         """Restore original TP configuration (same as MC2)."""
@@ -263,6 +264,7 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         """
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
+        self._no_pad_fast_path = False
         forward_context = get_forward_context()
         mc2_mask = forward_context.mc2_mask
         if self.tp_size > 1:
@@ -275,6 +277,10 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             self.num_tokens, _ = hidden_states.shape
             target_pad_length = forward_context.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
+            if (self.tp_size == 1 and pad_size == 0
+                    and not self.enable_shared_expert_dp):
+                self._no_pad_fast_path = True
+                return hidden_states, router_logits, mc2_mask, None
 
             # Pad if necessary (unless shared expert DP is enabled)
             if pad_size > 0 and not self.enable_shared_expert_dp:
@@ -300,6 +306,15 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         }
 
         return hidden_states, router_logits, mc2_mask, context_metadata
+
+    def finalize(self,
+                 hidden_states: torch.Tensor,
+                 reduce_results: bool,
+                 context_metadata: Optional[dict] = None) -> torch.Tensor:
+        if self._no_pad_fast_path:
+            return hidden_states
+        return super().finalize(hidden_states, reduce_results,
+                                context_metadata)
 
 
 class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):

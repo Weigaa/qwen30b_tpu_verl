@@ -1230,6 +1230,18 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         self.max_model_len = vllm_config.model_config.max_model_len
         get_ascend_config()
         self.dynamic_eplb = get_ascend_config().dynamic_eplb
+        # The old eager Qwen3 MoE stack reads this flag during profile/dummy
+        # force-load-balance. v0.14's base quant method no longer initializes
+        # it, so keep the legacy eager default explicit here.
+        self.use_aclgraph = False
+        # This legacy path is used to compare the real old eager Qwen3Moe
+        # implementation under v0.14 compiled-eager. The old implementation
+        # contains a few tensor-valued safety checks that are fine in eager but
+        # untraceable for Dynamo. Keep them opt-out so normal debugging can
+        # re-enable the checks, while performance probes can reach the hot path.
+        self.skip_invalid_topk_check = _env_flag(
+            "VLLM_QWEN3_MOE_SKIP_INVALID_TOPK_CHECK",
+            os.getenv("VLLM_QWEN3_MOE_ASCEND_LEGACY_STACK", "0"))
 
         try:
             device_group = get_mc2_group().device_group
@@ -2454,12 +2466,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if (log2phy is not None
                 and moe_comm_method.__class__.__name__ != "AlltoAllCommImpl"):
             topk_ids = log2phy[topk_ids]
-            invalid_mask = topk_ids < 0
-            if torch.any(invalid_mask):
-                raise RuntimeError(
-                    "Invalid remapped topk_ids encountered before fused "
-                    f"MoE execution at layer={getattr(layer, 'layer_idx', -1)}: "
-                    f"invalid_count={int(invalid_mask.sum().item())}")
+            if not self.skip_invalid_topk_check:
+                invalid_mask = topk_ids < 0
+                if torch.any(invalid_mask):
+                    raise RuntimeError(
+                        "Invalid remapped topk_ids encountered before fused "
+                        f"MoE execution at layer={getattr(layer, 'layer_idx', -1)}: "
+                        f"invalid_count={int(invalid_mask.sum().item())}")
         if enable_force_load_balance and not self.use_aclgraph:
             topk_ids = (
                 torch.arange(topk_ids.numel(), device=topk_ids.device)
@@ -5414,6 +5427,12 @@ class AscendFusedMoE(FusedMoE):
                 rm_router_logits=self.rm_router_logits,
                 replace_allreduce=replace_allreduce,
                 gate=gate)
+            # prepare() may pad/slice the token dimension and stores the
+            # matching x_active_mask on the comm method.  Passing the original
+            # forward_context mask into dispatch can make aclnnMoeDistribute*
+            # see a mask whose length no longer matches hidden_states.
+            mc2_mask = getattr(forward_context.moe_comm_method, "mc2_mask",
+                               mc2_mask)
 
             # print("is_dummy in ascendfusedmoe is:", is_dummy)
             # Matrix multiply.

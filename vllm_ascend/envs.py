@@ -144,6 +144,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_USE_LEGACY_FUSED_MOE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_USE_LEGACY_FUSED_MOE", "0"))
     ),
+    # Use the old common_fused_moe wrapper while keeping elastic shrink
+    # disabled.  This is a narrow rollout perf probe for comparing the
+    # v0.11-style eager MoE wrapper against the newer split-MoE wrapper.
+    "VLLM_ASCEND_USE_COMMON_FUSED_MOE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_USE_COMMON_FUSED_MOE", "0"))
+    ),
     # Use the old eager Ascend attention operator mix:
     # - KV block size 64
     # - DecodeOnly -> _npu_paged_attention

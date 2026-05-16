@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Callable, Optional
@@ -47,6 +49,145 @@ from vllm_ascend.utils import (AscendDeviceType, enable_sp,
                                get_ascend_device_type, maybe_trans_nz,
                                npu_stream_switch, shared_expert_dp_enabled,
                                shared_experts_calculation_stream)
+
+_moe_context_debug_seen = 0
+_moe_context_debug_summary: Counter[tuple[str, int, int]] = Counter()
+_fused_moe_profile_total = 0
+_fused_moe_profile_seen = 0
+_fused_moe_profile_summary: Counter[tuple[str, int]] = Counter()
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+_FUSED_MOE_PROFILE_ENABLED = _env_flag("VLLM_ASCEND_FUSED_MOE_PROFILE")
+_FUSED_MOE_PROFILE_INTERVAL = int(
+    os.getenv("VLLM_ASCEND_FUSED_MOE_PROFILE_INTERVAL", "1024"))
+_MOE_CONTEXT_DEBUG_ENABLED = _env_flag("VLLM_ASCEND_MOE_CONTEXT_DEBUG")
+
+
+def _maybe_new_timing_event() -> torch.npu.Event | None:
+    try:
+        return torch.npu.Event(enable_timing=True)
+    except TypeError:
+        return torch.npu.Event()
+
+
+def _record_timing_event() -> torch.npu.Event | None:
+    event = _maybe_new_timing_event()
+    if event is not None:
+        torch.npu.current_stream().record_event(event)
+    return event
+
+
+def _elapsed_ms(start_event: torch.npu.Event,
+                end_event: torch.npu.Event) -> float:
+    end_event.synchronize()
+    return float(start_event.elapsed_time(end_event))
+
+
+def _should_profile_fused_moe() -> bool:
+    if not _FUSED_MOE_PROFILE_ENABLED:
+        return False
+    global _fused_moe_profile_seen
+    _fused_moe_profile_seen += 1
+    return _fused_moe_profile_seen <= 32 or (
+        _FUSED_MOE_PROFILE_INTERVAL > 0
+        and _fused_moe_profile_seen % _FUSED_MOE_PROFILE_INTERVAL == 0)
+
+
+if _FUSED_MOE_PROFILE_ENABLED:
+    # Keep the sampling decision dynamic under compiled-eager; otherwise Dynamo
+    # may specialize on the first True and record timing events every step.
+    _should_profile_fused_moe = torch._dynamo.disable(
+        _should_profile_fused_moe)
+
+
+def _maybe_log_fused_moe_profile(*,
+                                 kind: str,
+                                 tokens: int,
+                                 forward_context,
+                                 **timings_ms: float) -> None:
+    global _fused_moe_profile_total
+    _fused_moe_profile_total += 1
+    comm_type = getattr(forward_context, "moe_comm_type", None)
+    comm_name = "None" if comm_type is None else comm_type.name
+    _fused_moe_profile_summary[(kind, tokens)] += 1
+    fields = " ".join(
+        f"{name}_ms={value:.3f}" for name, value in timings_ms.items())
+    summary = ", ".join(
+        f"{profile_kind}/tokens={profile_tokens}:{count}"
+        for (profile_kind, profile_tokens), count in sorted(
+            _fused_moe_profile_summary.items()))
+    logger.info(
+        "FusedMoE profile pid=%s call=%d kind=%s comm=%s tokens=%s %s "
+        "summary={%s}",
+        os.getpid(),
+        _fused_moe_profile_total,
+        kind,
+        comm_name,
+        tokens,
+        fields,
+        summary,
+    )
+
+
+def _maybe_log_moe_context(*,
+                           stage: str,
+                           before_tokens: int,
+                           after_tokens: int,
+                           router_before_tokens: int,
+                           router_after_tokens: int,
+                           mc2_mask_tokens: int | None,
+                           forward_context,
+                           replace_allreduce: bool,
+                           enable_shared_expert_dp: bool) -> None:
+    if not _MOE_CONTEXT_DEBUG_ENABLED:
+        return
+
+    global _moe_context_debug_seen
+    _moe_context_debug_seen += 1
+    comm_type = getattr(forward_context, "moe_comm_type", None)
+    comm_name = "None" if comm_type is None else comm_type.name
+    _moe_context_debug_summary[(comm_name, before_tokens, after_tokens)] += 1
+
+    interval = int(os.getenv("VLLM_ASCEND_MOE_CONTEXT_DEBUG_INTERVAL", "512"))
+    if not (_moe_context_debug_seen <= 64 or (
+            interval > 0 and _moe_context_debug_seen % interval == 0)):
+        return
+
+    summary = ", ".join(
+        f"{comm}/{before}->{after}:{count}"
+        for (comm, before, after), count in sorted(
+            _moe_context_debug_summary.items()))
+    logger.info(
+        "MoE context debug pid=%s call=%d stage=%s comm=%s "
+        "before_tokens=%s after_tokens=%s router_before=%s router_after=%s "
+        "mc2_mask_tokens=%s num_tokens=%s num_actual_tokens=%s "
+        "max_tokens_across_dp=%s padded_num_tokens=%s with_prefill=%s "
+        "sp_enabled=%s flashcomm_v2_enabled=%s replace_allreduce=%s "
+        "enable_shared_expert_dp=%s summary={%s}",
+        os.getpid(),
+        _moe_context_debug_seen,
+        stage,
+        comm_name,
+        before_tokens,
+        after_tokens,
+        router_before_tokens,
+        router_after_tokens,
+        mc2_mask_tokens,
+        getattr(forward_context, "num_tokens", None),
+        getattr(forward_context, "num_actual_tokens", None),
+        getattr(forward_context, "max_tokens_across_dp", None),
+        getattr(forward_context, "padded_num_tokens", None),
+        getattr(forward_context, "with_prefill", None),
+        getattr(forward_context, "sp_enabled", None),
+        getattr(forward_context, "flashcomm_v2_enabled", None),
+        replace_allreduce,
+        enable_shared_expert_dp,
+        summary,
+    )
 
 @dataclass
 class FusedMoEResult:
@@ -105,6 +246,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
               **kwargs) -> torch.Tensor:
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
+        should_profile = _should_profile_fused_moe()
+        profile_start = _record_timing_event() if should_profile else None
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -118,6 +261,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts)
+        after_select = _record_timing_event() if should_profile else None
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
@@ -149,10 +293,22 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             dynamic_eplb=self.dynamic_eplb,
-            mc2_mask=kwargs.get("mc2_mask", None),
-            record_events=kwargs.get("record_events", False))
+                mc2_mask=kwargs.get("mc2_mask", None),
+                record_events=kwargs.get("record_events", False))
+        after_fused_experts = _record_timing_event() if should_profile else None
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
+        if should_profile and profile_start is not None and \
+                after_select is not None and after_fused_experts is not None:
+            _maybe_log_fused_moe_profile(
+                kind="apply",
+                tokens=int(x.shape[0]),
+                forward_context=get_forward_context(),
+                select=_elapsed_ms(profile_start, after_select),
+                fused_experts=_elapsed_ms(after_select,
+                                          after_fused_experts),
+                total=_elapsed_ms(profile_start, after_fused_experts),
+            )
         return final_hidden_states
 
 
@@ -298,6 +454,8 @@ class AscendFusedMoE(FusedMoE):
         assert self.quant_method is not None
 
         forward_context = get_forward_context()
+        should_profile = _should_profile_fused_moe()
+        profile_start = _record_timing_event() if should_profile else None
 
         # Load balancing for token distribution among experts in dummy_run
         # TODO: The community only considers load balancing when DP > 1.
@@ -346,12 +504,28 @@ class AscendFusedMoE(FusedMoE):
                 set_flash_common3_context(topk_weights=topk_weights,
                                           topk_ids=topk_ids)
 
+        before_prepare_tokens = hidden_states.shape[0]
+        before_router_tokens = router_logits.shape[0]
+        replace_allreduce = forward_context.sp_enabled
         hidden_states, router_logits, mc2_mask, context_metadata = forward_context.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
-            replace_allreduce=forward_context.sp_enabled,
+            replace_allreduce=replace_allreduce,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type)
+        if _MOE_CONTEXT_DEBUG_ENABLED:
+            _maybe_log_moe_context(
+                stage="after_prepare",
+                before_tokens=before_prepare_tokens,
+                after_tokens=hidden_states.shape[0],
+                router_before_tokens=before_router_tokens,
+                router_after_tokens=router_logits.shape[0],
+                mc2_mask_tokens=None if mc2_mask is None else mc2_mask.shape[0],
+                forward_context=forward_context,
+                replace_allreduce=replace_allreduce,
+                enable_shared_expert_dp=self.enable_shared_expert_dp,
+            )
+        after_prepare = _record_timing_event() if should_profile else None
 
         # Make sure the default stream waits for the gate stream to finish.
         if self.multistream_overlap_gate:
@@ -363,7 +537,7 @@ class AscendFusedMoE(FusedMoE):
             pertoken_scale = None
 
         # Matrix multiply.
-        fused_experts_results: FusedExpertsResult = self.quant_method.apply(
+        fused_experts_results: FusedExpertsResult | torch.Tensor = self.quant_method.apply(
             layer=self,
             x=hidden_states,
             router_logits=router_logits,
@@ -386,8 +560,20 @@ class AscendFusedMoE(FusedMoE):
             global_redundant_expert_num=self.global_redundant_expert_num,
             mc2_mask=mc2_mask,
             record_events=return_with_event)
+        after_apply = _record_timing_event() if should_profile else None
+
+        if torch.is_tensor(fused_experts_results):
+            routed_out_before_finalize = fused_experts_results
+            before_dispatch_evt = None
+            before_combine_evt = None
+        else:
+            routed_out_before_finalize = fused_experts_results.routed_out
+            before_dispatch_evt = fused_experts_results.before_dispatch_evt
+            before_combine_evt = fused_experts_results.before_combine_evt
 
         if self.dynamic_eplb:
+            assert not torch.is_tensor(fused_experts_results), \
+                "dynamic_eplb requires FusedExpertsResult metadata."
             expert_tokens = fused_experts_results.expert_tokens
             group_list_type = fused_experts_results.group_list_type
             assert expert_tokens is not None and group_list_type is not None, \
@@ -396,15 +582,28 @@ class AscendFusedMoE(FusedMoE):
                 torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
 
         routed_out = forward_context.moe_comm_method.finalize(
-            hidden_states=fused_experts_results.routed_out,
+            hidden_states=routed_out_before_finalize,
             reduce_results=self.reduce_results,
             context_metadata=context_metadata)
+        after_finalize = _record_timing_event() if should_profile else None
+        if should_profile and profile_start is not None and \
+                after_prepare is not None and after_apply is not None and \
+                after_finalize is not None:
+            _maybe_log_fused_moe_profile(
+                kind="forward_impl",
+                tokens=int(before_prepare_tokens),
+                forward_context=forward_context,
+                prepare=_elapsed_ms(profile_start, after_prepare),
+                apply=_elapsed_ms(after_prepare, after_apply),
+                finalize=_elapsed_ms(after_apply, after_finalize),
+                total=_elapsed_ms(profile_start, after_finalize),
+            )
 
         if return_with_event:
             return FusedMoEResult(
                 routed_out=routed_out,
-                before_dispatch_evt=fused_experts_results.before_dispatch_evt,
-                before_combine_evt=fused_experts_results.before_combine_evt)
+                before_dispatch_evt=before_dispatch_evt,
+                before_combine_evt=before_combine_evt)
         else:
             # The vLLM FusedMoE forward_impl does not return events.
             return routed_out
@@ -566,12 +765,15 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             set_flash_common3_context(shared_experts=self._shared_experts)
 
         before_routed_experts = torch.npu.current_stream().record_event()
+        should_profile = _should_profile_fused_moe()
+        profile_start = _record_timing_event() if should_profile else None
         fused_moe_results = AscendFusedMoE.forward_impl(
             self,
             hidden_states=hidden_states,
             router_logits=router_logits,
             return_with_event=True,
         )
+        after_routed = _record_timing_event() if should_profile else None
         routed_out = fused_moe_results.routed_out
 
         if self.multistream_overlap_gate:
@@ -586,5 +788,16 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
                     before_dispatch=fused_moe_results.before_dispatch_evt,
                     before_combine=fused_moe_results.before_combine_evt,
                 ))
+        after_shared = _record_timing_event() if should_profile else None
+        if should_profile and profile_start is not None and \
+                after_routed is not None and after_shared is not None:
+            _maybe_log_fused_moe_profile(
+                kind="shared_forward_impl",
+                tokens=int(hidden_states.shape[0]),
+                forward_context=get_forward_context(),
+                routed=_elapsed_ms(profile_start, after_routed),
+                shared=_elapsed_ms(after_routed, after_shared),
+                total=_elapsed_ms(profile_start, after_shared),
+            )
 
         return shared_out, routed_out

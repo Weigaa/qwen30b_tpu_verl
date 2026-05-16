@@ -16,6 +16,7 @@
 # limitations under the License.
 #
 import functools
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -81,7 +82,9 @@ def npugraph_ex_compile(
     # use aclgraph mode, avoid the transformation from fx graph to Ascend IR.
     config.mode = "reduce-overhead"
     # execute FX graph in eager mode before graph mode to optimize FX graph.
-    config.debug.run_eagerly = True
+    config.debug.run_eagerly = os.getenv(
+        "VLLM_ASCEND_NPUGRAPH_EX_RUN_EAGERLY", "1"
+    ).lower() in {"1", "true", "yes", "on"}
     if npugraph_ex_config.enable_static_kernel:
         config.experimental_config.aclgraph._aclnn_static_shape_kernel = True
         # According to the cudagraph_capture_size configuration, set the shapes

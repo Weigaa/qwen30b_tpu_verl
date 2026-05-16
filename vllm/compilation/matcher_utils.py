@@ -26,10 +26,21 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
 
-RMS_OP = torch.ops._C.rms_norm.default
-RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
-ROTARY_OP = torch.ops._C.rotary_embedding.default
-FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
+def _optional_default_op(namespace: str, op_name: str):
+    op_namespace = getattr(torch.ops, namespace, None)
+    if op_namespace is None:
+        return None
+    try:
+        op = getattr(op_namespace, op_name)
+        return getattr(op, "default", None)
+    except AttributeError:
+        return None
+
+
+RMS_OP = _optional_default_op("_C", "rms_norm")
+RMS_ADD_OP = _optional_default_op("_C", "fused_add_rms_norm")
+ROTARY_OP = _optional_default_op("_C", "rotary_embedding")
+FLASHINFER_ROTARY_OP = _optional_default_op("vllm", "flashinfer_rotary_embedding")
 
 QUANT_OPS: dict[QuantKey, OpOverload] = {
     kFp8StaticTensorSym: torch.ops._C.static_scaled_fp8_quant.default,  # noqa: E501
@@ -44,7 +55,7 @@ if current_platform.is_cuda():
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
     QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
 
-SILU_MUL_OP = torch.ops._C.silu_and_mul.default
+SILU_MUL_OP = _optional_default_op("_C", "silu_and_mul")
 
 
 class MatcherCustomOp(ABC):

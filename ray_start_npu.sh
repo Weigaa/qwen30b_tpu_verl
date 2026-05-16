@@ -30,8 +30,51 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/asdsip/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
-export ASCEND_CUSTOM_OPP_PATH=./vllm_ascend/_cann_ops_custom/vendors/vllm-ascend:${ASCEND_CUSTOM_OPP_PATH}
-export LD_LIBRARY_PATH=./vllm_ascend/_cann_ops_custom/vendors/vllm-ascend/op_api/lib/:${LD_LIBRARY_PATH}
+FILTERED_CUSTOM_OPP_PATH=./vllm_ascend/_cann_ops_custom_moe_filtered/vendors/vllm-ascend
+FULL_CUSTOM_OPP_PATH=./vllm_ascend/_cann_ops_custom/vendors/vllm-ascend
+DEFAULT_CUSTOM_OPP_PATH=${FILTERED_CUSTOM_OPP_PATH}
+if [ ! -d "${DEFAULT_CUSTOM_OPP_PATH}" ]; then
+  DEFAULT_CUSTOM_OPP_PATH=${FULL_CUSTOM_OPP_PATH}
+fi
+CUSTOM_OPP_PATH=${VLLM_ASCEND_LOCAL_CUSTOM_OPP_PATH:-${DEFAULT_CUSTOM_OPP_PATH}}
+CUSTOM_OP_API_LIB=${CUSTOM_OPP_PATH}/op_api/lib
+FILTERED_CUSTOM_OP_API_LIB=${FILTERED_CUSTOM_OPP_PATH}/op_api/lib
+FULL_CUSTOM_OP_API_LIB=${FULL_CUSTOM_OPP_PATH}/op_api/lib
+USE_LOCAL_CUSTOM_OP_API_LIB=${VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB:-0}
+
+remove_colon_path() {
+  local var_name="$1"
+  local path_to_remove="$2"
+  local current_value="${!var_name:-}"
+  local new_value=""
+  local entry
+  IFS=':' read -r -a entries <<< "${current_value}"
+  for entry in "${entries[@]}"; do
+    if [ -z "${entry}" ] || [ "${entry}" = "${path_to_remove}" ]; then
+      continue
+    fi
+    if [ -z "${new_value}" ]; then
+      new_value="${entry}"
+    else
+      new_value="${new_value}:${entry}"
+    fi
+  done
+  export "${var_name}=${new_value}"
+}
+
+if [ "${VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP:-1}" = "1" ]; then
+  remove_colon_path LD_LIBRARY_PATH "${CUSTOM_OP_API_LIB}"
+  if [ "${CUSTOM_OPP_PATH}" != "${FULL_CUSTOM_OPP_PATH}" ]; then
+    remove_colon_path ASCEND_CUSTOM_OPP_PATH "${FILTERED_CUSTOM_OPP_PATH}"
+    remove_colon_path ASCEND_CUSTOM_OPP_PATH "${FULL_CUSTOM_OPP_PATH}"
+    remove_colon_path LD_LIBRARY_PATH "${FILTERED_CUSTOM_OP_API_LIB}"
+    remove_colon_path LD_LIBRARY_PATH "${FULL_CUSTOM_OP_API_LIB}"
+  fi
+  export ASCEND_CUSTOM_OPP_PATH=${CUSTOM_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH}
+  if [ "${USE_LOCAL_CUSTOM_OP_API_LIB}" = "1" ] && [ -d "${CUSTOM_OP_API_LIB}" ]; then
+    export LD_LIBRARY_PATH=${CUSTOM_OP_API_LIB}:${LD_LIBRARY_PATH}
+  fi
+fi
 
 export ASCEND_LAUNCH_BLOCKING=0             # debug usage, which seriously affects performance after use, but the error stack is accurate
 export ASCEND_GLOBAL_EVENT_ENABLE=0         # whether to display the Ascend EVENT log; 1 is for display

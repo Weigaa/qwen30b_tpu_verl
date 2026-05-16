@@ -42,6 +42,23 @@ logger = logging.getLogger(__name__)
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
 _chunk_debug_total = 0
 _chunk_debug_summary = Counter()
+_CHUNK_DEBUG = os.getenv("VLLM_ASCEND_MOE_CHUNK_DEBUG",
+                         "0").lower() in {"1", "true", "yes", "on"}
+_CHUNK_DEBUG_INTERVAL = int(
+    os.getenv("VLLM_ASCEND_MOE_CHUNK_DEBUG_INTERVAL", "1024"))
+_CHUNK_STRICT_LT = os.getenv("VLLM_ASCEND_MOE_CHUNK_STRICT_LT",
+                             "0").lower() in {"1", "true", "yes", "on"}
+_SKIP_EMPTY_EXPERT_MLP = os.getenv(
+    "VLLM_ASCEND_MOE_SKIP_EMPTY_EXPERT_MLP",
+    "0").lower() in {"1", "true", "yes", "on"}
+_SKIP_MC2_MASK_SHAPE_CHECK = os.getenv(
+    "VLLM_ASCEND_MOE_SKIP_MC2_MASK_SHAPE_CHECK",
+    os.getenv("VLLM_QWEN3_MOE_ASCEND_LEGACY_STACK", "0")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -51,7 +68,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 def _maybe_log_chunk_plan(*, num_tokens: int, max_tokens: int,
                           chunk_moe_size: int,
                           moe_comm_type: MoECommType | None) -> None:
-    if not _env_flag("VLLM_ASCEND_MOE_CHUNK_DEBUG"):
+    if not _CHUNK_DEBUG:
         return
 
     global _chunk_debug_total
@@ -62,9 +79,9 @@ def _maybe_log_chunk_plan(*, num_tokens: int, max_tokens: int,
     comm_name = "None" if moe_comm_type is None else moe_comm_type.name
     _chunk_debug_summary[(comm_name, chunks, dummy_chunks)] += 1
 
-    interval = int(os.getenv("VLLM_ASCEND_MOE_CHUNK_DEBUG_INTERVAL", "1024"))
-    if _chunk_debug_total <= 32 or (
-            interval > 0 and _chunk_debug_total % interval == 0):
+    if _chunk_debug_total <= 32 or (_CHUNK_DEBUG_INTERVAL > 0 and
+                                    _chunk_debug_total %
+                                    _CHUNK_DEBUG_INTERVAL == 0):
         summary = ", ".join(
             f"{comm}/chunks={chunk}/dummy={dummy}:{count}"
             for (comm, chunk, dummy), count in sorted(
@@ -192,14 +209,17 @@ class MoECommMethod(ABC):
             moe_comm_type=getattr(ctx, "moe_comm_type", None),
         )
         effective_mc2_mask = self.mc2_mask if mc2_mask is None else mc2_mask
-        if (effective_mc2_mask is not None
+        if (not _SKIP_MC2_MASK_SHAPE_CHECK and effective_mc2_mask is not None
                 and effective_mc2_mask.shape[0] != hidden_states.shape[0]):
             raise RuntimeError(
                 "MC2 mask length mismatch before token dispatch: "
                 f"hidden_tokens={hidden_states.shape[0]} "
                 f"mask_tokens={effective_mc2_mask.shape[0]}")
 
-        if max_tokens <= chunk_moe_size:
+        use_single_chunk = (max_tokens < chunk_moe_size
+                            if _CHUNK_STRICT_LT else
+                            max_tokens <= chunk_moe_size)
+        if use_single_chunk:
             results = self.token_dispatcher.token_dispatch(
                 hidden_states=hidden_states,
                 topk_weights=topk_weights,
@@ -216,21 +236,24 @@ class MoECommMethod(ABC):
                 with_quant=use_int8_w8a8 or use_int4_w4a8)
             permuted_hidden_states, expert_tokens, dynamic_scale, group_list_type, topk_scales = \
                 results["hidden_states"], results["group_list"], results.get("dynamic_scale"), results["group_list_type"], results.get("topk_scales")
-            mlp_output = unified_apply_mlp(hidden_states=permuted_hidden_states,
-                                            w1=w1,
-                                            w1_scale=w1_scale,
-                                            w2=w2,
-                                            w2_scale=w2_scale,
-                                            group_list=expert_tokens,
-                                            dynamic_scale=dynamic_scale,
-                                            group_list_type=group_list_type,
-                                            w1_scale_bias=w1_scale_bias,
-                                            w2_scale_bias=w2_scale_bias,
-                                            topk_scales=topk_scales,
-                                            with_quant=use_int8_w8a8
-                                            or use_int4_w4a8,
-                                            fusion=use_int8_w8a8,
-                                            need_trans=need_trans)
+            if _SKIP_EMPTY_EXPERT_MLP and not torch.any(expert_tokens):
+                mlp_output = permuted_hidden_states
+            else:
+                mlp_output = unified_apply_mlp(hidden_states=permuted_hidden_states,
+                                                w1=w1,
+                                                w1_scale=w1_scale,
+                                                w2=w2,
+                                                w2_scale=w2_scale,
+                                                group_list=expert_tokens,
+                                                dynamic_scale=dynamic_scale,
+                                                group_list_type=group_list_type,
+                                                w1_scale_bias=w1_scale_bias,
+                                                w2_scale_bias=w2_scale_bias,
+                                                topk_scales=topk_scales,
+                                                with_quant=use_int8_w8a8
+                                                or use_int4_w4a8,
+                                                fusion=use_int8_w8a8,
+                                                need_trans=need_trans)
             mlp_hidden_states = self.token_dispatcher.token_combine(
                 hidden_states=mlp_output)
             return mlp_hidden_states

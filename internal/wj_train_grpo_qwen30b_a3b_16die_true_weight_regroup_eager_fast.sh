@@ -5,6 +5,9 @@
 #   - true graph capture disabled
 #   - VLLM_ASCEND_EAGER_COMPILE enabled
 #   - new split-MoE / new attention kernels
+#   - system CANN MoE custom ops, not the bundled local OPP override
+#   - validated opaque vLLM attention wrapper by default
+#   - MC2 for <=512 tokens, AllToAll above 512
 #   - explicit manual free between rollout and actor phases
 #   - TP=1 + EP over 16 rollout workers
 #
@@ -13,6 +16,7 @@
 set -ex
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
 BASE_SCRIPT="${SCRIPT_DIR}/wj_train_grpo_qwen30b_a3b_16die_true_weight_regroup.sh"
 
 # Workload defaults.  These may be overridden for cheap probes.
@@ -49,48 +53,76 @@ unset VLLM_ASCEND_ELASTIC_MOE_MODE
 
 # Eager mode: keep vLLM compile, but disable ACL/cudagraph replay.
 export VLLM_ENABLE_GRAPH_MODE=0
-export ROLLOUT_ENFORCE_EAGER=True
-export VLLM_ASCEND_EAGER_COMPILE=1
+export VLLM_ASCEND_EAGER_COMPILE=${VLLM_ASCEND_EAGER_COMPILE:-1}
+export ROLLOUT_ENFORCE_EAGER=${VLLM_ROLLOUT_ENFORCE_EAGER:-True}
+# The fastest validated eager probes used the system CANN OPP path, not the
+# bundled qwen3 local OPP.  The local package helps graph by providing ops such
+# as AddRmsNormBias, but in eager it can either intercept MoE dispatch/combine
+# or register partial fusions that compiled eager cannot tile correctly.
+export VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP=${VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP:-0}
+export VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB=${VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB:-0}
+export VLLM_ASCEND_LOCAL_CUSTOM_OPP_PATH=${VLLM_ASCEND_LOCAL_CUSTOM_OPP_PATH:-"${PROJECT_ROOT}/vllm_ascend/_cann_ops_custom_moe_filtered/vendors/vllm-ascend"}
+# When local OPP is disabled, the system CANN package has no AddRmsNormBias
+# registration.  Keep residual RMSNorm on torch_npu.npu_add_rms_norm so
+# compiled eager does not emit the local-only _C_ascend.npu_add_rms_norm_bias.
+export VLLM_ASCEND_FORCE_TORCH_NPU_ADD_RMS_NORM=${VLLM_ASCEND_FORCE_TORCH_NPU_ADD_RMS_NORM:-1}
+# Pass fusion did not improve the threshold workload; keep the current-best
+# compiled-eager shape unless explicitly overridden for diagnostics.
+export VLLM_ASCEND_EAGER_COMPILE_PASS_FUSION=${VLLM_ASCEND_EAGER_COMPILE_PASS_FUSION:-0}
 export VLLM_ROLLOUT_GRAPH_WITH_RESAMPLER=0
 export VLLM_ROLLOUT_UNSAFE_TRUE_GRAPH_WITH_RESAMPLER=0
 export VLLM_ROLLOUT_ZIYI_ALIGN=0
 export VLLM_ROLLOUT_EAGER_OLDREF_ALIGN=0
-export VLLM_ASCEND_FORCE_CUDAGRAPH_NONE=0
-export VLLM_ASCEND_FORCE_COMPILE_WITHOUT_ACLGRAPH=0
 export VLLM_ASCEND_ALLOW_LAZY_ACLGRAPH_CAPTURE=0
 export VLLM_ROLLOUT_INVALIDATE_ACLGRAPH_AFTER_WEIGHT_UPDATE=0
 export VLLM_ROLLOUT_RECAPTURE_ACLGRAPH_AFTER_WEIGHT_UPDATE=0
 
 # Scheduler and memory policy validated for qwen3 eager rollout.
 export VLLM_ROLLOUT_ASYNC_SCHEDULING=${VLLM_ROLLOUT_ASYNC_SCHEDULING:-true}
-export VLLM_ROLLOUT_ENABLE_PREFIX_CACHING=false
-export VLLM_ROLLOUT_ENABLE_CHUNKED_PREFILL=true
-export VLLM_ROLLOUT_MAX_NUM_BATCHED_TOKENS=17408
-export VLLM_ROLLOUT_GPU_MEMORY_UTILIZATION=${VLLM_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.85}
+export VLLM_ROLLOUT_ENABLE_PREFIX_CACHING=${VLLM_ROLLOUT_ENABLE_PREFIX_CACHING:-false}
+export VLLM_ROLLOUT_ENABLE_CHUNKED_PREFILL=${VLLM_ROLLOUT_ENABLE_CHUNKED_PREFILL:-true}
+export VLLM_ROLLOUT_MAX_NUM_BATCHED_TOKENS=${VLLM_ROLLOUT_MAX_NUM_BATCHED_TOKENS:-17408}
+# Current best wrapper/run used 0.83; 0.85 is reserved for explicit probes.
+export VLLM_ROLLOUT_GPU_MEMORY_UTILIZATION=${VLLM_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.83}
 export VLLM_ROLLOUT_MANUAL_FREE_CACHE_ENGINE=${VLLM_ROLLOUT_MANUAL_FREE_CACHE_ENGINE:-1}
 export VLLM_ROLLOUT_FREE_CACHE_ENGINE=${VLLM_ROLLOUT_FREE_CACHE_ENGINE:-True}
 # Historical eager-fast wrapper pinned level 2 even though manual-free owns the
 # phase switch. Keep that surface aligned with the previous validated script.
 export VLLM_ROLLOUT_SLEEP_LEVEL=${VLLM_ROLLOUT_SLEEP_LEVEL:-2}
-export VLLM_ROLLOUT_CAMEM_WEIGHT_RELOAD=1
-export VLLM_ROLLOUT_FILTER_EMPTY_WEIGHT_SHARDS=1
-export VLLM_ROLLOUT_TASK_QUEUE_ENABLE=2
-export TASK_QUEUE_ENABLE=2
+export VLLM_ROLLOUT_CAMEM_WEIGHT_RELOAD=${VLLM_ROLLOUT_CAMEM_WEIGHT_RELOAD:-1}
+export VLLM_ROLLOUT_TASK_QUEUE_ENABLE=${VLLM_ROLLOUT_TASK_QUEUE_ENABLE:-2}
+# Avoid inheriting stale TASK_QUEUE_ENABLE=1 from graph/debug shells.
+export TASK_QUEUE_ENABLE=${VLLM_ROLLOUT_TASK_QUEUE_ENABLE}
 
 # Keep the high-performance qwen3 backend path, not legacy fallback kernels.
-export VLLM_ASCEND_USE_LEGACY_FUSED_MOE=0
-export VLLM_ASCEND_USE_LEGACY_ATTENTION=0
-export VLLM_ASCEND_LEGACY_ATTENTION_SPLITFUSE=0
+export VLLM_ASCEND_USE_LEGACY_FUSED_MOE=${VLLM_ASCEND_USE_LEGACY_FUSED_MOE:-0}
+export VLLM_ASCEND_USE_LEGACY_ATTENTION=${VLLM_ASCEND_USE_LEGACY_ATTENTION:-0}
+export VLLM_ASCEND_LEGACY_ATTENTION_SPLITFUSE=${VLLM_ASCEND_LEGACY_ATTENTION_SPLITFUSE:-0}
 export VLLM_ASCEND_DISABLE_GRAPH_FUSION=0
 export VLLM_ASCEND_DISABLE_NORM_QUANT_FUSION=0
 export VLLM_ASCEND_DISABLE_QKNORM_ROPE_FUSION=0
 export VLLM_ASCEND_DISABLE_ALLREDUCE_RMS_FUSION=0
-export VLLM_ASCEND_FORCE_ALLTOALL_MOE=0
-export VLLM_ASCEND_FORCE_PAGED_ATTENTION_DECODE=0
-export VLLM_ASCEND_USE_TOPK_TOPP_CUSTOM=${VLLM_ASCEND_USE_TOPK_TOPP_CUSTOM:-1}
-export VLLM_ASCEND_MC2_TOKENS_CAPACITY=512
-export VLLM_ASCEND_MC2_GLOBAL_BS=0
-export VLLM_ASCEND_MC2_MIN_EP_SIZE=2
+export VLLM_ASCEND_FORCE_ALLTOALL_MOE=${VLLM_ASCEND_FORCE_ALLTOALL_MOE:-0}
+export VLLM_ASCEND_FORCE_PAGED_ATTENTION_DECODE=${VLLM_ASCEND_FORCE_PAGED_ATTENTION_DECODE:-0}
+# Diagnostic only: bypass the generic opaque attention custom-op wrapper and
+# call the Ascend backend impl directly. This was fast on threshold-control
+# probes, but its full-16k run produced a much shorter response distribution,
+# so keep production eager on the behavior-preserving wrapper unless explicitly
+# requested.
+export VLLM_ASCEND_FORCE_DIRECT_ATTENTION_IMPL=${VLLM_ASCEND_FORCE_DIRECT_ATTENTION_IMPL:-0}
+export VLLM_ASCEND_USE_TOPK_TOPP_CUSTOM=${VLLM_ASCEND_USE_TOPK_TOPP_CUSTOM:-0}
+export VLLM_ASCEND_MC2_TOKENS_CAPACITY=${VLLM_ASCEND_MC2_TOKENS_CAPACITY:-512}
+export VLLM_ASCEND_MC2_GLOBAL_BS=${VLLM_ASCEND_MC2_GLOBAL_BS:-0}
+export VLLM_ASCEND_MC2_MIN_EP_SIZE=${VLLM_ASCEND_MC2_MIN_EP_SIZE:-2}
+export VLLM_ASCEND_ENABLE_FUSED_MC2=${VLLM_ASCEND_ENABLE_FUSED_MC2:-0}
+export VLLM_ROLLOUT_FORCE_ELASTIC_MOE_POLICY=${VLLM_ROLLOUT_FORCE_ELASTIC_MOE_POLICY:-1}
+export VLLM_ASCEND_ATTENTION_BLOCK_SIZE=${VLLM_ASCEND_ATTENTION_BLOCK_SIZE:-64}
+export VLLM_ASCEND_EAGER_METADATA_SYNC_DEVICE=${VLLM_ASCEND_EAGER_METADATA_SYNC_DEVICE:-1}
+export VLLM_ASCEND_FUSED_MOE_SIMPLE_MC2=${VLLM_ASCEND_FUSED_MOE_SIMPLE_MC2:-1}
+# Keep the upstream Qwen3Moe reduction semantics by default.  The
+# reduce_results=0 probe was slower on the threshold workload, so leave it as
+# an explicit diagnostic override only.
+export VLLM_QWEN3_MOE_REDUCE_RESULTS=${VLLM_QWEN3_MOE_REDUCE_RESULTS:-1}
 
 # Preserve GRPO semantics: prompt-local n samples, no cross-rank data rebalance.
 export VLLM_EPOCH_LENGTH_REGROUP_ENABLE=1
@@ -99,8 +131,12 @@ export VLLM_ROLLOUT_DATA_REBALANCE=0
 export VLLM_ROLLOUT_LENGTH_BALANCE=0
 export VLLM_ROLLOUT_DIVERSIFY_SAMPLING_SEED=0
 export VLLM_ROLLOUT_GRAPH_SPREAD_REPEATS=0
-export VLLM_ROLLOUT_USE_TQDM=0
+export VLLM_ROLLOUT_USE_TQDM=${VLLM_ROLLOUT_USE_TQDM:-1}
 export ACTOR_USE_FUSED_KERNELS=false
+# Keep compiled-eager artifacts for this production path separate from older
+# OPP experiments. The compile cache key now includes OPP provider envs, but a
+# dedicated cache root also makes stale artifacts easier to inspect and purge.
+export VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT:-"${PWD}/.cache/vllm_eager_fast_nolocalopp"}
 export OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-resample_result_16k_bs32_n16_eager_fast}
 
 exec bash "${BASE_SCRIPT}" "$@"
