@@ -58,6 +58,10 @@ export HCCL_ASYNC_ERROR_HANDLING=1
 
 # Train Drafter stays disabled in this sidecar experiment.
 export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=0
+export VLLM_ASCEND_DRAFT_PROFILE_ONLY=${VLLM_ASCEND_DRAFT_PROFILE_ONLY:-0}
+export VLLM_ASCEND_DRAFT_NPU_PROFILE=${VLLM_ASCEND_DRAFT_NPU_PROFILE:-0}
+export VLLM_ASCEND_DRAFT_PROFILE_BREAKDOWN=${VLLM_ASCEND_DRAFT_PROFILE_BREAKDOWN:-0}
+export VLLM_ASCEND_DRAFT_PROFILE_SYNC=${VLLM_ASCEND_DRAFT_PROFILE_SYNC:-0}
 DRAFT_PROFILE_MODE=${DRAFT_PROFILE_MODE:-breakdown}
 # 弹性执行模式:
 # 0: baseline dummy-run
@@ -143,8 +147,8 @@ export VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC:-
 export VLLM_ASCEND_MODE3_TRANSFER_LOG=${VLLM_ASCEND_MODE3_TRANSFER_LOG:-0}
 export VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG:-0}
 export VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N:-4}
-export VLLM_ASCEND_MODE3_TIMING_LOG=${VLLM_ASCEND_MODE3_TIMING_LOG:-1}
-export VLLM_ASCEND_MODE3_TIMING_SYNC=${VLLM_ASCEND_MODE3_TIMING_SYNC:-1}
+export VLLM_ASCEND_MODE3_TIMING_LOG=${VLLM_ASCEND_MODE3_TIMING_LOG:-0}
+export VLLM_ASCEND_MODE3_TIMING_SYNC=${VLLM_ASCEND_MODE3_TIMING_SYNC:-0}
 export VLLM_ASCEND_MODE3_TIMING_EVERY=${VLLM_ASCEND_MODE3_TIMING_EVERY:-1024}
 export VLLM_ASCEND_MODE3_TIMING_FIRST_N=${VLLM_ASCEND_MODE3_TIMING_FIRST_N:-1}
 export VLLM_ASCEND_MODE3_TIMING_LAYERS=${VLLM_ASCEND_MODE3_TIMING_LAYERS:-all}
@@ -152,19 +156,25 @@ export VLLM_ASCEND_MODE3_TIMING_LAYERS=${VLLM_ASCEND_MODE3_TIMING_LAYERS:-all}
 export VLLM_MOE_PATTERN_STATS=${VLLM_MOE_PATTERN_STATS:-0}  # 1: enable MoE pattern stats collection, 0: disable
 export VLLM_MOE_STATS=${VLLM_MOE_PATTERN_STATS}
 export VLLM_MOE_STATS_DIR=${VLLM_MOE_STATS_DIR:-./moe_stats}
-# Per-rank dummy waste accounting. Each dummy run emits one parseable line:
+# Per-rank dummy waste accounting is disabled for normal sidecar runs. Enable
+# these only in the dedicated waste/profiler wrapper scripts.
+# When enabled, each dummy run emits one parseable line:
 #   Dummy waste timing: rank=... dummy_wall_ms=... dummy_moe_selected_layers=... dummy_moe_effective_ms=... dummy_wasted_ms=...
 # Aggregate by rank as:
 #   wasted_time = sum(dummy_wasted_ms)
 #   effective_time = rollout_wall_time - sum(dummy_wall_ms) + sum(dummy_moe_effective_ms)
 # dummy_moe_effective_ms only includes MoE layers whose selected experts hit
 # the local rank; dummy attention and unselected MoE layers are counted wasted.
-export VLLM_ASCEND_DUMMY_WASTE_TIMING=${VLLM_ASCEND_DUMMY_WASTE_TIMING:-1}
-export VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC:-1}
+export VLLM_ASCEND_DUMMY_WASTE_TIMING=${VLLM_ASCEND_DUMMY_WASTE_TIMING:-0}
+export VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC:-0}
 export VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE:-0}
+export VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS:-0}
+export VLLM_ASCEND_DUMMY_WASTE_SELECTION_STATS=${VLLM_ASCEND_DUMMY_WASTE_SELECTION_STATS:-0}
+export VLLM_ASCEND_BUCKET_OP_PROFILE=${VLLM_ASCEND_BUCKET_OP_PROFILE:-0}
+export VLLM_ASCEND_LLM_PROFILE_ENABLE=${VLLM_ASCEND_LLM_PROFILE_ENABLE:-0}
 export VLLM_ASCEND_ELASTIC_UTIL_LOG=${VLLM_ASCEND_ELASTIC_UTIL_LOG:-0}
 export VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS:-500}
-echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} elastic_cache_mc2=${VLLM_ASCEND_ELASTIC_CACHE_MC2_GROUPS} elastic_keep_group_cache=${VLLM_ASCEND_ELASTIC_KEEP_GROUP_CACHE} elastic_group_stage_barrier=${VLLM_ASCEND_ELASTIC_GROUP_STAGE_BARRIER} dummy_waste_timing=${VLLM_ASCEND_DUMMY_WASTE_TIMING} dummy_waste_sync=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC} dummy_waste_profile=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE} elastic_util_log=${VLLM_ASCEND_ELASTIC_UTIL_LOG} elastic_util_bucket_steps=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS}"
+echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} elastic_cache_mc2=${VLLM_ASCEND_ELASTIC_CACHE_MC2_GROUPS} elastic_keep_group_cache=${VLLM_ASCEND_ELASTIC_KEEP_GROUP_CACHE} elastic_group_stage_barrier=${VLLM_ASCEND_ELASTIC_GROUP_STAGE_BARRIER} dummy_waste_timing=${VLLM_ASCEND_DUMMY_WASTE_TIMING} dummy_waste_sync=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC} dummy_waste_profile=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE} dummy_waste_markers=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS} bucket_op_profile=${VLLM_ASCEND_BUCKET_OP_PROFILE} llm_profile=${VLLM_ASCEND_LLM_PROFILE_ENABLE} elastic_util_log=${VLLM_ASCEND_ELASTIC_UTIL_LOG} elastic_util_bucket_steps=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS}"
 #模拟样本缩短规则
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
@@ -189,7 +199,6 @@ elastic_suffix=""
 if [ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" != "0" ]; then
     elastic_suffix="_elastic"
 fi
-logfile="${HOME}/wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}${elastic_suffix}.txt"
 
 export VERL_SIDECAR_ENABLE=${VERL_SIDECAR_ENABLE:-1}
 export VERL_SIDECAR_MODEL_PATH=${VERL_SIDECAR_MODEL_PATH:-"/home/data/Qwen3-8B"}
@@ -197,21 +206,18 @@ export VERL_SIDECAR_PROMPTS_FILE=${VERL_SIDECAR_PROMPTS_FILE:-"/home/qiuzy/verl_
 # Only keep non-default sidecar knobs here. Defaults live in
 # internal/run_elastic_sidecar_infer.sh.
 export VERL_SIDECAR_PARALLEL_MODE=${VERL_SIDECAR_PARALLEL_MODE:-hybrid}
-export VERL_SIDECAR_TENSOR_PARALLEL_SIZE=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-4}
-export VERL_SIDECAR_REPLICA_COUNT=${VERL_SIDECAR_REPLICA_COUNT:-2}
 export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL:-0}
-export VERL_SIDECAR_TP1_16K_MAX_NUM_SEQS=${VERL_SIDECAR_TP1_16K_MAX_NUM_SEQS:-6}
-if [[ -z "${VERL_SIDECAR_MAX_NUM_SEQS+x}" || -z "${VERL_SIDECAR_MAX_NUM_SEQS}" ]]; then
-    export VERL_SIDECAR_MAX_NUM_SEQS=$((VERL_SIDECAR_TP1_16K_MAX_NUM_SEQS * VERL_SIDECAR_TENSOR_PARALLEL_SIZE))
-    echo "[elastic sidecar] auto VERL_SIDECAR_MAX_NUM_SEQS=${VERL_SIDECAR_MAX_NUM_SEQS} for tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}, tp1_16k_max_num_seqs=${VERL_SIDECAR_TP1_16K_MAX_NUM_SEQS}"
-fi
-export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS:-98304}
-export VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-18432}
-export VERL_SIDECAR_MAX_TOKENS=${VERL_SIDECAR_MAX_TOKENS:-16384}
-if (( VERL_SIDECAR_MAX_TOKENS < 16384 )); then
-    echo "[elastic sidecar] bump VERL_SIDECAR_MAX_TOKENS=${VERL_SIDECAR_MAX_TOKENS} to 16384 for 16k response validation"
-    export VERL_SIDECAR_MAX_TOKENS=16384
-fi
+#并发数量超参数配置
+export VERL_SIDECAR_TENSOR_PARALLEL_SIZE=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-8}
+export VERL_SIDECAR_REPLICA_COUNT=${VERL_SIDECAR_REPLICA_COUNT:-1}
+sidecar_record_name="record_8b_tp${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}dp${VERL_SIDECAR_REPLICA_COUNT}_${time}"
+logfile="${HOME}/${sidecar_record_name}${elastic_suffix}.txt"
+export VERL_SIDECAR_MAX_NUM_SEQS=128
+export VERL_SIDECAR_GENERATE_CHUNK_SIZE=128
+export VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA=256
+export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS:-65536}
+export VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-6144}
+export VERL_SIDECAR_MAX_TOKENS=${VERL_SIDECAR_MAX_TOKENS:-4096}
 sidecar_min_model_len=$((VERL_SIDECAR_MAX_TOKENS + 2048))
 if (( VERL_SIDECAR_MAX_MODEL_LEN < sidecar_min_model_len )); then
     echo "[elastic sidecar] bump VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN} to ${sidecar_min_model_len} so prompt+response is not truncated"
@@ -221,10 +227,11 @@ if (( VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS < VERL_SIDECAR_MAX_MODEL_LEN )); then
     echo "[elastic sidecar] bump VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS} to ${VERL_SIDECAR_MAX_MODEL_LEN}"
     export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_MODEL_LEN}
 fi
+export VERL_SIDECAR_RESUME_REMAINING_TOKENS=${VERL_SIDECAR_RESUME_REMAINING_TOKENS:-1}
 export VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA=${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA:-${VERL_SIDECAR_MAX_NUM_SEQS}}
 export VERL_SIDECAR_GENERATE_CHUNK_SIZE=${VERL_SIDECAR_GENERATE_CHUNK_SIZE:-${VERL_SIDECAR_MAX_NUM_SEQS}}
 export VERL_SIDECAR_STATE_DIR=${VERL_SIDECAR_STATE_DIR:-"sidecar_runs/state/qwen3_8b_gsm8k_train"}
-export VERL_SIDECAR_LOG_DIR=${VERL_SIDECAR_LOG_DIR:-"sidecar_runs/${time}"}
+export VERL_SIDECAR_LOG_DIR=${VERL_SIDECAR_LOG_DIR:-"sidecar_runs/${sidecar_record_name}"}
 sidecar_monitor_pid=""
 cleanup_sidecar_monitor() {
     if [[ -n "${sidecar_monitor_pid}" ]] && kill -0 "${sidecar_monitor_pid}" 2>/dev/null; then
@@ -254,6 +261,8 @@ set -x
 python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     --config-name='ppo_megatron_trainer.yaml'\
     algorithm.adv_estimator=grpo \
+    global_profiler.tool=null \
+    global_profiler.steps=null \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.train_batch_size=32 \
@@ -270,6 +279,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.actor.optim.clip_grad=10000 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.profiler.enable=False \
     actor_rollout_ref.actor.megatron.sequence_parallel=True \
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=4 \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
@@ -290,6 +300,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.profiler.enable=False \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.max_num_batched_tokens=1024 \
     actor_rollout_ref.rollout.enforce_eager=True \
@@ -300,6 +311,7 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     actor_rollout_ref.rollout.top_p=0.9 \
     actor_rollout_ref.rollout.ignore_eos=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
+    actor_rollout_ref.ref.profiler.enable=False \
     actor_rollout_ref.ref.megatron.param_offload=True \
     actor_rollout_ref.ref.load_weight=True \
     actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \

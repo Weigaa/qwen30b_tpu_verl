@@ -198,42 +198,97 @@ print(f"VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE={int(effective)}")
 PY
 )
 eval "${SIDECAR_EP_PLAN}"
+VERL_SIDECAR_NEEDS_HCCL=0
 if [[ "${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" -gt 1 || "${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}" == "1" ]]; then
-    if [[ "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "1" \
-        && "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "true" \
-        && "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "yes" \
-        && "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" != "on" ]]; then
-        VERL_SIDECAR_HCCL_IF_BASE_PORT=$(python3 - \
-            "${VERL_SIDECAR_MASTER_ADDR}" \
+    VERL_SIDECAR_NEEDS_HCCL=1
+fi
+
+if [[ "${VERL_SIDECAR_NEEDS_HCCL}" == "1" ]]; then
+    if [[ "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" == "1" \
+        || "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" == "true" \
+        || "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" == "yes" \
+        || "${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED,,}" == "on" ]]; then
+        SIDECAR_PORT_PLAN=$(python3 - \
             "${VERL_SIDECAR_REPLICA_COUNT}" \
+            "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" \
+            "${VERL_SIDECAR_MASTER_PORT}" \
+            "${VERL_SIDECAR_MASTER_PORT_STRIDE}" \
+            "${VERL_SIDECAR_HCCL_IF_BASE_PORT}" \
             "${VERL_SIDECAR_HCCL_PORT_STRIDE}" \
             "${VERL_SIDECAR_HCCL_PORT_WINDOW}" <<'PY'
+import shlex
+import sys
+
+replica_count, data_parallel_size, master_base, master_stride, hccl_base, hccl_stride, window = map(int, sys.argv[1:8])
+master_ports = [master_base + index * master_stride for index in range(replica_count)]
+rpc_ports = [
+    master_base + index * master_stride + 1
+    for index in range(replica_count)
+] if data_parallel_size > 1 else []
+hccl_ports = [hccl_base + index * hccl_stride for index in range(replica_count)]
+max_master = max(master_ports + rpc_ports) if (master_ports or rpc_ports) else master_base
+max_hccl = max((base + 2 * window - 1 for base in hccl_ports), default=hccl_base)
+if max_master > 65535 or max_hccl > 65535:
+    raise SystemExit(
+        "Sidecar fixed TP/EP port range exceeds 65535: "
+        f"master max={max_master}, HCCL max={max_hccl}. "
+        "Lower *_BASE_PORT or *_PORT_STRIDE.")
+print("VERL_SIDECAR_MASTER_PORTS=" + shlex.quote(",".join(map(str, master_ports))))
+print("VERL_SIDECAR_DATA_PARALLEL_RPC_PORTS=" + shlex.quote(",".join(map(str, rpc_ports))))
+print("VERL_SIDECAR_HCCL_IF_BASE_PORTS=" + shlex.quote(",".join(map(str, hccl_ports))))
+print(f"VERL_SIDECAR_MASTER_PORT={master_ports[0]}")
+print(f"VERL_SIDECAR_HCCL_IF_BASE_PORT={hccl_ports[0]}")
+PY
+        )
+    else
+        SIDECAR_PORT_PLAN=$(python3 - \
+            "${VERL_SIDECAR_REPLICA_COUNT}" \
+            "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" \
+            "${VERL_SIDECAR_MASTER_PORT}" \
+            "${VERL_SIDECAR_MASTER_PORT_STRIDE}" \
+            "${VERL_SIDECAR_HCCL_IF_BASE_PORT}" \
+            "${VERL_SIDECAR_HCCL_PORT_WINDOW}" <<'PY'
+import shlex
 import socket
 import sys
 
-host, replica_count_arg, stride_arg, window_arg = sys.argv[1:5]
-replica_count = int(replica_count_arg)
-stride = int(stride_arg)
-window = int(window_arg)
+replica_count = int(sys.argv[1])
+data_parallel_size = int(sys.argv[2])
+master_hint = int(sys.argv[3])
+master_stride = int(sys.argv[4])
+hccl_hint = int(sys.argv[5])
+window = int(sys.argv[6])
+if replica_count <= 0:
+    raise SystemExit(f"Invalid sidecar replica count: {replica_count}")
 if window <= 0:
     raise SystemExit(f"Invalid HCCL port window: {window}")
 
-def range_is_free(base: int) -> bool:
+used: set[int] = set()
+
+def port_free(port: int) -> bool:
+    if port in used or port < 1 or port > 65535:
+        return False
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+def window_free(base: int, width: int) -> bool:
+    if base < 1 or base + width - 1 > 65535:
+        return False
+    ports = range(base, base + width)
+    if any(port in used for port in ports):
+        return False
     sockets = []
     try:
-        for index in range(replica_count):
-            group_base = base + index * stride
-            # HCCL can allocate from both host and NPU socket ranges. Reserve
-            # two adjacent windows per replica so concurrent sidecar shards do
-            # not fall back into the same default port pool.
-            if group_base + 2 * window - 1 > 65535:
-                return False
-            for offset in range(2 * window):
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # Bind all interfaces to catch conflicts from either 0.0.0.0
-                # or the concrete sidecar host IP.
-                sock.bind(("", group_base + offset))
-                sockets.append(sock)
+        for port in ports:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("", port))
+            sockets.append(sock)
         return True
     except OSError:
         return False
@@ -241,21 +296,81 @@ def range_is_free(base: int) -> bool:
         for sock in sockets:
             sock.close()
 
-for base in range(30000, 62000):
-    if range_is_free(base):
-        print(base)
-        break
-else:
-    raise SystemExit("No free HCCL base port range found for sidecar TP/EP")
+def reserve_port(start: int, end: int) -> int:
+    candidates = []
+    if start <= end:
+        candidates.extend(range(start, end + 1))
+    # Fallback range keeps the run alive if the preferred range is fragmented.
+    candidates.extend(range(20000, 30000))
+    for port in candidates:
+        if port_free(port):
+            used.add(port)
+            return port
+    raise SystemExit("No free master port found for sidecar shard")
+
+def reserve_window(start: int, end: int, width: int) -> int:
+    candidates = []
+    if start <= end:
+        candidates.extend(range(start, end + 1))
+    # HCCL ports are best kept away from common Ray/vLLM control ports.
+    candidates.extend(range(30000, 62000))
+    for base in candidates:
+        if window_free(base, width):
+            used.update(range(base, base + width))
+            return base
+    raise SystemExit("No free per-shard HCCL port windows found for sidecar TP/EP")
+
+master_ports = []
+rpc_ports = []
+hccl_ports = []
+hccl_width = 2 * window
+for index in range(replica_count):
+    master_pref = master_hint + index * max(1, master_stride)
+    master_ports.append(reserve_port(master_pref, 29999))
+    if data_parallel_size > 1:
+        rpc_ports.append(reserve_port(master_ports[-1] + 1, 29999))
+    # Allocate each replica independently. This avoids the old all-or-nothing
+    # equal-stride layout, which failed when only one shard window was occupied.
+    hccl_pref = hccl_hint + index * hccl_width
+    hccl_ports.append(reserve_window(hccl_pref, 62000 - hccl_width + 1, hccl_width))
+
+print("VERL_SIDECAR_MASTER_PORTS=" + shlex.quote(",".join(map(str, master_ports))))
+print("VERL_SIDECAR_DATA_PARALLEL_RPC_PORTS=" + shlex.quote(",".join(map(str, rpc_ports))))
+print("VERL_SIDECAR_HCCL_IF_BASE_PORTS=" + shlex.quote(",".join(map(str, hccl_ports))))
+print(f"VERL_SIDECAR_MASTER_PORT={master_ports[0]}")
+print(f"VERL_SIDECAR_HCCL_IF_BASE_PORT={hccl_ports[0]}")
 PY
         )
     fi
-    max_master_port=$((VERL_SIDECAR_MASTER_PORT + (VERL_SIDECAR_REPLICA_COUNT - 1) * VERL_SIDECAR_MASTER_PORT_STRIDE))
-    max_hccl_port=$((VERL_SIDECAR_HCCL_IF_BASE_PORT + (VERL_SIDECAR_REPLICA_COUNT - 1) * VERL_SIDECAR_HCCL_PORT_STRIDE + 2 * VERL_SIDECAR_HCCL_PORT_WINDOW - 1))
-    if [[ "${max_master_port}" -gt 65535 || "${max_hccl_port}" -gt 65535 ]]; then
-        echo "Sidecar TP/EP port range exceeds 65535: master ${VERL_SIDECAR_MASTER_PORT}-${max_master_port}, HCCL ${VERL_SIDECAR_HCCL_IF_BASE_PORT}-${max_hccl_port}. Lower *_BASE_PORT or *_PORT_STRIDE." >&2
-        exit 2
-    fi
+    eval "${SIDECAR_PORT_PLAN}"
+else
+    SIDECAR_PORT_PLAN=$(python3 - \
+        "${VERL_SIDECAR_REPLICA_COUNT}" \
+        "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" \
+        "${VERL_SIDECAR_MASTER_PORT}" \
+        "${VERL_SIDECAR_MASTER_PORT_STRIDE}" \
+        "${VERL_SIDECAR_HCCL_IF_BASE_PORT}" \
+        "${VERL_SIDECAR_HCCL_PORT_STRIDE}" <<'PY'
+import shlex
+import sys
+
+replica_count, data_parallel_size, master_base, master_stride, hccl_base, hccl_stride = map(int, sys.argv[1:7])
+master_ports = [master_base + index * max(1, master_stride) for index in range(replica_count)]
+rpc_ports = [
+    master_base + index * max(1, master_stride) + 1
+    for index in range(replica_count)
+] if data_parallel_size > 1 else []
+# TP1/DP1 dense replicas do not initialize HCCL, but the launcher still indexes
+# this array per shard when exporting common environment variables.
+hccl_ports = [hccl_base for _ in range(replica_count)]
+print("VERL_SIDECAR_MASTER_PORTS=" + shlex.quote(",".join(map(str, master_ports))))
+print("VERL_SIDECAR_DATA_PARALLEL_RPC_PORTS=" + shlex.quote(",".join(map(str, rpc_ports))))
+print("VERL_SIDECAR_HCCL_IF_BASE_PORTS=" + shlex.quote(",".join(map(str, hccl_ports))))
+print(f"VERL_SIDECAR_MASTER_PORT={master_ports[0]}")
+print(f"VERL_SIDECAR_HCCL_IF_BASE_PORT={hccl_ports[0]}")
+PY
+    )
+    eval "${SIDECAR_PORT_PLAN}"
 fi
 VERL_SIDECAR_GPU_MEMORY_UTILIZATION=${VERL_SIDECAR_GPU_MEMORY_UTILIZATION:-0.90}
 VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-2048}
@@ -324,10 +439,16 @@ export VERL_SIDECAR_DEVICE_GROUPS
 export VERL_SIDECAR_UNUSED_DEVICES
 export VERL_SIDECAR_PRIMARY_DEVICE_GROUP
 export VERL_SIDECAR_MASTER_ADDR
+export VERL_SIDECAR_MASTER_PORT
+export VERL_SIDECAR_MASTER_PORTS
 export VERL_SIDECAR_MASTER_PORT_STRIDE
+export VERL_SIDECAR_DATA_PARALLEL_RPC_PORTS
+export VERL_SIDECAR_HCCL_IF_BASE_PORT
+export VERL_SIDECAR_HCCL_IF_BASE_PORTS
 export VERL_SIDECAR_HCCL_PORT_STRIDE
 export VERL_SIDECAR_HCCL_PORT_WINDOW
 export VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED
+export VERL_SIDECAR_NEEDS_HCCL
 export VERL_SIDECAR_FORCE_HOST_IP_FOR_TP
 export VERL_SIDECAR_PARALLEL_MODE
 export VERL_SIDECAR_TENSOR_PARALLEL_SIZE
@@ -873,6 +994,22 @@ def _completion_payload(out, prefix_text: str = "") -> tuple[dict, int, str, int
     return payload, len(token_ids), text, len(token_ids)
 
 
+def _sampling_params_for_source(base_sampling_params, source: dict):
+    params = copy(base_sampling_params)
+    if not _as_bool(os.environ.get("VERL_SIDECAR_RESUME_REMAINING_TOKENS", "1")):
+        return params
+
+    max_response_tokens = int(os.environ.get("VERL_SIDECAR_MAX_TOKENS", "1024"))
+    already_generated = int(source.get("resume_token_ids_len", 0) or 0)
+    if already_generated <= 0:
+        return params
+
+    # Resume prompts already include the generated prefix. Continue only for the
+    # remaining response budget instead of granting another full max_tokens.
+    params.max_tokens = max(1, max_response_tokens - already_generated)
+    return params
+
+
 def _write_final_output(output_file: Path, completed_file: Path, resume_file: Path,
                         resume_records: dict[int, dict], source: dict,
                         output, completions: list[dict], iteration: int,
@@ -906,13 +1043,74 @@ def _write_final_output(output_file: Path, completed_file: Path, resume_file: Pa
     _write_resume_records(resume_file, resume_records)
 
 
+def _write_skipped_output(output_file: Path, completed_file: Path,
+                          resume_file: Path, resume_records: dict[int, dict],
+                          source: dict, iteration: int, chunk_start: int,
+                          reason: str, error: str) -> None:
+    """Quarantine an un-runnable resume prompt so one bad item does not kill a shard."""
+    prompt_id = int(source["prompt_id"])
+    prefix_text = source.get("resume_prefix_text", "")
+    token_ids_len = int(source.get("resume_token_ids_len", 0) or 0)
+    prompt = source.get("resume_prompt", source["prompt"])
+    with output_file.open("a", encoding="utf-8") as out_f:
+        out_f.write(json.dumps({
+            "sidecar_epoch": sidecar_epoch,
+            "iteration": iteration,
+            "chunk_start": chunk_start,
+            "prompt_id": prompt_id,
+            "prompt_source": source.get("source", ""),
+            "shard_index": shard_index,
+            "num_shards": num_shards,
+            "prompt": source["prompt"],
+            "resume_prompt": prompt,
+            "prompt_chars_len": len(prompt),
+            "sidecar_status": reason,
+            "sidecar_error": error,
+            "outputs": [{
+                "text": prefix_text,
+                "delta_text": "",
+                "token_ids_len": token_ids_len,
+                "resume_prefix_text_len": len(prefix_text),
+                "finish_reason": reason,
+            }],
+        }, ensure_ascii=False) + "\n")
+        out_f.flush()
+        os.fsync(out_f.fileno())
+    _append_jsonl(completed_file, [{
+        "time": time.time(),
+        "sidecar_epoch": sidecar_epoch,
+        "iteration": iteration,
+        "chunk_start": chunk_start,
+        "prompt_id": prompt_id,
+        "status": reason,
+        "output_file": str(output_file),
+    }])
+    resume_records.pop(prompt_id, None)
+    _write_resume_records(resume_file, resume_records)
+    print(json.dumps({
+        "event": "sidecar_prompt_skipped",
+        "reason": reason,
+        "error": error,
+        "prompt_id": prompt_id,
+        "prompt_chars_len": len(prompt),
+        "resume_token_ids_len": token_ids_len,
+        "shard_index": shard_index,
+        "num_shards": num_shards,
+        "output_file": str(output_file),
+    }, ensure_ascii=False), flush=True)
+
+
 def _generate_chunk_blocking(llm, chunk_records: list[dict], sampling_params,
                              output_file: Path, completed_file: Path,
                              resume_file: Path, resume_records: dict[int, dict],
                              iteration: int, chunk_start: int) -> tuple[float, int, int]:
     infer_start = time.perf_counter()
+    request_sampling_params = [
+        _sampling_params_for_source(sampling_params, item)
+        for item in chunk_records
+    ]
     outputs = llm.generate([item.get("resume_prompt", item["prompt"]) for item in chunk_records],
-                           sampling_params, use_tqdm=False)
+                           request_sampling_params, use_tqdm=False)
     infer_s = time.perf_counter() - infer_start
     chunk_output_tokens = 0
     for output_idx, output in enumerate(outputs):
@@ -938,17 +1136,28 @@ def _generate_chunk_streaming(llm, chunk_records: list[dict], sampling_params,
     request_to_record = {}
     partial_rows = []
     latest_by_request = {}
+    skipped_requests = 0
     for item in chunk_records:
-        params = copy(sampling_params)
+        params = _sampling_params_for_source(sampling_params, item)
         params.output_kind = RequestOutputKind.CUMULATIVE
         request_id = str(next(llm.request_counter))
         prompt = item.get("resume_prompt", item["prompt"])
-        llm.llm_engine.add_request(request_id, prompt, params, tokenization_kwargs={})
+        try:
+            llm.llm_engine.add_request(request_id, prompt, params, tokenization_kwargs={})
+        except ValueError as exc:
+            error = str(exc)
+            if "maximum model length" not in error and "longer than" not in error:
+                raise
+            _write_skipped_output(
+                output_file, completed_file, resume_file, resume_records,
+                item, iteration, chunk_start, "context_overflow_skipped", error)
+            skipped_requests += 1
+            continue
         request_to_record[request_id] = item
 
     infer_start = time.perf_counter()
     chunk_output_tokens = 0
-    finished_requests = 0
+    finished_requests = skipped_requests
     step_idx = 0
     partial_sync_every_steps = int(os.environ.get("VERL_SIDECAR_PARTIAL_SYNC_EVERY_STEPS", "0"))
 
@@ -1414,8 +1623,11 @@ PY
     echo "sidecar_vllm_multiproc_host_ip=${VLLM_MULTIPROC_DISTRIBUTED_HOST_IP:-}"
     echo "sidecar_vllm_reuse_world_group=${VLLM_REUSE_WORLD_GROUP_FOR_FULL_MODEL_PARALLEL:-}"
     echo "sidecar_master_port_base=${VERL_SIDECAR_MASTER_PORT}"
+    echo "sidecar_master_ports=${VERL_SIDECAR_MASTER_PORTS}"
     echo "sidecar_master_port_stride=${VERL_SIDECAR_MASTER_PORT_STRIDE}"
+    echo "sidecar_data_parallel_rpc_ports=${VERL_SIDECAR_DATA_PARALLEL_RPC_PORTS}"
     echo "sidecar_hccl_if_base_port=${VERL_SIDECAR_HCCL_IF_BASE_PORT}"
+    echo "sidecar_hccl_if_base_ports=${VERL_SIDECAR_HCCL_IF_BASE_PORTS}"
     echo "sidecar_hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE}"
     echo "sidecar_hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE}"
     echo "sidecar_hccl_if_base_port_fixed=${VERL_SIDECAR_HCCL_IF_BASE_PORT_FIXED}"
@@ -1434,6 +1646,20 @@ PY
     echo "sidecar_partial_sync_every_steps=${VERL_SIDECAR_PARTIAL_SYNC_EVERY_STEPS}"
     echo "sidecar_stop_file=${VERL_SIDECAR_STOP_FILE}"
     set +e
+    IFS=',' read -r -a sidecar_master_ports <<< "${VERL_SIDECAR_MASTER_PORTS}"
+    IFS=',' read -r -a sidecar_dp_rpc_ports <<< "${VERL_SIDECAR_DATA_PARALLEL_RPC_PORTS}"
+    IFS=',' read -r -a sidecar_hccl_base_ports <<< "${VERL_SIDECAR_HCCL_IF_BASE_PORTS}"
+    for ((port_index=${#sidecar_master_ports[@]}; port_index<VERL_SIDECAR_REPLICA_COUNT; port_index++)); do
+        sidecar_master_ports+=("$((VERL_SIDECAR_MASTER_PORT + port_index * VERL_SIDECAR_MASTER_PORT_STRIDE))")
+    done
+    for ((port_index=${#sidecar_hccl_base_ports[@]}; port_index<VERL_SIDECAR_REPLICA_COUNT; port_index++)); do
+        sidecar_hccl_base_ports+=("$((VERL_SIDECAR_HCCL_IF_BASE_PORT + port_index * VERL_SIDECAR_HCCL_PORT_STRIDE))")
+    done
+    if [[ "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" -gt 1 ]]; then
+        for ((port_index=${#sidecar_dp_rpc_ports[@]}; port_index<VERL_SIDECAR_REPLICA_COUNT; port_index++)); do
+            sidecar_dp_rpc_ports+=("$((sidecar_master_ports[port_index] + 1))")
+        done
+    fi
     if [[ "${VERL_SIDECAR_REPLICA_COUNT}" -gt 1 ]]; then
         IFS=';' read -r -a sidecar_device_groups <<< "${VERL_SIDECAR_DEVICE_GROUPS}"
         sidecar_pids=()
@@ -1449,12 +1675,17 @@ PY
                 export VERL_SIDECAR_SHARD_INDEX="${shard_index}"
                 export VERL_SIDECAR_NUM_SHARDS="${VERL_SIDECAR_REPLICA_COUNT}"
                 export VERL_SIDECAR_OUTPUT_FILE="${shard_output}"
-                export MASTER_PORT=$((VERL_SIDECAR_MASTER_PORT + shard_index * VERL_SIDECAR_MASTER_PORT_STRIDE))
-                export HCCL_IF_BASE_PORT=$((VERL_SIDECAR_HCCL_IF_BASE_PORT + shard_index * VERL_SIDECAR_HCCL_PORT_STRIDE))
+                export MASTER_PORT="${sidecar_master_ports[$shard_index]}"
+                if [[ "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" -gt 1 ]]; then
+                    export VERL_SIDECAR_DATA_PARALLEL_RPC_PORT="${sidecar_dp_rpc_ports[$shard_index]}"
+                else
+                    unset VERL_SIDECAR_DATA_PARALLEL_RPC_PORT
+                fi
+                export HCCL_IF_BASE_PORT="${sidecar_hccl_base_ports[$shard_index]}"
                 export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_IF_BASE_PORT}-$((HCCL_IF_BASE_PORT + VERL_SIDECAR_HCCL_PORT_WINDOW - 1))"
                 export HCCL_NPU_SOCKET_PORT_RANGE="$((HCCL_IF_BASE_PORT + VERL_SIDECAR_HCCL_PORT_WINDOW))-$((HCCL_IF_BASE_PORT + 2 * VERL_SIDECAR_HCCL_PORT_WINDOW - 1))"
                 export VLLM_DP_MASTER_PORT="${MASTER_PORT}"
-                echo "sidecar_shard_start_time=$(date +%s.%N) shard=${shard_index} device_group=${device_group} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} master_port=${MASTER_PORT} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${shard_output}"
+                echo "sidecar_shard_start_time=$(date +%s.%N) shard=${shard_index} device_group=${device_group} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} dp=${VERL_SIDECAR_DATA_PARALLEL_SIZE} master_port=${MASTER_PORT} data_parallel_rpc_port=${VERL_SIDECAR_DATA_PARALLEL_RPC_PORT:-} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${shard_output}"
                 if [[ "${VERL_SIDECAR_MAX_SECONDS}" != "0" ]]; then
                     timeout --kill-after=10s "${VERL_SIDECAR_MAX_SECONDS}s" python3 -u "${PY_SCRIPT}" 2>&1
                     shard_rc=$?
@@ -1486,14 +1717,20 @@ PY
         export ASCEND_RT_VISIBLE_DEVICES="${VERL_SIDECAR_PRIMARY_DEVICE_GROUP}"
         export VERL_SIDECAR_SHARD_INDEX=0
         export VERL_SIDECAR_NUM_SHARDS=1
-        echo "sidecar_shard_start_time=$(date +%s.%N) shard=0 device_group=${VERL_SIDECAR_PRIMARY_DEVICE_GROUP} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} dp=${VERL_SIDECAR_DATA_PARALLEL_SIZE} master_port=${MASTER_PORT} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${VERL_SIDECAR_OUTPUT_FILE}"
+        if [[ "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" -gt 1 && -n "${sidecar_dp_rpc_ports[0]:-}" ]]; then
+            export VERL_SIDECAR_DATA_PARALLEL_RPC_PORT="${sidecar_dp_rpc_ports[0]}"
+        fi
+        echo "sidecar_shard_start_time=$(date +%s.%N) shard=0 device_group=${VERL_SIDECAR_PRIMARY_DEVICE_GROUP} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} dp=${VERL_SIDECAR_DATA_PARALLEL_SIZE} master_port=${MASTER_PORT} data_parallel_rpc_port=${VERL_SIDECAR_DATA_PARALLEL_RPC_PORT:-} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${VERL_SIDECAR_OUTPUT_FILE}"
         timeout --kill-after=10s "${VERL_SIDECAR_MAX_SECONDS}s" python3 -u "${PY_SCRIPT}" 2>&1
         rc=$?
     else
         export ASCEND_RT_VISIBLE_DEVICES="${VERL_SIDECAR_PRIMARY_DEVICE_GROUP}"
         export VERL_SIDECAR_SHARD_INDEX=0
         export VERL_SIDECAR_NUM_SHARDS=1
-        echo "sidecar_shard_start_time=$(date +%s.%N) shard=0 device_group=${VERL_SIDECAR_PRIMARY_DEVICE_GROUP} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} dp=${VERL_SIDECAR_DATA_PARALLEL_SIZE} master_port=${MASTER_PORT} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${VERL_SIDECAR_OUTPUT_FILE}"
+        if [[ "${VERL_SIDECAR_DATA_PARALLEL_SIZE}" -gt 1 && -n "${sidecar_dp_rpc_ports[0]:-}" ]]; then
+            export VERL_SIDECAR_DATA_PARALLEL_RPC_PORT="${sidecar_dp_rpc_ports[0]}"
+        fi
+        echo "sidecar_shard_start_time=$(date +%s.%N) shard=0 device_group=${VERL_SIDECAR_PRIMARY_DEVICE_GROUP} tp=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} dp=${VERL_SIDECAR_DATA_PARALLEL_SIZE} master_port=${MASTER_PORT} data_parallel_rpc_port=${VERL_SIDECAR_DATA_PARALLEL_RPC_PORT:-} hccl_if_base_port=${HCCL_IF_BASE_PORT} hccl_host_socket_port_range=${HCCL_HOST_SOCKET_PORT_RANGE} hccl_npu_socket_port_range=${HCCL_NPU_SOCKET_PORT_RANGE} output=${VERL_SIDECAR_OUTPUT_FILE}"
         python3 -u "${PY_SCRIPT}" 2>&1
         rc=$?
     fi
