@@ -407,7 +407,7 @@ import signal
 import time
 from pathlib import Path
 
-from vllm import LLM, SamplingParams
+from vllm import LLM, ModelRegistry, SamplingParams
 from vllm.sampling_params import RequestOutputKind
 
 
@@ -423,6 +423,43 @@ def _dedupe(values: list[str]) -> list[str]:
             seen.add(value)
             result.append(value)
     return result
+
+
+def _model_architectures(model_path: str) -> list[str]:
+    config_path = Path(model_path) / "config.json"
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return []
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        return [architectures]
+    if isinstance(architectures, list):
+        return [str(arch) for arch in architectures]
+    return []
+
+
+def _register_sidecar_model_if_needed(model_path: str) -> None:
+    mode = os.environ.get("VERL_SIDECAR_REGISTER_PANGU_MODEL", "auto").strip().lower()
+    if mode in {"0", "false", "no", "off"}:
+        return
+    architectures = _model_architectures(model_path)
+    should_register = (
+        mode in {"1", "true", "yes", "on"}
+        or "PanguProMoEForCausalLM" in architectures
+    )
+    if not should_register:
+        return
+    ModelRegistry.register_model(
+        "PanguProMoEForCausalLM",
+        "vllm_ascend.torchair.models.torchair_pangu_moe:PanguProMoEForCausalLM")
+    print(json.dumps({
+        "event": "sidecar_model_registered",
+        "architecture": "PanguProMoEForCausalLM",
+        "reason": "forced" if mode in {"1", "true", "yes", "on"} else "auto_architecture",
+        "model_path": model_path,
+    }, ensure_ascii=False), flush=True)
 
 
 def _prompt_to_text(value) -> str:
@@ -1050,6 +1087,7 @@ def _generate_chunk_streaming(llm, chunk_records: list[dict], sampling_params,
     return infer_s, chunk_output_tokens, finished_requests
 
 model_path = os.environ["VERL_SIDECAR_MODEL_PATH"]
+_register_sidecar_model_if_needed(model_path)
 output_file = Path(os.environ["VERL_SIDECAR_OUTPUT_FILE"])
 output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1118,6 +1156,7 @@ load_start = time.perf_counter()
 engine_kwargs = {
     "model": model_path,
     "tensor_parallel_size": int(os.environ.get("VERL_SIDECAR_TENSOR_PARALLEL_SIZE", "1")),
+    "enable_expert_parallel": _as_bool(os.environ.get("VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE", "0")),
     "gpu_memory_utilization": float(os.environ.get("VERL_SIDECAR_GPU_MEMORY_UTILIZATION", "0.80")),
     "max_num_seqs": int(os.environ.get("VERL_SIDECAR_MAX_NUM_SEQS", "16")),
     "max_num_batched_tokens": int(os.environ.get("VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS", "1024")),

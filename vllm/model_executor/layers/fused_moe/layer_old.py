@@ -1179,7 +1179,7 @@ class FusedMoE(CustomOp):
 
             self.expert_map: Optional[torch.Tensor]
             #在这里决定了初始专家分布
-            local_num_experts, expert_map = determine_expert_map(
+            expert_map_result = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
                 global_num_experts=self.global_num_experts,
@@ -1187,6 +1187,7 @@ class FusedMoE(CustomOp):
                 # 新增参数传递
                 layer_idx=self.layer_idx,
             )
+            local_num_experts, expert_map = expert_map_result[:2]
             # print("rank is {}, local_num_experts is {}, expert_map is {}".format(self.ep_rank, local_num_experts, expert_map))
             # print("CVD =", os.environ.get("CUDA_VISIBLE_DEVICES"))
             # print("torch.cuda.device_count() =", torch.cuda.device_count())
@@ -1371,10 +1372,11 @@ class FusedMoE(CustomOp):
         # ep_size and ep_rank should already be updated
         assert self.expert_map is not None
         with self.expert_map.device:
-            local_num_experts, expert_map = determine_expert_map(
+            expert_map_result = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
                 global_num_experts=self.global_num_experts)
+            local_num_experts, expert_map = expert_map_result[:2]
             self.local_num_experts = local_num_experts
             self.register_buffer("expert_map", expert_map)
 

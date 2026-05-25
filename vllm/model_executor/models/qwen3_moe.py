@@ -98,7 +98,7 @@ class Qwen3MoeMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, is_dummy: bool = False):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -227,7 +227,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 print("diff ratio is", self.ep_sig_diff_cnt / self.ep_sig_total_cnt)
 
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        is_dummy: bool = False,
+    ) -> torch.Tensor:
         assert hidden_states.dim(
         ) <= 2, "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         is_input_1d = hidden_states.dim() == 1
@@ -250,8 +254,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         #     topk_ids=topk_ids,
         #     num_experts=128,
         # )
-        final_hidden_states = self.experts(hidden_states=hidden_states,
-                                           router_logits=router_logits)
+        if hasattr(self.experts, "elastic_execution_mode"):
+            forward_context = get_forward_context()
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                is_prefill=forward_context.with_prefill,
+                top_k=self.experts.top_k,
+                enable_force_load_balance=forward_context.in_profile_run,
+                shared_experts=None,
+                is_dummy=is_dummy,
+            )
+        else:
+            final_hidden_states = self.experts(hidden_states=hidden_states,
+                                               router_logits=router_logits)
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -451,7 +467,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         # Fully Connected
         # if hidden_states.shape[0] == 32:
         #     self._attn_end.record()
-        hidden_states = self.mlp(hidden_states, is_dummy)
+        hidden_states = self.mlp(hidden_states, is_dummy=is_dummy)
         # if hidden_states.shape[0] == 32:
         #     self._attn_end_moe.record()
         #     self._attn_end_moe.synchronize()

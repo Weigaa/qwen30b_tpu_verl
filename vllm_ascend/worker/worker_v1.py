@@ -74,6 +74,143 @@ torch._dynamo.trace_rules.torch_name_rule_map.append(
     torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 
 
+def _is_ascend_fused_moe_module(module: nn.Module) -> bool:
+    try:
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+        if isinstance(module, AscendFusedMoE):
+            return True
+    except Exception:
+        pass
+    try:
+        from vllm_ascend.ops.common_fused_moe import AscendFusedMoE as CommonAscendFusedMoE
+        return isinstance(module, CommonAscendFusedMoE)
+    except Exception:
+        return False
+
+
+def _is_custom_ascend_fused_moe_module(module: nn.Module) -> bool:
+    try:
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+        return isinstance(module, AscendFusedMoE)
+    except Exception:
+        return False
+
+
+def _is_elastic_headroom_moe_module(module: nn.Module) -> bool:
+    if _is_ascend_fused_moe_module(module):
+        return True
+    try:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        return isinstance(module, FusedMoE)
+    except Exception:
+        return False
+
+
+def _module_uses_lossless_elastic(module: nn.Module) -> bool:
+    module_mode = getattr(module, "elastic_moe_mode", None)
+    if module_mode is not None:
+        return module_mode == "lossless"
+    return (envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE == "lossless"
+            and envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (1, 2, 3))
+
+
+def _module_configured_elastic_floor(module: nn.Module) -> Optional[int]:
+    get_floor = getattr(module, "_get_configured_elastic_min_compute_group_size",
+                        None)
+    if callable(get_floor):
+        return get_floor()
+    return envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE
+
+
+def _module_initial_ep_size(module: nn.Module) -> int:
+    return int(getattr(module, "elastic_original_ep_size",
+                       getattr(module, "ep_size", 1)))
+
+
+def _module_followup_shrink_enabled(module: nn.Module) -> bool:
+    shrink_enabled = getattr(module, "_is_followup_shrink_enabled", None)
+    if callable(shrink_enabled):
+        return bool(shrink_enabled())
+    initial_ep_size = _module_initial_ep_size(module)
+    if initial_ep_size <= 1:
+        return False
+    configured_floor = _module_configured_elastic_floor(module)
+    if configured_floor is None:
+        return True
+    return int(configured_floor) < initial_ep_size
+
+
+def _module_has_preallocated_redundant_slots(module: nn.Module) -> bool:
+    if int(getattr(module, "global_redundant_expert_num", 0) or 0) > 0:
+        return True
+    active_slots = int(getattr(module, "local_num_experts",
+                               getattr(module, "active_local_num_experts", 0))
+                       or 0)
+    loaded_slots = int(getattr(module, "local_num_expert_weight_slots",
+                               getattr(module, "loaded_weight_capacity",
+                                       active_slots)) or 0)
+    return loaded_slots > active_slots
+
+
+def _module_hybrid_cpu_swap_enabled(module: nn.Module) -> bool:
+    is_enabled = getattr(module, "_is_hybrid_cpu_swap_enabled", None)
+    return bool(callable(is_enabled) and is_enabled())
+
+
+def _module_is_custom_mode1_redundant_static(module: nn.Module) -> bool:
+    if not _is_ascend_fused_moe_module(module):
+        return False
+    if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+        return False
+    if not _module_uses_lossless_elastic(module):
+        return False
+    if not _module_has_preallocated_redundant_slots(module):
+        return False
+    return not _module_hybrid_cpu_swap_enabled(module)
+
+
+def _module_is_custom_mode1_floor8(module: nn.Module) -> bool:
+    if not _module_is_custom_mode1_redundant_static(module):
+        return False
+    configured_floor = _module_configured_elastic_floor(module)
+    return configured_floor is not None and int(configured_floor) == 8
+
+
+def _module_is_custom_mode1_native_parity(
+        module: nn.Module, max_floor: Optional[int] = None) -> bool:
+    if not _is_custom_ascend_fused_moe_module(module):
+        return False
+    return _module_is_mode1_lightweight_parity(module, max_floor=max_floor)
+
+
+def _module_is_mode1_lightweight_parity(
+        module: nn.Module, max_floor: Optional[int] = None) -> bool:
+    if not _is_ascend_fused_moe_module(module):
+        return False
+    if not _module_is_custom_mode1_redundant_static(module):
+        return False
+    if not _module_has_mode1_native_parity_ready(module):
+        return False
+    if max_floor is None:
+        return True
+    configured_floor = _module_configured_elastic_floor(module)
+    return configured_floor is not None and int(configured_floor) <= max_floor
+
+
+def _module_has_mode1_native_parity_ready(module: nn.Module) -> bool:
+    return bool(getattr(module, "lossless_mode1_native_parity_ready", False))
+
+
+def _module_mode1_lightweight_parity_path(module: nn.Module) -> str:
+    if _is_custom_ascend_fused_moe_module(module):
+        return "old_custom_fused_moe"
+    return "native_common_fused_moe"
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
 class NPUWorker(WorkerBase):
 
     def __init__(
@@ -308,6 +445,22 @@ class NPUWorker(WorkerBase):
             logger.info(
                 "Applying post-shrink prefill AllToAll headroom: %s bytes",
                 post_shrink_prefill_alltoall_headroom_bytes)
+        custom_mode1_kv_headroom_bytes = (
+            self._estimate_custom_mode1_kv_materialize_headroom_bytes())
+        if custom_mode1_kv_headroom_bytes > 0:
+            available_kv_cache_memory = max(
+                available_kv_cache_memory - custom_mode1_kv_headroom_bytes,
+                0)
+            logger.info(
+                "Applying custom mode=1 KV materialization headroom: %s bytes",
+                custom_mode1_kv_headroom_bytes)
+        kv_cache_init_headroom_bytes = (
+            self._estimate_kv_cache_init_headroom_bytes())
+        if kv_cache_init_headroom_bytes > 0:
+            available_kv_cache_memory = max(
+                available_kv_cache_memory - kv_cache_init_headroom_bytes, 0)
+            logger.info("Applying KV cache init headroom: %s bytes",
+                        kv_cache_init_headroom_bytes)
         dp_collective_headroom_bytes = (
             self._estimate_post_restore_dp_collective_headroom_bytes())
         if dp_collective_headroom_bytes > 0:
@@ -341,14 +494,31 @@ class NPUWorker(WorkerBase):
                 "Applying first-live-prefill activation headroom: %s bytes",
                 first_prefill_headroom_bytes)
         available_kv_cache_memory = int(max(available_kv_cache_memory, 0))
+        if os.getenv("VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG", "0").lower() \
+                in ("1", "true", "yes", "on"):
+            logger.info(
+                "Elastic redundancy HBM profile: rank=%s mode=%s floor=%s "
+                "total_npu_memory=%s init_free=%s post_profile_free=%s "
+                "peak_memory=%s torch_current=%s non_torch_allocations=%s "
+                "available_kv_cache_memory=%s gpu_memory_utilization=%s",
+                self.rank,
+                envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE,
+                envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE,
+                total_npu_memory,
+                self.init_npu_memory,
+                free_npu_memory,
+                peak_memory,
+                torch_allocated_bytes,
+                max(non_torch_allocations, 0),
+                available_kv_cache_memory,
+                self.cache_config.gpu_memory_utilization,
+            )
         logger.info(
             f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
         )
         return available_kv_cache_memory
 
     def _has_effective_followup_elastic_shrink(self) -> bool:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return False
 
@@ -358,21 +528,17 @@ class NPUWorker(WorkerBase):
             return False
 
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_elastic_headroom_moe_module(module):
                 continue
-            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+            if not _module_uses_lossless_elastic(module):
                 continue
-            if getattr(module, "global_redundant_expert_num", 0) > 0:
+            if _module_has_preallocated_redundant_slots(module):
                 continue
-            shrink_enabled = getattr(module, "_is_followup_shrink_enabled",
-                                     None)
-            if callable(shrink_enabled) and shrink_enabled():
+            if _module_followup_shrink_enabled(module):
                 return True
         return False
 
     def _has_effective_post_restore_collective_headroom_need(self) -> bool:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return False
 
@@ -382,13 +548,19 @@ class NPUWorker(WorkerBase):
             return False
 
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_elastic_headroom_moe_module(module):
                 continue
-            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+            if not _module_uses_lossless_elastic(module):
                 continue
-            shrink_enabled = getattr(module, "_is_followup_shrink_enabled",
-                                     None)
-            if callable(shrink_enabled) and shrink_enabled():
+            if _module_is_mode1_lightweight_parity(module):
+                logger.info(
+                    "Skipping generic post-restore headroom for mode1 lightweight parity: layer=%s floor=%s path=%s",
+                    getattr(module, "layer_idx", -1),
+                    _module_configured_elastic_floor(module),
+                    _module_mode1_lightweight_parity_path(module),
+                )
+                continue
+            if _module_followup_shrink_enabled(module):
                 return True
         return False
 
@@ -396,8 +568,6 @@ class NPUWorker(WorkerBase):
         return self._has_effective_post_restore_collective_headroom_need()
 
     def _estimate_zero_redundancy_shrink_headroom_bytes(self) -> int:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         model_runner = getattr(self, "model_runner", None)
         model = getattr(model_runner, "model", None) if model_runner else None
         if model is None:
@@ -407,7 +577,7 @@ class NPUWorker(WorkerBase):
         saw_zero_redundancy_module = False
         preallocated_loaded_layers = 0
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_ascend_fused_moe_module(module):
                 continue
             if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
                 continue
@@ -473,8 +643,6 @@ class NPUWorker(WorkerBase):
         return total_headroom
 
     def _estimate_floor_prealloc_headroom_bytes(self) -> int:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         model_runner = getattr(self, "model_runner", None)
         model = getattr(model_runner, "model", None) if model_runner else None
         if model is None:
@@ -483,7 +651,7 @@ class NPUWorker(WorkerBase):
         estimated_bytes = 0
         saw_extra_floor_prealloc = False
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_ascend_fused_moe_module(module):
                 continue
             if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
                 continue
@@ -592,8 +760,6 @@ class NPUWorker(WorkerBase):
         margin, especially for lossless elastic modes with preloaded redundant
         experts.
         """
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return 0
 
@@ -611,23 +777,27 @@ class NPUWorker(WorkerBase):
                 str(2 * 1024 * 1024 * 1024)))
 
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_elastic_headroom_moe_module(module):
                 continue
-            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+            if not _module_uses_lossless_elastic(module):
                 continue
-            if not getattr(module, "_is_followup_shrink_enabled", lambda: False)():
+            if _module_is_mode1_lightweight_parity(module):
+                logger.info(
+                    "Skipping first-live-prefill headroom for mode1 lightweight parity: layer=%s floor=%s path=%s",
+                    getattr(module, "layer_idx", -1),
+                    _module_configured_elastic_floor(module),
+                    _module_mode1_lightweight_parity_path(module),
+                )
+                return 0
+            if not _module_followup_shrink_enabled(module):
                 continue
-            configured_floor = getattr(
-                module, "_get_configured_elastic_min_compute_group_size",
-                lambda: None)()
+            configured_floor = _module_configured_elastic_floor(module)
             if configured_floor is not None and int(configured_floor) <= 4:
                 return max(base_headroom_bytes, low_floor_headroom_bytes)
             return base_headroom_bytes
         return 0
 
     def _estimate_extra_elastic_safety_headroom_bytes(self) -> int:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return 0
         if not self._has_effective_post_restore_collective_headroom_need():
@@ -640,13 +810,11 @@ class NPUWorker(WorkerBase):
 
         saw_floor_four_or_lower = False
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_elastic_headroom_moe_module(module):
                 continue
-            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+            if not _module_uses_lossless_elastic(module):
                 continue
-            configured_floor = getattr(
-                module, "_get_configured_elastic_min_compute_group_size",
-                lambda: None)()
+            configured_floor = _module_configured_elastic_floor(module)
             if configured_floor is None or configured_floor > 4:
                 continue
             saw_floor_four_or_lower = True
@@ -666,11 +834,7 @@ class NPUWorker(WorkerBase):
         ))
 
     def _estimate_post_shrink_moe_dispatch_headroom_bytes(self) -> int:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
-            return 0
-        if not self._has_effective_post_restore_collective_headroom_need():
             return 0
 
         model_runner = getattr(self, "model_runner", None)
@@ -678,21 +842,28 @@ class NPUWorker(WorkerBase):
         if model is None:
             return 0
 
+        saw_mode1_lightweight_parity = False
         saw_low_floor_module = False
         saw_elastic_lossless_module = False
         min_configured_floor = None
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_elastic_headroom_moe_module(module):
                 continue
-            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+            if not _module_uses_lossless_elastic(module):
                 continue
-            if not getattr(module, "_is_followup_shrink_enabled",
-                           lambda: False)():
+            if _module_is_mode1_lightweight_parity(module):
+                saw_mode1_lightweight_parity = True
+                logger.info(
+                    "Skipping post-shrink MoE dispatch headroom for mode1 lightweight parity: layer=%s floor=%s path=%s",
+                    getattr(module, "layer_idx", -1),
+                    _module_configured_elastic_floor(module),
+                    _module_mode1_lightweight_parity_path(module),
+                )
+                continue
+            if not _module_followup_shrink_enabled(module):
                 continue
             saw_elastic_lossless_module = True
-            configured_floor = getattr(
-                module, "_get_configured_elastic_min_compute_group_size",
-                lambda: None)()
+            configured_floor = _module_configured_elastic_floor(module)
             if configured_floor is None:
                 continue
             configured_floor = int(configured_floor)
@@ -703,6 +874,12 @@ class NPUWorker(WorkerBase):
                                            configured_floor)
             if configured_floor <= 4:
                 saw_low_floor_module = True
+
+        if saw_mode1_lightweight_parity and not saw_elastic_lossless_module:
+            return 0
+
+        if not self._has_effective_post_restore_collective_headroom_need():
+            return 0
 
         if not saw_elastic_lossless_module:
             return 0
@@ -727,11 +904,7 @@ class NPUWorker(WorkerBase):
                       str(512 * 1024 * 1024)))
 
     def _estimate_post_shrink_prefill_alltoall_headroom_bytes(self) -> int:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
-            return 0
-        if not self._has_effective_post_restore_collective_headroom_need():
             return 0
 
         model_runner = getattr(self, "model_runner", None)
@@ -739,22 +912,28 @@ class NPUWorker(WorkerBase):
         if model is None:
             return 0
 
+        saw_mode1_lightweight_parity = False
         saw_low_floor_lossless_module = False
         min_configured_floor = None
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_elastic_headroom_moe_module(module):
                 continue
-            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+            if not _module_uses_lossless_elastic(module):
                 continue
-            if not getattr(module, "_is_followup_shrink_enabled",
-                           lambda: False)():
+            if _module_is_mode1_lightweight_parity(module):
+                saw_mode1_lightweight_parity = True
+                logger.info(
+                    "Skipping post-shrink prefill AllToAll headroom for mode1 lightweight parity: layer=%s floor=%s path=%s",
+                    getattr(module, "layer_idx", -1),
+                    _module_configured_elastic_floor(module),
+                    _module_mode1_lightweight_parity_path(module),
+                )
                 continue
-            if hasattr(module, "_is_hybrid_cpu_swap_enabled") and \
-                    module._is_hybrid_cpu_swap_enabled():
+            if not _module_followup_shrink_enabled(module):
                 continue
-            configured_floor = getattr(
-                module, "_get_configured_elastic_min_compute_group_size",
-                lambda: None)()
+            if _module_hybrid_cpu_swap_enabled(module):
+                continue
+            configured_floor = _module_configured_elastic_floor(module)
             if configured_floor is None:
                 continue
             configured_floor = int(configured_floor)
@@ -765,6 +944,12 @@ class NPUWorker(WorkerBase):
                                            configured_floor)
             if configured_floor <= 4:
                 saw_low_floor_lossless_module = True
+
+        if saw_mode1_lightweight_parity and not saw_low_floor_lossless_module:
+            return 0
+
+        if not self._has_effective_post_restore_collective_headroom_need():
+            return 0
 
         if not saw_low_floor_lossless_module:
             return 0
@@ -783,6 +968,36 @@ class NPUWorker(WorkerBase):
             os.getenv(
                 "VLLM_ASCEND_POST_SHRINK_PREFILL_ALLTOALL_HEADROOM_BYTES",
                 str(default_headroom_bytes)))
+
+    def _estimate_custom_mode1_kv_materialize_headroom_bytes(self) -> int:
+        if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
+            return 0
+
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return 0
+
+        for module in model.modules():
+            if _module_is_mode1_lightweight_parity(module):
+                logger.info(
+                    "Skipping mode=1 KV materialization headroom for lightweight parity: layer=%s floor=%s path=%s",
+                    getattr(module, "layer_idx", -1),
+                    _module_configured_elastic_floor(module),
+                    _module_mode1_lightweight_parity_path(module),
+                )
+                return 0
+            if (_is_custom_ascend_fused_moe_module(module)
+                    and _module_is_custom_mode1_redundant_static(module)):
+                return int(
+                    os.getenv(
+                        "VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES",
+                        str(2 * 1024 * 1024 * 1024)))
+        return 0
+
+    def _estimate_kv_cache_init_headroom_bytes(self) -> int:
+        return int(float(os.getenv("VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES",
+                                   "0")))
 
     def execute_model(
         self,
@@ -1142,8 +1357,6 @@ class NPUWorker(WorkerBase):
                                         active_ranks: list[int],
                                         world_group,
                                         participate_only: bool = False) -> None:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         current_rank = torch.distributed.get_rank()
         is_active_rank = current_rank in active_ranks
         restoring_full_world = len(active_ranks) == torch.distributed.get_world_size()
@@ -1168,7 +1381,7 @@ class NPUWorker(WorkerBase):
         preloaded_direct_import_slots = getattr(
             self, "_lossless_preloaded_direct_import_slots", {})
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_ascend_fused_moe_module(module):
                 continue
 
             use_lossless_mode = (
@@ -1179,6 +1392,13 @@ class NPUWorker(WorkerBase):
                 payload = lossless_shrink_payload.get(module.layer_idx)
                 if payload is None:
                     if restoring_full_world:
+                        # The full-world restore invalidates the previous
+                        # post-shrink communicator/workspace warm state. Even
+                        # if a later shrink lands on the same active-rank
+                        # signature, we must warm it again because the EP/MC2
+                        # groups have been rebuilt from the restored 16-rank
+                        # world in between.
+                        self._post_shrink_moe_dispatch_warmed_active_signatures.clear()
                         current_dp_group = get_dp_group()
                         current_ep_group = get_ep_group()
                         module.set_active_expert_mask(None)
@@ -1237,12 +1457,16 @@ class NPUWorker(WorkerBase):
                     module.moe_config.num_experts = module.elastic_original_num_experts
                     continue
                 logical_num_experts = int(module.elastic_original_num_experts)
-                # 在mode=3下，不设置active_expert_mask，因为双缓冲模式有自己的专家管理机制
-                if getattr(module, "elastic_execution_mode", 0) != 3:
-                    active_expert_mask = torch.ones(logical_num_experts,
-                                                    dtype=torch.bool)
-                    module.set_active_expert_mask(active_expert_mask.to(
-                        device=module.expert_map.device))
+                # Do not blindly mark every logical expert as active on the
+                # old custom mode=1 shrink path. Native/common mode1 keeps the
+                # dispatch space aligned with the actual post-shrink runtime
+                # mapping. A full logical-all-ones mask keeps router space
+                # artificially wide and is a plausible reason why the real
+                # post-shrink MC2 path remains heavier than the synthetic
+                # warmup. Mode=3 still manages active experts through its own
+                # double-buffer metadata and therefore keeps this mask unset.
+                if getattr(module, "elastic_execution_mode", 0) == 3:
+                    module.set_active_expert_mask(None)
                 else:
                     module.set_active_expert_mask(None)
                 assignments = payload["assignments"]
@@ -1257,6 +1481,7 @@ class NPUWorker(WorkerBase):
                 ]
                 local_direct_import_slots = preloaded_direct_import_slots.get(
                     module.layer_idx, {})
+                parity_preloaded_direct_fill = False
                 if local_direct_import_slots:
                     for local_slot, expert_id in enumerate(local_active_expert_ids):
                         if local_source_local_ids[local_slot] >= 0:
@@ -1269,6 +1494,12 @@ class NPUWorker(WorkerBase):
                                 f"layer={module.layer_idx}: expert_id={expert_id} "
                                 f"local_slot={local_slot} direct_slot={direct_slot}")
                         local_source_local_ids[local_slot] = direct_slot
+                    parity_preloaded_direct_fill = (
+                        getattr(module, "elastic_execution_mode", 0) == 1
+                        and len(local_direct_import_slots)
+                        == len(local_active_expert_ids)
+                        and len(local_active_expert_ids) > int(
+                            getattr(module, "active_local_num_experts", 0)))
                 use_hybrid_cpu_swap = False
                 hybrid_enabled = (
                     hasattr(module, "_is_hybrid_cpu_swap_enabled")
@@ -1356,14 +1587,43 @@ class NPUWorker(WorkerBase):
                                 "should_offload_loaded_weights_after_lossless_activation")
                         and module
                         .should_offload_loaded_weights_after_lossless_activation())
+                    if parity_preloaded_direct_fill:
+                        setattr(module,
+                                "_lossless_mode1_direct_preloaded_activation_ok",
+                                True)
                     module.activate_lossless_local_experts(
                         local_active_expert_ids,
                         local_source_local_ids,
                         cpu_expert_weights=local_cpu_import_weights,
                         offload_loaded_after_activation=
                         offload_loaded_after_activation)
+                    if parity_preloaded_direct_fill:
+                        setattr(module,
+                                "_lossless_mode1_direct_preloaded_activation_ok",
+                                False)
                     new_log2phy_cpu = payload["runtime_log2phy_cpu"]
-                    module.set_runtime_num_experts(logical_num_experts)
+                    # Keep the old custom mode=1 runtime expert cardinality
+                    # aligned with the post-shrink dense runtime mapping.
+                    # Restoring `num_experts` back to the original logical
+                    # expert count here makes the downstream MC2 dispatcher
+                    # allocate/prepare for a larger expert space than the
+                    # actual active dense runtime layout, which is the opposite
+                    # of native/common mode=1 semantics.
+                    if new_log2phy_cpu is not None:
+                        try:
+                            runtime_num_experts = int(
+                                (new_log2phy_cpu >= 0).sum().item())
+                        except Exception:
+                            runtime_num_experts = logical_num_experts
+                    else:
+                        runtime_num_experts = logical_num_experts
+                    module.set_runtime_num_experts(runtime_num_experts)
+                    if (getattr(module, "elastic_execution_mode", 0) == 1
+                            and new_log2phy_cpu is not None):
+                        active_expert_mask = (new_log2phy_cpu >= 0).to(
+                            device=module.expert_map.device,
+                            dtype=torch.bool)
+                        module.set_active_expert_mask(active_expert_mask)
                 if module.log2phy is not None and new_log2phy_cpu is not None:
                     module.set_elastic_runtime_log2phy(
                         new_log2phy_cpu.to(device=module.log2phy.device,
@@ -1557,8 +1817,6 @@ class NPUWorker(WorkerBase):
 
     def _prepare_lossless_shrink_payload(self, active_ranks: list[int],
                                          world_group) -> None:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         self._lossless_shrink_payload = {}
         model_runner = getattr(self, "model_runner", None)
         model = getattr(model_runner, "model", None) if model_runner else None
@@ -1579,7 +1837,7 @@ class NPUWorker(WorkerBase):
                 current_rank, active_ranks, source_ranks, previous_active_ranks)
 
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_ascend_fused_moe_module(module):
                 continue
             if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
                 continue
@@ -2403,10 +2661,18 @@ class NPUWorker(WorkerBase):
                             and expert_id in local_needed_cpu_import_ids):
                         if direct_fill_preallocated_loaded:
                             target_slot = local_import_slot_by_expert[expert_id]
-                            recv_target_w13 = module.w13_weight[
-                                target_slot:target_slot + 1]
-                            recv_target_w2 = module.w2_weight[
-                                target_slot:target_slot + 1]
+                            recv_buf_fn = getattr(
+                                module,
+                                "get_lossless_expert_npu_slot_recv_buffers",
+                                None)
+                            if callable(recv_buf_fn):
+                                recv_target_w13, recv_target_w2 = recv_buf_fn(
+                                    target_slot)
+                            else:
+                                recv_target_w13 = module.w13_weight[
+                                    target_slot:target_slot + 1]
+                                recv_target_w2 = module.w2_weight[
+                                    target_slot:target_slot + 1]
                         else:
                             recv_target_w13 = recv_w13
                             recv_target_w2 = recv_w2
@@ -2467,8 +2733,6 @@ class NPUWorker(WorkerBase):
 
     def _preload_lossless_shrink_import_weights(self, active_ranks: list[int],
                                                 world_group) -> None:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         self._lossless_preloaded_cpu_import_weights = {}
         self._lossless_preloaded_direct_import_slots = {}
         model_runner = getattr(self, "model_runner", None)
@@ -2478,7 +2742,7 @@ class NPUWorker(WorkerBase):
 
         lossless_shrink_payload = getattr(self, "_lossless_shrink_payload", {})
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_ascend_fused_moe_module(module):
                 continue
             use_lossless_mode = (
                 envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE == "lossless"
@@ -2499,6 +2763,55 @@ class NPUWorker(WorkerBase):
         if group is not None:
             group.destroy()
             setattr(state_module, attr_name, None)
+
+    def _custom_mode1_worker_memory_diag_enabled(self) -> bool:
+        return (_env_flag("VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG", "0")
+                or _env_flag("VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG", "0"))
+
+    def _log_custom_mode1_worker_memory(self, tag: str,
+                                        extra: str = "") -> None:
+        if not self._custom_mode1_worker_memory_diag_enabled():
+            return
+        if not torch.npu.is_available():
+            return
+        try:
+            free_bytes, total_bytes = torch.npu.mem_get_info()
+            stats = torch_npu.npu.memory_stats()
+            torch_current = int(stats.get("allocated_bytes.all.current", 0))
+            torch_reserved = int(stats.get("reserved_bytes.all.current", 0))
+            total_allocated = int(total_bytes - free_bytes)
+            non_torch = max(total_allocated - torch_current, 0)
+            logger.info(
+                "Mode1 parity worker memory: tag=%s rank=%s "
+                "free_bytes=%s total_bytes=%s torch_current=%s "
+                "torch_reserved=%s non_torch=%s total_allocated=%s%s",
+                tag,
+                self.rank,
+                free_bytes,
+                total_bytes,
+                torch_current,
+                torch_reserved,
+                non_torch,
+                total_allocated,
+                f" {extra}" if extra else "",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Mode1 parity worker memory logging failed at %s: %s",
+                tag,
+                exc,
+            )
+
+    def _cleanup_after_elastic_mc2_group_destroy(self, reason: str) -> None:
+        import gc
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        self._log_custom_mode1_worker_memory(
+            "after_mc2_group_destroy_cleanup",
+            f"reason={reason}",
+        )
 
     def _get_cached_elastic_parallel_groups(self) -> dict[str, dict[tuple[int, ...], object]]:
         cached_groups = getattr(self, "_elastic_cached_parallel_groups", None)
@@ -2527,11 +2840,264 @@ class NPUWorker(WorkerBase):
         return normalized_name
 
     def _should_cache_elastic_parallel_group(self, attr_name: str) -> bool:
-        # Keep DP/EP restore fast, but recreate MC2 every time. Caching MC2 keeps
-        # the previous communicator alive while the post-shrink 8-rank MC2 group
-        # is created, which can push aclnnMoeDistributeDispatchV2 over the HCCL
-        # workspace memory budget on the next step.
-        return self._normalize_elastic_parallel_group_kind(attr_name) != "mc2"
+        group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
+        if group_kind != "mc2":
+            return True
+        if (_env_flag("VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP", "0")
+                and self._has_mode1_lightweight_parity_module()):
+            # Diagnostic escape hatch: force the old custom mode1 path to keep
+            # a single live MC2 communicator. This is no longer the default
+            # because repeatedly recreating MC2 diverges from native/common
+            # mode1 and can leak HCCL tiling resources across training steps.
+            return False
+        # Native/common mode1 does not repeatedly allocate a fresh MC2 resource
+        # for the same active-rank signature. The old custom path was
+        # recreating MC2 on every restore/shrink cycle; step 1 could run, but
+        # step 2 then failed when aclnnMoeDistributeDispatchV4 asked HCCL for
+        # another ~1.56 GiB communication resource. Cache MC2 by default for
+        # custom mode1 parity so the resource lifecycle matches the native
+        # execution pattern. Keep an opt-out for targeted diagnostics.
+        return os.getenv(
+            "VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE",
+            "0").lower() not in ("1", "true", "yes", "on")
+
+    def _should_keep_stale_mc2_cache_for_custom_mode1_parity(
+            self, stale_group_ranks: tuple[int, ...],
+            keep_group_ranks: tuple[int, ...]) -> bool:
+        if stale_group_ranks == keep_group_ranks:
+            return False
+        if not stale_group_ranks:
+            return False
+        # Keep this disabled by default. The old custom mode1 path should reuse
+        # the current full-world MC2 communicator across restore/resume, but a
+        # stale floor8 communicator must not remain resident into the next
+        # step's KV-cache materialization. Holding both the 16-rank and 8-rank
+        # MC2 HCCL resources raised non_torch memory by several GiB and made
+        # step-2 resume(kv_cache) OOM at native KV budget.
+        if not _env_flag("VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE",
+                         "0"):
+            return False
+        if _env_flag("VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP", "0"):
+            return False
+        if _env_flag("VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE", "0"):
+            return False
+        return self._has_mode1_lightweight_parity_module()
+
+    def _should_keep_stale_group_cache_for_custom_mode1_parity(
+            self, group_kind: str, stale_group_ranks: tuple[int, ...],
+            keep_group_ranks: tuple[int, ...]) -> bool:
+        if stale_group_ranks == keep_group_ranks:
+            return False
+        if not stale_group_ranks:
+            return False
+        if group_kind == "mc2":
+            return self._should_keep_stale_mc2_cache_for_custom_mode1_parity(
+                stale_group_ranks, keep_group_ranks)
+        if group_kind != "ep":
+            return False
+        if not _env_flag("VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE",
+                         "1"):
+            return False
+        if not self._has_mode1_lightweight_parity_module():
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+        world_size = int(torch.distributed.get_world_size())
+        full_world_ranks = tuple(range(world_size))
+        if stale_group_ranks != full_world_ranks:
+            return False
+        if keep_group_ranks == full_world_ranks:
+            return False
+        return True
+
+    def _should_drop_stale_group_cache_after_custom_mode1_shrink(
+            self, active_ranks: list[int], world_size: int) -> bool:
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK",
+                "1"):
+            return False
+        if len(active_ranks) >= int(world_size):
+            return False
+        return self._has_mode1_lightweight_parity_module()
+
+    def _has_custom_mode1_floor8_parity_module(self) -> bool:
+        return self._has_custom_mode1_native_parity_module(exact_floor=8)
+
+    def _has_mode1_lightweight_parity_module(
+            self,
+            exact_floor: Optional[int] = None,
+            max_floor: Optional[int] = None) -> bool:
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return False
+        for module in model.modules():
+            if not _module_is_mode1_lightweight_parity(module):
+                continue
+            configured_floor = _module_configured_elastic_floor(module)
+            if configured_floor is None:
+                continue
+            configured_floor = int(configured_floor)
+            if exact_floor is not None and configured_floor != exact_floor:
+                continue
+            if max_floor is not None and configured_floor > max_floor:
+                continue
+            return True
+        return False
+
+    def _has_custom_mode1_native_parity_module(
+            self,
+            exact_floor: Optional[int] = None,
+            max_floor: Optional[int] = None) -> bool:
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return False
+        for module in model.modules():
+            if not _module_is_custom_mode1_native_parity(module):
+                continue
+            configured_floor = _module_configured_elastic_floor(module)
+            if configured_floor is None:
+                continue
+            configured_floor = int(configured_floor)
+            if exact_floor is not None and configured_floor != exact_floor:
+                continue
+            if max_floor is not None and configured_floor > max_floor:
+                continue
+            return True
+        return False
+
+    def _warmup_post_restore_mc2_dispatch_for_custom_mode1_parity(
+            self, world_size: int) -> None:
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_MC2_WARMUP", "1"):
+            return
+        if not self._has_custom_mode1_native_parity_module():
+            return
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None or not hasattr(
+                model_runner, "warmup_mode1_parity_mc2_dispatcher_only"):
+            return
+        warmup_tokens = int(
+            os.getenv(
+                "VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_MC2_WARMUP_TOKENS",
+                "32"))
+        if warmup_tokens <= 0:
+            logger.info(
+                "Elastic post-restore MC2 dispatch warmup skipped: rank=%s "
+                "reason=no_tokens tokens=%s",
+                self.rank,
+                warmup_tokens,
+            )
+            return
+        self._log_custom_mode1_worker_memory(
+            "before_post_restore_mc2_dispatcher_warmup",
+            f"world_size={world_size} tokens={warmup_tokens}",
+        )
+        try:
+            model_runner.warmup_mode1_parity_mc2_dispatcher_only(
+                warmup_tokens)
+        except Exception:
+            logger.exception(
+                "Elastic post-restore MC2 dispatch warmup failed: rank=%s "
+                "world_size=%s tokens=%s",
+                self.rank,
+                world_size,
+                warmup_tokens,
+            )
+            raise
+        if torch.npu.is_available():
+            torch.npu.synchronize()
+        self._log_custom_mode1_worker_memory(
+            "after_post_restore_mc2_dispatcher_warmup",
+            f"world_size={world_size} tokens={warmup_tokens}",
+        )
+
+    def _warmup_post_restore_alltoall_dispatch_for_custom_mode1_parity(
+            self, world_size: int) -> None:
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP",
+                "0"):
+            return
+        if not self._has_custom_mode1_native_parity_module():
+            return
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None or not hasattr(
+                model_runner,
+                "warmup_mode1_parity_alltoall_dispatcher_only"):
+            return
+        warmup_tokens = int(
+            os.getenv(
+                "VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP_TOKENS",
+                "513"))
+        max_tokens_across_dp = int(
+            os.getenv(
+                "VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP_MAX_TOKENS",
+                str(warmup_tokens)))
+        if max_tokens_across_dp != warmup_tokens:
+            logger.info(
+                "Elastic post-restore ALLTOALL dispatch warmup adjusting "
+                "max_tokens_across_dp to satisfy DPMetadata: rank=%s "
+                "tokens=%s requested_max_tokens_across_dp=%s",
+                self.rank,
+                warmup_tokens,
+                max_tokens_across_dp,
+            )
+            max_tokens_across_dp = warmup_tokens
+        if warmup_tokens <= 0 or max_tokens_across_dp <= 0:
+            logger.info(
+                "Elastic post-restore ALLTOALL dispatch warmup skipped: rank=%s "
+                "reason=no_tokens tokens=%s max_tokens_across_dp=%s",
+                self.rank,
+                warmup_tokens,
+                max_tokens_across_dp,
+            )
+            return
+        self._log_custom_mode1_worker_memory(
+            "before_post_restore_alltoall_dispatcher_warmup",
+            f"world_size={world_size} tokens={warmup_tokens} "
+            f"max_tokens_across_dp={max_tokens_across_dp}",
+        )
+        try:
+            model_runner.warmup_mode1_parity_alltoall_dispatcher_only(
+                warmup_tokens,
+                max_tokens_across_dp=max_tokens_across_dp)
+        except Exception:
+            logger.exception(
+                "Elastic post-restore ALLTOALL dispatch warmup failed: rank=%s "
+                "world_size=%s tokens=%s max_tokens_across_dp=%s",
+                self.rank,
+                world_size,
+                warmup_tokens,
+                max_tokens_across_dp,
+            )
+            raise
+        if torch.npu.is_available():
+            torch.npu.synchronize()
+        self._post_kv_ep_collectives_warmed_up = True
+        self._log_custom_mode1_worker_memory(
+            "after_post_restore_alltoall_dispatcher_warmup",
+            f"world_size={world_size} tokens={warmup_tokens} "
+            f"max_tokens_across_dp={max_tokens_across_dp}",
+        )
+
+    def _should_destroy_stashed_mc2_for_single_live_group(
+            self, attr_name: str, group_ranks: tuple[int, ...]) -> bool:
+        if self._normalize_elastic_parallel_group_kind(attr_name) != "mc2":
+            return False
+        if not _env_flag("VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP",
+                         "0"):
+            return False
+        if not group_ranks:
+            return False
+        target_ranks = tuple(
+            int(rank) for rank in getattr(
+                self, "_elastic_rebuild_target_ranks", ()) or ())
+        if not target_ranks or group_ranks == target_ranks:
+            return False
+        if not self._has_custom_mode1_native_parity_module():
+            return False
+        return True
 
     def _stash_group_if_present(self, state_module, attr_name: str) -> None:
         group = getattr(state_module, attr_name, None)
@@ -2541,19 +3107,41 @@ class NPUWorker(WorkerBase):
         should_cache_group = self._should_cache_elastic_parallel_group(
             attr_name)
         group_ranks = tuple(int(rank) for rank in getattr(group, "ranks", []))
+        group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
+        destroy_for_single_live_mc2 = (
+            self._should_destroy_stashed_mc2_for_single_live_group(
+                attr_name, group_ranks))
+        if destroy_for_single_live_mc2:
+            target_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_rebuild_target_ranks", ()) or ())
+            logger.info(
+                "Elastic custom mode1 MC2 single-live-group destroying old group before rebuild: "
+                "rank=%s attr=%s old_ranks=%s target_ranks=%s",
+                self.rank,
+                attr_name,
+                group_ranks,
+                target_ranks,
+            )
+            self._log_custom_mode1_worker_memory(
+                "before_single_live_mc2_destroy",
+                f"old_ranks={group_ranks} target_ranks={target_ranks}",
+            )
+            should_cache_group = False
         if group_ranks and should_cache_group:
             cached_groups = self._get_cached_elastic_parallel_groups()
             cached_groups.setdefault(attr_name, {})[group_ranks] = group
-            group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
             self._get_seen_elastic_parallel_group_signatures().add(
                 (group_kind, group_ranks))
         else:
             if group_ranks:
-                group_kind = self._normalize_elastic_parallel_group_kind(
-                    attr_name)
                 self._get_seen_elastic_parallel_group_signatures().discard(
                     (group_kind, group_ranks))
             group.destroy()
+            if group_kind == "mc2":
+                self._cleanup_after_elastic_mc2_group_destroy(
+                    "single_live_rebuild"
+                    if destroy_for_single_live_mc2 else "stash_group")
         setattr(state_module, attr_name, None)
 
     def _get_local_group_ranks(self,
@@ -2577,20 +3165,57 @@ class NPUWorker(WorkerBase):
                 ranks
                 for ranks in list(groups_by_ranks.keys())
                 if ranks != keep_group_ranks
+                and not (
+                    self._should_keep_stale_group_cache_for_custom_mode1_parity(
+                        group_kind,
+                        tuple(int(rank) for rank in ranks),
+                        keep_group_ranks,
+                    )
+                )
             ]
+            kept_stale_group_ranks = [
+                ranks
+                for ranks in list(groups_by_ranks.keys())
+                if ranks != keep_group_ranks
+                and self._should_keep_stale_group_cache_for_custom_mode1_parity(
+                    group_kind,
+                    tuple(int(rank) for rank in ranks),
+                    keep_group_ranks,
+                )
+            ]
+            for ranks in kept_stale_group_ranks:
+                logger.info(
+                    "Elastic mode1 lightweight parity keeps stale %s cache for native-like reuse: rank=%s keep_ranks=%s cached_ranks=%s",
+                    group_kind.upper(), self.rank, keep_group_ranks, ranks)
             for ranks in stale_group_ranks:
                 group = groups_by_ranks.pop(ranks, None)
                 if group is not None:
+                    if group_kind == "mc2":
+                        self._log_custom_mode1_worker_memory(
+                            "before_stale_mc2_cache_drop",
+                            f"stale_ranks={ranks} keep_ranks={keep_group_ranks}",
+                        )
                     group.destroy()
+                    if group_kind == "mc2":
+                        self._cleanup_after_elastic_mc2_group_destroy(
+                            "drop_stale_cache")
                     dropped_groups += 1
                 if (group_kind, ranks) in seen_signatures:
                     seen_signatures.discard((group_kind, ranks))
                     dropped_signatures += 1
+                if group_kind == "mc2":
+                    logger.info(
+                        "Elastic parallel stale MC2 cache dropped across restore: rank=%s keep_ranks=%s stale_ranks=%s",
+                        self.rank, keep_group_ranks, ranks)
 
         stale_signatures = [
-            signature
-            for signature in seen_signatures
+            signature for signature in seen_signatures
             if signature[1] != keep_group_ranks
+            and not self._should_keep_stale_group_cache_for_custom_mode1_parity(
+                signature[0],
+                signature[1],
+                keep_group_ranks,
+            )
         ]
         for signature in stale_signatures:
             seen_signatures.discard(signature)
@@ -2707,8 +3332,6 @@ class NPUWorker(WorkerBase):
     def _detach_from_elastic_parallel_groups(self) -> None:
         import vllm.distributed.parallel_state as vllm_ps
         import vllm_ascend.distributed.parallel_state as ascend_ps
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         self._stash_group_if_present(vllm_ps, "_DP")
         self._stash_group_if_present(vllm_ps, "_EP")
         self._stash_group_if_present(ascend_ps, "_MC2")
@@ -2726,7 +3349,7 @@ class NPUWorker(WorkerBase):
             return
 
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_ascend_fused_moe_module(module):
                 continue
             if hasattr(module, "clear_lossless_hybrid_state"):
                 module.clear_lossless_hybrid_state()
@@ -2748,34 +3371,64 @@ class NPUWorker(WorkerBase):
     def _rebuild_group(self, state_module, attr_name: str,
                        group_ranks: list[list[int]], world_group,
                        backend: str, group_name: str) -> None:
-        self._stash_group_if_present(state_module, attr_name)
-
-        should_cache_group = self._should_cache_elastic_parallel_group(
-            attr_name)
         local_group_ranks = self._get_local_group_ranks(group_ranks)
-        if should_cache_group:
-            cached_groups = self._get_cached_elastic_parallel_groups()
-            cached_group = cached_groups.get(attr_name,
-                                             {}).get(local_group_ranks)
-            if cached_group is not None:
-                setattr(state_module, attr_name, cached_group)
-                logger.info(
-                    "Elastic parallel group cache hit: rank=%s attr=%s group_name=%s ranks=%s",
-                    self.rank, attr_name, group_name, local_group_ranks)
-                return
+        previous_target_ranks = getattr(self, "_elastic_rebuild_target_ranks",
+                                        None)
+        self._elastic_rebuild_target_ranks = local_group_ranks
+        group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
+        try:
+            if group_kind == "mc2":
+                self._log_custom_mode1_worker_memory(
+                    "before_rebuild_mc2_stash",
+                    f"group_name={group_name} target_ranks={local_group_ranks}",
+                )
+            self._stash_group_if_present(state_module, attr_name)
 
-        setattr(
-            state_module, attr_name,
-            init_model_parallel_group(group_ranks, world_group.local_rank,
-                                      backend, group_name=group_name))
-        if local_group_ranks:
+            should_cache_group = self._should_cache_elastic_parallel_group(
+                attr_name)
             if should_cache_group:
                 cached_groups = self._get_cached_elastic_parallel_groups()
-                cached_groups.setdefault(attr_name, {})[
-                    local_group_ranks] = getattr(state_module, attr_name)
-            group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
-            self._get_seen_elastic_parallel_group_signatures().add(
-                (group_kind, local_group_ranks))
+                cached_group = cached_groups.get(attr_name,
+                                                 {}).get(local_group_ranks)
+                if cached_group is not None:
+                    setattr(state_module, attr_name, cached_group)
+                    logger.info(
+                        "Elastic parallel group cache hit: rank=%s attr=%s group_name=%s ranks=%s",
+                        self.rank, attr_name, group_name, local_group_ranks)
+                    if group_kind == "mc2":
+                        self._log_custom_mode1_worker_memory(
+                            "after_rebuild_mc2_cache_hit",
+                            f"group_name={group_name} ranks={local_group_ranks}",
+                        )
+                    return
+
+            if group_kind == "mc2":
+                self._log_custom_mode1_worker_memory(
+                    "before_rebuild_mc2_create",
+                    f"group_name={group_name} ranks={local_group_ranks}",
+                )
+            setattr(
+                state_module, attr_name,
+                init_model_parallel_group(group_ranks, world_group.local_rank,
+                                          backend, group_name=group_name))
+            if group_kind == "mc2":
+                self._log_custom_mode1_worker_memory(
+                    "after_rebuild_mc2_create",
+                    f"group_name={group_name} ranks={local_group_ranks}",
+                )
+            if local_group_ranks:
+                if should_cache_group:
+                    cached_groups = self._get_cached_elastic_parallel_groups()
+                    cached_groups.setdefault(attr_name, {})[
+                        local_group_ranks] = getattr(state_module, attr_name)
+                    if group_kind == "mc2":
+                        logger.info(
+                            "Elastic parallel MC2 group cached: rank=%s group_name=%s ranks=%s",
+                            self.rank, group_name, local_group_ranks)
+                self._get_seen_elastic_parallel_group_signatures().add(
+                    (group_kind, local_group_ranks))
+        finally:
+            self._elastic_rebuild_target_ranks = previous_target_ranks
 
     def _warmup_post_shrink_dp_collectives(self) -> None:
         dp_group = get_dp_group()
@@ -2784,26 +3437,45 @@ class NPUWorker(WorkerBase):
 
         # Force HCCL to materialize the new DP communicator/workspace before
         # post-shrink decode hits its first metadata all_reduce.
+        self._log_custom_mode1_worker_memory(
+            "before_post_shrink_dp_all_reduce_warmup",
+            f"dp_size={dp_group.world_size}",
+        )
         warmup_tensor = torch.zeros(1, dtype=torch.int32, device="npu")
         warmup_start_t = time.perf_counter()
         torch.distributed.all_reduce(warmup_tensor, group=dp_group.device_group)
         if torch.npu.is_available():
             torch.npu.synchronize()
+        warmup_ms = (time.perf_counter() - warmup_start_t) * 1000.0
+        self._log_custom_mode1_worker_memory(
+            "after_post_shrink_dp_all_reduce_warmup",
+            f"dp_size={dp_group.world_size}",
+        )
+        del warmup_tensor
+        if (_env_flag("VLLM_ASCEND_MODE1_PARITY_RELEASE_DP_WARMUP_CACHE",
+                      "1")
+                and self._has_mode1_lightweight_parity_module()):
+            import gc
+            gc.collect()
+            if torch.npu.is_available():
+                torch.npu.empty_cache()
+                torch.npu.synchronize()
+            self._log_custom_mode1_worker_memory(
+                "after_post_shrink_dp_warmup_cache_release",
+                f"dp_size={dp_group.world_size}",
+            )
         logger.info(
             "Elastic post-shrink DP all_reduce warmup done: rank=%s dp_size=%s total_ms=%.2f",
-            self.rank, dp_group.world_size,
-            (time.perf_counter() - warmup_start_t) * 1000.0)
+            self.rank, dp_group.world_size, warmup_ms)
 
     def _has_hybrid_lossless_module(self) -> bool:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         model_runner = getattr(self, "model_runner", None)
         model = getattr(model_runner, "model", None) if model_runner else None
         if model is None:
             return False
 
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_ascend_fused_moe_module(module):
                 continue
             if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
                 continue
@@ -2813,15 +3485,13 @@ class NPUWorker(WorkerBase):
         return False
 
     def _has_mode3_hybrid_lossless_module(self) -> bool:
-        from vllm_ascend.ops.fused_moe import AscendFusedMoE
-
         model_runner = getattr(self, "model_runner", None)
         model = getattr(model_runner, "model", None) if model_runner else None
         if model is None:
             return False
 
         for module in model.modules():
-            if not isinstance(module, AscendFusedMoE):
+            if not _is_ascend_fused_moe_module(module):
                 continue
             if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
                 continue
@@ -2858,6 +3528,33 @@ class NPUWorker(WorkerBase):
                       "32"))
         if warmup_tokens <= 0:
             return
+        force_mode1_parity_warmup = os.getenv(
+            "VLLM_ASCEND_MODE1_PARITY_POST_SHRINK_WARMUP", "0").lower() in (
+                "1", "true", "yes", "on")
+
+        model = getattr(model_runner, "model", None)
+        if model is not None:
+            for module in model.modules():
+                if _module_is_mode1_lightweight_parity(module):
+                    if not force_mode1_parity_warmup:
+                        if active_signature:
+                            self._post_shrink_moe_dispatch_warmed_active_signatures.add(
+                                active_signature)
+                        logger.info(
+                            "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode1_lightweight_parity_no_synthetic_warmup path=%s",
+                            self.rank,
+                            list(active_signature),
+                            _module_mode1_lightweight_parity_path(module),
+                        )
+                        return
+                    logger.info(
+                        "Elastic post-shrink MoE dispatch warmup forced for mode1 parity: rank=%s active_ranks=%s tokens=%s path=%s",
+                        self.rank,
+                        list(active_signature),
+                        warmup_tokens,
+                        _module_mode1_lightweight_parity_path(module),
+                    )
+                    break
 
         if self._has_mode3_hybrid_lossless_module():
             if active_signature:
@@ -2869,9 +3566,30 @@ class NPUWorker(WorkerBase):
             return
 
         warmup_start_t = time.perf_counter()
-        model_runner._dummy_run(warmup_tokens, with_prefill=False)
+        if force_mode1_parity_warmup:
+            model_runner.warmup_mode1_parity_moe_dispatch_only(
+                warmup_tokens)
+        else:
+            model_runner._dummy_run(
+                warmup_tokens,
+                with_prefill=False,
+                num_actual_tokens_override=warmup_tokens,
+            )
         if torch.npu.is_available():
             torch.npu.synchronize()
+        release_warmup_cache = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_RELEASE_WARMUP_CACHE", "1")
+        if release_warmup_cache:
+            self._log_custom_mode1_worker_memory(
+                "before_post_shrink_moe_warmup_cache_release",
+                f"active_ranks={list(active_signature)}")
+            import gc
+            gc.collect()
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+            self._log_custom_mode1_worker_memory(
+                "after_post_shrink_moe_warmup_cache_release",
+                f"active_ranks={list(active_signature)}")
         if active_signature:
             self._post_shrink_moe_dispatch_warmed_active_signatures.add(
                 active_signature)
@@ -2899,7 +3617,11 @@ class NPUWorker(WorkerBase):
             torch.npu.empty_cache()
             torch.npu.synchronize()
 
-        pass  # debug log removed
+        self._log_custom_mode1_worker_memory(
+            "after_post_shrink_staging_state_release",
+            f"payload_layers={payload_layers} import_layers={import_layers} "
+            f"direct_import_layers={direct_import_layers}",
+        )
 
     def rebuild_elastic_ep_group(self, active_global_ranks: list[int]) -> bool:
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
@@ -2973,6 +3695,19 @@ class NPUWorker(WorkerBase):
 
         self._release_post_shrink_staging_state()
 
+        if self._should_drop_stale_group_cache_after_custom_mode1_shrink(
+                active_ranks, world_size):
+            keep_group_ranks = tuple(int(rank) for rank in active_ranks)
+            self._log_custom_mode1_worker_memory(
+                "before_stale_group_cache_drop_after_shrink",
+                f"keep_ranks={keep_group_ranks}",
+            )
+            self._drop_stale_cached_elastic_parallel_groups(keep_group_ranks)
+            self._log_custom_mode1_worker_memory(
+                "after_stale_group_cache_drop_after_shrink",
+                f"keep_ranks={keep_group_ranks}",
+            )
+
         if is_active_rank:
             warmup_start_t = time.perf_counter()
             self._warmup_post_shrink_dp_collectives()
@@ -3030,6 +3765,10 @@ class NPUWorker(WorkerBase):
         self._elastic_current_active_ranks = list(range(world_size))
         self._drop_stale_cached_elastic_parallel_groups(
             tuple(range(world_size)))
+        self._warmup_post_restore_mc2_dispatch_for_custom_mode1_parity(
+            world_size)
+        self._warmup_post_restore_alltoall_dispatch_for_custom_mode1_parity(
+            world_size)
 
         logger.info(
             "Elastic parallel restore done: rank=%s dp_size=%s ep_size=%s rebuild_ms=%.2f refresh_ms=%.2f total_ms=%.2f",

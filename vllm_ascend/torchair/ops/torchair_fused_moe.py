@@ -1106,8 +1106,20 @@ class TorchairAscendFusedMoE(FusedMoE):
         else:
             # init moe.
             # print("use code in torchair_fused_moe to init expert_map")
-            self.local_num_experts, self.expert_map, self.log2phy = determine_expert_map(
-                self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
+            expert_map_result = determine_expert_map(
+                self.ep_size,
+                self.ep_rank,
+                self.global_num_experts,
+                layer_idx=self.layer_idx)
+            if len(expert_map_result) == 3:
+                self.local_num_experts, self.expert_map, self.log2phy = expert_map_result
+            elif len(expert_map_result) == 2:
+                self.local_num_experts, self.expert_map = expert_map_result
+                self.log2phy = determine_default_log2phy_map(
+                    self.global_num_experts, self.ep_size, self.ep_rank, 0)
+            else:
+                raise ValueError(
+                    f"Unexpected determine_expert_map return arity={len(expert_map_result)}")
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
                 self.global_redundant_expert_num = ascend_config.init_redundancy_expert

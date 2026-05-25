@@ -27,3 +27,21 @@ def register_model():
 
     from .models import register_model
     register_model()
+
+
+def register_connector():
+    import vllm_ascend.distributed  # noqa
+
+
+def register_model_loader():
+    import os
+
+    def _env_flag(name: str, default: str = "0") -> bool:
+        return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+    if _env_flag("VLLM_ASCEND_REGISTER_CUSTOM_MODELS"):
+        register_model()
+
+
+def register_service_profiling():
+    return None

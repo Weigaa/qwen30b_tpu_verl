@@ -6,7 +6,7 @@ export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/asdsip/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
 
 export HYDRA_FULL_ERROR=1
 #export ASCEND_LAUNCH_BLOCKING=1         
@@ -164,11 +164,11 @@ export ACL_MDL_STREAM_SYNC_TIMEOUT=-1
 export ACL_MDL_EVENT_SYNC_TIMEOUT=-1
 
 HOME=$(pwd)
-MODEL_PATH=${MODEL_PATH:-"/home/data/Qwen3-30B-A3B"}
+MODEL_PATH=${MODEL_PATH:-"/data/Qwen3-30B-A3B"}
 CONFIG_DIR=${CONFIG_DIR:-"${HOME}/verl/trainer/config"}
-DISTCP_PATH="/home/data/Qwen3-30B-A3B_megatron"
-TRAIN_FILE=${TRAIN_FILE:-"/workspace/data/deepscaler/train.parquet"}
-TEST_FILE=${TEST_FILE:-"/workspace/data/deepscaler/test.parquet"}
+DISTCP_PATH="/data/Qwen3-30B-A3B_megatron"
+TRAIN_FILE=${TRAIN_FILE:-"/data/deepscaler/train.parquet"}
+TEST_FILE=${TEST_FILE:-"/data/deepscaler/test.parquet"}
 RECORD_DIR="/workspace/cann-recipes-train/llm_rl/qwen3/record"
 mkdir -p "${RECORD_DIR}"
 
@@ -177,26 +177,30 @@ elastic_suffix=""
 if [ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" != "0" ]; then
     elastic_suffix="_elastic"
 fi
-logfile="${HOME}/wjeagerqwen30b-a3b-with_draft_${DRAFT_PROFILE_MODE}_${time}${elastic_suffix}.txt"
 
 export VERL_SIDECAR_ENABLE=${VERL_SIDECAR_ENABLE:-1}
-export VERL_SIDECAR_MODEL_PATH=${VERL_SIDECAR_MODEL_PATH:-"/home/sharedata/models/pangu-pro-moe-model"}
-export VERL_SIDECAR_PROMPTS_FILE=${VERL_SIDECAR_PROMPTS_FILE:-"/home/qiuzy/verl_dev/data/gsm8k"}
+export VERL_SIDECAR_MODEL_PATH=${VERL_SIDECAR_MODEL_PATH:-"/data/pangu-pro-moe-model"}
+export VERL_SIDECAR_PROMPTS_FILE=${VERL_SIDECAR_PROMPTS_FILE:-"/data/gsm8k"}
 # Only keep non-default sidecar knobs here. Defaults live in
 # internal/run_elastic_sidecar_infer.sh.
-export VERL_SIDECAR_MAX_NUM_SEQS=${VERL_SIDECAR_MAX_NUM_SEQS:-16}
-export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS:-32768}
-export VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-4096}
-export VERL_SIDECAR_MAX_TOKENS=${VERL_SIDECAR_MAX_TOKENS:-1024}
-export VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA=${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA:-8}
-export VERL_SIDECAR_GENERATE_CHUNK_SIZE=${VERL_SIDECAR_GENERATE_CHUNK_SIZE:-8}
+export VERL_SIDECAR_MAX_NUM_SEQS=${VERL_SIDECAR_MAX_NUM_SEQS:-153}
+export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS:-65536}
+export VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-6144}
+export VERL_SIDECAR_MAX_TOKENS=${VERL_SIDECAR_MAX_TOKENS:-4096}
+export VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA=${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA:-306}
+export VERL_SIDECAR_GENERATE_CHUNK_SIZE=${VERL_SIDECAR_GENERATE_CHUNK_SIZE:-306}
 export VERL_SIDECAR_STATE_DIR=${VERL_SIDECAR_STATE_DIR:-"sidecar_runs/state/pangu_pro_moe_gsm8k_train"}
 export VERL_SIDECAR_PARALLEL_MODE=${VERL_SIDECAR_PARALLEL_MODE:-hybrid}
-export VERL_SIDECAR_TENSOR_PARALLEL_SIZE=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-4}
-export VERL_SIDECAR_REPLICA_COUNT=${VERL_SIDECAR_REPLICA_COUNT:-2}
+export VERL_SIDECAR_TENSOR_PARALLEL_SIZE=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-8}
+export VERL_SIDECAR_REPLICA_COUNT=${VERL_SIDECAR_REPLICA_COUNT:-1}
 export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL:-1}
 export VERL_SIDECAR_MODEL_IS_MOE=${VERL_SIDECAR_MODEL_IS_MOE:-1}
-export VERL_SIDECAR_LOG_DIR=${VERL_SIDECAR_LOG_DIR:-"sidecar_runs/${time}"}
+export VERL_SIDECAR_GRACEFUL_KILL_SECONDS=${VERL_SIDECAR_GRACEFUL_KILL_SECONDS:-8}
+export VERL_SIDECAR_RESTORE_WAIT_SECONDS=${VERL_SIDECAR_RESTORE_WAIT_SECONDS:-12}
+export VERL_SIDECAR_RESTORE_EXTRA_GRACE_SECONDS=${VERL_SIDECAR_RESTORE_EXTRA_GRACE_SECONDS:-8}
+sidecar_record_name="record_72b_tp${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}dp${VERL_SIDECAR_REPLICA_COUNT}_${time}"
+logfile="${HOME}/${sidecar_record_name}${elastic_suffix}.txt"
+export VERL_SIDECAR_LOG_DIR=${VERL_SIDECAR_LOG_DIR:-"sidecar_runs/${sidecar_record_name}"}
 sidecar_monitor_pid=""
 cleanup_sidecar_monitor() {
     if [[ -n "${sidecar_monitor_pid}" ]] && kill -0 "${sidecar_monitor_pid}" 2>/dev/null; then
@@ -213,7 +217,7 @@ if [[ "${VERL_SIDECAR_ENABLE}" == "1" ]]; then
     export VERL_SIDECAR_LOG_FILE=${VERL_SIDECAR_LOG_FILE:-"${VERL_SIDECAR_LOG_DIR}/infer.log"}
     export VERL_SIDECAR_OUTPUT_FILE=${VERL_SIDECAR_OUTPUT_FILE:-"${VERL_SIDECAR_LOG_DIR}/outputs.jsonl"}
     sidecar_monitor_log=${VERL_SIDECAR_MONITOR_LOG:-"${VERL_SIDECAR_LOG_DIR}/monitor.log"}
-    echo "[elastic sidecar] enabled=1 train_log=${VERL_SIDECAR_TRAIN_LOG} log_dir=${VERL_SIDECAR_LOG_DIR} lease_log=${VERL_SIDECAR_LEASE_LOG} sidecar_log=${VERL_SIDECAR_LOG_FILE} sidecar_output=${VERL_SIDECAR_OUTPUT_FILE} monitor_log=${sidecar_monitor_log} devices=${VERL_SIDECAR_NPU_DEVICES:-auto_from_inactive_ranks} parallel_mode=${VERL_SIDECAR_PARALLEL_MODE} tensor_parallel_size=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} replica_count=${VERL_SIDECAR_REPLICA_COUNT} sidecar_ep=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL} model=${VERL_SIDECAR_MODEL_PATH} prompts=${VERL_SIDECAR_PROMPTS_FILE} state_dir=${VERL_SIDECAR_STATE_DIR} max_prompts_per_replica=${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA} generate_chunk_size=${VERL_SIDECAR_GENERATE_CHUNK_SIZE} max_num_seqs=${VERL_SIDECAR_MAX_NUM_SEQS} max_num_batched_tokens=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS} max_model_len=${VERL_SIDECAR_MAX_MODEL_LEN} max_tokens=${VERL_SIDECAR_MAX_TOKENS}"
+    echo "[elastic sidecar] enabled=1 train_log=${VERL_SIDECAR_TRAIN_LOG} log_dir=${VERL_SIDECAR_LOG_DIR} lease_log=${VERL_SIDECAR_LEASE_LOG} sidecar_log=${VERL_SIDECAR_LOG_FILE} sidecar_output=${VERL_SIDECAR_OUTPUT_FILE} monitor_log=${sidecar_monitor_log} devices=${VERL_SIDECAR_NPU_DEVICES:-auto_from_inactive_ranks} parallel_mode=${VERL_SIDECAR_PARALLEL_MODE} tensor_parallel_size=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE} replica_count=${VERL_SIDECAR_REPLICA_COUNT} sidecar_ep=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL} model=${VERL_SIDECAR_MODEL_PATH} prompts=${VERL_SIDECAR_PROMPTS_FILE} state_dir=${VERL_SIDECAR_STATE_DIR} max_prompts_per_replica=${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA} generate_chunk_size=${VERL_SIDECAR_GENERATE_CHUNK_SIZE} max_num_seqs=${VERL_SIDECAR_MAX_NUM_SEQS} max_num_batched_tokens=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS} max_model_len=${VERL_SIDECAR_MAX_MODEL_LEN} max_tokens=${VERL_SIDECAR_MAX_TOKENS} graceful_kill_seconds=${VERL_SIDECAR_GRACEFUL_KILL_SECONDS} restore_wait_seconds=${VERL_SIDECAR_RESTORE_WAIT_SECONDS} restore_extra_grace_seconds=${VERL_SIDECAR_RESTORE_EXTRA_GRACE_SECONDS}"
     internal/watch_elastic_shrink_and_run_sidecar.sh "${logfile}" >> "${sidecar_monitor_log}" 2>&1 &
     sidecar_monitor_pid=$!
     trap cleanup_sidecar_monitor EXIT
@@ -221,6 +225,7 @@ else
     echo "[elastic sidecar] enabled=0"
 fi
 
+set +e
 set -x
 
 python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
@@ -300,4 +305,10 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
     +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True  $@ >> "${logfile}" 
+    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True \
+    "$@" >> "${logfile}" 2>&1
+run_exit_code=$?
+set -e
+
+echo "[run] end_time=$(date '+%Y-%m-%dT%H:%M:%S%z') exit_code=${run_exit_code}" | tee -a "${logfile}"
+exit "${run_exit_code}"

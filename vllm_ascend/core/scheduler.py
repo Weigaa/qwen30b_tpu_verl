@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 import time
+import os
 from collections import deque
 from collections import defaultdict
 from typing import Iterable, Union
@@ -390,9 +391,23 @@ class AscendScheduler(Scheduler):
                                 scheduled_timestamp)
                         self.waiting.appendleft(preempted_req)
                         preempted_reqs.append(preempted_req)
-                        logger.info("Preempting request %s for request %s",
-                                    preempted_req.request_id,
-                                    request.request_id)
+                        if os.getenv(
+                                "VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG",
+                                "0").lower() in ("1", "true", "yes", "on"):
+                            logger.warning(
+                                "Elastic redundancy KV preemption: preempted=%s "
+                                "request=%s running=%s waiting=%s "
+                                "kv_cache_usage=%.6f",
+                                preempted_req.request_id,
+                                request.request_id,
+                                len(self.running),
+                                len(self.waiting),
+                                self.kv_cache_manager.usage,
+                            )
+                        else:
+                            logger.info("Preempting request %s for request %s",
+                                        preempted_req.request_id,
+                                        request.request_id)
                         if preempted_req == request:
                             # No more request to preempt.
                             can_schedule = False

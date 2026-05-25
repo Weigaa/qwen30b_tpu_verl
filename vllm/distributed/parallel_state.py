@@ -876,6 +876,7 @@ class GroupCoordinator:
     def destroy(self):
         if self.device_communicator is not None:
             self.device_communicator.destroy()
+            self.device_communicator = None
         if self._owns_process_groups and hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
@@ -888,6 +889,11 @@ class GroupCoordinator:
             del self.cpu_group
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
+        # Break any lingering references so backend/HCCL resources can be
+        # reclaimed promptly between elastic shrink/restore stages.
+        self.ranks = []
+        self.world_size = 0
+        self.rank_in_group = -1
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
         if self.device_communicator is not None:

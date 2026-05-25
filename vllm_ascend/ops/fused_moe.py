@@ -290,6 +290,103 @@ def _lossless_weight_format(weight: Optional[torch.Tensor]) -> str:
         return "unknown"
 
 
+def _npu_weight_format_value(weight: Optional[torch.Tensor]) -> Optional[Any]:
+    if weight is None or weight.device.type != "npu":
+        return None
+    try:
+        return torch_npu.get_npu_format(weight)
+    except Exception:
+        return None
+
+
+def _npu_weight_format_matches(weight: Optional[torch.Tensor],
+                               target_format: Any) -> bool:
+    current_format = _npu_weight_format_value(weight)
+    if current_format is None:
+        return False
+    return current_format == target_format or str(current_format) == str(
+        target_format)
+
+
+def _mode1_reload_allocator_trim_enabled() -> bool:
+    try:
+        floor = int(
+            os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", "0")
+            or "0")
+    except ValueError:
+        floor = 0
+    default = "1" if 0 < floor <= 2 else "0"
+    return _env_flag("VLLM_ASCEND_MODE1_RELOAD_TRIM_ALLOCATOR", default)
+
+
+def _trim_npu_allocator_for_mode1_reload(layer: Any, reason: str) -> None:
+    if not _mode1_reload_allocator_trim_enabled():
+        return
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        return
+    try:
+        if _env_flag("VLLM_ASCEND_MODE1_RELOAD_SYNC_ON_TRIM", "1"):
+            torch.npu.synchronize()
+        gc.collect()
+        torch.npu.empty_cache()
+    except Exception:
+        return
+    if getattr(layer, "layer_idx", -1) == 0 and not getattr(
+            layer, "_mode1_reload_trim_logged", False):
+        logger.info(
+            "Mode1 reload allocator trim enabled: floor=%s reason=%s",
+            os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", ""),
+            reason,
+        )
+        layer._mode1_reload_trim_logged = True
+
+
+def _maybe_npu_format_cast_for_mode1_reload(weight: torch.Tensor,
+                                            target_format: Any, *,
+                                            layer: Any,
+                                            weight_name: str,
+                                            mode1_reload: bool) -> torch.Tensor:
+    if weight.device.type != "npu":
+        return weight
+    if not mode1_reload:
+        return torch_npu.npu_format_cast(weight, target_format)
+
+    current_format = _npu_weight_format_value(weight)
+    force_cast = _env_flag("VLLM_ASCEND_MODE1_RELOAD_FORCE_FORMAT_CAST", "0")
+    skip_same = _env_flag("VLLM_ASCEND_MODE1_RELOAD_SKIP_SAME_FORMAT_CAST", "1")
+    same_format = (current_format is not None and
+                   (current_format == target_format
+                    or str(current_format) == str(target_format)))
+    if skip_same and same_format and not force_cast:
+        if getattr(layer, "layer_idx", -1) == 0 and not getattr(
+                layer, f"_mode1_reload_skip_cast_logged_{weight_name}", False):
+            logger.info(
+                "Mode1 reload skips redundant npu_format_cast: weight=%s "
+                "format=%s target=%s floor=%s",
+                weight_name,
+                current_format,
+                target_format,
+                os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", ""),
+            )
+            setattr(layer, f"_mode1_reload_skip_cast_logged_{weight_name}",
+                    True)
+        return weight
+
+    if getattr(layer, "layer_idx", -1) == 0 and not getattr(
+            layer, f"_mode1_reload_do_cast_logged_{weight_name}", False):
+        logger.info(
+            "Mode1 reload executes npu_format_cast: weight=%s format=%s "
+            "target=%s force=%s floor=%s",
+            weight_name,
+            current_format,
+            target_format,
+            force_cast,
+            os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", ""),
+        )
+        setattr(layer, f"_mode1_reload_do_cast_logged_{weight_name}", True)
+    return torch_npu.npu_format_cast(weight, target_format)
+
+
 def _allocate_formatted_buffer_like(weight: torch.Tensor,
                                     row_count: int,
                                     *,
@@ -307,6 +404,42 @@ def _allocate_formatted_buffer_like(weight: torch.Tensor,
     except Exception:
         pass
     return buffer
+
+
+def _npu_zero_offset_alias_for_p2p(base: torch.Tensor,
+                                   slot_view: torch.Tensor) -> torch.Tensor:
+    if slot_view.device.type != "npu":
+        return slot_view
+    if int(slot_view.storage_offset()) == 0:
+        return slot_view
+
+    try:
+        target_format = torch_npu.get_npu_format(slot_view)
+        alias = torch.empty(tuple(slot_view.shape),
+                            device=slot_view.device,
+                            dtype=slot_view.dtype)
+        alias = torch_npu.npu_format_cast(alias, target_format)
+
+        ptr_delta = int(slot_view.data_ptr()) - int(base.data_ptr())
+        element_size = int(slot_view.element_size())
+        storage_index = int(slot_view.storage_offset())
+        if ptr_delta >= 0 and element_size > 0 and ptr_delta % element_size == 0:
+            storage_index = ptr_delta // element_size
+        torch_npu.npu_change_data_ptr(alias, base, int(storage_index))
+
+        if int(alias.storage_offset()) != 0:
+            raise RuntimeError(
+                f"alias storage_offset={int(alias.storage_offset())}")
+        if int(alias.data_ptr()) != int(slot_view.data_ptr()):
+            raise RuntimeError(
+                f"alias data_ptr={int(alias.data_ptr())} "
+                f"view data_ptr={int(slot_view.data_ptr())}")
+        return alias
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to build zero-offset NPU P2P alias for formatted expert "
+            f"slot: base_meta={_lossless_weight_meta(base)} "
+            f"slot_meta={_lossless_weight_meta(slot_view)}") from exc
 
 
 def _hybrid_rank_owned_signature(
@@ -358,6 +491,21 @@ def _build_dispatch_log2phy_tensor(
         dispatch_log2phy_cpu[expert_index] = dense_ids
     return dispatch_log2phy_cpu.to(device=device, non_blocking=False), \
         dispatch_num_experts
+
+
+def _active_moe_weight_view(layer: torch.nn.Module,
+                            weight: torch.Tensor) -> torch.Tensor:
+    active_num_experts = int(
+        getattr(layer, "active_local_num_experts",
+                getattr(layer, "local_num_experts", int(weight.shape[0]))))
+    if active_num_experts == int(weight.shape[0]):
+        return weight
+    if active_num_experts <= 0 or active_num_experts > int(weight.shape[0]):
+        raise RuntimeError(
+            "Invalid active local expert count for MoE weight view: "
+            f"active={active_num_experts}, weight_shape={tuple(weight.shape)}, "
+            f"layer={getattr(layer, 'layer_idx', 'unknown')}")
+    return weight[:active_num_experts]
 
 
 class _Mode3DoubleBufferSlot:
@@ -2757,6 +2905,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             prepared_mc2_mask: Optional[torch.Tensor],
             enable_force_load_balance: bool,
             kwargs: dict[str, Any],
+            ids_already_runtime_remapped: bool,
             is_dummy: bool) -> torch.Tensor:
         moe_comm_method = get_forward_context().moe_comm_method
         token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
@@ -2786,7 +2935,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 active_rank_count=active_rank_count,
                 owned_per_rank=owned_per_rank,
             )
-        dispatch_topk_ids = dispatch_log2phy[logical_topk_ids]
+        dispatch_topk_ids = (
+            logical_topk_ids if ids_already_runtime_remapped else
+            dispatch_log2phy[logical_topk_ids])
         if torch.any(dispatch_topk_ids < 0):
             invalid_count = int(torch.count_nonzero(dispatch_topk_ids < 0).item())
             raise RuntimeError(
@@ -3001,10 +3152,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             log2phy: Optional[Any],
             mc2_mask: Optional[torch.Tensor],
             enable_force_load_balance: bool,
-            kwargs: dict[str, Any]) -> torch.Tensor:
+            kwargs: dict[str, Any],
+            ids_already_runtime_remapped: bool = False) -> torch.Tensor:
         moe_comm_method = get_forward_context().moe_comm_method
         topk_ids = logical_topk_ids
         if (log2phy is not None
+                and not ids_already_runtime_remapped
                 and moe_comm_method.__class__.__name__ != "AlltoAllCommImpl"):
             topk_ids = log2phy[topk_ids]
             invalid_mask = topk_ids < 0
@@ -3020,12 +3173,41 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
         runtime_w13_weight = getattr(layer, "runtime_w13_weight", None)
         runtime_w2_weight = getattr(layer, "runtime_w2_weight", None)
+        active_w13_weight = (runtime_w13_weight if runtime_w13_weight is not None
+                             else _active_moe_weight_view(layer,
+                                                          layer.w13_weight))
+        active_w2_weight = (runtime_w2_weight if runtime_w2_weight is not None
+                            else _active_moe_weight_view(layer,
+                                                         layer.w2_weight))
+        if (getattr(layer, "elastic_execution_mode", 0) == 1
+                and getattr(layer, "lossless_mode1_native_parity_ready", False)
+                and getattr(layer, "layer_idx", -1) == 0
+                and not getattr(layer, "_mode1_execute_single_wave_logged", False)):
+            logger.info(
+                "Mode1 execute_single_wave: layer=%s active_local=%s local_num=%s "
+                "moe_config_local=%s loaded_capacity=%s runtime_w13_shape=%s "
+                "runtime_w2_shape=%s active_w13_shape=%s active_w2_shape=%s "
+                "topk_shape=%s log2phy=%s already_remapped=%s comm_impl=%s",
+                getattr(layer, "layer_idx", -1),
+                int(getattr(layer, "active_local_num_experts", -1)),
+                int(getattr(layer, "local_num_experts", -1)),
+                int(getattr(getattr(layer, "moe_config", None),
+                            "num_local_experts", -1)),
+                int(getattr(layer, "loaded_weight_capacity", -1)),
+                None if runtime_w13_weight is None else tuple(runtime_w13_weight.shape),
+                None if runtime_w2_weight is None else tuple(runtime_w2_weight.shape),
+                tuple(active_w13_weight.shape),
+                tuple(active_w2_weight.shape),
+                tuple(topk_ids.shape),
+                log2phy is not None,
+                ids_already_runtime_remapped,
+                moe_comm_method.__class__.__name__,
+            )
+            layer._mode1_execute_single_wave_logged = True
         return moe_comm_method.fused_experts(
             hidden_states=hidden_states,
-            w1=runtime_w13_weight
-            if runtime_w13_weight is not None else layer.w13_weight,
-            w2=runtime_w2_weight
-            if runtime_w2_weight is not None else layer.w2_weight,
+            w1=active_w13_weight,
+            w2=active_w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             row_idx=row_idx,
@@ -3053,10 +3235,30 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if layer.w13_weight.device.type == "cpu":
             pass  # CPU-staged reload finalizes tensor format after the buffers are moved back to NPU.
         elif not is_310p():
-            layer.w13_weight.data = torch_npu.npu_format_cast(
-                layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
-            layer.w2_weight.data = torch_npu.npu_format_cast(
-                layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            mode1_reload = (
+                getattr(layer, "elastic_moe_mode", "lossy") == "lossless"
+                and int(getattr(layer, "elastic_execution_mode", 0)) == 1)
+            if mode1_reload:
+                _trim_npu_allocator_for_mode1_reload(layer,
+                                                     "before_w13_format_cast")
+            layer.w13_weight.data = _maybe_npu_format_cast_for_mode1_reload(
+                layer.w13_weight.data,
+                ACL_FORMAT_FRACTAL_NZ,
+                layer=layer,
+                weight_name="w13",
+                mode1_reload=mode1_reload)
+            if mode1_reload:
+                _trim_npu_allocator_for_mode1_reload(layer,
+                                                     "before_w2_format_cast")
+            layer.w2_weight.data = _maybe_npu_format_cast_for_mode1_reload(
+                layer.w2_weight.data,
+                ACL_FORMAT_FRACTAL_NZ,
+                layer=layer,
+                weight_name="w2",
+                mode1_reload=mode1_reload)
+            if mode1_reload:
+                _trim_npu_allocator_for_mode1_reload(layer,
+                                                     "after_weight_format_cast")
         pass  # debug log removed
         if getattr(layer, "lossless_zero_redundancy_preallocated_loaded", False):
             valid_rows = int(getattr(layer, "loaded_local_num_experts", 0))
@@ -3202,10 +3404,15 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     selected_token_count)
                 dummy_waste_timing["_current_moe_selected_experts"] = (
                     selected_expert_count)
+        ids_already_runtime_remapped = False
         if (log2phy is not None
                 and moe_comm_method.__class__.__name__ != "AlltoAllCommImpl"):
-            old_topk_ids = topk_ids
+            # Keep mode=1/mode=2 shrink runtime aligned with common/native
+            # semantics: runtime log2phy is applied exactly once to the
+            # logical expert ids selected by the router. Downstream wave/
+            # single-wave helpers must not remap the already-dense ids again.
             topk_ids = log2phy[topk_ids]
+            ids_already_runtime_remapped = True
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
@@ -3396,6 +3603,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                             prepared_mc2_mask=prepared_mc2_mask,
                             enable_force_load_balance=enable_force_load_balance,
                             kwargs=kwargs,
+                            ids_already_runtime_remapped=
+                            ids_already_runtime_remapped,
                             is_dummy=is_dummy)
                     except RuntimeError as err:
                         if "Hybrid mode2 single-dispatch" not in str(err):
@@ -3621,7 +3830,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                     mc2_mask=group_mc2_mask,
                                     enable_force_load_balance=
                                     enable_force_load_balance,
-                                    kwargs=kwargs)
+                                    kwargs=kwargs,
+                                    ids_already_runtime_remapped=True)
                                 executed_group = True
                                 if (not group_placeholder_only
                                         and group_indices is not None
@@ -3664,7 +3874,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                             mc2_mask=wave_mc2_mask,
                             enable_force_load_balance=
                             enable_force_load_balance,
-                            kwargs=kwargs)
+                            kwargs=kwargs,
+                            ids_already_runtime_remapped=True)
                         if (not placeholder_only and token_indices is not None
                                 and token_indices.numel() > 0):
                             final_hidden_states.index_add_(
@@ -3684,7 +3895,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                             log2phy=wave_log2phy_cpu,
                             mc2_mask=wave_mc2_mask,
                             enable_force_load_balance=enable_force_load_balance,
-                            kwargs=kwargs)
+                            kwargs=kwargs,
+                            ids_already_runtime_remapped=False)
                         final_hidden_states.index_add_(0, token_indices,
                                                        wave_output)
                     # MC2 dispatch/combine stays asynchronous longer than the
@@ -3743,7 +3955,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 log2phy=log2phy,
                 mc2_mask=None,
                 enable_force_load_balance=enable_force_load_balance,
-                kwargs=kwargs)
+                kwargs=kwargs,
+                ids_already_runtime_remapped=ids_already_runtime_remapped)
 
 
 class AscendFusedMoE(FusedMoE):
@@ -3776,40 +3989,25 @@ class AscendFusedMoE(FusedMoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = -1,
     ):
-        # TODO: This could not initialize FusedMoE baseclass,
-        # fixme and make __init__() of AscendFusedMoE more clear
-        super().__init__(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            params_dtype=params_dtype,
-            reduce_results=reduce_results,
-            renormalize=renormalize,
-            use_grouped_topk=use_grouped_topk,
-            num_expert_group=num_expert_group,
-            topk_group=topk_group,
-            quant_config=quant_config,
-            tp_size=tp_size,
-            ep_size=ep_size,
-            dp_size=dp_size,
-            prefix=prefix,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            layer_idx=layer_idx,
-        )
+        # Avoid constructing the native vLLM FusedMoE first. The base
+        # initializer allocates native expert weights, then this custom
+        # initializer immediately replaces them with Ascend-formatted weights.
+        # That transient allocation distorts KV-cache profiling and can leave
+        # enough allocator pressure to OOM when the cache is materialized.
+        torch.nn.Module.__init__(self)
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
         self.layer_idx = layer_idx
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
+        self.params_dtype = params_dtype
 
         vllm_config = get_current_vllm_config()
         self.model_type = vllm_config.model_config.hf_config.model_type
+        self.total_run_time = 0
+        self.total_comm_time = 0
+        self.is_sequence_parallel = False
 
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size_=(tp_size if tp_size is not None else
@@ -3817,6 +4015,30 @@ class AscendFusedMoE(FusedMoE):
             dp_size_=(dp_size
                       if dp_size is not None else get_dp_group().world_size),
             vllm_parallel_config=vllm_config.parallel_config)
+        self.sp_size = self.tp_size
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.layer_name = prefix
+        self.enable_eplb = False
+        self.expert_load_view = None
+        self.logical_to_physical_map = None
+        self.logical_replica_count = None
+        self.local_num_expert_weight_slots = None
+        self.quant_config = quant_config
+        self.moe_quant_config = None
+        self.routed_scaling_factor = 1.0
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.zero_expert_num = 0
+        self.zero_expert_type = None
+        self.hidden_size = hidden_size
+        self.batched_hidden_states = None
+        self.batched_router_logits = None
+        try:
+            self.rank = int(torch.distributed.get_rank())
+        except Exception:
+            self.rank = -1
 
         self.top_k = top_k
         self.num_experts = num_experts
@@ -3857,6 +4079,7 @@ class AscendFusedMoE(FusedMoE):
         self.lossless_cpu_import_expert_ids = []
         self.lossless_zero_redundancy_preallocated = False
         self.lossless_zero_redundancy_preallocated_loaded = False
+        self.lossless_mode1_native_parity_ready = False
         self.loaded_weight_capacity = num_experts
         self.lossless_saved_primary_prefix_w13 = None
         self.lossless_saved_primary_prefix_w2 = None
@@ -3903,6 +4126,8 @@ class AscendFusedMoE(FusedMoE):
                 int(getattr(self.moe_parallel_config, "ep_size", 1)),
                 ascend_config.init_redundancy_expert,
             ))
+        effective_init_redundancy_expert = int(
+            self.global_redundant_expert_num)
         if (self.elastic_moe_mode == "lossless"
                 and self.global_redundant_expert_num <= 0):
             pass  # debug log removed
@@ -3943,7 +4168,13 @@ class AscendFusedMoE(FusedMoE):
                 raise ValueError(
                     f"Unexpected determine_expert_map return arity={len(primary_mapping)}")
             if self.elastic_moe_mode == "lossless":
-                self.global_redundant_expert_num = ascend_config.init_redundancy_expert
+                # In unified mode=1 the effective redundancy can be derived
+                # from VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE even when
+                # the legacy init_redundancy knob is left at zero. Preserve
+                # that derived value so custom Qwen3 loads real redundant
+                # expert slots, matching the native fixed-slot mode=1 path.
+                self.global_redundant_expert_num = (
+                    effective_init_redundancy_expert)
                 self.loaded_local_num_experts, self.loaded_expert_map = (
                     determine_redundant_replica_expert_map(
                         num_experts, self.ep_size, self.ep_rank,
@@ -3989,6 +4220,37 @@ class AscendFusedMoE(FusedMoE):
                 self.loaded_weight_capacity = prealloc_capacity
                 if getattr(self, "global_redundant_expert_num", 0) <= 0:
                     self.lossless_zero_redundancy_preallocated_loaded = True
+        if self.elastic_moe_mode == "lossless" and self.elastic_execution_mode == 1:
+            self.lossless_hybrid_cpu_swap_enabled = False
+            self.lossless_hybrid_active = False
+            self.lossless_hybrid_resident_capacity = 0
+            self.lossless_hybrid_owned_expert_ids = []
+            self.lossless_hybrid_resident_expert_ids = []
+            self.lossless_hybrid_cpu_only_expert_ids = []
+            self.lossless_hybrid_active_ranks = []
+            self.lossless_hybrid_active_rank_index = -1
+            self.lossless_hybrid_rank_owned_expert_ids = []
+            self.lossless_hybrid_rank_resident_expert_ids = []
+            self.lossless_hybrid_rank_lru = []
+            self.lossless_hybrid_owner_rank_by_expert = None
+            self.lossless_hybrid_owner_global_rank_by_expert = None
+            self.lossless_hybrid_last_stats = {}
+            self.lossless_cpu_shadow_local_slots = {}
+            self.lossless_mode1_native_parity_ready = True
+            if self.layer_idx == 0:
+                logger.info(
+                    "Mode1 parity init: layer=%s floor=%s active_local=%s "
+                    "loaded_local=%s loaded_capacity=%s hybrid_disabled=%s "
+                    "runtime_buffers_disabled=%s parity_ready=%s",
+                    self.layer_idx,
+                    envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE,
+                    int(self.active_local_num_experts),
+                    int(self.loaded_local_num_experts),
+                    int(self.loaded_weight_capacity),
+                    True,
+                    True,
+                    True,
+                )
         if self.layer_idx == 0:
             pass  # debug log removed
         local_num_experts = (torch.sum(self.expert_map != -1)
@@ -4057,6 +4319,44 @@ class AscendFusedMoE(FusedMoE):
         # NOTE: self.tp_group is not expert_tp_group
         self.tp_group = get_tp_group().device_group
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        if (os.getenv("VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG", "0")
+                in ("1", "true", "TRUE", "yes", "on")
+                and self.elastic_moe_mode == "lossless"):
+            try:
+                w13_bytes = int(self.w13_weight.numel()) * int(
+                    self.w13_weight.element_size())
+                w2_bytes = int(self.w2_weight.numel()) * int(
+                    self.w2_weight.element_size())
+                total_weight_bytes = w13_bytes + w2_bytes
+                loaded_capacity = max(int(self.loaded_weight_capacity), 1)
+                expert_weight_bytes = total_weight_bytes // loaded_capacity
+                logger.info(
+                    "Elastic redundancy MoE slots: layer=%s ep_rank=%s "
+                    "ep_size=%s mode=%s floor=%s num_experts=%s "
+                    "active_local=%s loaded_local=%s loaded_capacity=%s "
+                    "redundant_experts=%s w13_shape=%s w2_shape=%s "
+                    "expert_weight_bytes=%s total_weight_bytes=%s",
+                    self.layer_idx,
+                    self.ep_rank,
+                    self.ep_size,
+                    self.elastic_execution_mode,
+                    envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE,
+                    self.elastic_original_num_experts,
+                    self.active_local_num_experts,
+                    self.loaded_local_num_experts,
+                    self.loaded_weight_capacity,
+                    self.global_redundant_expert_num,
+                    tuple(self.w13_weight.shape),
+                    tuple(self.w2_weight.shape),
+                    expert_weight_bytes,
+                    total_weight_bytes,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Elastic redundancy MoE slot logging failed at layer=%s: %s",
+                    self.layer_idx,
+                    exc,
+                )
         if self.layer_idx == 0:
             pass  # debug log removed
 
@@ -4087,7 +4387,9 @@ class AscendFusedMoE(FusedMoE):
         return self.expert_map[expert_id].item()
 
     def set_runtime_num_experts(self, num_experts: int) -> None:
-        self.moe_config.num_experts = int(num_experts)
+        runtime_num_experts = int(num_experts)
+        self.moe_config.num_experts = runtime_num_experts
+        self.num_experts = runtime_num_experts
 
     @staticmethod
     def _is_power_of_two(value: int) -> bool:
@@ -4309,6 +4611,8 @@ class AscendFusedMoE(FusedMoE):
         self.lossless_hybrid_owner_rank_by_expert = None
         self.lossless_hybrid_owner_global_rank_by_expert = None
         self.lossless_hybrid_last_stats = {}
+        if self.elastic_execution_mode != 1:
+            self.lossless_mode1_native_parity_ready = False
         self.lossless_mode3_primary_prefix_expert_ids = []
         self.lossless_mode3_primary_prefix_local_slots = {}
         self.lossless_cpu_shadow_local_slots = {}
@@ -5068,6 +5372,91 @@ class AscendFusedMoE(FusedMoE):
             return False
         return True
 
+    def _can_materialize_lossless_loaded_prefix_slots(
+            self,
+            source_local_ids: list[int],
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]],
+    ) -> bool:
+        if self.elastic_moe_mode != "lossless":
+            return False
+        if self.lossless_loaded_offloaded:
+            return False
+        active_local_num_experts = int(self.active_local_num_experts)
+        if len(source_local_ids) != active_local_num_experts:
+            return False
+        if active_local_num_experts > int(self.w13_weight.shape[0]):
+            return False
+        if active_local_num_experts > int(self.w2_weight.shape[0]):
+            return False
+        if active_local_num_experts > int(
+                getattr(self, "loaded_weight_capacity", 0)):
+            return False
+        if getattr(self, "elastic_execution_mode", 0) == 1:
+            return True
+        return bool(
+            getattr(self, "lossless_zero_redundancy_preallocated_loaded",
+                    False))
+
+    def _can_materialize_lossless_loaded_prefix_slots_for_target(
+            self,
+            target_active_local_num_experts: int,
+            source_local_ids: list[int],
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]],
+    ) -> bool:
+        if self.elastic_moe_mode != "lossless":
+            return False
+        if self.lossless_loaded_offloaded:
+            return False
+        target_active_local_num_experts = int(target_active_local_num_experts)
+        if len(source_local_ids) != target_active_local_num_experts:
+            return False
+        if target_active_local_num_experts > int(self.w13_weight.shape[0]):
+            return False
+        if target_active_local_num_experts > int(self.w2_weight.shape[0]):
+            return False
+        if target_active_local_num_experts > int(
+                getattr(self, "loaded_weight_capacity", 0)):
+            return False
+        if getattr(self, "elastic_execution_mode", 0) == 1:
+            return True
+        return bool(
+            getattr(self, "lossless_zero_redundancy_preallocated_loaded",
+                    False))
+
+    def _copy_lossless_loaded_slots_into_prefix(
+            self, moves: list[tuple[int, int]]) -> None:
+        pending = {int(dst): int(src) for dst, src in moves if dst != src}
+        while pending:
+            progressed = False
+            pending_sources = set(pending.values())
+            for dst, src in list(pending.items()):
+                if dst in pending_sources:
+                    continue
+                self.w13_weight[dst].copy_(self.w13_weight[src])
+                self.w2_weight[dst].copy_(self.w2_weight[src])
+                del pending[dst]
+                progressed = True
+            if progressed:
+                continue
+
+            start = next(iter(pending))
+            tmp_w13 = self.w13_weight[start].detach().clone()
+            tmp_w2 = self.w2_weight[start].detach().clone()
+            dst = start
+            while True:
+                src = pending[dst]
+                if src == start:
+                    self.w13_weight[dst].copy_(tmp_w13)
+                    self.w2_weight[dst].copy_(tmp_w2)
+                    del pending[dst]
+                    break
+                self.w13_weight[dst].copy_(self.w13_weight[src])
+                self.w2_weight[dst].copy_(self.w2_weight[src])
+                del pending[dst]
+                dst = src
+
     def restore_lossless_full_world_primary_layout(self) -> None:
         if self.elastic_moe_mode != "lossless":
             self.reset_expert_map_and_log2phy()
@@ -5099,13 +5488,22 @@ class AscendFusedMoE(FusedMoE):
                 self.ep_rank,
                 self.global_redundant_expert_num,
             ))
-        (self.active_local_num_experts, self.expert_map,
-         self.log2phy) = determine_expert_map(
-             self.ep_size,
-             self.ep_rank,
-             logical_num_experts,
-             layer_idx=self.layer_idx,
-         )
+        active_mapping = determine_expert_map(
+            self.ep_size,
+            self.ep_rank,
+            logical_num_experts,
+            layer_idx=self.layer_idx,
+        )
+        if len(active_mapping) == 3:
+            (self.active_local_num_experts, self.expert_map,
+             self.log2phy) = active_mapping
+        elif len(active_mapping) == 2:
+            self.active_local_num_experts, self.expert_map = active_mapping
+            self.log2phy = determine_default_log2phy_map(
+                logical_num_experts, self.ep_size, self.ep_rank, 0)
+        else:
+            raise ValueError(
+                f"Unexpected determine_expert_map return arity={len(active_mapping)}")
         if target_device is not None:
             if self.loaded_expert_map is not None:
                 self.loaded_expert_map = self.loaded_expert_map.to(
@@ -5123,6 +5521,8 @@ class AscendFusedMoE(FusedMoE):
         self.lossless_cpu_import_expert_ids = []
         self._restore_stashed_lossless_primary_prefix()
         self.set_lossless_runtime_prefix_views()
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = True
         if self.layer_idx == 0 and self.ep_rank == 0:
             logger.info(
                 "Lossless full-world primary layout restored with loaded-slot prefix views: layer=%s active_local=%s loaded_capacity=%s",
@@ -5186,6 +5586,8 @@ class AscendFusedMoE(FusedMoE):
                 and self.runtime_w2_weight is old_w2_weight):
             self.runtime_w2_weight = None
         self.lossless_loaded_offloaded = True
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = False
         gc.collect()
         if torch.npu.is_available():
             torch.npu.empty_cache()
@@ -5205,6 +5607,7 @@ class AscendFusedMoE(FusedMoE):
             self.runtime_w13_buffer = None
             self.runtime_w2_buffer = None
             self.runtime_weight_capacity = 0
+            self.lossless_mode1_native_parity_ready = False
             return
 
         active_local_num_experts = int(self.active_local_num_experts)
@@ -5233,6 +5636,8 @@ class AscendFusedMoE(FusedMoE):
                     f"buffers; got preserve_prefix_len={preserve_prefix_len} "
                     f"at layer={self.layer_idx}.")
             self.set_lossless_runtime_prefix_views()
+            if self.elastic_execution_mode == 1:
+                self.lossless_mode1_native_parity_ready = True
             return
 
         target_capacity = self._get_lossless_runtime_capacity(
@@ -5311,6 +5716,8 @@ class AscendFusedMoE(FusedMoE):
 
         self.runtime_w13_weight = self.runtime_w13_buffer[:active_local_num_experts]
         self.runtime_w2_weight = self.runtime_w2_buffer[:active_local_num_experts]
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = False
 
     def _get_lossless_runtime_capacity(self,
                                        active_local_num_experts: int) -> int:
@@ -5521,13 +5928,22 @@ class AscendFusedMoE(FusedMoE):
             # For the shrink path we export one expert at a time. Return a
             # narrow view of the canonical NPU tensor so P2P send can reuse the
             # source slot directly instead of materializing an index_select copy.
-            return (source_w13[local_slot:local_slot + 1],
-                    source_w2[local_slot:local_slot + 1])
+            export_w13 = source_w13[local_slot:local_slot + 1]
+            export_w2 = source_w2[local_slot:local_slot + 1]
+            return (_npu_zero_offset_alias_for_p2p(source_w13, export_w13),
+                    _npu_zero_offset_alias_for_p2p(source_w2, export_w2))
         export_index = torch.tensor(local_slots,
                                     device=source_w13.device,
                                     dtype=torch.long)
         return (source_w13.index_select(0, export_index),
                 source_w2.index_select(0, export_index))
+
+    def get_lossless_expert_npu_slot_recv_buffers(
+            self, local_slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+        recv_w13 = self.w13_weight[local_slot:local_slot + 1]
+        recv_w2 = self.w2_weight[local_slot:local_slot + 1]
+        return (_npu_zero_offset_alias_for_p2p(self.w13_weight, recv_w13),
+                _npu_zero_offset_alias_for_p2p(self.w2_weight, recv_w2))
 
     def activate_lossless_local_experts(self, active_expert_ids: list[int],
                                         source_local_ids: list[int],
@@ -5536,6 +5952,47 @@ class AscendFusedMoE(FusedMoE):
                                         offload_loaded_after_activation: bool = False) -> None:
         if self.elastic_moe_mode != "lossless":
             return
+        if self.elastic_execution_mode == 1:
+            self.clear_lossless_hybrid_state()
+            self.lossless_hybrid_cpu_swap_enabled = False
+            target_active_local_num_experts = len(active_expert_ids)
+            direct_preloaded_activation_ok = bool(
+                getattr(self, "_lossless_mode1_direct_preloaded_activation_ok",
+                        False))
+            if (direct_preloaded_activation_ok and self.layer_idx == 0
+                    and not getattr(self,
+                                    "_mode1_direct_preloaded_activation_logged",
+                                    False)):
+                logger.info(
+                    "Mode1 parity accepting direct-preloaded activation: "
+                    "layer=%s target_active=%s loaded_capacity=%s source_local_ids=%s",
+                    self.layer_idx,
+                    len(active_expert_ids),
+                    int(getattr(self, "loaded_weight_capacity", 0)),
+                    source_local_ids[:16],
+                )
+                self._mode1_direct_preloaded_activation_logged = True
+            if (not direct_preloaded_activation_ok and
+                    not self
+                    ._can_materialize_lossless_loaded_prefix_slots_for_target(
+                        target_active_local_num_experts,
+                        source_local_ids,
+                        cpu_expert_weights)):
+                logger.warning(
+                    "Mode1 parity path refused heavyweight activation fallback: "
+                    "layer=%s active_local=%s loaded_capacity=%s "
+                    "cpu_imports=%s source_local_ids=%s direct_preloaded_ok=%s",
+                    self.layer_idx,
+                    target_active_local_num_experts,
+                    int(getattr(self, "loaded_weight_capacity", 0)),
+                    0 if cpu_expert_weights is None else len(cpu_expert_weights),
+                    source_local_ids,
+                    direct_preloaded_activation_ok,
+                )
+                if _env_flag("VLLM_ASCEND_CUSTOM_MODE1_STRICT", "1"):
+                    raise RuntimeError(
+                        "Mode1 parity path would fall back to heavyweight "
+                        f"runtime-buffer activation at layer={self.layer_idx}.")
         hybrid_enabled = self._is_hybrid_cpu_swap_enabled()
         primary_prefix_rows = self._get_lossless_primary_prefix_row_count()
         resident_capacity = (self._get_hybrid_resident_capacity()
@@ -5593,18 +6050,19 @@ class AscendFusedMoE(FusedMoE):
             int(expert_id) for expert_id, source_local_id in zip(
                 active_expert_ids, source_local_ids) if source_local_id < 0
         ]
-        if getattr(self, "lossless_zero_redundancy_preallocated_loaded", False):
+        if self._can_materialize_lossless_loaded_prefix_slots(
+                source_local_ids, cpu_expert_weights):
             activation_start = time.perf_counter()
             if new_local_num_experts > int(self.w13_weight.shape[0]):
                 raise RuntimeError(
                     f"need {new_local_num_experts}, have {int(self.w13_weight.shape[0])} "
                     f"at layer={self.layer_idx}.")
+            local_slot_moves: list[tuple[int, int]] = []
             for local_slot, source_local_id in enumerate(source_local_ids):
                 if source_local_id >= 0:
                     if local_slot != source_local_id:
-                        raise RuntimeError(
-                            f"experts to stay in-place at layer={self.layer_idx}: "
-                            f"slot={local_slot}, source_local_id={source_local_id}")
+                        local_slot_moves.append(
+                            (local_slot, int(source_local_id)))
                     continue
                 if cpu_expert_weights is None:
                     continue
@@ -5637,6 +6095,7 @@ class AscendFusedMoE(FusedMoE):
                 cpu_w13, cpu_w2 = cpu_expert_weights[expert_id]
                 self.w13_weight[local_slot].copy_(cpu_w13, non_blocking=False)
                 self.w2_weight[local_slot].copy_(cpu_w2, non_blocking=False)
+            self._copy_lossless_loaded_slots_into_prefix(local_slot_moves)
             # In preallocated loaded mode, imported experts are materialized into
             # the canonical loaded tensor prefix. Keep the loaded map aligned with
             # the current active layout so follow-up shrink/export logic sees the
@@ -5648,6 +6107,8 @@ class AscendFusedMoE(FusedMoE):
             self.lossless_cpu_w2_weight = None
             self.lossless_cpu_shadow_local_slots = {}
             self.set_lossless_runtime_prefix_views()
+            if self.elastic_execution_mode == 1:
+                self.lossless_mode1_native_parity_ready = True
             self.elastic_debug_tag += 1
             self.elastic_debug_budget = 1 if self.layer_idx == 0 else 0
             self.elastic_debug_reason = ("lossless_post_shrink"
@@ -5662,6 +6123,8 @@ class AscendFusedMoE(FusedMoE):
             self.lossless_cpu_w2_weight = None
             self.lossless_cpu_shadow_local_slots = {}
             self.set_lossless_runtime_prefix_views()
+            if self.elastic_execution_mode == 1:
+                self.lossless_mode1_native_parity_ready = True
             if self.layer_idx == 0:
                 logger.info(
                     "Lossless activation reused loaded-slot prefix views: layer=%s active_local=%s loaded_capacity=%s",
@@ -5680,6 +6143,8 @@ class AscendFusedMoE(FusedMoE):
             source_local_ids,
             cpu_expert_weights=cpu_expert_weights,
             preserve_prefix_len=preserve_prefix_len)
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = False
         if offload_loaded_after_activation and not self.lossless_loaded_offloaded:
             self.offload_lossless_loaded_weights_to_cpu()
         self.elastic_debug_tag += 1
@@ -5779,17 +6244,11 @@ class AscendFusedMoE(FusedMoE):
 
         forward_context = get_forward_context()
         mc2_mask = forward_context.mc2_mask
-        debug_enabled = bool(self.elastic_debug_budget > 0 and not is_dummy
-                             and not getattr(forward_context, "in_profile_run",
-                                             False))
+        debug_enabled = bool(
+            _env_flag("VLLM_ASCEND_CUSTOM_FUSED_MOE_FORWARD_DEBUG", "0")
+            and self.elastic_debug_budget > 0 and not is_dummy
+            and not getattr(forward_context, "in_profile_run", False))
         if debug_enabled:
-            local_expert_ids = []
-            if self.expert_map is not None:
-                local_expert_ids = [
-                    expert_id for expert_id, local_slot in enumerate(
-                        self.expert_map.detach().cpu().tolist())
-                    if int(local_slot) >= 0
-                ]
             runtime_log2phy = (self.elastic_runtime_log2phy
                                if self.elastic_runtime_log2phy is not None else
                                self.log2phy)
@@ -5920,6 +6379,28 @@ class AscendFusedMoE(FusedMoE):
             forward_context, "hybrid_force_host_alltoall_metadata", None)
         original_hybrid_stage = getattr(forward_context,
                                         "hybrid_stage_active_ranks", None)
+        mode1_host_alltoall_metadata = (
+            getattr(self, "elastic_execution_mode", 0) == 1
+            and getattr(self, "lossless_mode1_native_parity_ready", False)
+            and _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_ALLTOALL_HOST_METADATA", "1")
+            and selected_moe_comm_type == MoECommType.ALLTOALL)
+        if mode1_host_alltoall_metadata:
+            forward_context.hybrid_force_host_alltoall_metadata = True
+            forward_context.hybrid_stage_active_ranks = int(
+                getattr(getattr(self, "moe_parallel_config", None), "ep_size",
+                        getattr(self, "ep_size", 0)) or 0)
+            if self.layer_idx == 0 and not getattr(
+                    self, "_mode1_host_alltoall_metadata_logged", False):
+                logger.info(
+                    "Mode1 parity ALLTOALL metadata host path enabled: "
+                    "layer=%s stage=%s selected=%s original=%s",
+                    self.layer_idx,
+                    forward_context.hybrid_stage_active_ranks,
+                    selected_moe_comm_type,
+                    original_moe_comm_type,
+                )
+                self._mode1_host_alltoall_metadata_logged = True
         if forced_hybrid_comm_alignment:
             effective_comm_type = selected_moe_comm_type
             effective_method = (get_moe_comm_method(effective_comm_type)
@@ -6118,7 +6599,7 @@ class AscendFusedMoE(FusedMoE):
             else:
                 return final_hidden_states
         finally:
-            if forced_hybrid_comm_alignment:
+            if forced_hybrid_comm_alignment or mode1_host_alltoall_metadata:
                 forward_context.moe_comm_method = original_moe_comm_method
                 forward_context.moe_comm_type = original_moe_comm_type
                 forward_context.fused_moe_state = original_fused_moe_state
@@ -6148,11 +6629,21 @@ class AscendFusedMoE(FusedMoE):
             self.loaded_local_num_experts, self.loaded_expert_map = determine_redundant_replica_expert_map(
                 logical_num_experts, self.ep_size, self.ep_rank,
                 self.global_redundant_expert_num)
-            self.active_local_num_experts, self.expert_map, self.log2phy = determine_expert_map(
+            active_mapping = determine_expert_map(
                 self.ep_size,
                 self.ep_rank,
                 logical_num_experts,
                 layer_idx=self.layer_idx)
+            if len(active_mapping) == 3:
+                (self.active_local_num_experts, self.expert_map,
+                 self.log2phy) = active_mapping
+            elif len(active_mapping) == 2:
+                self.active_local_num_experts, self.expert_map = active_mapping
+                self.log2phy = determine_default_log2phy_map(
+                    logical_num_experts, self.ep_size, self.ep_rank, 0)
+            else:
+                raise ValueError(
+                    f"Unexpected determine_expert_map return arity={len(active_mapping)}")
             if target_device is not None:
                 if self.loaded_expert_map is not None:
                     self.loaded_expert_map = self.loaded_expert_map.to(
@@ -6168,6 +6659,13 @@ class AscendFusedMoE(FusedMoE):
             self.moe_config.num_local_experts = self.active_local_num_experts
             self.elastic_runtime_log2phy = None
             self.refresh_lossless_runtime_weights()
+            if self.elastic_execution_mode == 1:
+                self.lossless_mode1_native_parity_ready = (
+                    self.runtime_w13_buffer is None
+                    and self.runtime_w2_buffer is None
+                    and self.runtime_w13_weight is not None
+                    and self.runtime_w2_weight is not None
+                )
             return
         else:
             _, expert_map = determine_default_expert_map(

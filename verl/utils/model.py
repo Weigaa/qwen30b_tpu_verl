@@ -542,31 +542,100 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
     return unpad_tokens, cu_seqlens, max_seqlen_in_batch
 
 
-def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False):
+def load_mcore_dist_weights(
+    parallel_model,
+    dist_weight_path,
+    is_value_model=False,
+    disable_ckpt_mismatch_validation=False,
+):
     from megatron.core import dist_checkpointing
+    from megatron.core.dist_checkpointing.dict_utils import extract_matching_values, nested_values
+    from megatron.core.dist_checkpointing.mapping import ShardedObject
     from megatron.core.dist_checkpointing.serialization import StrictHandling
+    from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
+    from torch.distributed.checkpoint import BytesStorageMetadata, FileSystemReader
 
     from verl.utils.megatron_utils import unwrap_model
 
-    # strict = StrictHandling.IGNORE_ALL if is_value_model else StrictHandling.ASSUME_OK_UNEXPECTED
-    strict = StrictHandling.ASSUME_OK_UNEXPECTED
-    for model in parallel_model:
+    def prune_unexpected_extra_state_objects(sharded_state_dict):
+        metadata = FileSystemReader(dist_weight_path).read_metadata()
+        ckpt_object_keys = {
+            ShardedObject.empty_from_unique_key(metadata_key).key
+            for metadata_key, storage_metadata in metadata.state_dict_metadata.items()
+            if isinstance(storage_metadata, BytesStorageMetadata)
+        }
+
+        def is_unexpected_extra_state(x):
+            return (
+                isinstance(x, ShardedObject)
+                and x.key.endswith("_extra_state")
+                and x.key not in ckpt_object_keys
+            )
+
+        unexpected_extra, pruned_state_dict = extract_matching_values(sharded_state_dict, is_unexpected_extra_state)
+        removed_keys = sorted({x.key for x in nested_values(unexpected_extra) if isinstance(x, ShardedObject)})
+        if removed_keys:
+            print(
+                f"[load_mcore_dist_weights] pruned_unexpected_extra_state_keys={len(removed_keys)} "
+                f"sample_pruned={removed_keys[:4]}",
+                flush=True,
+            )
+        return pruned_state_dict
+
+    strict = (
+        StrictHandling.IGNORE_ALL
+        if disable_ckpt_mismatch_validation
+        else StrictHandling.ASSUME_OK_UNEXPECTED
+    )
+    for model_idx, model in enumerate(parallel_model):
         ssd = unwrap_model(model).sharded_state_dict()
+        if disable_ckpt_mismatch_validation:
+            ssd = prune_unexpected_extra_state_objects(ssd)
+        extra_state_keys = [k for k in ssd.keys() if "_extra_state" in k]
         if is_value_model:
             for k in list(ssd.keys()):
                 if "output_layer" in k:
                     ssd.pop(k)
+        if disable_ckpt_mismatch_validation:
+            print(
+                f"[load_mcore_dist_weights] begin model_idx={model_idx} "
+                f"is_value_model={is_value_model} overlap={os.getenv('USE_ALLTOALL_OVERLAP', '0')} "
+                f"keys={len(ssd)} extra_state_keys={len(extra_state_keys)} "
+                f"sample_extra={extra_state_keys[:3]} path={dist_weight_path}",
+                flush=True,
+            )
+        load_kwargs = {"strict": strict}
+        if disable_ckpt_mismatch_validation:
+            load_kwargs.update(
+                sharded_strategy=TorchDistLoadShardedStrategy(),
+                validate_access_integrity=False,
+            )
         if os.getenv('USE_ALLTOALL_OVERLAP', '0') == '1':
-            new_ssd = dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
+            new_ssd = dist_checkpointing.load(ssd, dist_weight_path, **load_kwargs)
+            if disable_ckpt_mismatch_validation:
+                print(
+                    f"[load_mcore_dist_weights] load_returned model_idx={model_idx} overlap=1 "
+                    f"keys={len(new_ssd)}",
+                    flush=True,
+                )
             sd = unwrap_model(model).state_dict()
+            if disable_ckpt_mismatch_validation:
+                print(f"[load_mcore_dist_weights] expert_copy begin model_idx={model_idx}", flush=True)
             for key in list(ssd.keys()):
                 if "mlp.experts.weight" in key:
                     with torch.no_grad():
                         ssd[key].data.copy_(new_ssd[key])   # param update
                         sd[key].copy_(new_ssd[key])         # tensor update
+            if disable_ckpt_mismatch_validation:
+                print(f"[load_mcore_dist_weights] expert_copy end model_idx={model_idx}", flush=True)
         else:
-            dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
-            
+            dist_checkpointing.load(ssd, dist_weight_path, **load_kwargs)
+            if disable_ckpt_mismatch_validation:
+                print(
+                    f"[load_mcore_dist_weights] load_returned model_idx={model_idx} overlap=0 keys={len(ssd)}",
+                    flush=True,
+                )
+
     return
 
 

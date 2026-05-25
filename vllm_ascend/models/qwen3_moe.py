@@ -17,7 +17,9 @@
 # Adapted from vllm/model_executor/models/qwen3_moe.py
 # This file is a part of the vllm-ascend project.
 
-from typing import Optional, Tuple
+import os
+import typing
+from typing import Iterable, Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -44,8 +46,11 @@ from vllm.model_executor.models.qwen3_moe import (Qwen3MoeAttention,
                                                   Qwen3MoeMLP, Qwen3MoeModel,
                                                   Qwen3MoeSparseMoeBlock)
 from vllm.model_executor.models.utils import (
-    PPMissingLayer, extract_layer_index,
+    AutoWeightsLoader, PPMissingLayer, extract_layer_index,
     make_empty_intermediate_tensors_factory, make_layers, maybe_prefix)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader, maybe_remap_kv_scale_name)
+from vllm.model_executor.models.utils import is_pp_missing_parameter
 
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.draft.draft_trainer import DraftTrainer, build_draft_trainer
@@ -54,11 +59,28 @@ from vllm_ascend.utils import vllm_version_is
 from vllm.forward_context import get_forward_context
 from vllm.utils.moe_stats import moe_stats
 from vllm.distributed.parallel_state import get_ep_group
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 import torch.distributed as dist
 import time
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _custom_mode1_debug_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_CUSTOM_MODE1_DEBUG", False)
+
+
+def _custom_mode1_timing_events_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_CUSTOM_MODE1_TIMING_EVENTS", False)
+
+
+def _new_npu_timing_event() -> Optional[torch.npu.Event]:
+    if not _custom_mode1_timing_events_enabled():
+        return None
+    return torch.npu.Event(enable_timing=True)
 
 
 class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
@@ -108,11 +130,12 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
 
         self.params_dtype = torch.get_default_dtype()
         self.prefix = prefix
-        # Keep pre-shrink logging focused on the MoE output path; gate and
-        # mapping summaries are too noisy for the current kernel-input check.
-        self._pre_shrink_live_gate_debug_logged = True
+        # Keep custom-only live diagnostics fully opt-in so mode=1 parity runs
+        # do not pay for extra temporary tensors on the hot path.
+        debug_enabled = _custom_mode1_debug_enabled()
+        self._pre_shrink_live_gate_debug_logged = not debug_enabled
         self._pre_shrink_live_gate_debug_remaining = 0
-        self._pre_shrink_live_mapping_debug_logged = True
+        self._pre_shrink_live_mapping_debug_logged = not debug_enabled
         self._pre_shrink_live_moe_io_debug_remaining = 0
 
     def forward(
@@ -139,7 +162,7 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
                         "lossless_zero_redundancy_preallocated_loaded", False)
             and getattr(self.experts, "loaded_weight_capacity", 0) >
             getattr(self.experts, "active_local_num_experts", 0))
-        if pre_shrink_loaded_only:
+        if pre_shrink_loaded_only and _custom_mode1_debug_enabled():
             topk_ids = self.compute_topk(router_logits, k=self.top_k)
             hidden_fp32 = hidden_states.float()
             logits_fp32 = router_logits.float()
@@ -478,10 +501,9 @@ class CustomQwen3MoeDecoderLayer(Qwen3MoeDecoderLayer):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
-        ###新增参数
-        self._attn_start = torch.npu.Event(enable_timing=True)
-        self._attn_end   = torch.npu.Event(enable_timing=True)
-        self._attn_end_moe   = torch.npu.Event(enable_timing=True)
+        self._attn_start = _new_npu_timing_event()
+        self._attn_end = _new_npu_timing_event()
+        self._attn_end_moe = _new_npu_timing_event()
         self.ep_group = get_ep_group().device_group
         self.draft_trainer: Optional[DraftTrainer] = None
 
@@ -543,6 +565,127 @@ class CustomQwen3MoeModel(Qwen3MoeModel):
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
 
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        ignore_suffixes = (".bias", "_bias", ".k_scale", "_k_scale",
+                           ".v_scale", "_v_scale", ".weight_scale",
+                           "_weight_scale", ".input_scale", "_input_scale")
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        expert_params_mapping = self.get_expert_mapping()
+        lossless_reload_modules: list[tuple[nn.Module, object]] = []
+        for module in self.modules():
+            quant_method = getattr(module, "quant_method", None)
+            invalidate_runtime = getattr(
+                quant_method,
+                "invalidate_lossless_runtime_state_for_reload",
+                None,
+            )
+            if callable(invalidate_runtime):
+                invalidated = invalidate_runtime(
+                    layer=module,
+                    reason="CustomQwen3MoeModel.load_weights",
+                )
+                if invalidated:
+                    lossless_reload_modules.append((module, quant_method))
+
+        for name, loaded_weight in weights:
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if "mlp.experts" in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                if name.endswith(ignore_suffixes) and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if name.endswith("scale"):
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                if weight_loader == default_weight_loader:
+                    weight_loader(param, loaded_weight)
+                else:
+                    weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                is_expert_weight = False
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+
+                    is_expert_weight = True
+                    name_mapped = name.replace(weight_name, param_name)
+
+                    if is_pp_missing_parameter(name_mapped, self):
+                        continue
+                    if (name_mapped.endswith(ignore_suffixes)
+                            and name_mapped not in params_dict):
+                        continue
+
+                    param = params_dict[name_mapped]
+                    weight_loader = cast(typing.Callable[..., bool],
+                                         param.weight_loader)
+                    success = weight_loader(param,
+                                            loaded_weight,
+                                            name_mapped,
+                                            shard_id=shard_id,
+                                            expert_id=expert_id,
+                                            return_success=True)
+                    if success:
+                        name = name_mapped
+                        break
+                else:
+                    if is_expert_weight:
+                        continue
+                    if name.endswith(ignore_suffixes) and name not in params_dict:
+                        continue
+                    if is_pp_missing_parameter(name, self):
+                        continue
+                    if name.endswith("kv_scale"):
+                        remapped_kv_scale_name = name.replace(
+                            ".kv_scale", ".attn.kv_scale")
+                        if remapped_kv_scale_name not in params_dict:
+                            logger.warning_once(
+                                "Found kv scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv-scale is not loaded.",
+                                name,
+                                remapped_kv_scale_name,
+                            )
+                            continue
+                        name = remapped_kv_scale_name
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        for module, quant_method in lossless_reload_modules:
+            process_after_reload = getattr(quant_method,
+                                           "process_weights_after_loading",
+                                           None)
+            if callable(process_after_reload):
+                process_after_reload(module)
+
+        return loaded_params
+
 
 class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
 
@@ -592,3 +735,56 @@ class CustomQwen3MoeForCausalLM(Qwen3MoeForCausalLM):
         self.num_moe_layers = len(self.moe_layers)
         self.num_expert_groups = 1
         self.num_shared_experts = 0
+
+    def _route_model_subtree_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> set[str]:
+        stripped_weights: list[tuple[str, torch.Tensor]] = []
+        for name, loaded_weight in weights:
+            if name.startswith("model."):
+                stripped_weights.append((name[len("model."):], loaded_weight))
+        return self.model.load_weights(stripped_weights)
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        model_subtree_weights: list[tuple[str, torch.Tensor]] = []
+
+        for name, loaded_weight in weights:
+            if name.startswith("model."):
+                model_subtree_weights.append((name, loaded_weight))
+                continue
+
+            if name == "lm_head.weight" and self.config.tie_word_embeddings:
+                # Tied embeddings are loaded through model.embed_tokens.weight.
+                loaded_params.add(name)
+                continue
+
+            if is_pp_missing_parameter(name, self):
+                continue
+
+            if name.endswith("kv_scale"):
+                remapped_kv_scale_name = name.replace(".kv_scale",
+                                                      ".attn.kv_scale")
+                if remapped_kv_scale_name not in params_dict:
+                    logger.warning_once(
+                        "Found kv scale in the checkpoint (e.g. %s), but not found the expected name in the model (e.g. %s). kv-scale is not loaded.",
+                        name,
+                        remapped_kv_scale_name,
+                    )
+                    continue
+                name = remapped_kv_scale_name
+
+            if name not in params_dict:
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        loaded_params.update(self._route_model_subtree_weights(model_subtree_weights))
+        return loaded_params
