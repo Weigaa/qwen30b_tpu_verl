@@ -22,6 +22,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+import os
 from typing import Any, Optional
 
 import torch
@@ -34,6 +35,43 @@ from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.moe.comm_utils import (_gather_along_first_dim,
                                             async_all_to_all)
 from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _log_mc2_memory(tag: str, layer_idx: int, ep_world_size: int,
+                    ep_rank_id: int) -> None:
+    if not _env_flag("VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG", "0"):
+        return
+    if layer_idx != 0 and not _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG_ALL", "0"):
+        return
+    try:
+        free_bytes, total_bytes = torch.npu.mem_get_info()
+        stats = torch_npu.npu.memory_stats()
+        torch_current = int(stats.get("allocated_bytes.all.current", 0))
+        torch_reserved = int(stats.get("reserved_bytes.all.current", 0))
+        total_allocated = int(total_bytes - free_bytes)
+        non_torch = max(total_allocated - torch_current, 0)
+        logger.info(
+            "MC2 memory: tag=%s layer=%s ep_world_size=%s ep_rank=%s "
+            "free_bytes=%s total_bytes=%s torch_current=%s "
+            "torch_reserved=%s non_torch=%s total_allocated=%s",
+            tag,
+            layer_idx,
+            ep_world_size,
+            ep_rank_id,
+            free_bytes,
+            total_bytes,
+            torch_current,
+            torch_reserved,
+            non_torch,
+            total_allocated,
+        )
+    except Exception as exc:
+        logger.warning("MC2 memory logging failed at %s: %s", tag, exc)
 
 
 class MoETokenDispatcher(ABC):
@@ -91,13 +129,14 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        device_group = get_mc2_group().device_group
+        mc2_group = get_mc2_group()
+        device_group = mc2_group.device_group
         # TODO: Try local_rank = ep_group.rank_in_group
         local_rank = torch.distributed.get_rank(group=device_group)
         backend = device_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
-        self.ep_rank_id = get_mc2_group().rank_in_group
-        self.ep_world_size = get_mc2_group().world_size
+        self.ep_rank_id = mc2_group.rank_in_group
+        self.ep_world_size = mc2_group.world_size
         self.enable_dispatch_v2 = hasattr(torch_npu,
                                           "npu_moe_distribute_dispatch_v2")
         self.need_extra_args = (
@@ -115,7 +154,23 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.shared_experts = None
         self.mc2_mask = None
         self.with_quant = False
-        self.expert_token_nums_type = 0
+        # Align old custom MC2 dispatch_v2 with the native/torchair default:
+        # use per-expert token counts instead of cumulative counts.
+        self.expert_token_nums_type = 1
+        if _env_flag("VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG", "0"):
+            logger.info(
+                "MC2 dispatcher init: dispatcher_id=%s ranks=%s "
+                "ep_world_size=%s ep_rank=%s local_rank=%s "
+                "expert_token_nums_type=%s dispatch_v2=%s a3_extra_args=%s",
+                id(self),
+                tuple(int(rank) for rank in getattr(mc2_group, "ranks", [])),
+                self.ep_world_size,
+                self.ep_rank_id,
+                local_rank,
+                self.expert_token_nums_type,
+                self.enable_dispatch_v2,
+                self.a3_need_extra_args,
+            )
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -182,6 +237,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                        with_quant: bool = False):
         self.with_quant = with_quant
         self.expert_map = expert_map
+        if log2phy is not None:
+            topk_ids = log2phy[topk_ids]
         self.topk_ids = topk_ids
         self.topk_weights = topk_weights
         self.shared_experts = shared_experts
@@ -198,13 +255,51 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                     f"topk_rows={topk_ids.shape[0]}")
         self.mc2_mask = mc2_mask
 
+        forward_context = get_forward_context()
+        debug_info = getattr(forward_context, "elastic_debug_info", None)
+        layer_idx = -1
+        if debug_info is not None:
+            try:
+                layer_idx = int(debug_info.get("layer_idx", -1))
+            except Exception:
+                layer_idx = -1
+        if debug_info is not None and debug_info.get("layer_idx", -1) == 0:
+            active_mask_count = (
+                int(torch.count_nonzero(self.mc2_mask).item())
+                if self.mc2_mask is not None else -1)
+            logger.info(
+                "MC2 dispatch args: layer=%s ep_world_size=%s ep_rank=%s "
+                "hidden_tokens=%s topk_shape=%s moe_expert_num=%s "
+                "dispatcher_num_experts=%s expert_token_nums_type=%s "
+                "active_mask_count=%s topk_min=%s topk_max=%s topk_unique=%s",
+                debug_info.get("layer_idx", -1),
+                self.ep_world_size,
+                self.ep_rank_id,
+                int(hidden_states.shape[0]),
+                tuple(topk_ids.shape),
+                int(self.get_dispatch_mc2_kwargs(hidden_states, topk_weights,
+                                                 topk_ids, expert_map,
+                                                 global_redundant_expert_num)
+                    ["moe_expert_num"]),
+                int(getattr(self, "num_experts", -1)),
+                int(getattr(self, "expert_token_nums_type", -1)),
+                active_mask_count,
+                int(topk_ids.min().item()) if topk_ids.numel() > 0 else -1,
+                int(topk_ids.max().item()) if topk_ids.numel() > 0 else -1,
+                int(torch.unique(topk_ids).numel()) if topk_ids.numel() > 0 else 0,
+            )
+
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(hidden_states, topk_weights,
                                                   topk_ids, expert_map,
                                                   global_redundant_expert_num)
+        _log_mc2_memory("before_dispatch", layer_idx, self.ep_world_size,
+                        self.ep_rank_id)
         self.output = torch_npu.npu_moe_distribute_dispatch_v2(
             **kwargs_mc2
         ) if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
             **kwargs_mc2)
+        _log_mc2_memory("after_dispatch_submit", layer_idx, self.ep_world_size,
+                        self.ep_rank_id)
         # comm_stream.wait_stream(torch.npu.current_stream())
         expand_x, dynamic_scale, self.assist_info_for_combine, \
             expert_token_nums, self.ep_recv_counts = self.output[0:5]
@@ -292,10 +387,14 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                       hidden_states: torch.Tensor,
                       bias: torch.Tensor = None):
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states)
+        _log_mc2_memory("before_combine", -1, self.ep_world_size,
+                        self.ep_rank_id)
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(
             **kwargs_mc2
         ) if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_combine(
             **kwargs_mc2)
+        _log_mc2_memory("after_combine_submit", -1, self.ep_world_size,
+                        self.ep_rank_id)
 
         # these values are no longer used, so they need to be set to None for memory release.
         self.output = None
@@ -369,7 +468,16 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher):
             ), "Only support topk=1 when `apply_router_weight_on_input` is True"
             hidden_states = hidden_states * \
                 topk_weights.to(hidden_states.dtype)
-        if expert_map is not None:
+        if log2phy is not None:
+            topk_ids = log2phy[topk_ids]
+            global_num_experts = len(log2phy)
+            first_expert_idx = get_ep_group(
+            ).rank_in_group * self.num_experts_local
+            last_expert_idx = first_expert_idx + self.num_experts_local
+            mask = ((topk_ids >= first_expert_idx) &
+                    (topk_ids < last_expert_idx))
+            self.topk_weights = topk_weights * mask
+        elif expert_map is not None:
             global_num_experts = len(expert_map)
             mask = (expert_map[topk_ids] != -1)
             self.topk_weights = topk_weights * mask
@@ -753,9 +861,28 @@ class TokenDispatcherWithAll2AllV(MoETokenDispatcher):
 
     def _should_use_host_metadata_gather(self) -> bool:
         forward_context = get_forward_context()
-        return bool(
+        force_host = bool(
             getattr(forward_context, "hybrid_force_host_alltoall_metadata",
                     False))
+        if force_host:
+            debug_info = getattr(forward_context, "elastic_debug_info", None)
+            if debug_info is not None and not debug_info.get(
+                    "_alltoall_host_metadata_logged", False):
+                logger.info(
+                    "AllToAll metadata gather using host path: %s rank=%s "
+                    "ep_size=%s stage=%s num_experts=%s "
+                    "num_local_experts=%s",
+                    self._debug_context(),
+                    self.ep_rank,
+                    self.ep_size,
+                    getattr(forward_context, "hybrid_stage_active_ranks", None),
+                    self.num_experts,
+                    self.num_local_experts,
+                )
+                debug_info["_alltoall_host_metadata_logged"] = True
+            return True
+        return bool(
+            force_host)
 
     def _gather_global_tokens_per_expert_host(
             self, num_local_tokens_per_expert: torch.Tensor) -> torch.Tensor:

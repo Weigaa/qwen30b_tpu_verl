@@ -17,6 +17,7 @@
 # Adapted from vllm/model_executor/models/qwen3_moe.py
 # This file is a part of the vllm-ascend project.
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -59,6 +60,18 @@ import torch.distributed as dist
 import time
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _custom_mode1_debug_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_CUSTOM_MODE1_DEBUG", "0")
+
+
+def _custom_mode1_timing_events_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_CUSTOM_MODE1_TIMING_EVENTS", "0")
 
 
 class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
@@ -132,7 +145,9 @@ class CustomSparseMoeBlock(Qwen3MoeSparseMoeBlock):
         router_logits, _ = self.gate(hidden_states)
         forward_context = get_forward_context()
         pre_shrink_loaded_only = bool(
-            not getattr(forward_context, "in_profile_run", False)
+            (_custom_mode1_debug_enabled()
+             or _custom_mode1_timing_events_enabled())
+            and not getattr(forward_context, "in_profile_run", False)
             and not is_dummy
             and self.layer_idx == 0
             and getattr(self.experts,

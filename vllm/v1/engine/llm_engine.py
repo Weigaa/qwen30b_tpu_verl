@@ -283,7 +283,7 @@ class LLMEngine:
                                              dp_world_size: int) -> bool:
         if num_active_ranks != 1 or dp_world_size != 2:
             return False
-        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE not in (2, 3):
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE not in (2, 3, 4):
             return False
         min_compute_group_size = (
             self._get_configured_elastic_min_compute_group_size())

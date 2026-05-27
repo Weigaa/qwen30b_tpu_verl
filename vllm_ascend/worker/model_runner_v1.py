@@ -62,6 +62,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.interfaces import supports_transcription
 from vllm.model_executor.models.interfaces_base import (
     VllmModelForPooling, is_pooling_model, is_text_generation_model)
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.multimodal.inputs import MultiModalKwargsItem, PlaceholderRange
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.pooling_params import PoolingParams
@@ -159,6 +160,38 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
 
 
+def _custom_mode1_kv_diag_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG", "0")
+
+
+def _log_custom_mode1_kv_memory(tag: str) -> None:
+    if not _custom_mode1_kv_diag_enabled():
+        return
+    if int(getattr(envs_ascend, "VLLM_ASCEND_ELASTIC_EXECUTION_MODE", 0)) != 1:
+        return
+    try:
+        free_bytes, total_bytes = torch.npu.mem_get_info()
+        stats = torch_npu.npu.memory_stats()
+        torch_current = int(stats.get("allocated_bytes.all.current", 0))
+        torch_reserved = int(stats.get("reserved_bytes.all.current", 0))
+        total_allocated = int(total_bytes - free_bytes)
+        non_torch = max(total_allocated - torch_current, 0)
+        logger.info(
+            "Custom mode=1 KV memory: tag=%s free_bytes=%s total_bytes=%s "
+            "torch_current=%s torch_reserved=%s non_torch=%s total_allocated=%s",
+            tag,
+            free_bytes,
+            total_bytes,
+            torch_current,
+            torch_reserved,
+            non_torch,
+            total_allocated,
+        )
+    except Exception as exc:
+        logger.warning("Custom mode=1 KV memory logging failed at %s: %s",
+                       tag, exc)
+
+
 def _dummy_waste_rank() -> int:
     if dist.is_available() and dist.is_initialized():
         try:
@@ -166,6 +199,27 @@ def _dummy_waste_rank() -> int:
         except Exception:
             pass
     return -1
+
+
+def _module_is_custom_mode1_floor8(module: Any) -> bool:
+    get_floor = getattr(module, "_get_configured_elastic_min_compute_group_size",
+                        None)
+    configured_floor = None
+    if callable(get_floor):
+        try:
+            configured_floor = get_floor()
+        except Exception:
+            configured_floor = None
+    if configured_floor is None:
+        configured_floor = int(
+            getattr(envs_ascend,
+                    "VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", 0) or 0)
+    return (getattr(module, "elastic_execution_mode", 0) == 1
+            and int(configured_floor or 0) == 8)
+
+
+def _module_has_mode1_native_parity_ready(module: Any) -> bool:
+    return bool(getattr(module, "lossless_mode1_native_parity_ready", False))
 
 
 def _dummy_waste_sync() -> None:
@@ -310,7 +364,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.prefetch_stream = torch.npu.Stream(device=device)
         else:
             self.prefetch_stream = None
-        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 3:
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (3, 4):
             self.moe_prefetch_stream = torch.npu.Stream(device=device)
         else:
             self.moe_prefetch_stream = None
@@ -870,21 +924,30 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if self.dp_size == 1:
             return num_tokens, None, with_prefill, enable_dbo
 
+        use_cpu_dp_metadata_sync = (
+            int(getattr(envs_ascend, "VLLM_ASCEND_ELASTIC_EXECUTION_MODE", 0))
+            == 4
+            and _env_flag("VLLM_ASCEND_MODE4_CPU_DP_METADATA_SYNC", "1"))
+        sync_device = "cpu" if use_cpu_dp_metadata_sync else "npu"
+        sync_group = (get_dp_group().cpu_group
+                      if use_cpu_dp_metadata_sync else
+                      get_dp_group().device_group)
+
         # Sync num_tokens, with_prefill, enable_dbo across dp ranks
         num_tokens_tensor = torch.tensor([
             num_tokens if i == self.dp_rank else 0 for i in range(self.dp_size)
         ],
                                          dtype=torch.int32,
-                                         device="npu")
+                                         device=sync_device)
 
         flags_tensor = torch.tensor(
             [int(with_prefill), int(not enable_dbo)],
             dtype=torch.int32,
-            device="npu")
+            device=sync_device)
 
         packed_tensor = torch.cat([num_tokens_tensor, flags_tensor])
 
-        dist.all_reduce(packed_tensor, group=get_dp_group().device_group)
+        dist.all_reduce(packed_tensor, group=sync_group)
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[:-2]
@@ -898,7 +961,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Create a tensor for num_tokens_after_padding
         num_tokens_after_padding = torch.tensor([max_tokens_across_dp] *
                                                 self.dp_size,
-                                                device="npu",
+                                                device=sync_device,
                                                 dtype=torch.int32)
 
         return max_tokens_across_dp, num_tokens_after_padding, global_with_prefill, global_enable_dbo
@@ -934,6 +997,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if self.parallel_config.enable_expert_parallel:
             current_ep_size = get_ep_group().world_size
 
+        runtime_num_experts = None
+        model = self.get_model()
+        for module in model.modules():
+            if getattr(module, "layer_idx", -1) == 0 and hasattr(
+                    getattr(module, "moe_config", None), "num_experts"):
+                runtime_num_experts = int(module.moe_config.num_experts)
+                break
+
         signature = (
             local_num_reqs,
             local_num_scheduled_tokens,
@@ -947,6 +1018,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             str(attn_state),
             str(moe_comm_type),
             int(current_ep_size),
+            runtime_num_experts,
         )
         if getattr(self, "_last_elastic_forward_fingerprint", None) == signature:
             return
@@ -959,7 +1031,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             "synced_input_tokens=%s synced_tokens_across_dp=%s "
             "local_with_prefill=%s global_with_prefill=%s "
             "local_enable_dbo=%s global_enable_dbo=%s "
-            "attn_state=%s moe_comm_type=%s",
+            "attn_state=%s moe_comm_type=%s runtime_num_experts=%s",
             global_rank,
             self.dp_rank,
             current_ep_size,
@@ -974,6 +1046,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             global_enable_dbo,
             attn_state,
             moe_comm_type,
+            runtime_num_experts,
         )
 
     def _check_dbo_is_valid(self, query_lens: torch.Tensor,
@@ -2665,12 +2738,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         force_attention: bool = False,
         uniform_decode: bool = False,
+        num_actual_tokens_override: Optional[int] = None,
     ) -> torch.Tensor:
         # only support eager mode and piecewise graph now
         assert aclgraph_runtime_mode in {
             CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL
         }
         before_num_tokens = num_tokens
+        num_actual_tokens = (before_num_tokens if num_actual_tokens_override
+                             is None else int(num_actual_tokens_override))
         #单独处理长尾阶段的dummy_run
         is_long_tail = False
         if num_tokens == 1:
@@ -2862,7 +2938,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     in_profile_run=self.in_profile_run,
                     reserved_mc2_mask=self.reserved_mc2_mask,
                     moe_comm_type=moe_comm_type,
-                    num_actual_tokens=0,
+                    num_actual_tokens=max(0, min(num_actual_tokens, num_tokens)),
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     prefetch_stream=self.prefetch_stream,
@@ -3074,6 +3150,611 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         max_task = max(output_size.items(), key=lambda x: x[1])[0]
         return self._dummy_pooler_run_task(hidden_states, max_task)
+
+    @torch.inference_mode()
+    def warmup_mode1_parity_moe_dispatch_only(self, num_tokens: int) -> None:
+        """Warm up old custom mode=1 MC2 MoE dispatch without attention/KV.
+
+        The generic `_dummy_run()` also executes attention and can move the
+        second-step failure from MC2 dispatch into paged attention. This helper
+        primes the old custom mode=1 MoE path directly, using real non-dummy
+        layer MLP calls so HCCL dispatch resources are created with the same
+        MC2 semantics as live decode while avoiding attention/KV.
+        """
+        if num_tokens <= 0:
+            logger.info(
+                "Mode1 parity MoE-only warmup skipped: reason=no_tokens tokens=%s",
+                num_tokens,
+            )
+            return
+        model = self.get_model()
+        if model is None:
+            logger.info(
+                "Mode1 parity MoE-only warmup skipped: reason=no_model")
+            return
+
+        warm_all_layers = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_WARMUP_ALL_LAYERS", "0")
+        warmup_is_dummy = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_WARMUP_IS_DUMMY", "0")
+        sync_each_layer = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_WARMUP_SYNC_EACH_LAYER", "1")
+        target_mlps = []
+        modules_with_experts = 0
+        parity_ready_experts = 0
+        for mlp in model.modules():
+            experts = getattr(mlp, "experts", None)
+            if experts is None:
+                continue
+            modules_with_experts += 1
+            if (_module_is_custom_mode1_floor8(experts)
+                    and _module_has_mode1_native_parity_ready(experts)):
+                parity_ready_experts += 1
+                target_mlps.append(mlp)
+                if not warm_all_layers:
+                    break
+
+        if not target_mlps:
+            logger.info(
+                "Mode1 parity MoE-only warmup skipped: reason=no_target_mlps "
+                "model_type=%s modules_with_experts=%s parity_ready_experts=%s "
+                "has_moe_layers=%s",
+                type(model).__name__,
+                modules_with_experts,
+                parity_ready_experts,
+                hasattr(model, "moe_layers"),
+            )
+            return
+
+        first_experts = getattr(target_mlps[0], "experts", None)
+        hidden_size = int(
+            getattr(target_mlps[0], "hidden_size",
+                    getattr(first_experts, "hidden_size", 0)))
+        if hidden_size <= 0:
+            logger.info(
+                "Mode1 parity MoE-only warmup skipped: reason=no_hidden_size "
+                "model_type=%s first_mlp_type=%s first_experts_type=%s",
+                type(model).__name__,
+                type(target_mlps[0]).__name__,
+                type(first_experts).__name__ if first_experts is not None else None,
+            )
+            return
+
+        num_tokens = int(num_tokens)
+        num_tokens_across_dp = torch.full(
+            (self.dp_size, ), num_tokens, dtype=torch.int64)
+        moe_comm_type = self._select_moe_comm_method(num_tokens, False)
+
+        hidden_states = torch.zeros(
+            (num_tokens, hidden_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        rank = dist.get_rank() if dist.is_initialized() else self.dp_rank
+        logger.info(
+            "Mode1 parity MoE-only warmup start: rank=%s tokens=%s "
+            "layers=%s warm_all_layers=%s is_dummy=%s sync_each_layer=%s "
+            "moe_comm_type=%s model_type=%s hidden_size=%s",
+            rank,
+            num_tokens,
+            len(target_mlps),
+            warm_all_layers,
+            warmup_is_dummy,
+            sync_each_layer,
+            moe_comm_type,
+            type(model).__name__,
+            hidden_size,
+        )
+
+        with set_ascend_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=False,
+                reserved_mc2_mask=self.reserved_mc2_mask,
+                moe_comm_type=moe_comm_type,
+                num_actual_tokens=num_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=num_tokens, uniform_decode=False),
+                prefetch_stream=self.prefetch_stream,
+                moe_prefetch_stream=self.moe_prefetch_stream,
+                model_instance=self.model):
+            for warmup_idx, target_mlp in enumerate(target_mlps):
+                experts = getattr(target_mlp, "experts", None)
+                layer_idx = int(getattr(experts, "layer_idx", warmup_idx))
+                if warmup_idx == 0 or warmup_idx == len(target_mlps) - 1:
+                    logger.info(
+                        "Mode1 parity MoE-only warmup layer: rank=%s "
+                        "warmup_idx=%s layer=%s tokens=%s experts_type=%s "
+                        "ep_size=%s runtime_num_experts=%s",
+                        rank,
+                        warmup_idx,
+                        layer_idx,
+                        num_tokens,
+                        type(experts).__name__ if experts is not None else None,
+                        int(getattr(getattr(experts, "moe_parallel_config", None),
+                                    "ep_size", -1)),
+                        int(getattr(getattr(experts, "moe_config", None),
+                                    "num_experts", -1)),
+                    )
+                try:
+                    output = target_mlp(hidden_states,
+                                        is_dummy=warmup_is_dummy)
+                    del output
+                    if sync_each_layer and torch.npu.is_available():
+                        torch.npu.synchronize()
+                except Exception:
+                    logger.exception(
+                        "Mode1 parity MoE-only warmup failed: rank=%s "
+                        "warmup_idx=%s layer=%s tokens=%s is_dummy=%s",
+                        rank,
+                        warmup_idx,
+                        layer_idx,
+                        num_tokens,
+                        warmup_is_dummy,
+                    )
+                    raise
+
+        if torch.npu.is_available():
+            torch.npu.synchronize()
+        logger.info(
+            "Mode1 parity MoE-only warmup complete: rank=%s tokens=%s "
+            "layers_warmed=%s is_dummy=%s",
+            rank,
+            num_tokens,
+            len(target_mlps),
+            warmup_is_dummy,
+        )
+
+    @torch.inference_mode()
+    def warmup_mode1_parity_mc2_dispatcher_only(self,
+                                                num_tokens: int) -> None:
+        """Materialize old custom mode=1 MC2 dispatch resources after restore.
+
+        This is deliberately narrower than `warmup_mode1_parity_moe_dispatch_only`:
+        it calls the custom token dispatcher/combine pair directly and never runs
+        expert MLP kernels. Restore happens while full-world memory is abundant;
+        priming MC2 here prevents the same HCCL dispatch resource from being
+        lazily allocated during the next live decode after KV cache is resident.
+        """
+        if num_tokens <= 0:
+            logger.info(
+                "Mode1 parity MC2 dispatcher-only warmup skipped: "
+                "reason=no_tokens tokens=%s",
+                num_tokens,
+            )
+            return
+        model = self.get_model()
+        if model is None:
+            logger.info(
+                "Mode1 parity MC2 dispatcher-only warmup skipped: reason=no_model")
+            return
+
+        target_experts = None
+        modules_with_experts = 0
+        parity_ready_experts = 0
+        for mlp in model.modules():
+            experts = getattr(mlp, "experts", None)
+            if experts is None:
+                continue
+            modules_with_experts += 1
+            if (_module_is_custom_mode1_floor8(experts)
+                    and _module_has_mode1_native_parity_ready(experts)):
+                parity_ready_experts += 1
+                target_experts = experts
+                break
+
+        if target_experts is None:
+            logger.info(
+                "Mode1 parity MC2 dispatcher-only warmup skipped: "
+                "reason=no_target_experts model_type=%s modules_with_experts=%s "
+                "parity_ready_experts=%s",
+                type(model).__name__,
+                modules_with_experts,
+                parity_ready_experts,
+            )
+            return
+
+        hidden_size = int(getattr(target_experts, "hidden_size", 0))
+        top_k = int(getattr(target_experts, "top_k", 0))
+        moe_config = getattr(target_experts, "moe_config", None)
+        dispatch_num_experts = int(
+            max(
+                getattr(moe_config, "num_experts", 0) if moe_config else 0,
+                getattr(target_experts, "num_experts", 0),
+                getattr(target_experts, "global_num_experts", 0),
+            ))
+        if hidden_size <= 0 or top_k <= 0 or dispatch_num_experts <= 0:
+            logger.info(
+                "Mode1 parity MC2 dispatcher-only warmup skipped: "
+                "reason=invalid_shape hidden_size=%s top_k=%s "
+                "dispatch_num_experts=%s experts_type=%s",
+                hidden_size,
+                top_k,
+                dispatch_num_experts,
+                type(target_experts).__name__,
+            )
+            return
+
+        num_tokens = int(num_tokens)
+        moe_comm_type = self._select_moe_comm_method(num_tokens, False)
+        if moe_comm_type != MoECommType.MC2:
+            logger.info(
+                "Mode1 parity MC2 dispatcher-only warmup skipped: "
+                "reason=not_mc2 tokens=%s selected=%s",
+                num_tokens,
+                moe_comm_type,
+            )
+            return
+
+        hidden_states = torch.zeros(
+            (num_tokens, hidden_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        topk_ids = (
+            torch.arange(num_tokens * top_k,
+                         dtype=torch.int32,
+                         device=self.device) % dispatch_num_experts).reshape(
+                             num_tokens, top_k).contiguous()
+        topk_weights = torch.full(
+            (num_tokens, top_k),
+            1.0 / float(top_k),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        row_idx = (torch.arange(0,
+                                num_tokens * top_k,
+                                dtype=torch.int32,
+                                device=self.device).view(
+                                    top_k, -1).permute(1, 0).contiguous())
+        expert_map = getattr(target_experts, "expert_map", None)
+        if expert_map is None:
+            expert_map = torch.arange(dispatch_num_experts,
+                                      dtype=torch.int32,
+                                      device=self.device)
+
+        num_tokens_across_dp = torch.full(
+            (self.dp_size, ), num_tokens, dtype=torch.int64)
+        rank = dist.get_rank() if dist.is_initialized() else self.dp_rank
+        logger.info(
+            "Mode1 parity MC2 dispatcher-only warmup start: rank=%s tokens=%s "
+            "hidden_size=%s top_k=%s dispatch_num_experts=%s ep_size=%s "
+            "layer=%s",
+            rank,
+            num_tokens,
+            hidden_size,
+            top_k,
+            dispatch_num_experts,
+            int(getattr(getattr(target_experts, "moe_parallel_config", None),
+                        "ep_size", -1)),
+            int(getattr(target_experts, "layer_idx", -1)),
+        )
+
+        old_num_experts = None
+        old_top_k = None
+        old_expert_token_nums_type = None
+        with set_ascend_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=False,
+                reserved_mc2_mask=self.reserved_mc2_mask,
+                moe_comm_type=moe_comm_type,
+                num_actual_tokens=num_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=num_tokens, uniform_decode=False),
+                prefetch_stream=self.prefetch_stream,
+                moe_prefetch_stream=self.moe_prefetch_stream,
+                model_instance=self.model):
+            forward_context = get_forward_context()
+            moe_comm_method = getattr(forward_context, "moe_comm_method", None)
+            if moe_comm_method is None:
+                raise RuntimeError(
+                    "Mode1 parity MC2 dispatcher-only warmup missing "
+                    "moe_comm_method.")
+            token_dispatcher = getattr(moe_comm_method, "token_dispatcher",
+                                       None)
+            if token_dispatcher is None:
+                raise RuntimeError(
+                    "Mode1 parity MC2 dispatcher-only warmup missing "
+                    "token_dispatcher.")
+            forward_context.elastic_debug_info = {
+                "layer_idx": int(getattr(target_experts, "layer_idx", -1)),
+                "phase": "post_restore_mc2_dispatcher_only_warmup",
+            }
+            old_num_experts = int(getattr(token_dispatcher, "num_experts", 0))
+            old_top_k = int(getattr(token_dispatcher, "top_k", 0))
+            old_expert_token_nums_type = int(
+                getattr(token_dispatcher, "expert_token_nums_type", 0))
+            token_dispatcher.num_experts = dispatch_num_experts
+            token_dispatcher.top_k = top_k
+            if hasattr(token_dispatcher, "expert_token_nums_type"):
+                token_dispatcher.expert_token_nums_type = 1
+            try:
+                dispatch_results = token_dispatcher.token_dispatch(
+                    hidden_states=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    row_idx=row_idx,
+                    expert_map=expert_map,
+                    log2phy=None,
+                    global_redundant_expert_num=0,
+                    shared_experts=None,
+                    quantized_x_for_share=None,
+                    dynamic_scale_for_share=None,
+                    mc2_mask=getattr(forward_context, "mc2_mask", None),
+                    apply_router_weight_on_input=False,
+                    with_quant=False)
+                combined = token_dispatcher.token_combine(
+                    dispatch_results["hidden_states"])
+                del combined, dispatch_results
+            finally:
+                token_dispatcher.num_experts = old_num_experts
+                token_dispatcher.top_k = old_top_k
+                if hasattr(token_dispatcher, "expert_token_nums_type"):
+                    token_dispatcher.expert_token_nums_type = (
+                        old_expert_token_nums_type)
+                for attr in (
+                        "output",
+                        "assist_info_for_combine",
+                        "ep_recv_counts",
+                        "topk_ids",
+                        "topk_weights",
+                        "mc2_mask",
+                        "expert_map",
+                        "shared_experts",
+                        "shared_act",
+                ):
+                    if hasattr(token_dispatcher, attr):
+                        setattr(token_dispatcher, attr, None)
+
+        del hidden_states, topk_ids, topk_weights, row_idx, expert_map
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        logger.info(
+            "Mode1 parity MC2 dispatcher-only warmup complete: rank=%s "
+            "tokens=%s dispatch_num_experts=%s",
+            rank,
+            num_tokens,
+            dispatch_num_experts,
+        )
+
+    @torch.inference_mode()
+    def warmup_mode1_parity_alltoall_dispatcher_only(
+            self,
+            num_tokens: int,
+            max_tokens_across_dp: Optional[int] = None) -> None:
+        """Materialize old custom mode=1 ALLTOALL-V payload resources.
+
+        After elastic restore, custom mode=1 rebuilds the full EP communicator
+        before the next rollout step. Native survives at the same KV budget
+        because this dispatcher state is already stable by the time KV is
+        resident. This warmup exercises the old custom ALLTOALL-V
+        token_dispatch/token_combine pair directly with a small shape while
+        restore memory is still abundant, without running attention, expert MLP,
+        or any native/common fused-MoE path.
+        """
+        if num_tokens <= 0:
+            logger.info(
+                "Mode1 parity ALLTOALL dispatcher-only warmup skipped: "
+                "reason=no_tokens tokens=%s max_tokens_across_dp=%s",
+                num_tokens,
+                max_tokens_across_dp,
+            )
+            return
+        model = self.get_model()
+        if model is None:
+            logger.info(
+                "Mode1 parity ALLTOALL dispatcher-only warmup skipped: reason=no_model")
+            return
+
+        target_experts = None
+        modules_with_experts = 0
+        parity_ready_experts = 0
+        for mlp in model.modules():
+            experts = getattr(mlp, "experts", None)
+            if experts is None:
+                continue
+            modules_with_experts += 1
+            if (_module_is_custom_mode1_floor8(experts)
+                    and _module_has_mode1_native_parity_ready(experts)):
+                parity_ready_experts += 1
+                target_experts = experts
+                break
+
+        if target_experts is None:
+            logger.info(
+                "Mode1 parity ALLTOALL dispatcher-only warmup skipped: "
+                "reason=no_target_experts model_type=%s modules_with_experts=%s "
+                "parity_ready_experts=%s",
+                type(model).__name__,
+                modules_with_experts,
+                parity_ready_experts,
+            )
+            return
+
+        hidden_size = int(getattr(target_experts, "hidden_size", 0))
+        top_k = int(getattr(target_experts, "top_k", 0))
+        moe_config = getattr(target_experts, "moe_config", None)
+        dispatch_num_experts = int(
+            max(
+                getattr(moe_config, "num_experts", 0) if moe_config else 0,
+                getattr(target_experts, "num_experts", 0),
+                getattr(target_experts, "global_num_experts", 0),
+            ))
+        if hidden_size <= 0 or top_k <= 0 or dispatch_num_experts <= 0:
+            logger.info(
+                "Mode1 parity ALLTOALL dispatcher-only warmup skipped: "
+                "reason=invalid_shape hidden_size=%s top_k=%s "
+                "dispatch_num_experts=%s experts_type=%s",
+                hidden_size,
+                top_k,
+                dispatch_num_experts,
+                type(target_experts).__name__,
+            )
+            return
+
+        num_tokens = int(num_tokens)
+        if max_tokens_across_dp is None:
+            max_tokens_across_dp = num_tokens
+        max_tokens_across_dp = max(int(max_tokens_across_dp), num_tokens)
+        moe_comm_type = self._select_moe_comm_method(max_tokens_across_dp, True)
+        if moe_comm_type != MoECommType.ALLTOALL:
+            logger.info(
+                "Mode1 parity ALLTOALL dispatcher-only warmup skipped: "
+                "reason=not_alltoall tokens=%s max_tokens_across_dp=%s "
+                "selected=%s",
+                num_tokens,
+                max_tokens_across_dp,
+                moe_comm_type,
+            )
+            return
+
+        hidden_states = torch.zeros(
+            (num_tokens, hidden_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        topk_ids = (
+            torch.arange(num_tokens * top_k,
+                         dtype=torch.int32,
+                         device=self.device) % dispatch_num_experts).reshape(
+                             num_tokens, top_k).contiguous()
+        topk_weights = torch.full(
+            (num_tokens, top_k),
+            1.0 / float(top_k),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        row_idx = (torch.arange(0,
+                                num_tokens * top_k,
+                                dtype=torch.int32,
+                                device=self.device).view(
+                                    top_k, -1).permute(1, 0).contiguous())
+        expert_map = getattr(target_experts, "expert_map", None)
+        if expert_map is None:
+            expert_map = torch.arange(dispatch_num_experts,
+                                      dtype=torch.int32,
+                                      device=self.device)
+
+        num_tokens_across_dp = torch.full(
+            (self.dp_size, ), max_tokens_across_dp, dtype=torch.int64)
+        rank = dist.get_rank() if dist.is_initialized() else self.dp_rank
+        logger.info(
+            "Mode1 parity ALLTOALL dispatcher-only warmup start: rank=%s "
+            "tokens=%s max_tokens_across_dp=%s hidden_size=%s top_k=%s "
+            "dispatch_num_experts=%s ep_size=%s layer=%s",
+            rank,
+            num_tokens,
+            max_tokens_across_dp,
+            hidden_size,
+            top_k,
+            dispatch_num_experts,
+            int(getattr(getattr(target_experts, "moe_parallel_config", None),
+                        "ep_size", -1)),
+            int(getattr(target_experts, "layer_idx", -1)),
+        )
+
+        old_num_experts = None
+        old_top_k = None
+        with set_ascend_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=True,
+                reserved_mc2_mask=None,
+                moe_comm_type=moe_comm_type,
+                num_actual_tokens=num_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=num_tokens, uniform_decode=False),
+                prefetch_stream=self.prefetch_stream,
+                moe_prefetch_stream=self.moe_prefetch_stream,
+                model_instance=self.model):
+            forward_context = get_forward_context()
+            moe_comm_method = getattr(forward_context, "moe_comm_method", None)
+            if moe_comm_method is None:
+                raise RuntimeError(
+                    "Mode1 parity ALLTOALL dispatcher-only warmup missing "
+                    "moe_comm_method.")
+            token_dispatcher = getattr(moe_comm_method, "token_dispatcher",
+                                       None)
+            if token_dispatcher is None:
+                raise RuntimeError(
+                    "Mode1 parity ALLTOALL dispatcher-only warmup missing "
+                    "token_dispatcher.")
+            forward_context.elastic_debug_info = {
+                "layer_idx": int(getattr(target_experts, "layer_idx", -1)),
+                "phase": "post_restore_alltoall_dispatcher_only_warmup",
+                "max_tokens_across_dp": max_tokens_across_dp,
+            }
+            forward_context.hybrid_force_host_alltoall_metadata = _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_ALLTOALL_HOST_METADATA", "1")
+            forward_context.hybrid_stage_active_ranks = int(
+                getattr(getattr(target_experts, "moe_parallel_config", None),
+                        "ep_size", self.dp_size))
+            old_num_experts = int(getattr(token_dispatcher, "num_experts", 0))
+            old_top_k = int(getattr(token_dispatcher, "top_k", 0))
+            token_dispatcher.num_experts = dispatch_num_experts
+            token_dispatcher.top_k = top_k
+            try:
+                dispatch_results = token_dispatcher.token_dispatch(
+                    hidden_states=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    row_idx=row_idx,
+                    expert_map=expert_map,
+                    log2phy=None,
+                    global_redundant_expert_num=0,
+                    shared_experts=None,
+                    quantized_x_for_share=None,
+                    dynamic_scale_for_share=None,
+                    mc2_mask=None,
+                    apply_router_weight_on_input=False,
+                    with_quant=False)
+                combined = token_dispatcher.token_combine(
+                    dispatch_results["hidden_states"])
+                del combined, dispatch_results
+            finally:
+                token_dispatcher.num_experts = old_num_experts
+                token_dispatcher.top_k = old_top_k
+                for attr in (
+                        "hidden_shape",
+                        "topk_weights",
+                        "input_splits",
+                        "output_splits",
+                        "hidden_shape_before_permute",
+                        "num_global_tokens_per_local_expert",
+                        "tokens_per_expert",
+                        "global_input_tokens_local_experts_indices",
+                        "reversed_local_input_permutation_mapping",
+                        "reversed_global_input_permutation_mapping",
+                ):
+                    if hasattr(token_dispatcher, attr):
+                        setattr(token_dispatcher, attr, None)
+
+        del hidden_states, topk_ids, topk_weights, row_idx, expert_map
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        logger.info(
+            "Mode1 parity ALLTOALL dispatcher-only warmup complete: rank=%s "
+            "tokens=%s max_tokens_across_dp=%s dispatch_num_experts=%s",
+            rank,
+            num_tokens,
+            max_tokens_across_dp,
+            dispatch_num_experts,
+        )
 
     def eplb_warmup(self):
         if self.dynamic_eplb and not self.is_eplb_warmuped:
@@ -3388,6 +4069,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             corresponding memory buffer for KV cache.
         """
         # init kv cache tensors
+        _log_custom_mode1_kv_memory("before_initialize_kv_cache_tensors")
         kv_cache_raw_tensors: dict[str, Union[torch.Tensor,
                                               Optional[torch.Tensor]]] = {}
         # llmdatadist need the addr of cache tensor be aligned with 2M
@@ -3447,6 +4129,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         assert layer_names == set(kv_cache_raw_tensors.keys(
         )), "Some layers are not correctly initialized"
 
+        _log_custom_mode1_kv_memory("after_raw_kv_tensor_alloc")
         kv_caches: Dict[str, torch.Tensor] = {}
         for group in self._kv_cache_spec_attn_group_iterator_dispatcher():
             if vllm_version_is("0.10.2"):
@@ -3549,6 +4232,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                       self.compilation_config.static_forward_context,
                       self.kv_caches)
 
+        _log_custom_mode1_kv_memory("after_initialize_kv_cache_tensors")
         return kv_caches
 
     def may_reinitialize_input_batch(self,

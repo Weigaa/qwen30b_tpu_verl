@@ -55,9 +55,9 @@ def _has_explicit_elastic_execution_mode() -> bool:
 
 def _parse_elastic_execution_mode(raw_value: str) -> int:
     value = int(raw_value)
-    if value not in (0, 1, 2, 3):
+    if value not in (0, 1, 2, 3, 4):
         raise ValueError(
-            "VLLM_ASCEND_ELASTIC_EXECUTION_MODE must be one of 0, 1, 2, or 3, "
+            "VLLM_ASCEND_ELASTIC_EXECUTION_MODE must be one of 0, 1, 2, 3, or 4, "
             f"got {raw_value!r}.")
     return value
 
@@ -91,7 +91,7 @@ def get_effective_elastic_parallel_shrink_enabled() -> bool:
 
 def get_effective_elastic_moe_mode() -> str:
     if _has_explicit_elastic_execution_mode():
-        return "lossless" if get_elastic_execution_mode() in (1, 2, 3) else "lossy"
+        return "lossless" if get_elastic_execution_mode() in (1, 2, 3, 4) else "lossy"
     return os.getenv("VLLM_ASCEND_ELASTIC_MOE_MODE", "lossy").lower().strip()
 
 
@@ -135,7 +135,7 @@ def compute_elastic_init_redundancy_expert(logical_num_experts: int,
                 f"logical_num_experts={logical_num_experts} must divide the "
                 f"configured floor={min_compute_group_size}.")
         target_local_experts = logical_num_experts // min_compute_group_size
-    elif mode == 3:
+    elif mode in (3, 4):
         return 0
     else:
         hybrid_resident_slots = _get_optional_positive_int_env(
@@ -156,6 +156,7 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # - 1: preloaded redundant experts only
     # - 2: preloaded redundant experts + CPU/NPU hybrid fallback
     # - 3: no redundancy + cross-layer double-buffer hybrid tail
+    # - 4: no redundancy + cross-layer double-buffer remote-NPU expert cache
     # When this is set, it overrides the older elastic enable / moe mode /
     # init redundancy expert knobs.
     "VLLM_ASCEND_ELASTIC_EXECUTION_MODE":
