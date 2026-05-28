@@ -267,6 +267,8 @@ def _lossless_weight_meta(weight: Optional[torch.Tensor]) -> dict[str, Any]:
             "stride": None,
             "ptr": None,
             "storage_offset": None,
+            "format": None,
+            "contiguous": None,
         }
     return {
         "shape": tuple(weight.shape),
@@ -275,6 +277,8 @@ def _lossless_weight_meta(weight: Optional[torch.Tensor]) -> dict[str, Any]:
         "stride": tuple(weight.stride()),
         "ptr": int(weight.data_ptr()),
         "storage_offset": int(weight.storage_offset()),
+        "format": _lossless_weight_format(weight),
+        "contiguous": _tensor_is_contiguous(weight),
     }
 
 
@@ -404,6 +408,16 @@ def _allocate_formatted_buffer_like(weight: torch.Tensor,
     except Exception:
         pass
     return buffer
+
+
+def _allocate_plain_buffer_like(weight: torch.Tensor,
+                                row_count: int,
+                                *,
+                                dtype: Optional[torch.dtype] = None
+                                ) -> torch.Tensor:
+    return torch.empty((row_count, ) + tuple(weight.shape[1:]),
+                       device=weight.device,
+                       dtype=weight.dtype if dtype is None else dtype)
 
 
 def _npu_zero_offset_alias_for_p2p(base: torch.Tensor,
@@ -567,6 +581,7 @@ class Mode3DoubleBufferManager:
         self._logged_cpu_fill_deferrals: set[tuple[int, int]] = set()
         self._logged_async_cpu_stage: set[tuple[int, int]] = set()
         self._logged_transfer_plans: set[tuple[int, int, str]] = set()
+        self._copy_format_diag_count = 0
         self._dispatch_remap_cache: dict[
             tuple[str, tuple[Any, ...]], dict[str, Any]] = {}
         self._slot_expert_map_cache: dict[
@@ -615,6 +630,15 @@ class Mode3DoubleBufferManager:
                                        minimum=0)
         self.timing_layers = _parse_layer_filter(
             os.getenv("VLLM_ASCEND_MODE3_TIMING_LAYERS", "all"))
+        self.enable_copy_format_diag = _env_flag(
+            "VLLM_ASCEND_MODE3_COPY_FORMAT_DIAG")
+        self.copy_format_diag_first_n = _env_int(
+            "VLLM_ASCEND_MODE3_COPY_FORMAT_DIAG_FIRST_N", 8, minimum=0)
+        self.runtime_buffer_format = os.getenv(
+            "VLLM_ASCEND_MODE3_RUNTIME_BUFFER_FORMAT", "plain").strip().lower()
+        if self.runtime_buffer_format not in ("formatted", "plain"):
+            self.runtime_buffer_format = "plain"
+        self._logged_runtime_buffer_format = False
 
     @staticmethod
     def _build_layer_lookup(model_instance: Any) -> dict[int, Any]:
@@ -972,6 +996,47 @@ class Mode3DoubleBufferManager:
                 src[src_start:src_start + length],
                 non_blocking=non_blocking)
 
+    def _maybe_log_copy_format_diag(self, layer: Any,
+                                    slot: _Mode3DoubleBufferSlot,
+                                    assignments: list[tuple[int, int]], *,
+                                    reason: str) -> None:
+        if not self.enable_copy_format_diag:
+            return
+        if self._copy_format_diag_count >= self.copy_format_diag_first_n:
+            return
+        runs = self._assignment_runs(assignments)
+        first_run = runs[0] if runs else None
+
+        def _view_meta(weight: Optional[torch.Tensor],
+                       run_index: int) -> dict[str, Any]:
+            if weight is None or first_run is None:
+                return _lossless_weight_meta(None)
+            dst_start, src_start, length = first_run
+            start = dst_start if run_index == 0 else src_start
+            return _lossless_weight_meta(weight[start:start + length])
+
+        logger.info(
+            "Mode3 copy format diag: rank=%s layer=%s reason=%s "
+            "assignments=%s runs=%s first_run=%s slot_w13=%s slot_w2=%s "
+            "layer_w13=%s layer_w2=%s dst_w13_view=%s src_w13_view=%s "
+            "dst_w2_view=%s src_w2_view=%s",
+            getattr(layer, "rank", _profile_rank()),
+            getattr(layer, "layer_idx", -1),
+            reason,
+            len(assignments),
+            len(runs),
+            first_run,
+            _lossless_weight_meta(slot.w13),
+            _lossless_weight_meta(slot.w2),
+            _lossless_weight_meta(getattr(layer, "w13_weight", None)),
+            _lossless_weight_meta(getattr(layer, "w2_weight", None)),
+            _view_meta(slot.w13, 0),
+            _view_meta(getattr(layer, "w13_weight", None), 1),
+            _view_meta(slot.w2, 0),
+            _view_meta(getattr(layer, "w2_weight", None), 1),
+        )
+        self._copy_format_diag_count += 1
+
     def _copy_cpu_assignments_to_stage(
             self, slot: _Mode3DoubleBufferSlot,
             cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
@@ -1067,8 +1132,18 @@ class Mode3DoubleBufferManager:
         target_device = layer.w13_weight.device
         target_dtype_w13 = layer.w13_weight.dtype
         target_dtype_w2 = layer.w2_weight.dtype
-        target_format_w13 = _lossless_weight_format(layer.w13_weight)
-        target_format_w2 = _lossless_weight_format(layer.w2_weight)
+        if self.runtime_buffer_format == "plain":
+            target_format_w13 = "plain"
+            target_format_w2 = "plain"
+        else:
+            target_format_w13 = _lossless_weight_format(layer.w13_weight)
+            target_format_w2 = _lossless_weight_format(layer.w2_weight)
+        current_format_w13 = (
+            "plain" if self.runtime_buffer_format == "plain"
+            else _lossless_weight_format(slot.w13))
+        current_format_w2 = (
+            "plain" if self.runtime_buffer_format == "plain"
+            else _lossless_weight_format(slot.w2))
         if (slot.w13 is not None and slot.w2 is not None
                 and slot.w13.shape == target_shape_w13
                 and slot.w2.shape == target_shape_w2
@@ -1076,11 +1151,27 @@ class Mode3DoubleBufferManager:
                 and slot.w2.device == target_device
                 and slot.w13.dtype == target_dtype_w13
                 and slot.w2.dtype == target_dtype_w2
-                and _lossless_weight_format(slot.w13) == target_format_w13
-                and _lossless_weight_format(slot.w2) == target_format_w2):
+                and current_format_w13 == target_format_w13
+                and current_format_w2 == target_format_w2):
             return
-        slot.w13 = _allocate_formatted_buffer_like(layer.w13_weight, 128)
-        slot.w2 = _allocate_formatted_buffer_like(layer.w2_weight, 128)
+        if self.runtime_buffer_format == "plain":
+            slot.w13 = _allocate_plain_buffer_like(layer.w13_weight, 128)
+            slot.w2 = _allocate_plain_buffer_like(layer.w2_weight, 128)
+        else:
+            slot.w13 = _allocate_formatted_buffer_like(layer.w13_weight, 128)
+            slot.w2 = _allocate_formatted_buffer_like(layer.w2_weight, 128)
+        if (not self._logged_runtime_buffer_format
+                and self.enable_copy_format_diag):
+            logger.info(
+                "Mode3 runtime buffer format: requested=%s w13=%s w2=%s "
+                "layer_w13=%s layer_w2=%s",
+                self.runtime_buffer_format,
+                _lossless_weight_format(slot.w13),
+                _lossless_weight_format(slot.w2),
+                _lossless_weight_format(layer.w13_weight),
+                _lossless_weight_format(layer.w2_weight),
+            )
+            self._logged_runtime_buffer_format = True
 
     def _ensure_cpu_stage_capacity(self, slot: _Mode3DoubleBufferSlot,
                                    layer: Any, row_count: int) -> None:
@@ -1356,15 +1447,23 @@ class Mode3DoubleBufferManager:
                 slot.w13 = None
                 slot.w2 = None
             self._ensure_slot_capacity(slot, layer)
+            self._maybe_log_copy_format_diag(layer,
+                                             slot,
+                                             npu_assignments,
+                                             reason=reason)
             _event_record((timing_events or {}).get("npu_start_event"))
+            _event_record((timing_events or {}).get("npu_w13_start_event"))
             self._copy_npu_assignment_runs(slot.w13,
                                            layer.w13_weight,
                                            npu_assignments,
                                            async_copy=async_copy)
+            _event_record((timing_events or {}).get("npu_w13_end_event"))
+            _event_record((timing_events or {}).get("npu_w2_start_event"))
             self._copy_npu_assignment_runs(slot.w2,
                                            layer.w2_weight,
                                            npu_assignments,
                                            async_copy=async_copy)
+            _event_record((timing_events or {}).get("npu_w2_end_event"))
             _event_record((timing_events or {}).get("npu_end_event"))
         if host_timing is not None:
             host_timing["submit_npu_us"] = (
@@ -1500,7 +1599,7 @@ class Mode3DoubleBufferManager:
                      *,
                      reason: str) -> _Mode3DoubleBufferSlot:
         slot = self.slots[slot_id]
-        if self._slot_matches(slot, layer):
+        if self._slot_matches(slot, layer) and not slot.inflight_prefetch:
             return slot
         submit_start = time.perf_counter()
         host_timing: Optional[dict[str, float]] = (
@@ -1511,6 +1610,10 @@ class Mode3DoubleBufferManager:
         timing_events = {
             "npu_start_event": self.new_timing_event() if async_copy else None,
             "npu_end_event": self.new_timing_event() if async_copy else None,
+            "npu_w13_start_event": self.new_timing_event() if async_copy else None,
+            "npu_w13_end_event": self.new_timing_event() if async_copy else None,
+            "npu_w2_start_event": self.new_timing_event() if async_copy else None,
+            "npu_w2_end_event": self.new_timing_event() if async_copy else None,
             "cpu_start_event": self.new_timing_event() if async_copy else None,
             "cpu_end_event": self.new_timing_event() if async_copy else None,
             "cpu_pack_start_event": self.new_timing_event() if async_copy else None,
@@ -2309,6 +2412,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             prefetch_npu_dev_ms = _elapsed_ms(
                 next_prefetch_timing.get("npu_start_event"),
                 next_prefetch_timing.get("npu_end_event"))
+            prefetch_npu_w13_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_w13_start_event"),
+                next_prefetch_timing.get("npu_w13_end_event"))
+            prefetch_npu_w2_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_w2_start_event"),
+                next_prefetch_timing.get("npu_w2_end_event"))
             prefetch_cpu_dev_ms = _elapsed_ms(
                 next_prefetch_timing.get("cpu_start_event"),
                 next_prefetch_timing.get("cpu_end_event"))
@@ -2506,6 +2615,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             prefetch_npu_dev_ms = _elapsed_ms(
                 next_prefetch_timing.get("npu_start_event"),
                 next_prefetch_timing.get("npu_end_event"))
+            prefetch_npu_w13_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_w13_start_event"),
+                next_prefetch_timing.get("npu_w13_end_event"))
+            prefetch_npu_w2_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_w2_start_event"),
+                next_prefetch_timing.get("npu_w2_end_event"))
             prefetch_cpu_dev_ms = _elapsed_ms(
                 next_prefetch_timing.get("cpu_start_event"),
                 next_prefetch_timing.get("cpu_end_event"))
@@ -2585,6 +2700,22 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 dispatch_num_experts,
                 manager.expert_token_nums_type,
             )
+            if getattr(manager, "enable_copy_format_diag", False):
+                logger.info(
+                    "Mode3 copy timing detail fused-experts: rank=%s layer=%s "
+                    "prefetch_next_layer=%s slot=%s npu_total_ms=%.3f "
+                    "npu_w13_ms=%.3f npu_w2_ms=%.3f cpu_ms=%.3f "
+                    "cpu_pack_ms=%.3f",
+                    layer.rank if hasattr(layer, "rank") else -1,
+                    layer.layer_idx,
+                    next_prefetch_timing.get("layer_idx", -1),
+                    next_prefetch_timing.get("slot_id", -1),
+                    prefetch_npu_dev_ms,
+                    prefetch_npu_w13_dev_ms,
+                    prefetch_npu_w2_dev_ms,
+                    prefetch_cpu_dev_ms,
+                    prefetch_cpu_pack_dev_ms,
+                )
         return final_hidden_states
 
     def _execute_mode3_single_dispatch_hybrid(
@@ -3989,56 +4120,94 @@ class AscendFusedMoE(FusedMoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = -1,
     ):
-        # Avoid constructing the native vLLM FusedMoE first. The base
-        # initializer allocates native expert weights, then this custom
-        # initializer immediately replaces them with Ascend-formatted weights.
-        # That transient allocation distorts KV-cache profiling and can leave
-        # enough allocator pressure to OOM when the cache is materialized.
-        torch.nn.Module.__init__(self)
+        elastic_execution_mode = (
+            envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
+        use_base_init = (
+            elastic_execution_mode == 3
+            and _env_flag("VLLM_ASCEND_CUSTOM_MODE3_USE_BASE_INIT", "0"))
+        if use_base_init:
+            super().__init__(
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                params_dtype=params_dtype,
+                reduce_results=reduce_results,
+                renormalize=renormalize,
+                use_grouped_topk=use_grouped_topk,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+                quant_config=quant_config,
+                tp_size=tp_size,
+                ep_size=ep_size,
+                dp_size=dp_size,
+                prefix=prefix,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                layer_idx=layer_idx,
+            )
+        else:
+            # Avoid constructing the native vLLM FusedMoE first. The base
+            # initializer allocates native expert weights, then this custom
+            # initializer immediately replaces them with Ascend-formatted weights.
+            # That transient allocation distorts KV-cache profiling and can leave
+            # enough allocator pressure to OOM when the cache is materialized.
+            torch.nn.Module.__init__(self)
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
         self.layer_idx = layer_idx
+        if layer_idx == 0:
+            logger.info(
+                "Custom AscendFusedMoE init path: mode=%s use_base_init=%s",
+                elastic_execution_mode,
+                int(use_base_init),
+            )
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        self.params_dtype = params_dtype
+        if not use_base_init:
+            self.params_dtype = params_dtype
 
         vllm_config = get_current_vllm_config()
         self.model_type = vllm_config.model_config.hf_config.model_type
-        self.total_run_time = 0
-        self.total_comm_time = 0
-        self.is_sequence_parallel = False
+        if not use_base_init:
+            self.total_run_time = 0
+            self.total_comm_time = 0
+            self.is_sequence_parallel = False
 
-        self.moe_parallel_config = FusedMoEParallelConfig.make(
-            tp_size_=(tp_size if tp_size is not None else
-                      get_tensor_model_parallel_world_size()),
-            dp_size_=(dp_size
-                      if dp_size is not None else get_dp_group().world_size),
-            vllm_parallel_config=vllm_config.parallel_config)
-        self.sp_size = self.tp_size
-        compilation_config = vllm_config.compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
-        self.layer_name = prefix
-        self.enable_eplb = False
-        self.expert_load_view = None
-        self.logical_to_physical_map = None
-        self.logical_replica_count = None
-        self.local_num_expert_weight_slots = None
-        self.quant_config = quant_config
-        self.moe_quant_config = None
-        self.routed_scaling_factor = 1.0
-        self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.zero_expert_num = 0
-        self.zero_expert_type = None
-        self.hidden_size = hidden_size
-        self.batched_hidden_states = None
-        self.batched_router_logits = None
-        try:
-            self.rank = int(torch.distributed.get_rank())
-        except Exception:
-            self.rank = -1
+            self.moe_parallel_config = FusedMoEParallelConfig.make(
+                tp_size_=(tp_size if tp_size is not None else
+                          get_tensor_model_parallel_world_size()),
+                dp_size_=(dp_size
+                          if dp_size is not None else get_dp_group().world_size),
+                vllm_parallel_config=vllm_config.parallel_config)
+            self.sp_size = self.tp_size
+            compilation_config = vllm_config.compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
+            self.layer_name = prefix
+            self.enable_eplb = False
+            self.expert_load_view = None
+            self.logical_to_physical_map = None
+            self.logical_replica_count = None
+            self.local_num_expert_weight_slots = None
+            self.quant_config = quant_config
+            self.moe_quant_config = None
+            self.routed_scaling_factor = 1.0
+            self.apply_router_weight_on_input = apply_router_weight_on_input
+            self.zero_expert_num = 0
+            self.zero_expert_type = None
+            self.hidden_size = hidden_size
+            self.batched_hidden_states = None
+            self.batched_router_logits = None
+            try:
+                self.rank = int(torch.distributed.get_rank())
+            except Exception:
+                self.rank = -1
 
         self.top_k = top_k
         self.num_experts = num_experts
@@ -4116,8 +4285,7 @@ class AscendFusedMoE(FusedMoE):
 
         ascend_config = get_ascend_config()
         self.dynamic_eplb = ascend_config.dynamic_eplb
-        self.elastic_execution_mode = (
-            envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
+        self.elastic_execution_mode = elastic_execution_mode
         self.elastic_moe_mode = ascend_config.elastic_moe_mode
         self.expert_map_path = ascend_config.expert_map_path
         self.global_redundant_expert_num = (

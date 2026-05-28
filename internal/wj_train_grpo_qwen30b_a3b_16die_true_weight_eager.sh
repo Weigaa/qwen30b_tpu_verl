@@ -1,7 +1,7 @@
 set -ex
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-"expandable_segments:True"}
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -19,9 +19,9 @@ export ASCEND_GLOBAL_EVENT_ENABLE=0
 export ASCEND_SLOG_PRINT_TO_STDOUT=0       
 export ASCEND_GLOBAL_LOG_LEVEL=3           
 
-export HCCL_CONNECT_TIMEOUT=360   
+export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-360}
 export HCCL_IF_BASE_PORT=64021
-export HCCL_EXEC_TIMEOUT=360
+export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-360}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 export MASTER_PORT=23300    # vllm port error
@@ -40,14 +40,14 @@ fi
 export VLLM_DP_SIZE=16                        # world_size // rollout.tp_sizebaseline dummy-run, 1: redundant experts only, 2: redundant experts + CPU/NPU hybrid tail
 export HCCL_BUFFSIZE=800
 
-export TASK_QUEUE_ENABLE=2
+export TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-2}
 
 export VLLM_ENABLE_FIX_ROUTE=0    
 export VLLM_MODEL_EXECUTE_TIME_OBSERVE=0     # decode prefill的耗时打印
 
 #extra env in qwen3_235b_env.sh
 # Recipe features
-export VLLM_ENABLE_GRAPH_MODE=0             # 0: eager mode, 1: graph mode
+export VLLM_ENABLE_GRAPH_MODE=${VLLM_ENABLE_GRAPH_MODE:-0}  # 0: eager mode, 1: graph mode
 export VLLM_ENABLE_EXPERT_PARALLEL=1        # Enable EP in vLLM rollout.
 export VLLM_CHUNK_MOE_SIZE=512              # The minimum block size set for prefill computation partition.
 export ALL_TO_ALL_RESHARD=1                 # Enable EP to reshard parameters with AllToAllV (without communication redundancy).
@@ -57,7 +57,7 @@ export USE_HDP=0                            # 0: disable hdp, 1: enable hdp
 export ROLLOUT_REBALANCE_ENABLE=0          # 0: disable rollout rebalance, 1: enable rollout rebalance
 
 #关闭看门狗
-export HCCL_ASYNC_ERROR_HANDLING=1
+export HCCL_ASYNC_ERROR_HANDLING=${HCCL_ASYNC_ERROR_HANDLING:-1}
 
 #Train Drafter开关
 export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=0
@@ -103,7 +103,7 @@ export VLLM_ASCEND_DRAFT_PROFILE_BREAKDOWN=1
 export VLLM_ASCEND_DRAFT_PROFILE_SYNC=0
 export VLLM_ASCEND_DRAFT_ASYNC_TRAIN=0
 #配置native模式还是custom模式
-export VLLM_ASCEND_REGISTER_CUSTOM_MODELS=${VLLM_ASCEND_REGISTER_CUSTOM_MODELS:-1}
+export VLLM_ASCEND_REGISTER_CUSTOM_MODELS=${VLLM_ASCEND_REGISTER_CUSTOM_MODELS:-0}
 export VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES=0
 export VLLM_ASCEND_CUSTOM_MODE1_DEBUG=0
 export VLLM_ASCEND_CUSTOM_MODE1_TIMING_EVENTS=0
@@ -116,16 +116,15 @@ export VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG=1
 # 3: 无冗余专家 + 跨层双缓冲 hybrid tail
 #    使用建议:
 #    - mode=3 主要面向 shrink 到 <=8 rank 之后的 MoE 主路径
-#    - 若希望允许 2 -> 1 的 single-rank no-EP tail，保持
-#      VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=1
+#    - mode=3 下 floor 是阈值控制边界；默认 shrink 到该 floor 后停止
 #    - mode=3 不依赖冗余专家；运行时 expert double buffer 固定为 128 expert slots
 #    - VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS 在 mode=3 下只保留
 #      primary prefix 语义，不再决定运行时 buffer 容量
-export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE:-1}
+export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE:-0}
 # 弹性缩容的最小计算组:
 #   1  -> 允许在 2-rank 阶段后进入 single-rank no-EP tail
-#   2/4/8/16 -> 最多缩到该 floor 结束，不再进入 1-rank tail
-export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE:-2}
+#   2/4/8/16 -> 最多缩到该 floor
+export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE:-8}
 # mode=2 时每个 rank 固定保留的 NPU resident expert 槽位数
 # mode=3 时该值不控制双缓冲大小；当前 runtime double buffer 固定为 128 experts
 export VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS:-8}
@@ -204,7 +203,7 @@ export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEAD
 echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} dummy_waste_timing=${VLLM_ASCEND_DUMMY_WASTE_TIMING} dummy_waste_sync=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC} dummy_waste_profile=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE} dummy_waste_markers=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS} elastic_util_log=${VLLM_ASCEND_ELASTIC_UTIL_LOG} elastic_util_bucket_steps=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES}"
 #模拟样本缩短规则
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
-# export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
+export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
 echo "[elastic tail validate] VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=${VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS}"
 
 if [ "${DRAFT_PROFILE_MODE}" = "profile_only" ]; then
@@ -224,10 +223,10 @@ export ACL_MDL_EVENT_SYNC_TIMEOUT=-1
 HOME=$(pwd)
 MODEL_PATH=${MODEL_PATH:-"/data/Qwen3-30B-A3B"}
 CONFIG_DIR=${CONFIG_DIR:-"${HOME}/verl/trainer/config"}
-DISTCP_PATH="/data/Qwen3-30B-A3B_megatron"
+DISTCP_PATH=${DISTCP_PATH:-"/data/Qwen3-30B-A3B_megatron"}
 TRAIN_FILE=${TRAIN_FILE:-"/data/deepscaler/train.parquet"}
 TEST_FILE=${TEST_FILE:-"/data/deepscaler/test.parquet"}
-RECORD_DIR="/workspace/cann-recipes-train/llm_rl/qwen3/record"
+RECORD_DIR=${RECORD_DIR:-"${HOME}/record"}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-32}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-16384}

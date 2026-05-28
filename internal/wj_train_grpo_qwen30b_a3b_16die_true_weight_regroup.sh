@@ -55,7 +55,7 @@ export HCCL_CONNECT_TIMEOUT=7200
 export VLLM_ASCEND_LLM_PROFILE_ENABLE=0
 
 # Unified output root for checkpoints / rollout dumps / draft dumps / logs.
-OUTPUT_ROOT=${OUTPUT_ROOT:-/workspace/cann-recipes-train/llm_rl/qwen3}
+OUTPUT_ROOT=${OUTPUT_ROOT:-$(pwd)}
 OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-resample_result_16k_bs32_n16_baseline_ft}
 OUTPUT_DIR="${OUTPUT_ROOT}/${OUTPUT_SUBDIR}"
 ROLL_OUT_DIR="${OUTPUT_DIR}/rollout_data"
