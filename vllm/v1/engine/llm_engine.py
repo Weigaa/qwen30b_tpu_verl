@@ -3,6 +3,7 @@
 
 import os
 import time
+from datetime import timedelta
 from collections.abc import Mapping
 from copy import copy
 from typing import Any, Callable, Optional, Union
@@ -283,11 +284,28 @@ class LLMEngine:
                                              dp_world_size: int) -> bool:
         if num_active_ranks != 1 or dp_world_size != 2:
             return False
-        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE not in (2, 3, 4):
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE not in (2, 3, 4, 5):
             return False
         min_compute_group_size = (
-            self._get_configured_elastic_min_compute_group_size())
+            self._get_runtime_elastic_min_compute_group_size())
         if min_compute_group_size != 1:
+            return False
+        if not self.external_launcher_dp:
+            return False
+        if not self.vllm_config.parallel_config.enable_expert_parallel:
+            return False
+        return True
+
+    def _should_allow_mode3_below_floor_tail(self, num_active_ranks: int,
+                                             dp_world_size: int) -> bool:
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE != 3:
+            return False
+        if os.getenv("VLLM_ASCEND_MODE3_ALLOW_BELOW_FLOOR_TAIL",
+                     "0").strip().lower() not in ("1", "true", "yes", "on"):
+            return False
+        if num_active_ranks <= 0 or num_active_ranks >= dp_world_size:
+            return False
+        if self.elastic_ep_active_ranks is None:
             return False
         if not self.external_launcher_dp:
             return False
@@ -325,6 +343,38 @@ class LLMEngine:
                 f"{original_dp_world_size}.")
         return min_compute_group_size
 
+    def _get_runtime_elastic_min_compute_group_size(self) -> Optional[int]:
+        configured_floor = self._get_configured_elastic_min_compute_group_size()
+        mode = envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE
+        if mode not in (4, 5):
+            return configured_floor
+        runtime_floor = None
+        if mode == 5:
+            runtime_floor = (
+                envs_ascend.VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE)
+        if runtime_floor is None:
+            runtime_floor = (
+                envs_ascend.VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE)
+        if runtime_floor is None:
+            return configured_floor
+        env_name = ("VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE"
+                    if mode == 5 else
+                    "VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE")
+        original_dp_world_size = self.elastic_original_dp_world_size
+        if not isinstance(original_dp_world_size, int) or original_dp_world_size <= 0:
+            raise ValueError(
+                f"{env_name} requires "
+                "external-launcher DP to be initialized.")
+        if runtime_floor > original_dp_world_size:
+            raise ValueError(
+                f"{env_name} cannot exceed "
+                f"the initial DP size: {runtime_floor} > {original_dp_world_size}.")
+        if original_dp_world_size % runtime_floor != 0:
+            raise ValueError(
+                f"{env_name} must divide "
+                f"the initial DP size: {runtime_floor} vs {original_dp_world_size}.")
+        return runtime_floor
+
     def _is_followup_elastic_shrink_enabled(self) -> bool:
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return False
@@ -332,7 +382,7 @@ class LLMEngine:
         if not isinstance(original_dp_world_size, int) or original_dp_world_size <= 1:
             return False
         min_compute_group_size = (
-            self._get_configured_elastic_min_compute_group_size())
+            self._get_runtime_elastic_min_compute_group_size())
         if min_compute_group_size is None:
             return True
         if min_compute_group_size >= original_dp_world_size:
@@ -467,9 +517,12 @@ class LLMEngine:
                 allow_single_rank_no_ep_tail = (
                     self._should_enter_single_rank_no_ep_tail(
                         num_active_ranks, dp_world_size))
+                allow_mode3_below_floor_tail = (
+                    self._should_allow_mode3_below_floor_tail(
+                        num_active_ranks, dp_world_size))
                 min_mc2_ep_size = envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE
                 min_compute_group_size = (
-                    self._get_configured_elastic_min_compute_group_size())
+                    self._get_runtime_elastic_min_compute_group_size())
                 num_experts = None
                 hf_config = getattr(self.vllm_config.model_config, "hf_config",
                                     None)
@@ -527,7 +580,8 @@ class LLMEngine:
                             skip_reason = (
                                 f"non_halving_step:{dp_world_size}->{num_active_ranks}")
                         elif (num_active_ranks < min_compute_group_size
-                              and not allow_single_rank_no_ep_tail):
+                              and not allow_single_rank_no_ep_tail
+                              and not allow_mode3_below_floor_tail):
                             skip_reason = (
                                 f"below_configured_floor:{min_compute_group_size}")
 
@@ -544,6 +598,11 @@ class LLMEngine:
                             self.should_execute_dummy_batch = True
                         return True
 
+                    logger.info(
+                        "Elastic EP shrink rpc enter: global_rank=%s active_ranks=%s prev_active_ranks=%s dp_world_size=%s local_has_unfinished=%s",
+                        current_global_rank, active_global_ranks,
+                        self.elastic_ep_active_ranks, dp_world_size,
+                        has_unfinished)
                     if not has_unfinished:
                         if allow_single_rank_no_ep_tail:
                             logger.info(
@@ -559,10 +618,27 @@ class LLMEngine:
                             "Elastic EP rank exit start: global_rank=%s active_ranks=%s",
                             current_global_rank, active_global_ranks)
 
+                    prev_elastic_ep_active_ranks = self.elastic_ep_active_ranks
                     self.elastic_ep_active_ranks = active_ranks_tuple
                     self.elastic_ep_scaled_once = True
                     self._logged_followup_shrink_skip = None
                     rebuild_start_t = time.perf_counter()
+                    if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (2, 3, 4):
+                        try:
+                            torch.distributed.monitored_barrier(
+                                group=self.dp_group,
+                                timeout=timedelta(seconds=120),
+                            )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "Elastic EP shrink RPC pre-barrier failed; "
+                                "not all current DP ranks reached the same "
+                                "shrink boundary. "
+                                f"global_rank={current_global_rank} "
+                                f"active_ranks={active_global_ranks} "
+                                f"prev_active_ranks={prev_elastic_ep_active_ranks} "
+                                f"dp_world_size={dp_world_size} "
+                                f"local_has_unfinished={has_unfinished}") from exc
                     self.engine_core.collective_rpc(
                         "rebuild_elastic_ep_group", args=(active_global_ranks, ))
                     if self.external_launcher_dp:

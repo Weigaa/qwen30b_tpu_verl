@@ -21,9 +21,10 @@ import copy
 import os
 import threading
 import time
+from datetime import timedelta
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -118,6 +119,26 @@ def _mode4_tensor_signature(reference: torch.Tensor,
             int(rows), str(fmt))
 
 
+def _mode4_flat_payload_signature(w13: torch.Tensor, w2: torch.Tensor,
+                                  rows: int) -> tuple[object, ...]:
+    return ("flat", _mode4_tensor_signature(w13, rows),
+            _mode4_tensor_signature(w2, rows), int(w13.numel()),
+            int(w2.numel()))
+
+
+def _mode4_get_flat_payload(cache: dict[tuple[object, ...], torch.Tensor],
+                            key: tuple[object, ...], w13: torch.Tensor,
+                            w2: torch.Tensor, rows: int) -> torch.Tensor:
+    payload = cache.get(key)
+    if payload is not None:
+        return payload
+    rows = int(rows)
+    total_elems = rows * (int(w13[0].numel()) + int(w2[0].numel()))
+    payload = w13.new_empty((total_elems, ))
+    cache[key] = payload
+    return payload
+
+
 def _is_custom_ascend_fused_moe_module(module: nn.Module) -> bool:
     try:
         from vllm_ascend.ops.fused_moe import AscendFusedMoE
@@ -141,7 +162,8 @@ def _module_uses_lossless_elastic(module: nn.Module) -> bool:
     if module_mode is not None:
         return module_mode == "lossless"
     return (envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE == "lossless"
-            and envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (1, 2, 3, 4))
+            and envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in
+            (1, 2, 3, 4, 5))
 
 
 def _module_configured_elastic_floor(module: nn.Module) -> Optional[int]:
@@ -155,6 +177,74 @@ def _module_configured_elastic_floor(module: nn.Module) -> Optional[int]:
 def _module_initial_ep_size(module: nn.Module) -> int:
     return int(getattr(module, "elastic_original_ep_size",
                        getattr(module, "ep_size", 1)))
+
+
+def _remote_npu_runtime_elastic_floor() -> Optional[int]:
+    mode = int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
+    runtime_floor = None
+    if mode == 5:
+        runtime_floor = envs_ascend.VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE
+    if runtime_floor is None:
+        runtime_floor = envs_ascend.VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE
+    if runtime_floor is not None:
+        return int(runtime_floor)
+    return envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE
+
+
+def _mode4_runtime_elastic_floor() -> Optional[int]:
+    return _remote_npu_runtime_elastic_floor()
+
+
+def _mode5_remote_expert_fraction() -> float:
+    raw = os.getenv("VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION", "0.5")
+    try:
+        fraction = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION must be a float in [0, 1], "
+            f"got {raw!r}.") from exc
+    return min(max(fraction, 0.0), 1.0)
+
+
+def _mode5_select_remote_experts_by_target(
+        cpu_import_source_rank: dict[int, int],
+        cpu_import_target_rank: dict[int, int]) -> set[int]:
+    fraction = _mode5_remote_expert_fraction()
+    if fraction <= 0.0:
+        return set()
+    by_target: dict[int, list[int]] = {}
+    for expert_id, source_rank in cpu_import_source_rank.items():
+        target_rank = cpu_import_target_rank.get(expert_id)
+        if source_rank is None or target_rank is None:
+            continue
+        by_target.setdefault(int(target_rank), []).append(int(expert_id))
+    selected: set[int] = set()
+    for _target_rank, expert_ids in by_target.items():
+        expert_ids = sorted(expert_ids)
+        if not expert_ids:
+            continue
+        count = int(round(len(expert_ids) * fraction))
+        if fraction > 0.0:
+            count = max(1, count)
+        count = min(len(expert_ids), count)
+        selected.update(expert_ids[:count])
+    return selected
+
+
+def _mode5_filter_cpu_payload(payload: dict) -> dict:
+    remote_experts = set(int(x) for x in payload.get("mode5_remote_experts", []))
+    if not remote_experts:
+        return payload
+    filtered = dict(payload)
+    for key in ("cpu_import_source_rank", "cpu_import_target_rank",
+                "remote_import_source_slot"):
+        values = payload.get(key, {})
+        filtered[key] = {
+            int(expert_id): value
+            for expert_id, value in values.items()
+            if int(expert_id) not in remote_experts
+        }
+    return filtered
 
 
 def _module_followup_shrink_enabled(module: nn.Module) -> bool:
@@ -202,7 +292,7 @@ def _module_is_custom_mode1_redundant_static(module: nn.Module) -> bool:
 def _module_is_mode4_remote_npu_lightweight(module: nn.Module) -> bool:
     if not _is_ascend_fused_moe_module(module):
         return False
-    if int(getattr(module, "elastic_execution_mode", 0) or 0) != 4:
+    if int(getattr(module, "elastic_execution_mode", 0) or 0) not in (4, 5):
         return False
     if not _module_uses_lossless_elastic(module):
         return False
@@ -214,11 +304,38 @@ def _module_is_mode4_remote_npu_lightweight(module: nn.Module) -> bool:
     return True
 
 
+def _module_is_mode3_cross_layer_lightweight(module: nn.Module) -> bool:
+    if not _is_ascend_fused_moe_module(module):
+        return False
+    if int(getattr(module, "elastic_execution_mode", 0) or 0) != 3:
+        return False
+    if not _module_uses_lossless_elastic(module):
+        return False
+    is_enabled = getattr(module, "_is_mode3_cross_layer_buffer_enabled", None)
+    if not callable(is_enabled) or not is_enabled():
+        return False
+    # Mode 3 uses fixed double-buffer slots plus CPU shadow copies. The static
+    # buffers are profiled before KV sizing, so charging the generic
+    # zero-redundancy / post-restore headrooms again over-reserves HBM and can
+    # force KV preemption, which then incorrectly drives the shrunken decode
+    # path into AllToAll.
+    return True
+
+
 def _module_is_elastic_lightweight_no_headroom(module: nn.Module) -> bool:
     if _module_is_mode1_lightweight_parity(module):
         return True
     if (_module_is_mode4_remote_npu_lightweight(module)
             and not _env_flag("VLLM_ASCEND_MODE4_ENABLE_GENERIC_HEADROOM", "0")):
+        return True
+    return False
+
+
+def _module_skips_generic_headroom(module: nn.Module) -> bool:
+    if _module_is_elastic_lightweight_no_headroom(module):
+        return True
+    if (_module_is_mode3_cross_layer_lightweight(module)
+            and not _env_flag("VLLM_ASCEND_MODE3_ENABLE_GENERIC_HEADROOM", "0")):
         return True
     return False
 
@@ -263,7 +380,11 @@ def _module_mode1_lightweight_parity_path(module: nn.Module) -> str:
 
 def _module_lightweight_no_headroom_path(module: nn.Module) -> str:
     if _module_is_mode4_remote_npu_lightweight(module):
-        return "mode4_remote_npu_cache"
+        mode = int(getattr(module, "elastic_execution_mode", 0) or 0)
+        return ("mode5_cpu_remote_npu_cache"
+                if mode == 5 else "mode4_remote_npu_cache")
+    if _module_is_mode3_cross_layer_lightweight(module):
+        return "mode3_cross_layer_double_buffer"
     return _module_mode1_lightweight_parity_path(module)
 
 
@@ -272,7 +393,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 def _mode4_keep_weights_out_of_sleep_pool() -> bool:
-    return (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 4
+    return (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
             and _env_flag("VLLM_ASCEND_MODE4_KEEP_WEIGHTS_OUT_OF_SLEEP_POOL",
                           "1"))
 
@@ -357,6 +478,8 @@ class NPUWorker(WorkerBase):
                                                    torch.Tensor] = {}
         self._mode4_remote_send_buffer_cache: dict[tuple[object, ...],
                                                    torch.Tensor] = {}
+        self._mode4_remote_prepacked_payload_cache: dict[
+            tuple[int, tuple[tuple[int, int, int], ...]], torch.Tensor] = {}
         self._mode4_owned_cache_ranks: list[int] = []
         self._mode4_cache_owner_ranks: list[int] = []
         self._elastic_current_active_ranks: list[int] | None = None
@@ -473,6 +596,8 @@ class NPUWorker(WorkerBase):
         available_kv_cache_memory = int(
             total_npu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
+        floor_prealloc_headroom_bytes = (
+            self._estimate_floor_prealloc_headroom_bytes())
         if self._has_effective_followup_elastic_shrink():
             shrink_headroom_bytes = (
                 self._estimate_zero_redundancy_shrink_headroom_bytes())
@@ -481,15 +606,13 @@ class NPUWorker(WorkerBase):
             logger.info(
                 "Applying lossless zero-redundancy shrink headroom: %s bytes",
                 shrink_headroom_bytes)
-            floor_prealloc_headroom_bytes = (
-                self._estimate_floor_prealloc_headroom_bytes())
-            if floor_prealloc_headroom_bytes > 0:
-                available_kv_cache_memory = max(
-                    available_kv_cache_memory - floor_prealloc_headroom_bytes,
-                    0)
-                logger.info(
-                    "Applying elastic floor prealloc headroom: %s bytes",
-                    floor_prealloc_headroom_bytes)
+        if floor_prealloc_headroom_bytes > 0:
+            available_kv_cache_memory = max(
+                available_kv_cache_memory - floor_prealloc_headroom_bytes,
+                0)
+            logger.info(
+                "Applying elastic floor prealloc headroom: %s bytes",
+                floor_prealloc_headroom_bytes)
         extra_elastic_safety_headroom_bytes = (
             self._estimate_extra_elastic_safety_headroom_bytes())
         if extra_elastic_safety_headroom_bytes > 0:
@@ -625,7 +748,7 @@ class NPUWorker(WorkerBase):
                 continue
             if not _module_uses_lossless_elastic(module):
                 continue
-            if _module_is_elastic_lightweight_no_headroom(module):
+            if _module_skips_generic_headroom(module):
                 if not logged_lightweight_skip:
                     logger.info(
                         "Skipping generic post-restore headroom for elastic lightweight path: layer=%s floor=%s path=%s",
@@ -654,7 +777,9 @@ class NPUWorker(WorkerBase):
                 continue
             if not _module_followup_shrink_enabled(module):
                 continue
-            configured_floor = _module_configured_elastic_floor(module)
+            configured_floor = _mode4_runtime_elastic_floor()
+            if configured_floor is None:
+                configured_floor = _module_configured_elastic_floor(module)
             if configured_floor is None:
                 continue
             configured_floor = int(configured_floor)
@@ -678,7 +803,7 @@ class NPUWorker(WorkerBase):
                 continue
             if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
                 continue
-            if _module_is_elastic_lightweight_no_headroom(module):
+            if _module_skips_generic_headroom(module):
                 logger.info(
                     "Skipping zero-redundancy shrink headroom for elastic lightweight path: layer=%s floor=%s path=%s",
                     getattr(module, "layer_idx", -1),
@@ -755,12 +880,17 @@ class NPUWorker(WorkerBase):
 
         estimated_bytes = 0
         saw_extra_floor_prealloc = False
+        mode3_double_buffer_bytes = 0
+        mode3_cpu_stage_bytes = 0
+        mode3_low_floor_mc2_workspace_bytes = 0
+
         for module in model.modules():
             if not _is_ascend_fused_moe_module(module):
                 continue
             if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
                 continue
-            if _module_is_elastic_lightweight_no_headroom(module):
+            execution_mode = int(getattr(module, "elastic_execution_mode", 0))
+            if _module_skips_generic_headroom(module) and execution_mode not in (3, 4, 5):
                 logger.info(
                     "Skipping floor-prealloc headroom for elastic lightweight path: layer=%s floor=%s path=%s",
                     getattr(module, "layer_idx", -1),
@@ -770,21 +900,35 @@ class NPUWorker(WorkerBase):
                 return 0
             if getattr(module, "global_redundant_expert_num", 0) > 0:
                 continue
-            if not getattr(module, "lossless_zero_redundancy_preallocated_loaded",
-                           False):
-                continue
-            if hasattr(module, "_is_hybrid_cpu_swap_enabled") and \
-                    module._is_hybrid_cpu_swap_enabled():
+
+            # Mode 3 keeps additional experts in CPU shadow storage and only
+            # needs HBM for the two runtime double-buffer slots. Do not charge
+            # the mode=1/fixed-slot static expert delta here, but do reserve
+            # the final floor-sized runtime slots before KV cache sizing.
+            mode3_lightweight = (
+                execution_mode == 3
+                and _module_is_mode3_cross_layer_lightweight(module))
+            mode4_lightweight = (
+                execution_mode in (4, 5)
+                and _module_is_mode4_remote_npu_lightweight(module))
+            if (not mode3_lightweight and not mode4_lightweight
+                    and not getattr(module,
+                                    "lossless_zero_redundancy_preallocated_loaded",
+                                    False)):
                 continue
 
             configured_floor = getattr(
                 module, "_get_configured_elastic_min_compute_group_size",
                 lambda: None)()
+            if mode4_lightweight:
+                runtime_floor = _mode4_runtime_elastic_floor()
+                if runtime_floor is not None:
+                    configured_floor = int(runtime_floor)
             if configured_floor is None:
                 continue
             default_floor = getattr(module, "_get_default_single_shrink_ep_floor",
                                     lambda: configured_floor)()
-            if configured_floor >= default_floor:
+            if configured_floor >= default_floor and not mode4_lightweight:
                 continue
 
             get_reserved_slots = getattr(
@@ -794,7 +938,7 @@ class NPUWorker(WorkerBase):
             configured_capacity = int(get_reserved_slots(configured_floor))
             default_capacity = int(get_reserved_slots(default_floor))
             additional_experts = max(configured_capacity - default_capacity, 0)
-            if additional_experts <= 0:
+            if additional_experts <= 0 and not mode3_lightweight and not mode4_lightweight:
                 continue
 
             if int(module.w13_weight.shape[0]) <= 0:
@@ -804,24 +948,107 @@ class NPUWorker(WorkerBase):
             per_expert_bytes = (
                 w13_sample.numel() * w13_sample.element_size()
                 + w2_sample.numel() * w2_sample.element_size())
-            estimated_bytes += additional_experts * per_expert_bytes
+
+            if not mode3_lightweight and not mode4_lightweight:
+                if hasattr(module, "_is_hybrid_cpu_swap_enabled") and \
+                        module._is_hybrid_cpu_swap_enabled():
+                    continue
+                estimated_bytes += additional_experts * per_expert_bytes
+
+            # Mode3 double buffer slots: ALL layers share the same 2 slots
+            # (double buffer). These slots are allocated lazily on first forward,
+            # NOT during memory profiling, so we must account for them here.
+            # The CPU-shadow path also allocates one NPU staging buffer per
+            # runtime slot for CPU->NPU materialization, so reserve that too.
+            # Only calculate once for the first mode3 layer we encounter.
+            if mode3_lightweight and mode3_double_buffer_bytes == 0:
+                runtime_slot_experts = configured_capacity * 2
+                cpu_stage_experts = configured_capacity * 2
+                mode3_double_buffer_bytes = runtime_slot_experts * per_expert_bytes
+                mode3_cpu_stage_bytes = cpu_stage_experts * per_expert_bytes
+                logger.info(
+                    "Mode3 double buffer headroom (shared across all layers): configured_capacity=%s runtime_slot_experts=%s runtime_bytes=%.2fMB cpu_stage_experts=%s cpu_stage_bytes=%.2fMB",
+                    configured_capacity,
+                    runtime_slot_experts,
+                    mode3_double_buffer_bytes / (1024 * 1024),
+                    cpu_stage_experts,
+                    mode3_cpu_stage_bytes / (1024 * 1024),
+                )
+
+            # Even with the mode3 runtime slots and CPU staging buffers charged
+            # up front, the real low-floor MC2 decode path can lazily request an
+            # additional HCCL workspace after shrink. If this is not reserved
+            # before KV sizing, the first stage=4/stage=2 decode can fail inside
+            # HcclAllocComResourceByTiling and poison later collectives. Keep the
+            # reservation mode3-only so mode1/mode2/mode4 KV sizing is untouched.
+            if mode4_lightweight and mode3_double_buffer_bytes == 0:
+                runtime_slot_experts = configured_capacity * 2
+                mode3_double_buffer_bytes = runtime_slot_experts * per_expert_bytes
+                logger.info(
+                    "Mode4 remote-NPU double buffer headroom (shared across all layers): runtime_floor=%s configured_capacity=%s runtime_slot_experts=%s runtime_bytes=%.2fMB",
+                    configured_floor, configured_capacity, runtime_slot_experts,
+                    mode3_double_buffer_bytes / (1024 * 1024))
+
+            if mode4_lightweight and configured_floor <= 2 and mode3_low_floor_mc2_workspace_bytes == 0:
+                default_workspace_bytes = int(2 * 1024 * 1024 * 1024)
+                mode3_low_floor_mc2_workspace_bytes = int(
+                    os.getenv(
+                        "VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES",
+                        str(default_workspace_bytes)))
+                logger.info(
+                    "Mode4 low-floor MC2 workspace headroom: runtime_floor=%s bytes=%s (%.2fMB)",
+                    configured_floor, mode3_low_floor_mc2_workspace_bytes,
+                    mode3_low_floor_mc2_workspace_bytes / (1024 * 1024))
+
+            if (mode3_lightweight and configured_floor <= 2
+                    and mode3_low_floor_mc2_workspace_bytes == 0):
+                default_workspace_bytes = int(2.5 * 1024 * 1024 * 1024)
+                mode3_low_floor_mc2_workspace_bytes = int(
+                    os.getenv(
+                        "VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES",
+                        str(default_workspace_bytes)))
+                logger.info(
+                    "Mode3 low-floor MC2 workspace headroom: floor=%s bytes=%s (%.2fMB)",
+                    configured_floor, mode3_low_floor_mc2_workspace_bytes,
+                    mode3_low_floor_mc2_workspace_bytes / (1024 * 1024))
+
             saw_extra_floor_prealloc = True
 
-        if not saw_extra_floor_prealloc or estimated_bytes <= 0:
+        if not saw_extra_floor_prealloc or (
+                estimated_bytes <= 0 and mode3_double_buffer_bytes <= 0
+                and mode3_cpu_stage_bytes <= 0
+                and mode3_low_floor_mc2_workspace_bytes <= 0):
             return 0
 
         safety_margin_bytes = int(
             os.getenv("VLLM_ASCEND_FLOOR_PREALLOC_HEADROOM_SAFETY_BYTES",
                       str(1024 * 1024 * 1024)))
-        # The extra floor-preallocated expert weights and runtime slots are
-        # already materialized before memory profiling, so they are reflected
-        # in peak_memory. Only keep a small residual margin for allocator
-        # fragmentation and initialization jitter instead of subtracting the
-        # static bytes again from the KV-cache budget.
-        logger.info(
-            "Estimated elastic floor prealloc bytes already accounted in peak_memory: static_bytes=%s safety_margin=%s total=%s",
-            estimated_bytes, safety_margin_bytes, safety_margin_bytes)
-        return safety_margin_bytes
+
+        # For mode3 double buffer slots, they are NOT pre-allocated during
+        # memory profiling (allocated lazily on first forward), so we need to
+        # subtract the full estimated bytes from KV cache budget.
+        # For other cases, the weights are already in peak_memory, so only
+        # keep a small safety margin.
+        has_mode3_double_buffer = (
+            mode3_double_buffer_bytes > 0 or mode3_cpu_stage_bytes > 0)
+
+        if has_mode3_double_buffer:
+            total_headroom = (estimated_bytes + mode3_double_buffer_bytes
+                              + mode3_cpu_stage_bytes
+                              + mode3_low_floor_mc2_workspace_bytes
+                              + safety_margin_bytes)
+            logger.info(
+                "Estimated elastic floor prealloc headroom (including mode3/mode4 double buffer): static_bytes=%s runtime_buffer_bytes=%s mode3_cpu_stage_bytes=%s low_floor_mc2_workspace_bytes=%s safety_margin=%s total=%s (%.2fMB)",
+                estimated_bytes, mode3_double_buffer_bytes,
+                mode3_cpu_stage_bytes, mode3_low_floor_mc2_workspace_bytes,
+                safety_margin_bytes, total_headroom,
+                total_headroom / (1024 * 1024))
+            return total_headroom
+        else:
+            logger.info(
+                "Estimated elastic floor prealloc bytes already accounted in peak_memory: static_bytes=%s safety_margin=%s total=%s",
+                estimated_bytes, safety_margin_bytes, safety_margin_bytes)
+            return safety_margin_bytes
 
     def _estimate_post_restore_dp_collective_headroom_bytes(self) -> int:
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
@@ -910,7 +1137,7 @@ class NPUWorker(WorkerBase):
                 continue
             if not _module_uses_lossless_elastic(module):
                 continue
-            if _module_is_elastic_lightweight_no_headroom(module):
+            if _module_skips_generic_headroom(module):
                 logger.info(
                     "Skipping first-live-prefill headroom for elastic lightweight path: layer=%s floor=%s path=%s",
                     getattr(module, "layer_idx", -1),
@@ -981,7 +1208,7 @@ class NPUWorker(WorkerBase):
                 continue
             if not _module_uses_lossless_elastic(module):
                 continue
-            if _module_is_elastic_lightweight_no_headroom(module):
+            if _module_skips_generic_headroom(module):
                 saw_lightweight_no_headroom = True
                 if not logged_lightweight_skip:
                     logger.info(
@@ -1053,7 +1280,7 @@ class NPUWorker(WorkerBase):
                 continue
             if not _module_uses_lossless_elastic(module):
                 continue
-            if _module_is_elastic_lightweight_no_headroom(module):
+            if _module_skips_generic_headroom(module):
                 saw_lightweight_no_headroom = True
                 if not logged_lightweight_skip:
                     logger.info(
@@ -1114,7 +1341,7 @@ class NPUWorker(WorkerBase):
             return 0
 
         for module in model.modules():
-            if _module_is_elastic_lightweight_no_headroom(module):
+            if _module_skips_generic_headroom(module):
                 logger.info(
                     "Skipping KV materialization headroom for elastic lightweight path: layer=%s floor=%s path=%s",
                     getattr(module, "layer_idx", -1),
@@ -1594,20 +1821,26 @@ class NPUWorker(WorkerBase):
                 local_cpu_import_weights = preloaded_cpu_import_weights.get(
                     module.layer_idx, {})
                 mode4_remote_sources: dict[int, tuple[int, int]] = {}
-                if int(getattr(module, "elastic_execution_mode", 0)) == 4:
+                module_mode = int(getattr(module, "elastic_execution_mode", 0))
+                if module_mode in (4, 5):
                     source_rank_by_expert = payload.get(
                         "cpu_import_source_rank", {})
                     source_slot_by_expert = payload.get(
                         "remote_import_source_slot", {})
                     target_rank_by_expert = payload.get(
                         "cpu_import_target_rank", {})
+                    mode5_remote_experts = set(
+                        int(x) for x in payload.get("mode5_remote_experts", []))
                     for expert_id, source_rank in source_rank_by_expert.items():
+                        expert_id = int(expert_id)
+                        if module_mode == 5 and expert_id not in mode5_remote_experts:
+                            continue
                         if target_rank_by_expert.get(expert_id) != current_rank:
                             continue
                         source_slot = source_slot_by_expert.get(expert_id)
                         if source_rank is None or source_slot is None:
                             continue
-                        mode4_remote_sources[int(expert_id)] = (
+                        mode4_remote_sources[expert_id] = (
                             int(source_rank), int(source_slot))
                 if participate_only:
                     module.set_active_expert_mask(None)
@@ -1641,7 +1874,7 @@ class NPUWorker(WorkerBase):
                     module.layer_idx, {})
                 parity_preloaded_direct_fill = False
                 if (local_direct_import_slots
-                        and int(getattr(module, "elastic_execution_mode", 0)) != 4):
+                        and int(getattr(module, "elastic_execution_mode", 0)) not in (4, 5)):
                     for local_slot, expert_id in enumerate(local_active_expert_ids):
                         if local_source_local_ids[local_slot] >= 0:
                             continue
@@ -1674,7 +1907,15 @@ class NPUWorker(WorkerBase):
                     hybrid_enabled
                     and resident_capacity > 0
                     and len(active_ranks) < initial_ep_size)
-                if in_followup_hybrid_stage:
+                module_mode = int(getattr(module, "elastic_execution_mode", 0))
+                if module_mode in (3, 4, 5):
+                    # Mode 3/4/5 are zero-redundancy double-buffer paths.  Even
+                    # the first shrink target can exactly match the runtime
+                    # resident capacity (for example floor=8 -> 16 experts),
+                    # but it must still activate the hybrid metadata instead of
+                    # falling through to mode=1 preallocated-slot materialization.
+                    use_hybrid_cpu_swap = True
+                elif in_followup_hybrid_stage:
                     # Mode=2/3 both pivot into the hybrid tail after the first
                     # shrink. Mode=2 keeps the per-layer resident-slot path;
                     # mode=3 reuses the same ownership/import activation but
@@ -1696,7 +1937,7 @@ class NPUWorker(WorkerBase):
                     # prefix cannot represent the requested expert layout.
                     use_hybrid_cpu_swap = True
                 if use_hybrid_cpu_swap:
-                    if int(getattr(module, "elastic_execution_mode", 0)) == 4:
+                    if int(getattr(module, "elastic_execution_mode", 0)) in (4, 5):
                         module.lossless_mode4_remote_source_by_expert = (
                             mode4_remote_sources)
                         module.lossless_mode4_remote_fetcher = (
@@ -1713,9 +1954,10 @@ class NPUWorker(WorkerBase):
                     module._set_lossless_hybrid_runtime_num_experts()
                     if module.layer_idx == 0:
                         mode = int(getattr(module, "elastic_execution_mode", 0))
-                        if mode == 4:
+                        if mode in (4, 5):
                             logger.info(
-                                "Mode4 remote-NPU hybrid activated: rank=%s layer=%s active_ranks=%s owned_local=%s resident_capacity=%s remote_npu_local=%s cpu_only_local=%s runtime_num_experts=%s",
+                                "Mode%s remote-NPU hybrid activated: rank=%s layer=%s active_ranks=%s owned_local=%s resident_capacity=%s remote_npu_local=%s cpu_only_local=%s runtime_num_experts=%s",
+                                mode,
                                 self.rank,
                                 module.layer_idx,
                                 active_ranks,
@@ -1748,7 +1990,7 @@ class NPUWorker(WorkerBase):
                                 int(module.moe_config.num_experts),
                                 get_ep_group().world_size,
                             )
-                        if getattr(module, "elastic_execution_mode", 0) in (3, 4):
+                        if getattr(module, "elastic_execution_mode", 0) in (3, 4, 5):
                             logger.info(
                                 "Mode%s cross-layer buffer activation: rank=%s layer=%s stage=%s owned_local=%s primary_prefix_rows=%s remote_npu_local=%s cpu_only_local=%s",
                                 int(getattr(module, "elastic_execution_mode", 0)),
@@ -2014,6 +2256,26 @@ class NPUWorker(WorkerBase):
             logger.info(
                 "Elastic shrink payload source group: rank=%s active_ranks=%s source_ranks=%s previous_active_ranks=%s",
                 current_rank, active_ranks, source_ranks, previous_active_ranks)
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (2, 3, 4, 5):
+            logger.info(
+                "Elastic shrink payload source barrier enter: rank=%s active_ranks=%s source_ranks=%s previous_active_ranks=%s",
+                current_rank, active_ranks, source_ranks,
+                previous_active_ranks)
+            try:
+                torch.distributed.monitored_barrier(
+                    group=source_cpu_group,
+                    timeout=timedelta(seconds=120),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Elastic shrink payload source barrier failed; "
+                    "source ranks did not enter payload preparation together. "
+                    f"rank={current_rank} active_ranks={active_ranks} "
+                    f"source_ranks={source_ranks} "
+                    f"previous_active_ranks={previous_active_ranks}") from exc
+            logger.info(
+                "Elastic shrink payload source barrier done: rank=%s active_ranks=%s source_ranks=%s",
+                current_rank, active_ranks, source_ranks)
 
         for module in model.modules():
             if not _is_ascend_fused_moe_module(module):
@@ -2054,6 +2316,56 @@ class NPUWorker(WorkerBase):
                 source_ranks[idx]: gathered_resident_maps_source[idx]
                 for idx in range(len(source_ranks))
             }
+            gathered_mode4_remote_sources_by_rank: dict[
+                int, dict[int, tuple[int, int]]] = {}
+            gathered_mode4_owned_by_rank: dict[int, list[int]] = {}
+            if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5):
+                local_mode4_remote_sources = {
+                    int(expert_id): (int(source_rank), int(source_slot))
+                    for expert_id, (source_rank, source_slot) in getattr(
+                        module, "lossless_mode4_remote_source_by_expert",
+                        {}).items()
+                }
+                gathered_mode4_remote_sources = [
+                    None for _ in range(len(source_ranks))
+                ]
+                torch.distributed.all_gather_object(
+                    gathered_mode4_remote_sources,
+                    local_mode4_remote_sources,
+                    group=source_cpu_group)
+                gathered_mode4_remote_sources_by_rank = {
+                    source_ranks[idx]: (gathered_mode4_remote_sources[idx] or {})
+                    for idx in range(len(source_ranks))
+                }
+                local_mode4_owned = [
+                    int(expert_id) for expert_id in getattr(
+                        module, "lossless_hybrid_owned_expert_ids", [])
+                ]
+                gathered_mode4_owned = [None for _ in range(len(source_ranks))]
+                torch.distributed.all_gather_object(gathered_mode4_owned,
+                                                    local_mode4_owned,
+                                                    group=source_cpu_group)
+                gathered_mode4_owned_by_rank = {
+                    source_ranks[idx]: [
+                        int(expert_id)
+                        for expert_id in (gathered_mode4_owned[idx] or [])
+                    ]
+                    for idx in range(len(source_ranks))
+                }
+
+            def _resolve_mode4_npu_source(source_rank: int,
+                                          expert_id: int,
+                                          fallback_slot: int
+                                          ) -> tuple[int, int]:
+                """Return the rank/slot that actually owns this expert on NPU."""
+                if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE not in (4, 5):
+                    return int(source_rank), int(fallback_slot)
+                remote_sources = gathered_mode4_remote_sources_by_rank.get(
+                    int(source_rank), {})
+                remote_source = remote_sources.get(int(expert_id))
+                if remote_source is not None:
+                    return int(remote_source[0]), int(remote_source[1])
+                return int(source_rank), int(fallback_slot)
 
             logical_num_experts = int(module.elastic_original_num_experts)
             assignments: list[list[tuple[int, int]]] = [
@@ -2073,7 +2385,7 @@ class NPUWorker(WorkerBase):
                 and logical_num_experts % len(active_ranks) == 0
             )
             hybrid_resident_capacity = 0
-            if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 2
+            if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (2, 3, 4, 5)
                     and hasattr(module, "_get_hybrid_resident_capacity")):
                 hybrid_resident_capacity = int(
                     module._get_hybrid_resident_capacity())
@@ -2087,9 +2399,25 @@ class NPUWorker(WorkerBase):
                     or (
                         envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 2
                         and hybrid_resident_capacity > 0
+                    )
+                    or (
+                        envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+                        and hybrid_resident_capacity > 0
                         and target_per_rank <= hybrid_resident_capacity
                     )
                 ))
+            if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+                    and hybrid_resident_capacity > 0
+                    and len(previous_active_ranks) == 2 * len(active_ranks)
+                    and set(active_ranks).issubset(set(previous_active_ranks))
+                    and logical_num_experts % len(active_ranks) == 0):
+                # Mode=4 must keep a deterministic active/cache rank chain:
+                # 16->8 pairs each surviving rank with one cache rank, and
+                # follow-up shrinks fold the just-exited rank's ownership into
+                # its paired survivor. The generic greedy planner can produce a
+                # locally balanced but incomplete logical ownership map after
+                # 4->2; force the paired transfer path instead.
+                use_paired_redundant_transfer = True
             prefer_preloaded_local_slots = (
                 envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
                 and int(getattr(module, "global_redundant_expert_num", 0)) > 0
@@ -2111,6 +2439,156 @@ class NPUWorker(WorkerBase):
                     and module.layer_idx == 0):
                 pass  # debug log removed
                 logged_pairing_summary = True
+
+            if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+                    and hybrid_resident_capacity > 0
+                    and len(previous_active_ranks) == 2 * len(active_ranks)
+                    and len(inactive_ranks) == len(active_ranks)
+                    and set(active_ranks).issubset(set(previous_active_ranks))
+                    and logical_num_experts % len(active_ranks) == 0):
+                ordered_assignments: list[list[tuple[int, int]]] = []
+                runtime_log2phy_cpu = torch.full((logical_num_experts, ),
+                                                 -1,
+                                                 dtype=torch.int32)
+                dense_offset = 0
+                assigned_all: list[int] = []
+
+                def _owned_experts_for_rank(rank: int) -> list[int]:
+                    owned = list(gathered_mode4_owned_by_rank.get(int(rank), []))
+                    if owned:
+                        return owned
+                    pairs = sorted(
+                        ((expert_id, int(local_slot))
+                         for expert_id, local_slot in enumerate(
+                             gathered_loaded_maps_by_rank[int(rank)].tolist())
+                         if int(local_slot) >= 0),
+                        key=lambda item: item[1],
+                    )
+                    return [int(expert_id) for expert_id, _local_slot in pairs]
+
+                pairing_by_active = {
+                    int(active_rank): int(inactive_ranks[idx])
+                    for idx, active_rank in enumerate(active_ranks)
+                }
+
+                for rank_idx, active_rank in enumerate(active_ranks):
+                    active_rank = int(active_rank)
+                    inactive_rank = pairing_by_active[active_rank]
+                    active_owned = _owned_experts_for_rank(active_rank)
+                    inactive_owned = _owned_experts_for_rank(inactive_rank)
+                    active_primary_slots = {
+                        expert_id: int(local_slot)
+                        for expert_id, local_slot in enumerate(
+                            gathered_resident_maps_by_rank[active_rank].tolist())
+                        if 0 <= int(local_slot) < hybrid_resident_capacity
+                    }
+                    active_primary = [
+                        expert_id for expert_id, _local_slot in sorted(
+                            active_primary_slots.items(),
+                            key=lambda item: item[1])
+                        if expert_id in set(active_owned)
+                    ]
+                    active_primary_set = set(active_primary)
+                    active_remote_owned = [
+                        int(expert_id) for expert_id in active_owned
+                        if int(expert_id) not in active_primary_set
+                    ]
+                    target_owned = (
+                        active_primary + active_remote_owned +
+                        [int(expert_id) for expert_id in inactive_owned
+                         if int(expert_id) not in set(active_owned)])
+                    if len(target_owned) != target_per_rank:
+                        raise RuntimeError(
+                            "Mode4 paired cascade shrink produced unexpected "
+                            f"owned count at layer={module.layer_idx}: "
+                            f"active_rank={active_rank} inactive_rank={inactive_rank} "
+                            f"owned={len(target_owned)} target={target_per_rank} "
+                            f"active_owned={len(active_owned)} "
+                            f"inactive_owned={len(inactive_owned)}")
+
+                    rank_assignments: list[tuple[int, int]] = []
+                    for expert_id in target_owned:
+                        expert_id = int(expert_id)
+                        if expert_id in active_primary_slots:
+                            rank_assignments.append(
+                                (expert_id, int(active_primary_slots[expert_id])))
+                            continue
+                        base_rank = (
+                            active_rank if expert_id in set(active_owned)
+                            else inactive_rank)
+                        fallback_slot = int(
+                            gathered_loaded_maps_by_rank[base_rank][expert_id].
+                            item())
+                        if fallback_slot < 0:
+                            fallback_slot = int(
+                                gathered_resident_maps_by_rank[base_rank][
+                                    expert_id].item())
+                        source_world_rank, source_slot = _resolve_mode4_npu_source(
+                            base_rank, expert_id, fallback_slot)
+                        if source_world_rank == active_rank and (
+                                0 <= source_slot < hybrid_resident_capacity):
+                            rank_assignments.append((expert_id, int(source_slot)))
+                        else:
+                            rank_assignments.append((expert_id, -1))
+                            cpu_import_source_rank[expert_id] = int(
+                                source_world_rank)
+                            cpu_import_target_rank[expert_id] = active_rank
+                            remote_import_source_slot[expert_id] = int(source_slot)
+
+                    assignments[rank_idx] = rank_assignments
+                    ordered_assignments.append(rank_assignments)
+                    assigned_counts[rank_idx] = len(rank_assignments)
+                    assigned_all.extend(expert_id for expert_id, _ in rank_assignments)
+                    for local_slot, (expert_id, _source_local_id) in enumerate(
+                            rank_assignments):
+                        runtime_log2phy_cpu[int(expert_id)] = dense_offset + local_slot
+                    dense_offset += len(rank_assignments)
+
+                if (len(assigned_all) != logical_num_experts
+                        or len(set(assigned_all)) != logical_num_experts
+                        or bool(torch.any(runtime_log2phy_cpu < 0).item())):
+                    missing = [
+                        expert_id for expert_id in range(logical_num_experts)
+                        if int(runtime_log2phy_cpu[expert_id].item()) < 0
+                    ][:16]
+                    duplicates = sorted({
+                        expert_id
+                        for expert_id in assigned_all
+                        if assigned_all.count(expert_id) > 1
+                    })[:16]
+                    raise RuntimeError(
+                        "Mode4 paired cascade shrink must cover every logical "
+                        f"expert exactly once at layer={module.layer_idx}: "
+                        f"assigned={len(assigned_all)} "
+                        f"unique={len(set(assigned_all))} "
+                        f"missing_head={missing} duplicate_head={duplicates}")
+
+                if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 5:
+                    mode5_remote_experts = _mode5_select_remote_experts_by_target(
+                        cpu_import_source_rank, cpu_import_target_rank)
+                else:
+                    mode5_remote_experts = set(cpu_import_source_rank)
+                self._lossless_shrink_payload[module.layer_idx] = {
+                    "assignments": assignments,
+                    "ordered_assignments": ordered_assignments,
+                    "runtime_log2phy_cpu": runtime_log2phy_cpu,
+                    "cpu_import_source_rank": cpu_import_source_rank,
+                    "cpu_import_target_rank": cpu_import_target_rank,
+                    "remote_import_source_slot": remote_import_source_slot,
+                    "target_per_rank": target_per_rank,
+                    "mode5_remote_experts": sorted(mode5_remote_experts),
+                }
+                if module.layer_idx == 0 and current_rank == active_ranks[0]:
+                    logger.info(
+                        "Mode4 paired cascade shrink plan: rank=%s active_ranks=%s inactive_ranks=%s target_per_rank=%s remote_imports=%s assignment_counts=%s",
+                        current_rank,
+                        active_ranks,
+                        inactive_ranks,
+                        target_per_rank,
+                        len(cpu_import_source_rank),
+                        assigned_counts,
+                    )
+                continue
 
             if use_paired_redundant_transfer:
                 ordered_assignments: list[list[tuple[int, int]]] = []
@@ -2236,12 +2714,13 @@ class NPUWorker(WorkerBase):
                             int(expert_id), int(local_slot))
                     for free_slot, (expert_id, _) in zip(free_loaded_slots,
                                                          inactive_runtime_pairs):
+                        source_rank, source_slot = _resolve_mode4_npu_source(
+                            inactive_rank, int(expert_id), int(local_slot))
                         ordered_rank_assignments[free_slot] = (
                             int(expert_id), -1)
-                        cpu_import_source_rank[int(expert_id)] = inactive_rank
+                        cpu_import_source_rank[int(expert_id)] = source_rank
                         cpu_import_target_rank[int(expert_id)] = active_rank
-                        remote_import_source_slot[int(expert_id)] = int(
-                            local_slot)
+                        remote_import_source_slot[int(expert_id)] = source_slot
 
                     if any(item is None for item in ordered_rank_assignments):
                         raise RuntimeError(
@@ -2264,6 +2743,11 @@ class NPUWorker(WorkerBase):
                         f"{int(torch.unique(runtime_log2phy_cpu).numel())} "
                         f"logical={logical_num_experts}")
 
+                if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 5:
+                    mode5_remote_experts = _mode5_select_remote_experts_by_target(
+                        cpu_import_source_rank, cpu_import_target_rank)
+                else:
+                    mode5_remote_experts = set(cpu_import_source_rank)
                 self._lossless_shrink_payload[module.layer_idx] = {
                     "assignments": assignments,
                     "ordered_assignments": ordered_assignments,
@@ -2271,6 +2755,8 @@ class NPUWorker(WorkerBase):
                     "cpu_import_source_rank": cpu_import_source_rank,
                     "cpu_import_target_rank": cpu_import_target_rank,
                     "remote_import_source_slot": remote_import_source_slot,
+                    "target_per_rank": target_per_rank,
+                    "mode5_remote_experts": sorted(mode5_remote_experts),
                 }
                 if module.layer_idx == 0 and current_rank == active_ranks[0]:
                     logger.info(
@@ -2335,8 +2821,44 @@ class NPUWorker(WorkerBase):
                         selected_source_local_id = selected_loaded_local_id
                     else:
                         selected_source_local_id = selected_resident_local_id
-                    if selected_source_local_id < 0:
+                    mode4_needs_remote_source = (
+                        envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+                        and hybrid_resident_capacity > 0
+                        and int(selected_source_local_id) >= hybrid_resident_capacity
+                    )
+                    if mode4_needs_remote_source:
                         source_world_rank = None
+                        source_slot = -1
+                        # A follow-up shrink may select an expert that was
+                        # logically assigned to a previously-active rank but is
+                        # physically cached on an older inactive rank. Resolve
+                        # through that rank's mode4 remote-source table instead
+                        # of treating the active rank as a cache service.
+                        for world_rank in source_ranks:
+                            loaded_local_id = int(
+                                gathered_loaded_maps_by_rank[world_rank][expert_id]
+                                .item())
+                            if loaded_local_id < 0:
+                                continue
+                            resolved_rank, resolved_slot = (
+                                _resolve_mode4_npu_source(world_rank, expert_id,
+                                                          int(loaded_local_id)))
+                            if resolved_rank != selected_world_rank:
+                                source_world_rank = resolved_rank
+                                source_slot = resolved_slot
+                                break
+                        if source_world_rank is None:
+                            source_world_rank, source_slot = (
+                                _resolve_mode4_npu_source(selected_world_rank,
+                                                          expert_id,
+                                                          selected_source_local_id))
+                        selected_source_local_id = -1
+                        cpu_import_source_rank[expert_id] = source_world_rank
+                        cpu_import_target_rank[expert_id] = selected_world_rank
+                        remote_import_source_slot[expert_id] = source_slot
+                    elif selected_source_local_id < 0:
+                        source_world_rank = None
+                        source_slot = -1
                         for world_rank in source_ranks:
                             if world_rank == selected_world_rank:
                                 continue
@@ -2345,22 +2867,28 @@ class NPUWorker(WorkerBase):
                                 .item())
                             if loaded_local_id >= 0:
                                 source_world_rank = world_rank
+                                source_slot = int(loaded_local_id)
                                 break
                         if source_world_rank is None:
                             source_world_rank = selected_world_rank
+                            source_slot = int(selected_loaded_local_id)
+                        source_world_rank, source_slot = (
+                            _resolve_mode4_npu_source(source_world_rank,
+                                                      expert_id,
+                                                      source_slot))
                         cpu_import_source_rank[expert_id] = source_world_rank
                         cpu_import_target_rank[expert_id] = selected_world_rank
-                        remote_import_source_slot[expert_id] = int(
-                            gathered_loaded_maps_by_rank[source_world_rank]
-                            [expert_id].item())
+                        remote_import_source_slot[expert_id] = source_slot
                 else:
                     source_world_rank = None
+                    source_slot = -1
                     for world_rank in source_ranks:
                         loaded_local_id = int(
                             gathered_loaded_maps_by_rank[world_rank][expert_id].
                             item())
                         if loaded_local_id >= 0:
                             source_world_rank = world_rank
+                            source_slot = int(loaded_local_id)
                             break
                     if source_world_rank is None:
                         raise RuntimeError(
@@ -2379,11 +2907,11 @@ class NPUWorker(WorkerBase):
                             (assigned_counts[rank_idx], rank_idx))
                         selected_world_rank = active_ranks[selected_rank_idx]
                     selected_source_local_id = -1
+                    source_world_rank, source_slot = _resolve_mode4_npu_source(
+                        source_world_rank, expert_id, source_slot)
                     cpu_import_source_rank[expert_id] = source_world_rank
                     cpu_import_target_rank[expert_id] = selected_world_rank
-                    remote_import_source_slot[expert_id] = int(
-                        gathered_loaded_maps_by_rank[source_world_rank]
-                        [expert_id].item())
+                    remote_import_source_slot[expert_id] = source_slot
 
                 assignments[selected_rank_idx].append(
                     (expert_id, selected_source_local_id))
@@ -2442,6 +2970,11 @@ class NPUWorker(WorkerBase):
                     f"{int(torch.unique(runtime_log2phy_cpu).numel())} "
                     f"logical={logical_num_experts}")
 
+            if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 5:
+                mode5_remote_experts = _mode5_select_remote_experts_by_target(
+                    cpu_import_source_rank, cpu_import_target_rank)
+            else:
+                mode5_remote_experts = set(cpu_import_source_rank)
             self._lossless_shrink_payload[module.layer_idx] = {
                 "assignments": assignments,
                 "ordered_assignments": ordered_assignments,
@@ -2449,6 +2982,8 @@ class NPUWorker(WorkerBase):
                 "cpu_import_source_rank": cpu_import_source_rank,
                 "cpu_import_target_rank": cpu_import_target_rank,
                 "remote_import_source_slot": remote_import_source_slot,
+                "target_per_rank": target_per_rank,
+                "mode5_remote_experts": sorted(mode5_remote_experts),
             }
             if module.layer_idx == 0 and current_rank == active_ranks[0]:
                 ordered_heads = {
@@ -2501,17 +3036,49 @@ class NPUWorker(WorkerBase):
         if source_w13 is None or source_w2 is None:
             source_w13 = module.w13_weight.detach().cpu()
             source_w2 = module.w2_weight.detach().cpu()
-        export_map = (module.loaded_expert_map
-                      if getattr(module, "loaded_expert_map", None) is not None
-                      else module.expert_map)
-        if export_map is None:
-            raise RuntimeError(
-                f"Missing export_map at layer={module.layer_idx}.")
-        local_slots = [int(export_map[int(expert_id)].item()) for expert_id in expert_ids]
+        cpu_shadow_slots = getattr(module, "lossless_cpu_shadow_local_slots", {})
+        local_slots: list[int] = []
+        missing_cpu_shadow_ids: list[int] = []
+        if cpu_shadow_slots:
+            for expert_id in expert_ids:
+                cpu_slot = cpu_shadow_slots.get(int(expert_id))
+                if cpu_slot is None:
+                    missing_cpu_shadow_ids.append(int(expert_id))
+                    continue
+                local_slots.append(int(cpu_slot))
+            if missing_cpu_shadow_ids:
+                raise RuntimeError(
+                    "CPU export requested experts that are not present in the "
+                    f"CPU shadow at layer={module.layer_idx}: "
+                    f"missing={missing_cpu_shadow_ids[:16]} "
+                    f"count={len(missing_cpu_shadow_ids)} "
+                    f"cpu_shadow_rows={int(source_w13.shape[0])}. "
+                    "For mode=5 this usually means remote-NPU experts leaked "
+                    "into the CPU import payload.")
+        else:
+            export_map = (
+                module.loaded_expert_map
+                if getattr(module, "loaded_expert_map", None) is not None
+                else module.expert_map)
+            if export_map is None:
+                raise RuntimeError(
+                    f"Missing export_map at layer={module.layer_idx}.")
+            local_slots = [
+                int(export_map[int(expert_id)].item()) for expert_id in expert_ids
+            ]
         if any(local_slot < 0 for local_slot in local_slots):
             raise RuntimeError(
                 f"Invalid CPU export slot at layer={module.layer_idx}: "
                 f"expert_ids={expert_ids} local_slots={local_slots}")
+        max_slot = max(local_slots) if local_slots else -1
+        if (max_slot >= int(source_w13.shape[0])
+                or max_slot >= int(source_w2.shape[0])):
+            raise RuntimeError(
+                "CPU export slot exceeds available CPU shadow rows at "
+                f"layer={module.layer_idx}: expert_ids={expert_ids[:16]} "
+                f"local_slots={local_slots[:16]} max_slot={max_slot} "
+                f"w13_rows={int(source_w13.shape[0])} "
+                f"w2_rows={int(source_w2.shape[0])}.")
         export_index = torch.tensor(local_slots, device="cpu", dtype=torch.long)
         return (source_w13.index_select(0, export_index).contiguous(),
                 source_w2.index_select(0, export_index).contiguous())
@@ -2544,9 +3111,20 @@ class NPUWorker(WorkerBase):
         device_group = world_group.device_group
         assignments_by_rank: dict[int, list[tuple[int, int, int]]] = {}
         request_tag = 0
-        for slot_idx, remote_rank, remote_slot, expert_id in remote_assignments:
+        assignment_rows: list[tuple[int, int, int, int, int]] = []
+        for assignment in remote_assignments:
+            if len(assignment) == 5:
+                slot_idx, remote_rank, remote_slot, expert_id, layer_idx = assignment
+            else:
+                slot_idx, remote_rank, remote_slot, expert_id = assignment
+                layer_idx = int(getattr(layer, "layer_idx", 0))
+            assignment_rows.append((int(slot_idx), int(remote_rank),
+                                    int(remote_slot), int(expert_id),
+                                    int(layer_idx)))
+        for slot_idx, remote_rank, remote_slot, expert_id, layer_idx in assignment_rows:
             assignments_by_rank.setdefault(int(remote_rank), []).append(
-                (int(slot_idx), int(remote_slot), int(expert_id)))
+                (int(slot_idx), int(remote_slot), int(expert_id),
+                 int(layer_idx)))
         for remote_rank, assignments in sorted(assignments_by_rank.items()):
             if (getattr(layer, "layer_idx", -1) == 0
                     and not getattr(self, "_mode4_fetch_begin_logged", False)):
@@ -2559,8 +3137,8 @@ class NPUWorker(WorkerBase):
                 )
                 self._mode4_fetch_begin_logged = True
             request = torch.tensor(
-                [[int(getattr(layer, "layer_idx", 0)), int(remote_slot),
-                  int(expert_id)] for _slot_idx, remote_slot, expert_id in
+                [[int(layer_idx), int(remote_slot), int(expert_id)]
+                 for _slot_idx, remote_slot, expert_id, layer_idx in
                  assignments],
                 device="cpu",
                 dtype=torch.int64,
@@ -2595,33 +3173,32 @@ class NPUWorker(WorkerBase):
                     len(assignments),
                 )
                 self._mode4_fetch_request_logged = True
-            recv_key_w13 = ("recv_w13", remote_rank,
-                            _mode4_tensor_signature(dst_w13,
-                                                    len(assignments)))
-            recv_key_w2 = ("recv_w2", remote_rank,
-                           _mode4_tensor_signature(dst_w2, len(assignments)))
             recv_cache = self._mode4_remote_recv_buffer_cache
-            recv_w13 = recv_cache.get(recv_key_w13)
-            if recv_w13 is None:
-                recv_w13 = _mode4_new_like_rows(dst_w13, len(assignments))
-                recv_cache[recv_key_w13] = recv_w13
-            recv_w2 = recv_cache.get(recv_key_w2)
-            if recv_w2 is None:
-                recv_w2 = _mode4_new_like_rows(dst_w2, len(assignments))
-                recv_cache[recv_key_w2] = recv_w2
-            req_w13 = torch.distributed.irecv(recv_w13,
-                                              src=remote_rank,
-                                              group=device_group)
-            req_w2 = torch.distributed.irecv(recv_w2,
-                                             src=remote_rank,
-                                             group=device_group)
-            req_w13.wait()
-            req_w2.wait()
+            rows = len(assignments)
+            recv_key_flat = ("recv_flat", remote_rank,
+                             _mode4_flat_payload_signature(
+                                 dst_w13, dst_w2, rows))
+            recv_flat = _mode4_get_flat_payload(recv_cache, recv_key_flat,
+                                                dst_w13, dst_w2, rows)
+            req_flat = torch.distributed.irecv(recv_flat,
+                                               src=remote_rank,
+                                               group=device_group)
+            req_flat.wait()
+            w13_elems = int(dst_w13[0].numel())
+            w2_elems = int(dst_w2[0].numel())
+            recv_w13 = recv_flat[:rows * w13_elems].view(
+                (rows, ) + tuple(dst_w13.shape[1:]))
+            recv_w2 = recv_flat[rows * w13_elems:rows *
+                                (w13_elems + w2_elems)].view(
+                                    (rows, ) + tuple(dst_w2.shape[1:]))
             # Most shrink-to-8 windows map the remote experts into a dense
             # prefix of the runtime slot. Keep the generic scatter path for
             # later 8->4/4->2/2->1 windows, but use a single contiguous copy
             # when the destination slots are already dense.
-            slot_ids = [int(slot_idx) for slot_idx, _remote_slot, _expert_id in assignments]
+            slot_ids = [
+                int(slot_idx)
+                for slot_idx, _remote_slot, _expert_id, _layer_idx in assignments
+            ]
             if slot_ids == list(range(min(slot_ids), min(slot_ids) + len(slot_ids))):
                 dst_start = min(slot_ids)
                 dst_w13[dst_start:dst_start + len(slot_ids)].copy_(
@@ -2646,6 +3223,330 @@ class NPUWorker(WorkerBase):
                 len(remote_assignments),
             )
             self._mode4_fetch_logged = True
+
+    def _mode4_warmup_remote_payload_fetch(
+            self, active_ranks: list[int], world_group) -> None:
+        if not _env_flag("VLLM_ASCEND_MODE4_WARMUP_REMOTE_PAYLOAD_FETCH",
+                         "1"):
+            return
+        if self.rank not in set(int(rank) for rank in active_ranks):
+            return
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return
+        layers = {
+            int(module.layer_idx): module
+            for module in model.modules()
+            if _is_ascend_fused_moe_module(module)
+        }
+        if not layers:
+            return
+        payloads = getattr(self, "_lossless_shrink_payload", {})
+        if not payloads:
+            return
+        block_layers = int(os.getenv("VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS",
+                                     "1"))
+        if block_layers <= 1:
+            return
+        active_idx = list(active_ranks).index(self.rank)
+        layer_indices = sorted(int(layer_idx) for layer_idx in payloads)
+        block_start = min(layer_indices) + block_layers
+        if block_start > max(layer_indices):
+            return
+        request_rows: list[tuple[int, int, int]] = []
+        remote_rank: Optional[int] = None
+        for layer_idx in range(block_start, block_start + block_layers):
+            payload = payloads.get(int(layer_idx))
+            if payload is None:
+                continue
+            ordered = payload.get("ordered_assignments", [])
+            if active_idx >= len(ordered):
+                continue
+            source_rank_by_expert = payload.get("cpu_import_source_rank", {})
+            source_slot_by_expert = payload.get("remote_import_source_slot", {})
+            target_rank_by_expert = payload.get("cpu_import_target_rank", {})
+            for expert_id, _local_slot in ordered[active_idx]:
+                expert_id = int(expert_id)
+                if target_rank_by_expert.get(expert_id) != self.rank:
+                    continue
+                if expert_id not in source_rank_by_expert:
+                    continue
+                source_rank = int(source_rank_by_expert[expert_id])
+                if remote_rank is None:
+                    remote_rank = source_rank
+                elif remote_rank != source_rank:
+                    # The first version warms only the common one-cache-rank
+                    # shrink-to-8 path. Later floors can still use the generic
+                    # fetch path safely.
+                    return
+                if expert_id not in source_slot_by_expert:
+                    continue
+                request_rows.append((int(layer_idx),
+                                     int(source_slot_by_expert[expert_id]),
+                                     expert_id))
+        if remote_rank is None or not request_rows:
+            return
+        first_layer = layers.get(block_start)
+        if first_layer is None:
+            return
+        rows = len(request_rows)
+        w13_ref = getattr(first_layer, "w13_weight", None)
+        w2_ref = getattr(first_layer, "w2_weight", None)
+        if w13_ref is None or w2_ref is None:
+            return
+        recv_key = ("warmup_recv_flat", int(remote_rank), rows,
+                    _mode4_flat_payload_signature(w13_ref, w2_ref, rows))
+        recv_flat = _mode4_get_flat_payload(
+            self._mode4_remote_recv_buffer_cache, recv_key, w13_ref, w2_ref,
+            rows)
+        cpu_group = world_group.cpu_group
+        device_group = world_group.device_group
+        request = torch.tensor(request_rows, device="cpu", dtype=torch.int64)
+        shape = torch.tensor([rows, 3], device="cpu", dtype=torch.int64)
+        warmup_start_t = time.perf_counter()
+        reqs = [
+            torch.distributed.isend(shape,
+                                    dst=int(remote_rank),
+                                    group=cpu_group,
+                                    tag=0),
+            torch.distributed.isend(request,
+                                    dst=int(remote_rank),
+                                    group=cpu_group,
+                                    tag=0),
+        ]
+        for req in reqs:
+            req.wait()
+        recv_req = torch.distributed.irecv(recv_flat,
+                                           src=int(remote_rank),
+                                           group=device_group)
+        recv_req.wait()
+        if torch.npu.is_available():
+            torch.npu.synchronize()
+        logger.info(
+            "Mode4 remote payload warmup done: rank=%s remote_rank=%s block_start=%s rows=%s total_ms=%.2f",
+            self.rank,
+            remote_rank,
+            block_start,
+            rows,
+            (time.perf_counter() - warmup_start_t) * 1000.0,
+        )
+
+    def _mode4_prime_next_block_runtime_slot(
+            self, active_ranks: list[int]) -> None:
+        if not _env_flag("VLLM_ASCEND_MODE4_PRIME_NEXT_BLOCK_SLOT", "1"):
+            return
+        if self.rank not in set(int(rank) for rank in active_ranks):
+            return
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return
+        block_layers = int(os.getenv("VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS",
+                                     "1"))
+        if block_layers <= 1:
+            return
+        prefetch_stream = getattr(model_runner, "moe_prefetch_stream", None)
+        if prefetch_stream is None:
+            logger.info(
+                "Mode4 next-block slot prime skipped: rank=%s reason=no_prefetch_stream",
+                self.rank)
+            return
+        try:
+            from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+            from vllm.forward_context import BatchDescriptor
+            from vllm.config import CUDAGraphMode
+            from vllm_ascend.ops.fused_moe import Mode3DoubleBufferManager
+        except Exception:
+            logger.exception(
+                "Mode4 next-block slot prime failed to import helpers: rank=%s",
+                self.rank)
+            raise
+
+        num_tokens = int(
+            os.getenv("VLLM_ASCEND_MODE4_PRIME_NEXT_BLOCK_TOKENS", "32"))
+        num_tokens = max(num_tokens, 1)
+        num_tokens_across_dp = torch.full(
+            (int(getattr(model_runner, "dp_size", 1)), ),
+            num_tokens,
+            dtype=torch.int64)
+        prime_start_t = time.perf_counter()
+        with set_ascend_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=False,
+                reserved_mc2_mask=getattr(model_runner, "reserved_mc2_mask",
+                                          None),
+                moe_comm_type=None,
+                num_actual_tokens=num_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(num_tokens=num_tokens,
+                                                 uniform_decode=False),
+                prefetch_stream=getattr(model_runner, "prefetch_stream", None),
+                moe_prefetch_stream=prefetch_stream,
+                model_instance=model):
+            manager = Mode3DoubleBufferManager(model, prefetch_stream)
+            target_layer = manager.layer_lookup.get(block_layers)
+            if target_layer is None:
+                logger.info(
+                    "Mode4 next-block slot prime skipped: rank=%s reason=no_target_layer block_start=%s",
+                    self.rank, block_layers)
+                return
+            slot_id = manager._slot_id_for_runtime_layer(target_layer)
+            manager.prepare_mode4_block_slot(target_layer,
+                                             slot_id,
+                                             async_copy=False,
+                                             reason="post_shrink_prime")
+        if torch.npu.is_available():
+            torch.npu.synchronize()
+        logger.info(
+            "Mode4 next-block slot primed: rank=%s block_start=%s block_layers=%s total_ms=%.2f",
+            self.rank, block_layers, block_layers,
+            (time.perf_counter() - prime_start_t) * 1000.0)
+
+    def _ensure_mode4_double_buffer_manager(self) -> None:
+        if not self._has_mode4_remote_npu_lightweight_module():
+            return
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return
+        prefetch_stream = getattr(model_runner, "moe_prefetch_stream", None)
+        if prefetch_stream is None:
+            prefetch_stream = torch.npu.Stream(device=getattr(model_runner,
+                                                             "device", None))
+            setattr(model_runner, "moe_prefetch_stream", prefetch_stream)
+            logger.info(
+                "Mode4 double-buffer manager created fallback moe prefetch stream: rank=%s",
+                self.rank)
+        try:
+            from vllm_ascend.ops.fused_moe import Mode3DoubleBufferManager
+        except Exception:
+            logger.exception(
+                "Mode4 double-buffer manager init failed to import helper: rank=%s",
+                self.rank)
+            raise
+        manager = getattr(model, "_mode3_double_buffer_manager", None)
+        if manager is None:
+            manager = Mode3DoubleBufferManager(model, prefetch_stream)
+            setattr(model, "_mode3_double_buffer_manager", manager)
+        for module in model.modules():
+            if _is_ascend_fused_moe_module(module):
+                setattr(module, "_mode3_double_buffer_manager", manager)
+
+    def _mode4_build_prepacked_remote_payloads(
+            self,
+            owner_ranks: list[int],
+            expert_cache: dict[tuple[int, int], tuple[torch.Tensor,
+                                                     torch.Tensor]]) -> dict[
+                                                         tuple[int, tuple[
+                                                             tuple[int, int,
+                                                                   int],
+                                                             ...]],
+                                                         torch.Tensor]:
+        block_layers = int(os.getenv("VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS",
+                                     "1"))
+        if block_layers <= 1:
+            return {}
+        payloads = getattr(self, "_lossless_shrink_payload", {})
+        if not payloads or not owner_ranks:
+            return {}
+        owner_rank_set = {int(rank) for rank in owner_ranks}
+        layer_indices = sorted(int(layer_idx) for layer_idx in payloads)
+        if not layer_indices:
+            return {}
+        first_payload = payloads[layer_indices[0]]
+        target_per_rank = int(first_payload.get("target_per_rank", 0))
+        if target_per_rank <= 0:
+            assignments = first_payload.get("ordered_assignments", [])
+            target_per_rank = len(assignments[0]) if assignments else 0
+        if target_per_rank <= 0:
+            return {}
+        prepacked: dict[tuple[int, tuple[tuple[int, int, int], ...]],
+                        torch.Tensor] = {}
+        send_cache = self._mode4_remote_send_buffer_cache
+        block_starts = range(min(layer_indices), max(layer_indices) + 1,
+                             block_layers)
+        for owner_rank in sorted(owner_rank_set):
+            owner_idx = owner_rank % len(payloads[layer_indices[0]].get(
+                "ordered_assignments", []) or [0])
+            for idx, rank_assignments in enumerate(
+                    first_payload.get("ordered_assignments", [])):
+                for expert_id, _slot in rank_assignments:
+                    if first_payload.get("cpu_import_target_rank", {}).get(
+                            int(expert_id)) == owner_rank:
+                        owner_idx = idx
+                        break
+                else:
+                    continue
+                break
+            for block_start in block_starts:
+                request_rows: list[tuple[int, int, int]] = []
+                send_batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+                for layer_idx in range(int(block_start),
+                                       int(block_start) + block_layers):
+                    payload = payloads.get(int(layer_idx))
+                    if payload is None:
+                        continue
+                    ordered = payload.get("ordered_assignments", [])
+                    if owner_idx >= len(ordered):
+                        continue
+                    source_rank_by_expert = payload.get(
+                        "cpu_import_source_rank", {})
+                    source_slot_by_expert = payload.get(
+                        "remote_import_source_slot", {})
+                    target_rank_by_expert = payload.get(
+                        "cpu_import_target_rank", {})
+                    for expert_id, _local_slot in ordered[owner_idx]:
+                        expert_id = int(expert_id)
+                        if target_rank_by_expert.get(expert_id) != owner_rank:
+                            continue
+                        if int(source_rank_by_expert.get(expert_id, -1)) != self.rank:
+                            continue
+                        if expert_id not in source_slot_by_expert:
+                            continue
+                        remote_slot = int(source_slot_by_expert[expert_id])
+                        cached_pair = expert_cache.get((int(layer_idx),
+                                                        remote_slot))
+                        if cached_pair is None:
+                            continue
+                        request_rows.append((int(layer_idx), remote_slot,
+                                             expert_id))
+                        send_batches.append(cached_pair)
+                if not send_batches:
+                    continue
+                first_w13, first_w2 = send_batches[0]
+                rows = len(send_batches)
+                send_key_flat = ("prepack_flat", int(owner_rank),
+                                 int(block_start),
+                                 _mode4_flat_payload_signature(
+                                     first_w13, first_w2, rows))
+                flat_payload = _mode4_get_flat_payload(
+                    send_cache, send_key_flat, first_w13, first_w2, rows)
+                w13_elems = int(first_w13.numel())
+                w2_elems = int(first_w2.numel())
+                batch_w13 = flat_payload[:rows * w13_elems].view(
+                    (rows, ) + tuple(first_w13.shape))
+                batch_w2 = flat_payload[rows * w13_elems:rows *
+                                        (w13_elems + w2_elems)].view(
+                                            (rows, ) + tuple(first_w2.shape))
+                for row_idx, (send_w13, send_w2) in enumerate(send_batches):
+                    batch_w13[row_idx:row_idx + 1].copy_(send_w13,
+                                                         non_blocking=False)
+                    batch_w2[row_idx:row_idx + 1].copy_(send_w2,
+                                                        non_blocking=False)
+                request_key = (int(owner_rank), tuple(request_rows))
+                prepacked[request_key] = flat_payload
+        logger.info(
+            "Mode4 remote cache prepacked flat payloads: rank=%s owners=%s entries=%s block_layers=%s",
+            self.rank,
+            owner_ranks,
+            len(prepacked),
+            block_layers,
+        )
+        return prepacked
 
     def _mode4_remote_cache_service_loop(self,
                                          active_ranks: list[int],
@@ -2742,136 +3643,148 @@ class NPUWorker(WorkerBase):
                 retained_bytes,
             )
             self._mode4_cache_snapshot_logged = True
-        logger.info("Mode4 remote cache service owners: rank=%s owner_ranks=%s",
-                    self.rank, owner_ranks)
+        self._mode4_remote_prepacked_payload_cache = (
+            self._mode4_build_prepacked_remote_payloads(owner_ranks,
+                                                        expert_cache))
+        logger.info(
+            "Mode4 remote cache service owners: rank=%s owner_ranks=%s listen=any_source",
+            self.rank, owner_ranks)
         while not stop_event.is_set():
-            for owner_rank in owner_ranks:
-                shape = torch.empty((2, ), device="cpu", dtype=torch.int64)
-                try:
-                    torch.distributed.recv(shape,
-                                           src=owner_rank,
-                                           group=cpu_group,
-                                           tag=0)
-                    rows = int(shape[0].item())
-                    cols = int(shape[1].item())
-                    if rows <= 0 or cols <= 0:
-                        logger.info(
-                            "Mode4 remote cache stop sentinel received: rank=%s owner_rank=%s rows=%s cols=%s",
-                            self.rank, owner_rank, rows, cols)
-                        stop_event.set()
-                        return
-                    request = torch.empty((rows, cols),
-                                          device="cpu",
-                                          dtype=torch.int64)
-                    torch.distributed.recv(request,
-                                           src=owner_rank,
-                                           group=cpu_group,
-                                           tag=0)
-                    if not getattr(self, "_mode4_cache_request_logged", False):
-                        logger.info(
-                            "Mode4 remote cache request received: rank=%s owner_rank=%s rows=%s cols=%s first=%s",
-                            self.rank,
-                            owner_rank,
-                            rows,
-                            cols,
-                            request[0].tolist() if rows > 0 else [],
-                        )
-                        self._mode4_cache_request_logged = True
-                    send_batches: list[tuple[torch.Tensor, torch.Tensor, int,
-                                             int, int]] = []
-                    for row in request.tolist():
-                        layer_idx, remote_slot, _expert_id = map(int, row[:3])
-                        cached_pair = expert_cache.get((layer_idx, remote_slot))
-                        if cached_pair is None:
-                            raise RuntimeError(
-                                "Mode4 cache rank missing NPU snapshot: "
-                                f"rank={self.rank} owner_rank={owner_rank} "
-                                f"layer={layer_idx} remote_slot={remote_slot} "
-                                f"expert_id={_expert_id}")
-                        send_w13, send_w2 = cached_pair
-                        if send_w13.device.type != "npu" or send_w2.device.type != "npu":
-                            raise RuntimeError(
-                                "Mode4 remote cache send tensor is not NPU-resident: "
-                                f"rank={self.rank} owner_rank={owner_rank} "
-                                f"layer={layer_idx} remote_slot={remote_slot} "
-                                f"expert_id={_expert_id} "
-                                f"send_w13_device={send_w13.device} "
-                                f"send_w2_device={send_w2.device}")
-                        send_batches.append((send_w13, send_w2, layer_idx,
-                                             remote_slot, _expert_id))
-                    if not send_batches:
-                        continue
-                    # Send all requested experts for this cache->owner pair as
-                    # two batched NPU tensors. The previous per-expert protocol
-                    # issued two HCCL operations per expert (w13/w2), so the
-                    # 16->8 case paid 16 tiny P2P ops per layer per rank. This
-                    # keeps the same CPU control handshake but collapses the
-                    # NPU payload to one w13 send plus one w2 send.
-                    first_w13, first_w2, first_layer, first_slot, first_expert = (
-                        send_batches[0])
-                    send_key_w13 = ("send_w13", owner_rank,
-                                    _mode4_tensor_signature(
-                                        first_w13, len(send_batches)))
-                    send_key_w2 = ("send_w2", owner_rank,
-                                   _mode4_tensor_signature(
-                                       first_w2, len(send_batches)))
-                    send_cache = self._mode4_remote_send_buffer_cache
-                    batch_w13 = send_cache.get(send_key_w13)
-                    if batch_w13 is None:
-                        batch_w13 = _mode4_new_like_rows(first_w13,
-                                                         len(send_batches))
-                        send_cache[send_key_w13] = batch_w13
-                    batch_w2 = send_cache.get(send_key_w2)
-                    if batch_w2 is None:
-                        batch_w2 = _mode4_new_like_rows(first_w2,
-                                                        len(send_batches))
-                        send_cache[send_key_w2] = batch_w2
-                    for row_idx, (send_w13, send_w2, _layer_idx,
-                                  _remote_slot, _expert_id) in enumerate(
-                                          send_batches):
-                        batch_w13[row_idx:row_idx + 1].copy_(send_w13,
-                                                             non_blocking=False)
-                        batch_w2[row_idx:row_idx + 1].copy_(send_w2,
-                                                            non_blocking=False)
-                    if not getattr(self, "_mode4_cache_send_logged", False):
-                        logger.info(
-                            "Mode4 remote cache device batch send begin: rank=%s owner_rank=%s layer=%s first_remote_slot=%s first_expert_id=%s rows=%s w13_device=%s w2_device=%s w13_shape=%s w2_shape=%s",
-                            self.rank,
-                            owner_rank,
-                            first_layer,
-                            first_slot,
-                            first_expert,
-                            len(send_batches),
-                            batch_w13.device,
-                            batch_w2.device,
-                            tuple(batch_w13.shape),
-                            tuple(batch_w2.shape),
-                        )
-                        self._mode4_cache_send_logged = True
-                    req_w13 = torch.distributed.isend(batch_w13,
-                                                      dst=owner_rank,
-                                                      group=device_group)
-                    req_w2 = torch.distributed.isend(batch_w2,
-                                                     dst=owner_rank,
-                                                     group=device_group)
-                    req_w13.wait()
-                    req_w2.wait()
-                    if not getattr(self, "_mode4_cache_send_done_logged",
-                                   False):
-                        logger.info(
-                            "Mode4 remote cache device send done: rank=%s owner_rank=%s rows=%s",
-                            self.rank,
-                            owner_rank,
-                            rows,
-                        )
-                        self._mode4_cache_send_done_logged = True
-                except Exception as exc:
-                    if stop_event.is_set():
-                        return
-                    logger.exception(
-                        "Mode4 remote cache service failed: rank=%s owner_rank=%s error=%s",
-                        self.rank, owner_rank, exc)
+            shape = torch.empty((2, ), device="cpu", dtype=torch.int64)
+            try:
+                owner_rank = torch.distributed.recv(shape,
+                                                    src=None,
+                                                    group=cpu_group,
+                                                    tag=0)
+                if owner_rank is None:
+                    logger.warning(
+                        "Mode4 remote cache recv returned no source rank: rank=%s",
+                        self.rank)
+                    continue
+                owner_rank = int(owner_rank)
+                rows = int(shape[0].item())
+                cols = int(shape[1].item())
+                if rows <= 0 or cols <= 0:
+                    logger.info(
+                        "Mode4 remote cache stop sentinel received: rank=%s owner_rank=%s rows=%s cols=%s",
+                        self.rank, owner_rank, rows, cols)
+                    stop_event.set()
                     return
+                request = torch.empty((rows, cols), device="cpu", dtype=torch.int64)
+                torch.distributed.recv(request,
+                                       src=owner_rank,
+                                       group=cpu_group,
+                                       tag=0)
+                if not getattr(self, "_mode4_cache_request_logged", False):
+                    logger.info(
+                        "Mode4 remote cache request received: rank=%s owner_rank=%s rows=%s cols=%s first=%s",
+                        self.rank,
+                        owner_rank,
+                        rows,
+                        cols,
+                        request[0].tolist() if rows > 0 else [],
+                    )
+                    self._mode4_cache_request_logged = True
+                request_rows = tuple(
+                    (int(row[0]), int(row[1]), int(row[2]))
+                    for row in request.tolist())
+                prepacked_payload = self._mode4_remote_prepacked_payload_cache.get(
+                    (int(owner_rank), request_rows))
+                if prepacked_payload is not None:
+                    if not getattr(self, "_mode4_cache_prepacked_logged", False):
+                        logger.info(
+                            "Mode4 remote cache prepacked send begin: rank=%s owner_rank=%s rows=%s payload_shape=%s",
+                            self.rank,
+                            owner_rank,
+                            rows,
+                            tuple(prepacked_payload.shape),
+                        )
+                        self._mode4_cache_prepacked_logged = True
+                    req_flat = torch.distributed.isend(prepacked_payload,
+                                                       dst=owner_rank,
+                                                       group=device_group)
+                    req_flat.wait()
+                    continue
+                send_batches: list[tuple[torch.Tensor, torch.Tensor, int,
+                                         int, int]] = []
+                for row in request_rows:
+                    layer_idx, remote_slot, _expert_id = map(int, row[:3])
+                    cached_pair = expert_cache.get((layer_idx, remote_slot))
+                    if cached_pair is None:
+                        raise RuntimeError(
+                            "Mode4 cache rank missing NPU snapshot: "
+                            f"rank={self.rank} owner_rank={owner_rank} "
+                            f"layer={layer_idx} remote_slot={remote_slot} "
+                            f"expert_id={_expert_id}")
+                    send_w13, send_w2 = cached_pair
+                    if send_w13.device.type != "npu" or send_w2.device.type != "npu":
+                        raise RuntimeError(
+                            "Mode4 remote cache send tensor is not NPU-resident: "
+                            f"rank={self.rank} owner_rank={owner_rank} "
+                            f"layer={layer_idx} remote_slot={remote_slot} "
+                            f"expert_id={_expert_id} "
+                            f"send_w13_device={send_w13.device} "
+                            f"send_w2_device={send_w2.device}")
+                    send_batches.append((send_w13, send_w2, layer_idx,
+                                         remote_slot, _expert_id))
+                if not send_batches:
+                    continue
+                first_w13, first_w2, first_layer, first_slot, first_expert = (
+                    send_batches[0])
+                send_cache = self._mode4_remote_send_buffer_cache
+                rows = len(send_batches)
+                send_key_flat = ("send_flat", owner_rank,
+                                 _mode4_flat_payload_signature(
+                                     first_w13, first_w2, rows))
+                flat_payload = _mode4_get_flat_payload(
+                    send_cache, send_key_flat, first_w13, first_w2, rows)
+                w13_elems = int(first_w13.numel())
+                w2_elems = int(first_w2.numel())
+                batch_w13 = flat_payload[:rows * w13_elems].view(
+                    (rows, ) + tuple(first_w13.shape))
+                batch_w2 = flat_payload[rows * w13_elems:rows *
+                                        (w13_elems + w2_elems)].view(
+                                            (rows, ) + tuple(first_w2.shape))
+                for row_idx, (send_w13, send_w2, _layer_idx,
+                              _remote_slot, _expert_id) in enumerate(send_batches):
+                    batch_w13[row_idx:row_idx + 1].copy_(send_w13,
+                                                         non_blocking=False)
+                    batch_w2[row_idx:row_idx + 1].copy_(send_w2,
+                                                        non_blocking=False)
+                if not getattr(self, "_mode4_cache_send_logged", False):
+                    logger.info(
+                        "Mode4 remote cache device flat send begin: rank=%s owner_rank=%s layer=%s first_remote_slot=%s first_expert_id=%s rows=%s payload_device=%s payload_shape=%s w13_shape=%s w2_shape=%s",
+                        self.rank,
+                        owner_rank,
+                        first_layer,
+                        first_slot,
+                        first_expert,
+                        len(send_batches),
+                        flat_payload.device,
+                        tuple(flat_payload.shape),
+                        tuple(batch_w13.shape),
+                        tuple(batch_w2.shape),
+                    )
+                    self._mode4_cache_send_logged = True
+                req_flat = torch.distributed.isend(flat_payload,
+                                                   dst=owner_rank,
+                                                   group=device_group)
+                req_flat.wait()
+                if not getattr(self, "_mode4_cache_send_done_logged", False):
+                    logger.info(
+                        "Mode4 remote cache device send done: rank=%s owner_rank=%s rows=%s",
+                        self.rank,
+                        owner_rank,
+                        rows,
+                    )
+                    self._mode4_cache_send_done_logged = True
+            except Exception as exc:
+                if stop_event.is_set():
+                    return
+                logger.exception(
+                    "Mode4 remote cache service failed: rank=%s error=%s",
+                    self.rank, exc)
+                return
 
     def _start_mode4_remote_cache_service(self, active_ranks: list[int],
                                           world_group) -> None:
@@ -2905,12 +3818,16 @@ class NPUWorker(WorkerBase):
                 "_mode4_cache_request_logged",
                 "_mode4_cache_send_logged",
                 "_mode4_cache_send_done_logged",
+                "_mode4_cache_prepacked_logged",
         ):
             if hasattr(self, attr):
                 setattr(self, attr, False)
         if self.rank in active_ranks:
             return
-        self._stop_mode4_remote_cache_service()
+        # Follow-up shrinks (8->4->2->1) can still need cache ranks from older
+        # stages. Do not send stop sentinels here; only clear this rank's local
+        # service thread if it is being repurposed as a new cache rank.
+        self._stop_mode4_remote_cache_service(world_group=None)
         stop_event = threading.Event()
         self._mode4_remote_cache_stop_event = stop_event
         thread = threading.Thread(target=self._mode4_remote_cache_service_loop,
@@ -2980,6 +3897,7 @@ class NPUWorker(WorkerBase):
         self._mode4_remote_expert_tensor_cache = {}
         self._mode4_remote_recv_buffer_cache = {}
         self._mode4_remote_send_buffer_cache = {}
+        self._mode4_remote_prepacked_payload_cache = {}
         self._mode4_owned_cache_ranks = []
         self._mode4_cache_owner_ranks = []
 
@@ -3169,10 +4087,17 @@ class NPUWorker(WorkerBase):
         if ordered_assignments:
             target_owned_local_expert_count = max(
                 len(assignments) for assignments in ordered_assignments)
-        use_hybrid_cpu_swap = (
-            hasattr(module, "should_activate_lossless_hybrid_for_target")
-            and module.should_activate_lossless_hybrid_for_target(
-                target_owned_local_expert_count, len(active_ranks)))
+        module_mode = int(getattr(module, "elastic_execution_mode", 0))
+        use_hybrid_cpu_swap = False
+        if module_mode in (3, 4, 5):
+            # Match _refresh_elastic_parallel_state(): all zero-redundancy
+            # double-buffer modes use the hybrid ownership/import path even
+            # when the first shrink target exactly fits the resident capacity.
+            use_hybrid_cpu_swap = True
+        elif (hasattr(module, "should_activate_lossless_hybrid_for_target")
+              and module.should_activate_lossless_hybrid_for_target(
+                  target_owned_local_expert_count, len(active_ranks))):
+            use_hybrid_cpu_swap = True
         loaded_weight_capacity = int(getattr(module, "loaded_weight_capacity", 0))
         w13_rows = int(module.w13_weight.shape[0])
         w2_rows = int(module.w2_weight.shape[0])
@@ -3242,11 +4167,14 @@ class NPUWorker(WorkerBase):
                 cpu_import_target_rank=cpu_import_target_rank,
                 participate_only=participate_only)
 
+        execution_mode = int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
+        zero_redundancy_paired_npu_import = (
+            execution_mode != 3
+            and getattr(module, "global_redundant_expert_num", 0) <= 0
+            and len(previous_active_ranks) == 2 * len(active_ranks)
+            and set(active_ranks).issubset(set(previous_active_ranks)))
         use_npu_import = (
-            (getattr(module, "global_redundant_expert_num", 0) <= 0
-             and len(previous_active_ranks) == 2 * len(active_ranks)
-             and set(active_ranks).issubset(set(previous_active_ranks)))
-            or use_direct_npu_slot_import
+            zero_redundancy_paired_npu_import or use_direct_npu_slot_import
         )
 
         if use_npu_import:
@@ -3410,9 +4338,13 @@ class NPUWorker(WorkerBase):
                 self._lossless_preloaded_cpu_import_weights[module.layer_idx] = {}
                 self._lossless_preloaded_direct_import_slots[module.layer_idx] = {}
                 continue
+            cpu_payload = (
+                _mode5_filter_cpu_payload(payload)
+                if int(getattr(module, "elastic_execution_mode", 0)) == 5
+                else payload)
             cpu_imports, direct_import_slots = (
                 self._stream_lossless_layer_cpu_import_weights(
-                    module, payload, active_ranks, world_group))
+                    module, cpu_payload, active_ranks, world_group))
             if (getattr(module, "elastic_execution_mode", 0) == 4
                     and cpu_imports):
                 raise RuntimeError(
@@ -3442,6 +4374,8 @@ class NPUWorker(WorkerBase):
             setattr(state_module, attr_name, None)
 
     def _custom_mode1_worker_memory_diag_enabled(self) -> bool:
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE != 1:
+            return False
         return (_env_flag("VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG", "0")
                 or _env_flag("VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG", "0"))
 
@@ -3600,11 +4534,49 @@ class NPUWorker(WorkerBase):
             return False
         return True
 
-    def _should_drop_stale_group_cache_after_custom_mode1_shrink(
+    def _should_keep_stale_group_cache_for_mode3(
+            self, group_kind: str, stale_group_ranks: tuple[int, ...],
+            keep_group_ranks: tuple[int, ...]) -> bool:
+        if stale_group_ranks == keep_group_ranks:
+            return False
+        if not stale_group_ranks:
+            return False
+        if not self._has_mode3_cross_layer_lightweight_module():
+            return False
+        if group_kind == "mc2":
+            # MC2/HCCL resources are the only stale groups that have shown
+            # large low-floor allocation pressure when they are rebuilt after
+            # every rollout step. Keep them by default for mode3 stability and
+            # performance; memory reclamation experiments can opt back into
+            # dropping them explicitly.
+            return not _env_flag(
+                "VLLM_ASCEND_MODE3_DROP_STALE_MC2_GROUP_CACHE_AFTER_SHRINK",
+                "0")
+        if group_kind == "dp":
+            # Do not keep stale DP/EP groups by default. After restore the next
+            # step starts with full-world prefill/alltoall, and stale shrink
+            # DP/EP handles are not on the hot MC2 path but can poison the
+            # restored communication state.
+            return _env_flag(
+                "VLLM_ASCEND_MODE3_KEEP_STALE_DP_GROUP_CACHE", "0")
+        if group_kind == "ep":
+            return _env_flag(
+                "VLLM_ASCEND_MODE3_KEEP_STALE_EP_GROUP_CACHE", "0")
+        return False
+
+    def _should_drop_stale_group_cache_after_elastic_shrink(
             self, active_ranks: list[int], world_size: int) -> bool:
         if self._has_mode4_remote_npu_lightweight_module():
             return _env_flag(
                 "VLLM_ASCEND_MODE4_DROP_STALE_GROUP_CACHE_AFTER_SHRINK", "0")
+        if self._has_mode3_cross_layer_lightweight_module():
+            if not _env_flag(
+                    "VLLM_ASCEND_MODE3_DROP_STALE_GROUP_CACHE_AFTER_SHRINK",
+                    "0"):
+                return False
+            if len(active_ranks) >= int(world_size):
+                return False
+            return True
         if not _env_flag(
                 "VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK",
                 "1"):
@@ -3612,6 +4584,16 @@ class NPUWorker(WorkerBase):
         if len(active_ranks) >= int(world_size):
             return False
         return self._has_elastic_lightweight_no_headroom_module()
+
+    def _has_mode3_cross_layer_lightweight_module(self) -> bool:
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return False
+        for module in model.modules():
+            if _module_is_mode3_cross_layer_lightweight(module):
+                return True
+        return False
 
     def _has_mode4_remote_npu_lightweight_module(
             self,
@@ -3950,22 +4932,35 @@ class NPUWorker(WorkerBase):
                         tuple(int(rank) for rank in ranks),
                         keep_group_ranks,
                     )
+                    or self._should_keep_stale_group_cache_for_mode3(
+                        group_kind,
+                        tuple(int(rank) for rank in ranks),
+                        keep_group_ranks,
+                    )
                 )
             ]
             kept_stale_group_ranks = [
                 ranks
                 for ranks in list(groups_by_ranks.keys())
                 if ranks != keep_group_ranks
-                and self._should_keep_stale_group_cache_for_custom_mode1_parity(
-                    group_kind,
-                    tuple(int(rank) for rank in ranks),
-                    keep_group_ranks,
+                and (
+                    self._should_keep_stale_group_cache_for_custom_mode1_parity(
+                        group_kind,
+                        tuple(int(rank) for rank in ranks),
+                        keep_group_ranks,
+                    )
+                    or self._should_keep_stale_group_cache_for_mode3(
+                        group_kind,
+                        tuple(int(rank) for rank in ranks),
+                        keep_group_ranks,
+                    )
                 )
             ]
             for ranks in kept_stale_group_ranks:
                 logger.info(
-                    "Elastic mode1 lightweight parity keeps stale %s cache for native-like reuse: rank=%s keep_ranks=%s cached_ranks=%s",
-                    group_kind.upper(), self.rank, keep_group_ranks, ranks)
+                    "Elastic lightweight path keeps stale %s cache: rank=%s keep_ranks=%s cached_ranks=%s mode3=%s",
+                    group_kind.upper(), self.rank, keep_group_ranks, ranks,
+                    self._has_mode3_cross_layer_lightweight_module())
             for ranks in stale_group_ranks:
                 group = groups_by_ranks.pop(ranks, None)
                 if group is not None:
@@ -3975,7 +4970,9 @@ class NPUWorker(WorkerBase):
                             f"stale_ranks={ranks} keep_ranks={keep_group_ranks}",
                         )
                     group.destroy()
-                    if group_kind == "mc2":
+                    if group_kind == "mc2" and (
+                            self._has_mode1_lightweight_parity_module()
+                            or self._has_mode4_remote_npu_lightweight_module()):
                         self._cleanup_after_elastic_mc2_group_destroy(
                             "drop_stale_cache")
                     dropped_groups += 1
@@ -3991,6 +4988,11 @@ class NPUWorker(WorkerBase):
             signature for signature in seen_signatures
             if signature[1] != keep_group_ranks
             and not self._should_keep_stale_group_cache_for_custom_mode1_parity(
+                signature[0],
+                signature[1],
+                keep_group_ranks,
+            )
+            and not self._should_keep_stale_group_cache_for_mode3(
                 signature[0],
                 signature[1],
                 keep_group_ranks,
@@ -4213,7 +5215,7 @@ class NPUWorker(WorkerBase):
         dp_group = get_dp_group()
         if dp_group.world_size <= 1:
             return
-        if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 4
+        if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
                 and not _env_flag(
                     "VLLM_ASCEND_MODE4_ENABLE_POST_SHRINK_DP_WARMUP",
                     "0")):
@@ -4311,20 +5313,45 @@ class NPUWorker(WorkerBase):
                 self.rank, list(active_signature))
             return
 
-        if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 4
-                and not _env_flag(
-                    "VLLM_ASCEND_MODE4_FORCE_POST_SHRINK_MOE_WARMUP", "0")):
-            # Mode 4 keeps expert weights resident on NPU/cache ranks and lets
-            # the real decode path lazily initialize the post-shrink MC2/MoE
-            # workspace. The synthetic dummy-run warmup can take a different
-            # routing/dispatcher path and has shown minute-level stalls, so it
-            # is not a safe proxy for the actual threshold-controlled run.
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5):
+            if not _env_flag("VLLM_ASCEND_MODE4_POST_SHRINK_MOE_WARMUP",
+                             "0"):
+                if active_signature:
+                    self._post_shrink_moe_dispatch_warmed_active_signatures.add(
+                        active_signature)
+                logger.info(
+                    "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode4_disabled",
+                    self.rank, list(active_signature))
+                return
+            if model_runner is None or not hasattr(
+                    model_runner, "warmup_mode4_remote_npu_moe_compute_only"):
+                logger.info(
+                    "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode4_no_helper",
+                    self.rank, list(active_signature))
+                return
+            warmup_tokens = int(
+                os.getenv("VLLM_ASCEND_MODE4_POST_SHRINK_MOE_WARMUP_TOKENS",
+                          "32"))
+            if warmup_tokens <= 0:
+                if active_signature:
+                    self._post_shrink_moe_dispatch_warmed_active_signatures.add(
+                        active_signature)
+                logger.info(
+                    "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode4_no_tokens tokens=%s",
+                    self.rank, list(active_signature), warmup_tokens)
+                return
+            warmup_start_t = time.perf_counter()
+            model_runner.warmup_mode4_remote_npu_moe_compute_only(
+                warmup_tokens)
+            if torch.npu.is_available():
+                torch.npu.synchronize()
             if active_signature:
                 self._post_shrink_moe_dispatch_warmed_active_signatures.add(
                     active_signature)
             logger.info(
-                "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode4_lazy_real_decode",
-                self.rank, list(active_signature))
+                "Elastic post-shrink MoE dispatch warmup done: rank=%s active_ranks=%s reason=mode4_remote_npu_moe_only tokens=%s total_ms=%.2f",
+                self.rank, list(active_signature), warmup_tokens,
+                (time.perf_counter() - warmup_start_t) * 1000.0)
             return
 
         warmup_tokens = int(
@@ -4361,12 +5388,43 @@ class NPUWorker(WorkerBase):
                     break
 
         if self._has_mode3_hybrid_lossless_module():
+            if not _env_flag("VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP",
+                             "0"):
+                if active_signature:
+                    self._post_shrink_moe_dispatch_warmed_active_signatures.add(
+                        active_signature)
+                logger.info(
+                    "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode3_disabled",
+                    self.rank, list(active_signature))
+                return
+            if not hasattr(model_runner,
+                           "warmup_mode3_mc2_dispatcher_only"):
+                logger.info(
+                    "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode3_no_dispatcher_helper",
+                    self.rank, list(active_signature))
+                return
+            mode3_warmup_tokens = int(
+                os.getenv("VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS",
+                          str(warmup_tokens)))
+            if mode3_warmup_tokens <= 0:
+                if active_signature:
+                    self._post_shrink_moe_dispatch_warmed_active_signatures.add(
+                        active_signature)
+                logger.info(
+                    "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode3_no_tokens tokens=%s",
+                    self.rank, list(active_signature), mode3_warmup_tokens)
+                return
+            warmup_start_t = time.perf_counter()
+            model_runner.warmup_mode3_mc2_dispatcher_only(mode3_warmup_tokens)
+            if torch.npu.is_available():
+                torch.npu.synchronize()
             if active_signature:
                 self._post_shrink_moe_dispatch_warmed_active_signatures.add(
                     active_signature)
             logger.info(
-                "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode3_lazy_init",
-                self.rank, list(active_signature))
+                "Elastic post-shrink MoE dispatch warmup done: rank=%s active_ranks=%s reason=mode3_mc2_dispatcher_only tokens=%s total_ms=%.2f",
+                self.rank, list(active_signature), mode3_warmup_tokens,
+                (time.perf_counter() - warmup_start_t) * 1000.0)
             return
 
         warmup_start_t = time.perf_counter()
@@ -4444,6 +5502,11 @@ class NPUWorker(WorkerBase):
             active_ranks = [torch.distributed.get_rank()]
         current_rank = torch.distributed.get_rank()
         backend = torch.distributed.get_backend(world_group.device_group)
+        previous_active_ranks_for_mode4 = self._get_previous_active_ranks_for_shrink(
+            world_size)
+        (_mode4_source_ranks_for_barrier,
+         mode4_source_cpu_group_for_barrier,
+         _) = self._get_shrink_source_group_state(world_group)
         cached_active_ranks = getattr(self, "_elastic_current_active_ranks",
                                       None)
         if cached_active_ranks == active_ranks:
@@ -4492,19 +5555,29 @@ class NPUWorker(WorkerBase):
 
         refresh_start_t = time.perf_counter()
         with set_current_vllm_config(self.vllm_config):
-            self._refresh_elastic_parallel_state(active_ranks,
-                                                 world_group,
-                                                 participate_only=not is_active_rank)
+            self._refresh_elastic_parallel_state(
+                active_ranks,
+                world_group,
+                participate_only=not is_active_rank)
         refresh_ms = (time.perf_counter() - refresh_start_t) * 1000.0
 
         if self._has_mode4_remote_npu_lightweight_module():
-            self._reset_mode4_double_buffer_runtime_slots("before_mode4_cache_service_start")
+            self._reset_mode4_double_buffer_runtime_slots(
+                "before_mode4_cache_service_start")
             self._start_mode4_remote_cache_service(active_ranks, world_group)
-            torch.distributed.barrier(group=world_group.cpu_group)
+            # This block is executed by the previous active ranks, including
+            # ranks that have just detached and no longer have a current DP
+            # group. Use the pre-shrink source CPU group instead of get_dp_group().
+            mode4_barrier_group = mode4_source_cpu_group_for_barrier
+            torch.distributed.barrier(group=mode4_barrier_group)
+            self._mode4_warmup_remote_payload_fetch(active_ranks, world_group)
+            self._ensure_mode4_double_buffer_manager()
+            self._mode4_prime_next_block_runtime_slot(active_ranks)
+            torch.distributed.barrier(group=mode4_barrier_group)
 
         self._release_post_shrink_staging_state()
 
-        if self._should_drop_stale_group_cache_after_custom_mode1_shrink(
+        if self._should_drop_stale_group_cache_after_elastic_shrink(
                 active_ranks, world_size):
             keep_group_ranks = tuple(int(rank) for rank in active_ranks)
             self._log_custom_mode1_worker_memory(
