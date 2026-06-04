@@ -938,17 +938,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         elastic_mode = int(
             getattr(envs_ascend, "VLLM_ASCEND_ELASTIC_EXECUTION_MODE", 0))
-        # Mode 3/4 shrink paths depend on the DP metadata result to keep the
+        # Elastic shrink paths depend on the DP metadata result to keep the
         # post-shrink decode path on MC2. A stale/corrupted NPU all-reduce here
         # can inflate synced token counts to O(1e9), which incorrectly selects
         # AllToAll and trips the double-buffer guards. Use the CPU group by
         # default for these lightweight paths; callers can opt out for focused
-        # experiments.
+        # experiments. Mode 5 is especially sensitive because bogus synced
+        # counts immediately poison the hybrid local/remote/cpu prefetch plan.
         use_cpu_dp_metadata_sync = (
-            elastic_mode == 4
-            and _env_flag("VLLM_ASCEND_MODE4_CPU_DP_METADATA_SYNC", "1")) or (
-                elastic_mode == 3
-                and _env_flag("VLLM_ASCEND_MODE3_CPU_DP_METADATA_SYNC", "1"))
+            elastic_mode == 5
+            and _env_flag("VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC", "1")) or (
+                elastic_mode == 4
+                and _env_flag("VLLM_ASCEND_MODE4_CPU_DP_METADATA_SYNC", "1")) or (
+                    elastic_mode == 3
+                    and _env_flag("VLLM_ASCEND_MODE3_CPU_DP_METADATA_SYNC", "1"))
         sync_device = "cpu" if use_cpu_dp_metadata_sync else "npu"
         sync_group = (get_dp_group().cpu_group
                       if use_cpu_dp_metadata_sync else
