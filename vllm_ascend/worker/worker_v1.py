@@ -4254,13 +4254,20 @@ class NPUWorker(WorkerBase):
         if request_cache is None:
             request_cache = {}
             self._mode4_remote_request_buffer_cache = request_cache
+        fetch_log_key = (
+            int(execution_mode),
+            int(getattr(layer, "layer_idx", -1)),
+            tuple(sorted(int(rank) for rank in assignments_by_rank)),
+            int(len(remote_assignments)),
+        )
+        parallel_warmed_keys = getattr(self,
+                                       "_mode4_parallel_fetch_warmed_keys",
+                                       set())
+        parallel_fetch_cold_start = (
+            parallel_remote_fetch
+            and execution_mode == 5
+            and fetch_log_key not in parallel_warmed_keys)
         for remote_rank, assignments in remote_items:
-            fetch_log_key = (
-                int(execution_mode),
-                int(getattr(layer, "layer_idx", -1)),
-                tuple(sorted(int(rank) for rank in assignments_by_rank)),
-                int(len(remote_assignments)),
-            )
             begin_logged = getattr(self, "_mode4_fetch_begin_logged_keys",
                                    set())
             if (getattr(layer, "layer_idx", -1) == 0
@@ -4349,7 +4356,9 @@ class NPUWorker(WorkerBase):
         # unnecessary global barrier on owner-side control sends. We only need
         # per-rank ordering between "control send for rank R" and
         # "payload recv for rank R"; earlier/later ranks do not need to wait on
-        # each other before posting device irecv.
+        # each other before posting device irecv. The first live pass is colder:
+        # reuse the older per-rank wait-before-irecv ordering once for each
+        # layer/topology key, then switch to the lower-overhead queued path.
         request_logged = getattr(self, "_mode4_fetch_request_logged_keys",
                                  set())
         pending_waited_recvs: list[tuple[object, torch.Tensor, int,
@@ -4357,7 +4366,7 @@ class NPUWorker(WorkerBase):
                                          list[object]]] = []
         for remote_rank, assignments, cpu_send_reqs, recv_flat in pending_control_msgs:
             request_log_key = fetch_log_key + (int(remote_rank), )
-            if parallel_remote_fetch:
+            if parallel_remote_fetch and not parallel_fetch_cold_start:
                 req_flat = torch.distributed.irecv(recv_flat,
                                                    src=remote_rank,
                                                    group=device_group)
@@ -4400,6 +4409,9 @@ class NPUWorker(WorkerBase):
                                                group=device_group)
             pending_waited_recvs.append((req_flat, recv_flat, int(remote_rank),
                                          assignments, cpu_send_reqs))
+        if parallel_fetch_cold_start:
+            parallel_warmed_keys.add(fetch_log_key)
+            self._mode4_parallel_fetch_warmed_keys = parallel_warmed_keys
         if parallel_remote_fetch:
             pending_recvs.extend(pending_waited_recvs)
         else:

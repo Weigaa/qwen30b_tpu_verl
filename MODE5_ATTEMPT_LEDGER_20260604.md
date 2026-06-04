@@ -926,3 +926,71 @@ Interpretation:
   - The clean `exit_code=0` matters: unlike the earlier failed `20260605023723` branch, this change stays on the valid mainline path.
   - The most defensible interpretation is that the patch improves the parallel owner-side submit path enough to matter in steady-state or later-step behavior, even though step1 regresses.
   - Because the full 3-step total now beats the previous `a3cfdc2` mainline, this run should be treated as the new strongest verified mainline snapshot for ongoing work, while still noting that the cold first step is worse.
+
+### 20260605042224
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605042224_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605042224_elastic.txt)
+- Ray session:
+  - `/tmp/ray/session_2026-06-05_04-22-33_888741_1033468`
+- Classification: valid clean hybrid follow-up on top of the `20260605034323` idea; clean exit with `exit_code=0`.
+- Patch intent:
+  - preserve the later-step benefit of the queued `parallel_remote_fetch=1` owner path
+  - but restore the older wait-before-irecv order on the first cold fetch key only
+  - practical meaning: first cold step uses the old conservative order; later same-key fetches use the newer lower-overhead queued order
+- Verified rollout results:
+  - step1 `rollout_output_time_s = 229.267634`
+  - step2 `rollout_output_time_s = 244.775307`
+  - step3 `rollout_output_time_s = 238.954965`
+- Verified step summaries:
+  - step1:
+    - `timing_s/gen = 229.264582`
+    - `timing_s/old_log_prob = 26.765794`
+    - `timing_s/ref = 13.748301`
+    - `timing_s/update_actor = 101.213635`
+    - `timing_s/step = 373.961911`
+  - step2:
+    - `timing_s/gen = 244.772300`
+    - `timing_s/old_log_prob = 21.359867`
+    - `timing_s/ref = 14.268682`
+    - `timing_s/update_actor = 103.327739`
+    - `timing_s/step = 386.852041`
+  - step3:
+    - `timing_s/gen = 238.951195`
+    - `timing_s/old_log_prob = 21.911121`
+    - `timing_s/ref = 13.794288`
+    - `timing_s/update_actor = 100.558493`
+    - `timing_s/step = 378.207749`
+- Clean exit evidence:
+  - elastic log records `[run] end_time=2026-06-05T04:43:43+0800 exit_code=0`
+  - no `Aborted`, `ActorDiedError`, or `SYSTEM_ERROR` markers appear in the run log
+- Comparison vs `20260605034323`:
+  - `20260605034323` three steps:
+    - `255.670438`
+    - `249.003097`
+    - `250.230129`
+  - current three steps:
+    - `229.267634`
+    - `244.775307`
+    - `238.954965`
+  - net effect:
+    - 3-step total improves from `754.903664 s` to `712.997906 s`
+    - 3-step average improves from about `251.634555 s` to about `237.665969 s`
+    - total gain is `41.905758 s`
+- Comparison vs `20260605030829`:
+  - `20260605030829` three steps:
+    - `252.091123`
+    - `255.107707`
+    - `249.546084`
+  - current three steps:
+    - `229.267634`
+    - `244.775307`
+    - `238.954965`
+  - net effect:
+    - 3-step total improves from `756.744914 s` to `712.997906 s`
+    - total gain is `43.747008 s`
+- Single-step comparison:
+  - fastest previous verified single rollout was `249.546084`
+  - current step1 `229.267634` is faster by `20.278450 s`
+- Practical reading:
+  - This is no longer just a promising first-step sample; it is the strongest verified multi-step profile seen so far on this mode5 line.
+  - The hybrid ordering successfully combines the cold-step strength that was missing in `20260605034323` with even stronger later-step behavior.
+  - As of the current verified evidence, this is the new mainline best candidate and should replace the prior `best_mode5` snapshot.
