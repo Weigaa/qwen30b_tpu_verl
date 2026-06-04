@@ -864,3 +864,65 @@ Interpretation:
     - the old `270s` direction on stage2/1,
     - and the faster wall-time path from the `252s` family.
   - This run also establishes a new fastest verified rollout value of **`249.546084 s`**.
+
+### 20260605034323
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605034323_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605034323_elastic.txt)
+- Ray session:
+  - `/tmp/ray/session_2026-06-05_03-43-32_630226_942076`
+- Classification: valid clean single-variable follow-up on top of the `a3cfdc2` mainline; clean exit with `exit_code=0`.
+- Config:
+  - kept the validated mainline:
+    - `mode=5`
+    - `dual_source`
+    - `VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=1`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=0.75`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=fixed`
+    - `VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=1`
+  - added one new owner-side submit-path patch in `worker_v1.py` that only changes the `parallel_remote_fetch=1` path:
+    - queue control sends
+    - post payload `irecv` earlier
+    - delay the corresponding CPU send waits until after payload copy
+    - leave `parallel=0` behavior unchanged
+- Verified rollout results:
+  - step1 `rollout_output_time_s = 255.670438`
+  - step2 `rollout_output_time_s = 249.003097`
+  - step3 `rollout_output_time_s = 250.230129`
+- Verified step summaries:
+  - step1:
+    - `timing_s/gen = 255.666954`
+    - `timing_s/old_log_prob = 29.405523`
+    - `timing_s/ref = 15.759657`
+    - `timing_s/update_actor = 104.363073`
+    - `timing_s/step = 408.309690`
+  - step2:
+    - `timing_s/gen = 248.999479`
+    - `timing_s/old_log_prob = 21.873047`
+    - `timing_s/ref = 14.775532`
+    - `timing_s/update_actor = 101.514047`
+    - `timing_s/step = 390.282393`
+  - step3:
+    - `timing_s/gen = 250.226310`
+    - `timing_s/old_log_prob = 22.134977`
+    - `timing_s/ref = 13.852267`
+    - `timing_s/update_actor = 101.537359`
+    - `timing_s/step = 390.792512`
+- Comparison vs previous best mainline `20260605030829`:
+  - previous three steps:
+    - `252.091123`
+    - `255.107707`
+    - `249.546084`
+  - current three steps:
+    - `255.670438`
+    - `249.003097`
+    - `250.230129`
+  - net effect:
+    - step1 is worse by `3.579315 s`
+    - step2 is better by `6.104610 s`
+    - step3 is worse by `0.684045 s`
+    - 3-step total improves from `756.744914 s` to `754.903664 s`
+    - 3-step average improves by about `0.613750 s`
+- Practical reading:
+  - This patch is not a simple cold-start win; it trades a slower first step for a materially stronger step2 and a slightly improved 3-step total.
+  - The clean `exit_code=0` matters: unlike the earlier failed `20260605023723` branch, this change stays on the valid mainline path.
+  - The most defensible interpretation is that the patch improves the parallel owner-side submit path enough to matter in steady-state or later-step behavior, even though step1 regresses.
+  - Because the full 3-step total now beats the previous `a3cfdc2` mainline, this run should be treated as the new strongest verified mainline snapshot for ongoing work, while still noting that the cold first step is worse.
