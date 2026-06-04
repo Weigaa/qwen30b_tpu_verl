@@ -27,24 +27,23 @@ It is intentionally stricter than chat memory:
 
 ### Fastest Verified End-to-End Rollout
 
-Current fastest verified `mode=5` rollout observed on 2026-06-04:
+Current fastest verified `mode=5` rollout observed so far:
 
-- log family: [wjeagerqwen30b-a3b-with_draft_breakdown_20260604182806_elastic.txt](/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260604182806_elastic.txt)
-- ray worker log: [/tmp/ray/session_2026-06-04_18-28-16_126908_3562084/logs/worker-663cadc54d9ec7e7fd9c1029fbc1f56cbcae53062d11ec2f8b1fbc11-01000000-3581720.out](/tmp/ray/session_2026-06-04_18-28-16_126908_3562084/logs/worker-663cadc54d9ec7e7fd9c1029fbc1f56cbcae53062d11ec2f8b1fbc11-01000000-3581720.out)
-- rollout times observed:
-  - step1: `255.078942`
-  - step2: `252.435529`
-  - step3: `252.556386`
+- run: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605030829_elastic.txt](/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260605030829_elastic.txt)
+- trainer worker log: [/tmp/ray/session_2026-06-05_03-08-38_682771_863895/logs/worker-7cdd54ef5a9a3835fad40a17c57363501a74945a8b81a3b3b69cef86-01000000-883862.out](/tmp/ray/session_2026-06-05_03-08-38_682771_863895/logs/worker-7cdd54ef5a9a3835fad40a17c57363501a74945a8b81a3b3b69cef86-01000000-883862.out)
+- verified rollout times observed:
+  - step1: `252.091123`
+  - step2: `255.107707`
+  - step3: `249.546084`
 
 Current fastest verified value:
 
-- **`252.435529 s`**
+- **`249.546084 s`**
 
 Important caveat:
 
-- This run is the fastest end-to-end wall time seen so far.
-- But its `stage=1/2` prefetch hotspot metrics were **worse** than the best hotspot-quality baseline below.
-- So this is the fastest wall-time sample, not the cleanest proof that CPU/NPU prefetch overlap has improved in the intended way.
+- This is now the strongest verified wall-time sample and it also materially improves the stage1 path versus `20260605021206`.
+- However, its stage2 submit-path metrics are still not as low as the old `20260604154651` overlap-quality reference, so the hotspot-quality baseline below remains useful as a directional reference for the original objective.
 
 ### Best Known Hotspot-Quality Timing Baseline
 
@@ -763,3 +762,105 @@ Interpretation:
     - stage2 `prefetch_submit_us` drops from `2972.05 / 3374.36` to `2318.65 / 2359.25`
   - Stage1 remains noticeably heavier than the old `20260604154651` overlap-quality baseline, so this is not yet the final answer to the original objective.
   - However, this run is the strongest evidence so far that the code can preserve the faster non-stage2/1 path while recovering a substantial portion of the desired stage2 behavior. The next narrowing step should focus only on stage1 submit-path overhead inside `worker_v1.py`, not on source mix or stage8/4 refresh.
+
+
+### 20260605023723
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605023723_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605023723_elastic.txt)
+- Ray session:
+  - `/tmp/ray/session_2026-06-05_02-37-32_767609_780790`
+- Classification: valid failed single-variable experiment.
+- Setup:
+  - kept the strong `20260605021206` mainline:
+    - `mode=5`
+    - `dual_source`
+    - `VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=1`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=0.75`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=fixed`
+    - `VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=1`
+  - added one new owner-side submit-path patch in `worker_v1.py` that deferred CPU control-send waits until after payload copy.
+- Result:
+  - run reached `Elastic first live step: entering engine_core.get_output`
+  - but never produced a valid `rollout_output_time_s` / `timing_s/gen`
+  - authoritative failure evidence later showed:
+    - `Aborted (core dumped)`
+    - `[run] ... exit_code=134`
+- Meaning:
+  - this was not merely a slow sample; it was a true failed patch branch.
+  - the deferred send-wait patch should not stay on the mainline.
+
+### 20260605030829
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605030829_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605030829_elastic.txt)
+- Ray session:
+  - `/tmp/ray/session_2026-06-05_03-08-38_682771_863895`
+- Classification: valid strongest positive rerun after rolling back the failed `20260605023723` patch; current strongest evidence that the `a12f64a` mainline really combines the fast wall-time path with a substantially improved stage1 path.
+- Config:
+  - `mode=5`
+  - `dual_source`
+  - `VLLM_ASCEND_MODE3_TIMING_SYNC=1`
+  - `VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=1`
+  - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=0.75`
+  - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=fixed`
+  - `VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=1`
+- Verified rollout results:
+  - step1 `rollout_output_time_s = 252.091123`
+  - step2 `rollout_output_time_s = 255.107707`
+  - step3 `rollout_output_time_s = 249.546084`
+- Verified step summaries:
+  - step1:
+    - `timing_s/gen = 252.087249`
+    - `timing_s/old_log_prob = 27.236369`
+    - `timing_s/ref = 14.688806`
+    - `timing_s/update_actor = 105.345235`
+    - `timing_s/step = 402.412223`
+  - step2:
+    - `timing_s/gen = 255.104085`
+    - `timing_s/old_log_prob = 20.986882`
+    - `timing_s/ref = 13.803832`
+    - `timing_s/update_actor = 99.966502`
+    - `timing_s/step = 392.856732`
+  - step3:
+    - `timing_s/gen = 249.538605`
+    - `timing_s/old_log_prob = 22.124644`
+    - `timing_s/ref = 13.276346`
+    - `timing_s/update_actor = 101.223105`
+    - `timing_s/step = 389.295643`
+- Interpretation relative to earlier references:
+  - versus the historical wall-time best family `20260604182806`:
+    - step1 beats `255.078942` by `2.987819 s`
+    - step2 is `2.672178 s` slower than the family best `252.435529`
+    - step3 beats `252.556386` by `3.010302 s`
+  - versus the previous strong mainline `20260605021206`:
+    - step1 improves by `2.400201 s`
+    - step2 improves by `9.574250 s`
+    - step3 improves by `8.567600 s`
+  - versus the old overlap-quality baseline `20260604154651 (270.998779)`:
+    - step1 improves by `18.907656 s`
+    - step2 improves by `15.891072 s`
+    - step3 improves by `21.452695 s`
+- Current stage-refresh aggregate summary from emitted lines:
+  - `stage8 total_mean ≈ 403.55 ms`
+  - `stage4 total_mean ≈ 664.35 ms`
+  - `stage2 total_mean ≈ 939.60 ms`
+  - `stage1 total_mean ≈ 1755.82 ms`
+- Current hotspot summary from emitted timing lines:
+  - stage2:
+    - `submit_populate_us p50/p90 = 2289.35 / 2436.00`
+    - `submit_remote_npu_us p50/p90 = 1809.70 / 1918.89`
+    - `prefetch_submit_us p50/p90 = 2417.05 / 2566.26`
+    - `prefetch_dev_ms p50/p90 = 5.08 / 5.14`
+  - stage1:
+    - `submit_populate_us p50/p90 = 3972.50 / 4143.58`
+    - `submit_remote_npu_us p50/p90 = 3357.70 / 3498.32`
+    - `prefetch_submit_us p50/p90 = 4102.60 / 4281.88`
+    - `prefetch_dev_ms p50/p90 = 10.33 / 10.37`
+- Practical reading:
+  - This run is materially stronger than `20260605021206` on all three verified rollout steps.
+  - It keeps the stage8/4 fast path while significantly improving the remaining stage1 path compared with `20260605021206`:
+    - stage1 `submit_populate_us` improves by about `752.8 us` at p50
+    - stage1 `submit_remote_npu_us` improves by about `621.4 us` at p50
+    - stage1 `prefetch_submit_us` improves by about `798.2 us` at p50
+  - stage2 is slightly worse than `20260605021206`, but still dramatically better than `20260605013258` and far closer to the original `270.998779` overlap-direction baseline than earlier stable mainline runs.
+  - As of the currently verified evidence, this is the best real combination yet of:
+    - the old `270s` direction on stage2/1,
+    - and the faster wall-time path from the `252s` family.
+  - This run also establishes a new fastest verified rollout value of **`249.546084 s`**.
