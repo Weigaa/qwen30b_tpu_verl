@@ -162,9 +162,23 @@ class AscendFusedMoE(FusedMoE):
             self.global_redundant_expert_num = (
                 self.expert_load_balancer.get_global_redundant_expert_num())
         else:
-            # init moe.
-            self.local_num_experts, self.expert_map = determine_expert_map(
+            # init moe. vLLM has returned either (local_num_experts,
+            # expert_map) or (local_num_experts, expert_map, log2phy)
+            # across versions/forks; keep this common OOT path compatible
+            # with both forms.
+            expert_mapping = determine_expert_map(
                 self.ep_size, self.ep_rank, self.global_num_experts)
+            if len(expert_mapping) == 3:
+                self.local_num_experts, self.expert_map, self.log2phy = (
+                    expert_mapping)
+            elif len(expert_mapping) == 2:
+                self.local_num_experts, self.expert_map = expert_mapping
+                self.log2phy = determine_default_log2phy_map(
+                    self.global_num_experts, self.ep_size, self.ep_rank, 0)
+            else:
+                raise ValueError(
+                    f"Unexpected determine_expert_map return arity="
+                    f"{len(expert_mapping)}")
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
                 self.global_redundant_expert_num = ascend_config.init_redundancy_expert

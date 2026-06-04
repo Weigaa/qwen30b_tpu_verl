@@ -83,6 +83,45 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _custom_mode1_rollout_reload_diag_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_CUSTOM_MODE1_ROLLOUT_RELOAD_DIAG", "1")
+
+
+def _log_custom_mode1_rollout_memory(tag: str) -> None:
+    if not _custom_mode1_rollout_reload_diag_enabled():
+        return
+    if int(getattr(envs_ascend, "VLLM_ASCEND_ELASTIC_EXECUTION_MODE", 0)) != 1:
+        return
+    if not is_npu_available:
+        return
+    try:
+        import torch_npu
+
+        free_bytes, total_bytes = torch.npu.mem_get_info()
+        stats = torch_npu.npu.memory_stats()
+        torch_current = int(stats.get("allocated_bytes.all.current", 0))
+        torch_reserved = int(stats.get("reserved_bytes.all.current", 0))
+        total_allocated = int(total_bytes - free_bytes)
+        non_torch = max(total_allocated - torch_current, 0)
+        logger.warning(
+            "Custom mode=1 rollout memory: tag=%s free_bytes=%s total_bytes=%s "
+            "torch_current=%s torch_reserved=%s non_torch=%s total_allocated=%s",
+            tag,
+            free_bytes,
+            total_bytes,
+            torch_current,
+            torch_reserved,
+            non_torch,
+            total_allocated,
+        )
+    except Exception:
+        logger.exception("Failed to log custom mode=1 rollout memory at %s", tag)
+
+
 def _load_model_num_experts(model_path: str) -> int:
     config_path = Path(model_path) / "config.json"
     if not config_path.exists():
@@ -292,9 +331,11 @@ class vLLMRollout(BaseRollout):
         self.model = self.model_runner.get_model()
         self.kv_cache_configs = None
         self.cpu_model = {}
+        self.gpu_buffer_formats = {}
         self.gpu_buffers = None
         for name, params in self.model.named_parameters():
             self.cpu_model[name] = torch.empty_like(params, device="cpu")
+            self.gpu_buffer_formats[name] = self._get_npu_buffer_format(params)
         self.free_cache_engine()
         self.offload_model_weights()
 
@@ -344,15 +385,88 @@ class vLLMRollout(BaseRollout):
         2) Eliminates the recursive traversal of submodules inherent in .cuda(),
         which can be particularly slow for deeply nested model architectures.
         """
+        _log_custom_mode1_rollout_memory("before_onload_model_weights")
         self.gpu_buffers = {}
+        formatted_buffers = 0
         for name, param in self.model.named_parameters():
-            self.gpu_buffers[name] = torch.empty_like(
-                param, device='cuda'
+            target_format = self.gpu_buffer_formats.get(name)
+            gpu_buffer = torch.empty_like(param, device='cuda')
+            if target_format is not None and str(target_format) not in (
+                    "ND", "0"):
+                try:
+                    import torch_npu  # type: ignore
+                    gpu_buffer = torch_npu.npu_format_cast(
+                        gpu_buffer, target_format)
+                    formatted_buffers += 1
+                except Exception:
+                    logger.exception(
+                        "Failed to allocate formatted rollout GPU buffer for %s format=%s",
+                        name,
+                        target_format,
+                    )
+            self.gpu_buffers[name] = gpu_buffer
+        if formatted_buffers > 0:
+            logger.info(
+                "Rollout onload allocated formatted GPU buffers: formatted=%s total=%s",
+                formatted_buffers,
+                len(self.gpu_buffers),
             )
         for name, param in self.model.named_parameters():
             param.data = self.gpu_buffers[name]
+        _log_custom_mode1_rollout_memory("after_onload_model_weights")
+
+    @staticmethod
+    def _get_npu_buffer_format(tensor: torch.Tensor):
+        if tensor is None or tensor.device.type != "npu":
+            return None
+        try:
+            import torch_npu  # type: ignore
+            return torch_npu.get_npu_format(tensor)
+        except Exception:
+            return None
+
+    def _refresh_gpu_buffer_format_metadata(self) -> None:
+        if not hasattr(self, "gpu_buffer_formats"):
+            self.gpu_buffer_formats = {}
+        for name, param in self.model.named_parameters():
+            fmt = self._get_npu_buffer_format(param.data)
+            if fmt is not None:
+                self.gpu_buffer_formats[name] = fmt
+
+    def _refresh_gpu_buffer_aliases(self) -> None:
+        if self.gpu_buffers is None:
+            return
+        refreshed_gpu_buffers = {}
+        for name, param in self.model.named_parameters():
+            refreshed_gpu_buffers[name] = param.data
+        self.gpu_buffers = refreshed_gpu_buffers
+        self._refresh_gpu_buffer_format_metadata()
 
     def offload_model_weights(self):
+        _log_custom_mode1_rollout_memory("before_offload_model_weights")
+        self._refresh_gpu_buffer_format_metadata()
+        invalidated_layers = 0
+        invalidated_runtime_layers = 0
+        for module in self.model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            invalidate_runtime = getattr(
+                quant_method,
+                "invalidate_lossless_runtime_state_for_reload",
+                None,
+            )
+            if callable(invalidate_runtime):
+                invalidated_layers += 1
+                try:
+                    invalidated = invalidate_runtime(
+                        layer=module,
+                        reason="vllm_rollout_offload_model_weights",
+                    )
+                    if invalidated:
+                        invalidated_runtime_layers += 1
+                except Exception:
+                    logger.exception(
+                        "Failed to invalidate lossless runtime state during rollout offload"
+                    )
         for name, params in self.model.named_parameters():
             params.data = self.cpu_model[name]
 
@@ -368,6 +482,13 @@ class vLLMRollout(BaseRollout):
         self.gpu_buffers = None
         gc.collect()
         torch.npu.empty_cache()
+        if invalidated_layers > 0:
+            logger.info(
+                "Rollout offload invalidated lossless runtime state: modules=%s runtime_modules=%s",
+                invalidated_layers,
+                invalidated_runtime_layers,
+            )
+        _log_custom_mode1_rollout_memory("after_offload_model_weights")
 
     def free_cache_engine(self):
         if os.environ['VLLM_USE_V1'] == '1':
@@ -388,6 +509,20 @@ class vLLMRollout(BaseRollout):
             for _ in range(pipeline_parallel_size):
                 kv_cache.append(torch.tensor([]))
             ctx[layer_name].kv_cache = kv_cache
+            # The layer modules themselves also keep strong `kv_cache`
+            # references. If we only replace the static forward-context entry,
+            # step-2 resume can still carry the previous large cache tensors
+            # through the model objects and leave attention/backend memory far
+            # above the native baseline.
+            try:
+                if hasattr(self.model, "named_modules"):
+                    module = dict(self.model.named_modules()).get(layer_name)
+                    if module is not None and hasattr(module, "kv_cache"):
+                        module.kv_cache = kv_cache
+            except Exception:
+                logger.exception(
+                    "Failed to clear module kv_cache reference for layer %s",
+                    layer_name)
 
         if os.environ['VLLM_USE_V1'] == '1':
             worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
@@ -404,6 +539,15 @@ class vLLMRollout(BaseRollout):
                 if hasattr(attn_impl, "key_cache"):
                     attn_impl.key_cache = None
                     attn_impl.value_cache = None
+        if hasattr(self.model.model.layers[0].self_attn, "mla_attn"):
+            for i in range(self.model.model.start_layer, self.model.model.end_layer):
+                mla_attn = self.model.model.layers[i].self_attn.mla_attn
+                if mla_attn is None or not hasattr(mla_attn, "impl"):
+                    continue
+                mla_impl = mla_attn.impl
+                if hasattr(mla_impl, "key_cache"):
+                    mla_impl.key_cache = None
+                    mla_impl.value_cache = None
 
         gc.collect()
         torch.npu.empty_cache()
@@ -762,7 +906,25 @@ class vLLMRollout(BaseRollout):
                 "Elastic execution mode=%s enables rollout.update_weights with redundant experts.",
                 self.elastic_execution_mode)
             self._lossless_weight_update_sync_logged = True
+        _log_custom_mode1_rollout_memory("before_update_weights_load")
+        if (self.elastic_execution_mode == 1
+                and int(os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE",
+                                  "0") or "0") <= 2):
+            try:
+                torch.npu.synchronize()
+                gc.collect()
+                torch.npu.empty_cache()
+            except Exception:
+                pass
+            _log_custom_mode1_rollout_memory(
+                "before_update_weights_load_after_trim")
         model.load_weights(weights)
+        self._refresh_gpu_buffer_aliases()
+        weights = []
+        filtered_weights = []
+        gc.collect()
+        torch.npu.empty_cache()
+        _log_custom_mode1_rollout_memory("after_update_weights_load")
         ###new wj
     def get_record(self):
         return moe_stats.snapshot_pattern()

@@ -89,6 +89,10 @@ TRUE_COMPILE = torch.compile
 DUMMY_COMPILE = dummy_compile
 
 
+def _disable_ckpt_mismatch_validation_for_mode1() -> bool:
+    return os.getenv("VLLM_ASCEND_ELASTIC_EXECUTION_MODE", "0") == "1"
+
+
 def set_random_seed(seed):
     import random
 
@@ -351,7 +355,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             if self.config.actor.load_weight:
                 if self.config.actor.megatron.use_dist_checkpointing:
                     load_mcore_dist_weights(
-                        actor_module, self.config.actor.megatron.dist_checkpointing_path, is_value_model=False
+                        actor_module,
+                        self.config.actor.megatron.dist_checkpointing_path,
+                        is_value_model=False,
+                        disable_ckpt_mismatch_validation=_disable_ckpt_mismatch_validation_for_mode1(),
                     )
                 else:
                     if self.bridge is not None:
@@ -384,7 +391,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 print("load ref weight start")
                 if self.config.ref.megatron.use_dist_checkpointing:
                     load_mcore_dist_weights(
-                        ref_module, self.config.ref.megatron.dist_checkpointing_path, is_value_model=False
+                        ref_module,
+                        self.config.ref.megatron.dist_checkpointing_path,
+                        is_value_model=False,
+                        disable_ckpt_mismatch_validation=_disable_ckpt_mismatch_validation_for_mode1(),
                     )
                 else:
                     if self.bridge is not None:
@@ -612,9 +622,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
         await self.rollout.update_weights(per_tensor_param)
+        del per_tensor_param
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor.actor_module)
         aggressive_empty_cache(force_sync=True)
+        log_gpu_memory_usage("After actor export generator release", logger=logger)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
 

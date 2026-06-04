@@ -98,7 +98,7 @@ class Qwen3MoeMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, is_dummy: Optional[bool] = False):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -227,7 +227,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 print("diff ratio is", self.ep_sig_diff_cnt / self.ep_sig_total_cnt)
 
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self,
+                hidden_states: torch.Tensor,
+                is_dummy: Optional[bool] = False) -> torch.Tensor:
         assert hidden_states.dim(
         ) <= 2, "Qwen3MoeSparseMoeBlock only supports 1D or 2D inputs"
         is_input_1d = hidden_states.dim() == 1
