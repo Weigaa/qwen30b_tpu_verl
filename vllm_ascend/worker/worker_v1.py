@@ -137,7 +137,7 @@ def _mode5_cpu_shadow_runtime_strategy() -> str:
 def _mode5_single_control_message_remote() -> bool:
     return os.getenv(
         "VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE",
-        "0").lower() in ("1", "true", "yes", "on")
+        "1").lower() in ("1", "true", "yes", "on")
 
 
 def _mode4_get_flat_payload(cache: dict[tuple[object, ...], torch.Tensor],

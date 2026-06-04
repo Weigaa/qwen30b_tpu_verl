@@ -701,3 +701,65 @@ Interpretation:
 - Remaining caveat:
   - stage=2/1 submit-path timing is still visibly heavier than the old `20260604154651` hotspot baseline, so this is not yet proof that the original stage=2/1 overlap-quality metrics have been fully recovered.
   - treat this run as a strong new stable-mainline milestone for the current submit-path patch. It is a better canonical baseline than `270.998779` for the current code path, but it still does not beat the historical wall-time best `252.435529`.
+
+### 20260605021206
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605021206_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605021206_elastic.txt)
+- Ray session:
+  - `/tmp/ray/session_2026-06-05_02-12-16_209900_714262`
+- Classification: valid positive sample with `single_control_message_remote=1`; current strongest candidate for combining the old `270s` stage=2/1 direction with the faster wall-time path from the `252s` family.
+- Config:
+  - `mode=5`
+  - `dual_source`
+  - `VLLM_ASCEND_MODE3_TIMING_SYNC=1`
+  - `VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=1`
+  - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=0.75`
+  - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=fixed`
+  - `VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=1`
+- Verified rollout results so far:
+  - step1 `rollout_output_time_s = 254.491324`
+  - step2 `rollout_output_time_s = 264.681957`
+- Verified step summaries:
+  - step1:
+    - `timing_s/gen = 254.487689`
+    - `timing_s/old_log_prob = 28.941315`
+    - `timing_s/ref = 14.691197`
+    - `timing_s/update_actor = 113.994052`
+    - `timing_s/step = 415.024120`
+  - step2:
+    - `timing_s/gen = 264.678575`
+    - `timing_s/old_log_prob = 25.340860`
+    - `timing_s/ref = 15.524812`
+    - `timing_s/update_actor = 111.496597`
+    - `timing_s/step = 419.897830`
+- Interpretation relative to earlier references:
+  - versus the old overlap-quality baseline `20260604154651 (270.998779)`:
+    - step1 improves by `16.507455 s`
+    - step2 improves by `6.316822 s`
+  - versus the newer stable-mainline baseline `20260605013258`:
+    - step1 improves by `15.285298 s`
+    - step2 improves by `1.336377 s`
+  - step1 is also very close to the historical wall-time best family `20260604182806`, landing only about `2.055795 s` above the absolute best `252.435529`.
+- Stage-refresh aggregate summary:
+  - `stage8 total_mean = 430.91 ms`
+  - `stage4 total_mean = 665.46 ms`
+  - `stage2 total_mean = 927.25 ms`
+  - `stage1 total_mean = 2035.63 ms`
+- Hotspot summary from emitted timing lines:
+  - stage2:
+    - `submit_populate_us p50/p90 = 2195.25 / 2235.80`
+    - `submit_remote_npu_us p50/p90 = 1745.00 / 1776.39`
+    - `prefetch_submit_us p50/p90 = 2318.65 / 2359.25`
+    - `prefetch_dev_ms p50/p90 = 4.94 / 5.03`
+  - stage1:
+    - `submit_populate_us p50/p90 = 4725.30 / 5055.66`
+    - `submit_remote_npu_us p50/p90 = 3979.10 / 4217.72`
+    - `prefetch_submit_us p50/p90 = 4900.80 / 5229.92`
+    - `prefetch_dev_ms p50/p90 = 10.35 / 10.41`
+- Practical reading:
+  - Re-opening the single-control-message path is now a valid mainline optimization, not just an unstable experiment, because the protocol mismatch bug was fixed earlier and the run has re-entered true mode5 runtime cleanly.
+  - This change materially improves wall time and strongly improves the stage2 submit path compared with `20260605013258`:
+    - stage2 `submit_remote_npu_us` drops from `2274.05 / 2580.48` to `1745.00 / 1776.39`
+    - stage2 `submit_populate_us` drops from `2823.00 / 3213.64` to `2195.25 / 2235.80`
+    - stage2 `prefetch_submit_us` drops from `2972.05 / 3374.36` to `2318.65 / 2359.25`
+  - Stage1 remains noticeably heavier than the old `20260604154651` overlap-quality baseline, so this is not yet the final answer to the original objective.
+  - However, this run is the strongest evidence so far that the code can preserve the faster non-stage2/1 path while recovering a substantial portion of the desired stage2 behavior. The next narrowing step should focus only on stage1 submit-path overhead inside `worker_v1.py`, not on source mix or stage8/4 refresh.
