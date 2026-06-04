@@ -137,7 +137,7 @@ def _mode5_cpu_shadow_runtime_strategy() -> str:
 def _mode5_single_control_message_remote() -> bool:
     return os.getenv(
         "VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE",
-        "0").lower() in ("1", "true", "yes", "on")
+        "1").lower() in ("1", "true", "yes", "on")
 
 
 def _mode4_get_flat_payload(cache: dict[tuple[object, ...], torch.Tensor],
@@ -151,6 +151,84 @@ def _mode4_get_flat_payload(cache: dict[tuple[object, ...], torch.Tensor],
     payload = w13.new_empty((total_elems, ))
     cache[key] = payload
     return payload
+
+
+def _mode4_get_request_cpu_buffer(
+        cache: dict[tuple[object, ...], torch.Tensor],
+        key: tuple[object, ...],
+        rows: int,
+        cols: int) -> torch.Tensor:
+    request = cache.get(key)
+    if request is not None:
+        return request
+    request = torch.empty((int(rows), int(cols)),
+                          device="cpu",
+                          dtype=torch.int64)
+    cache[key] = request
+    return request
+
+
+def _mode4_pack_remote_request_rows_to_flat_payload(
+        batch_w13: torch.Tensor,
+        batch_w2: torch.Tensor,
+        request_rows: list[tuple[int, int, int]],
+        layers: dict[int, nn.Module],
+        expert_cache: dict[tuple[int, int], tuple[torch.Tensor,
+                                                  torch.Tensor]]) -> None:
+    """Pack remote request rows into a flat payload using contiguous slot runs.
+
+    For mode5 the request rows are often already grouped by remote cache rank
+    and ordered by remote_slot. When that happens, copy contiguous
+    ``module.w13_weight/module.w2_weight`` ranges directly instead of falling
+    back to one row copy per expert.
+    """
+    row_start = 0
+    total_rows = len(request_rows)
+    while row_start < total_rows:
+        layer_idx, remote_slot, _expert_id = request_rows[row_start]
+        run_end = row_start + 1
+        prev_slot = int(remote_slot)
+        while run_end < total_rows:
+            next_layer_idx, next_remote_slot, _next_expert_id = request_rows[
+                run_end]
+            if (int(next_layer_idx) != int(layer_idx)
+                    or int(next_remote_slot) != prev_slot + 1):
+                break
+            prev_slot = int(next_remote_slot)
+            run_end += 1
+        run_len = run_end - row_start
+        module = layers.get(int(layer_idx))
+        used_bulk = False
+        if module is not None:
+            try:
+                src_w13 = module.w13_weight[int(remote_slot):int(remote_slot) +
+                                            run_len]
+                src_w2 = module.w2_weight[int(remote_slot):int(remote_slot) +
+                                          run_len]
+                if (tuple(src_w13.shape)
+                        == tuple(batch_w13[row_start:run_end].shape)
+                        and tuple(src_w2.shape)
+                        == tuple(batch_w2[row_start:run_end].shape)
+                        and src_w13.device.type == "npu"
+                        and src_w2.device.type == "npu"):
+                    batch_w13[row_start:run_end].copy_(src_w13,
+                                                       non_blocking=False)
+                    batch_w2[row_start:run_end].copy_(src_w2,
+                                                      non_blocking=False)
+                    used_bulk = True
+            except Exception:
+                used_bulk = False
+        if not used_bulk:
+            for row_idx in range(row_start, run_end):
+                cur_layer_idx, cur_remote_slot, _cur_expert_id = request_rows[
+                    row_idx]
+                send_w13, send_w2 = expert_cache[(int(cur_layer_idx),
+                                                  int(cur_remote_slot))]
+                batch_w13[row_idx:row_idx + 1].copy_(send_w13,
+                                                     non_blocking=False)
+                batch_w2[row_idx:row_idx + 1].copy_(send_w2,
+                                                    non_blocking=False)
+        row_start = run_end
 
 
 def _is_custom_ascend_fused_moe_module(module: nn.Module) -> bool:
@@ -4171,6 +4249,11 @@ class NPUWorker(WorkerBase):
                                   list[tuple[int, int, int, int]]]] = []
         pending_control_msgs: list[tuple[int, list[tuple[int, int, int, int]],
                                          list[object], torch.Tensor]] = []
+        request_cache = getattr(self, "_mode4_remote_request_buffer_cache",
+                                None)
+        if request_cache is None:
+            request_cache = {}
+            self._mode4_remote_request_buffer_cache = request_cache
         for remote_rank, assignments in remote_items:
             fetch_log_key = (
                 int(execution_mode),
@@ -4195,31 +4278,31 @@ class NPUWorker(WorkerBase):
                 )
                 begin_logged.add(fetch_log_key)
                 self._mode4_fetch_begin_logged_keys = begin_logged
-            request = torch.tensor(
-                [[int(layer_idx), int(remote_slot), int(expert_id)]
-                 for _slot_idx, remote_slot, expert_id, layer_idx in
-                 assignments],
-                device="cpu",
-                dtype=torch.int64,
-            )
+            request_rows = len(assignments)
+            request_cols = 3
             if execution_mode == 5:
                 # Mode5 requests are always 3-column rows. Collapse shape and
                 # payload into a single CPU control message to reduce host-side
                 # send/wait overhead per remote cache rank.
-                if int(request.shape[0]) > 128:
+                if int(request_rows) > 128:
                     raise RuntimeError(
                         "Mode5 remote request exceeds fixed control capacity: "
-                        f"rows={int(request.shape[0])} max_rows=128 "
+                        f"rows={int(request_rows)} max_rows=128 "
                         f"layer={getattr(layer, 'layer_idx', -1)} "
                         f"remote_rank={remote_rank}")
-                control = torch.empty((129, int(request.shape[1])),
-                                      device="cpu",
-                                      dtype=torch.int64)
-                control.zero_()
-                control[0, 0] = int(request.shape[0])
-                control[0, 1] = int(request.shape[1])
-                control[1:1 + int(request.shape[0])].copy_(request,
-                                                           non_blocking=False)
+                control = _mode4_get_request_cpu_buffer(
+                    request_cache,
+                    ("control_send", int(remote_rank), 129, request_cols),
+                    129,
+                    request_cols,
+                )
+                control[0, 0] = int(request_rows)
+                control[0, 1] = int(request_cols)
+                for row_idx, (_slot_idx, remote_slot, expert_id,
+                              layer_idx) in enumerate(assignments):
+                    control[1 + row_idx, 0] = int(layer_idx)
+                    control[1 + row_idx, 1] = int(remote_slot)
+                    control[1 + row_idx, 2] = int(expert_id)
                 cpu_send_reqs = [
                     torch.distributed.isend(control,
                                             dst=remote_rank,
@@ -4227,6 +4310,17 @@ class NPUWorker(WorkerBase):
                                             tag=request_tag)
                 ]
             else:
+                request_key = ("request", int(remote_rank), request_rows,
+                               request_cols)
+                request = _mode4_get_request_cpu_buffer(request_cache,
+                                                        request_key,
+                                                        request_rows,
+                                                        request_cols)
+                for row_idx, (_slot_idx, remote_slot, expert_id,
+                              layer_idx) in enumerate(assignments):
+                    request[row_idx, 0] = int(layer_idx)
+                    request[row_idx, 1] = int(remote_slot)
+                    request[row_idx, 2] = int(expert_id)
                 shape = torch.tensor([int(request.shape[0]),
                                       int(request.shape[1])],
                                      device="cpu",
@@ -4288,10 +4382,9 @@ class NPUWorker(WorkerBase):
                     _recv_flat, _assignments, dst_w13, dst_w2, async_copy)
             pending_recvs.clear()
         if pending_recvs:
-            for req_flat, _recv_flat, _remote_rank, _assignments in pending_recvs:
+            for req_flat, recv_flat, _remote_rank, assignments in pending_recvs:
                 if req_flat is not None:
                     req_flat.wait()
-            for _req, recv_flat, _remote_rank, assignments in pending_recvs:
                 self._copy_mode4_remote_fetch_payload_to_slot(
                     recv_flat, assignments, dst_w13, dst_w2, async_copy)
             pending_recvs.clear()
@@ -4325,28 +4418,40 @@ class NPUWorker(WorkerBase):
         recv_w2 = recv_flat[rows * w13_elems:rows *
                             (w13_elems + w2_elems)].view(
                                 (rows, ) + tuple(dst_w2.shape[1:]))
-        # Most shrink-to-8 windows map the remote experts into a dense
-        # prefix of the runtime slot. Keep the generic scatter path for later
-        # 8->4/4->2/2->1 windows, but use a single contiguous copy when the
-        # destination slots are already dense.
         slot_ids = [
             int(slot_idx)
             for slot_idx, _remote_slot, _expert_id, _layer_idx in assignments
         ]
-        if slot_ids == list(range(min(slot_ids), min(slot_ids) + len(slot_ids))):
-            dst_start = min(slot_ids)
-            dst_w13[dst_start:dst_start + len(slot_ids)].copy_(
-                recv_w13, non_blocking=async_copy)
-            dst_w2[dst_start:dst_start + len(slot_ids)].copy_(
-                recv_w2, non_blocking=async_copy)
-        else:
-            for row_idx, slot_idx in enumerate(slot_ids):
-                dst_w13[slot_idx:slot_idx + 1].copy_(
-                    recv_w13[row_idx:row_idx + 1],
-                    non_blocking=async_copy)
-                dst_w2[slot_idx:slot_idx + 1].copy_(
-                    recv_w2[row_idx:row_idx + 1],
-                    non_blocking=async_copy)
+        if not slot_ids:
+            return
+        # Remote payload rows are already contiguous in recv_w13/recv_w2. Copy
+        # them back to the runtime slot using the longest contiguous slot runs
+        # we can find instead of falling back to per-row scatter for every
+        # non-prefix window.
+        run_row_start = 0
+        run_slot_start = slot_ids[0]
+        prev_slot = slot_ids[0]
+        for row_idx, slot_idx in enumerate(slot_ids[1:], start=1):
+            if slot_idx == prev_slot + 1:
+                prev_slot = slot_idx
+                continue
+            run_len = row_idx - run_row_start
+            dst_w13[run_slot_start:run_slot_start + run_len].copy_(
+                recv_w13[run_row_start:run_row_start + run_len],
+                non_blocking=async_copy)
+            dst_w2[run_slot_start:run_slot_start + run_len].copy_(
+                recv_w2[run_row_start:run_row_start + run_len],
+                non_blocking=async_copy)
+            run_row_start = row_idx
+            run_slot_start = slot_idx
+            prev_slot = slot_idx
+        run_len = len(slot_ids) - run_row_start
+        dst_w13[run_slot_start:run_slot_start + run_len].copy_(
+            recv_w13[run_row_start:run_row_start + run_len],
+            non_blocking=async_copy)
+        dst_w2[run_slot_start:run_slot_start + run_len].copy_(
+            recv_w2[run_row_start:run_row_start + run_len],
+            non_blocking=async_copy)
 
     def _mode4_warmup_remote_payload_fetch(
             self, active_ranks: list[int], world_group) -> None:
@@ -4429,7 +4534,20 @@ class NPUWorker(WorkerBase):
             rows)
         cpu_group = world_group.cpu_group
         device_group = world_group.device_group
-        request = torch.tensor(request_rows, device="cpu", dtype=torch.int64)
+        request_cache = getattr(self, "_mode4_remote_request_buffer_cache",
+                                None)
+        if request_cache is None:
+            request_cache = {}
+            self._mode4_remote_request_buffer_cache = request_cache
+        request = _mode4_get_request_cpu_buffer(request_cache,
+                                                ("warmup_request",
+                                                 int(remote_rank), rows, 3),
+                                                rows, 3)
+        for row_idx, (layer_idx, remote_slot, expert_id) in enumerate(
+                request_rows):
+            request[row_idx, 0] = int(layer_idx)
+            request[row_idx, 1] = int(remote_slot)
+            request[row_idx, 2] = int(expert_id)
         warmup_start_t = time.perf_counter()
         if (int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) == 5
                 and _mode5_single_control_message_remote()):
@@ -4437,8 +4555,10 @@ class NPUWorker(WorkerBase):
                 raise RuntimeError(
                     "Mode5 warmup remote request exceeds fixed control "
                     f"capacity: rows={rows} max_rows=128 remote_rank={remote_rank}")
-            control = torch.empty((129, 3), device="cpu", dtype=torch.int64)
-            control.zero_()
+            control = _mode4_get_request_cpu_buffer(request_cache,
+                                                    ("warmup_control",
+                                                     int(remote_rank), 129, 3),
+                                                    129, 3)
             control[0, 0] = rows
             control[0, 1] = 3
             control[1:1 + rows].copy_(request, non_blocking=False)
@@ -4684,11 +4804,13 @@ class NPUWorker(WorkerBase):
                 batch_w2 = flat_payload[rows * w13_elems:rows *
                                         (w13_elems + w2_elems)].view(
                                             (rows, ) + tuple(first_w2.shape))
-                for row_idx, (send_w13, send_w2) in enumerate(send_batches):
-                    batch_w13[row_idx:row_idx + 1].copy_(send_w13,
-                                                         non_blocking=False)
-                    batch_w2[row_idx:row_idx + 1].copy_(send_w2,
-                                                        non_blocking=False)
+                _mode4_pack_remote_request_rows_to_flat_payload(
+                    batch_w13,
+                    batch_w2,
+                    request_rows,
+                    layers,
+                    expert_cache,
+                )
                 request_key = (int(owner_rank), tuple(request_rows))
                 prepacked[request_key] = flat_payload
         logger.info(
@@ -4857,15 +4979,21 @@ class NPUWorker(WorkerBase):
             self._mode4_remote_prepacked_payload_cache = (
                 self._mode4_build_prepacked_remote_payloads(owner_ranks,
                                                             expert_cache))
+        request_cache = getattr(self, "_mode4_remote_request_buffer_cache",
+                                None)
+        if request_cache is None:
+            request_cache = {}
+            self._mode4_remote_request_buffer_cache = request_cache
         logger.info(
             "%s remote cache service owners: rank=%s owner_ranks=%s listen=any_source",
             mode_name, self.rank, owner_ranks)
         while not stop_event.is_set():
             try:
                 if execution_mode == 5 and _mode5_single_control_message_remote():
-                    control = torch.empty((129, 3),
-                                          device="cpu",
-                                          dtype=torch.int64)
+                    control = _mode4_get_request_cpu_buffer(
+                        request_cache,
+                        ("control_recv", 129, 3),
+                        129, 3)
                     owner_rank = torch.distributed.recv(control,
                                                         src=None,
                                                         group=cpu_group,
@@ -4884,7 +5012,7 @@ class NPUWorker(WorkerBase):
                             mode_name, self.rank, owner_rank, rows, cols)
                         stop_event.set()
                         return
-                    request = control[1:1 + rows, :cols].contiguous()
+                    request = control[1:1 + rows, :cols]
                 else:
                     shape = torch.empty((2, ), device="cpu", dtype=torch.int64)
                     owner_rank = torch.distributed.recv(shape,
@@ -4905,9 +5033,12 @@ class NPUWorker(WorkerBase):
                             mode_name, self.rank, owner_rank, rows, cols)
                         stop_event.set()
                         return
-                    request = torch.empty((rows, cols),
-                                          device="cpu",
-                                          dtype=torch.int64)
+                    request = _mode4_get_request_cpu_buffer(
+                        request_cache,
+                        ("request_recv", int(owner_rank), int(rows),
+                         int(cols)),
+                        rows,
+                        cols)
                     torch.distributed.recv(request,
                                            src=owner_rank,
                                            group=cpu_group,
@@ -4923,31 +5054,43 @@ class NPUWorker(WorkerBase):
                         request[0].tolist() if rows > 0 else [],
                     )
                     self._mode4_cache_request_logged = True
-                request_rows = tuple(
-                    (int(row[0]), int(row[1]), int(row[2]))
-                    for row in request.tolist())
-                prepacked_payload = self._mode4_remote_prepacked_payload_cache.get(
-                    (int(owner_rank), request_rows))
-                if prepacked_payload is not None:
-                    if not getattr(self, "_mode4_cache_prepacked_logged", False):
-                        logger.info(
-                            "%s remote cache prepacked send begin: rank=%s owner_rank=%s rows=%s payload_shape=%s",
-                            mode_name,
-                            self.rank,
-                            owner_rank,
-                            rows,
-                            tuple(prepacked_payload.shape),
-                        )
-                        self._mode4_cache_prepacked_logged = True
-                    req_flat = torch.distributed.isend(prepacked_payload,
-                                                       dst=owner_rank,
-                                                       group=device_group)
-                    req_flat.wait()
-                    continue
-                send_batches: list[tuple[torch.Tensor, torch.Tensor, int,
-                                         int, int]] = []
-                for row in request_rows:
-                    layer_idx, remote_slot, _expert_id = map(int, row[:3])
+                request_rows = None
+                if execution_mode != 5:
+                    request_rows = tuple(
+                        (int(request[row_idx, 0].item()),
+                         int(request[row_idx, 1].item()),
+                         int(request[row_idx, 2].item()))
+                        for row_idx in range(int(rows)))
+                    prepacked_payload = (
+                        self._mode4_remote_prepacked_payload_cache.get(
+                            (int(owner_rank), request_rows)))
+                    if prepacked_payload is not None:
+                        if not getattr(self, "_mode4_cache_prepacked_logged",
+                                       False):
+                            logger.info(
+                                "%s remote cache prepacked send begin: rank=%s owner_rank=%s rows=%s payload_shape=%s",
+                                mode_name,
+                                self.rank,
+                                owner_rank,
+                                rows,
+                                tuple(prepacked_payload.shape),
+                            )
+                            self._mode4_cache_prepacked_logged = True
+                        req_flat = torch.distributed.isend(
+                            prepacked_payload,
+                            dst=owner_rank,
+                            group=device_group)
+                        req_flat.wait()
+                        continue
+                first_w13 = None
+                first_w2 = None
+                first_layer = None
+                first_slot = None
+                first_expert = None
+                for row_idx in range(int(rows)):
+                    layer_idx = int(request[row_idx, 0].item())
+                    remote_slot = int(request[row_idx, 1].item())
+                    _expert_id = int(request[row_idx, 2].item())
                     cached_pair = expert_cache.get((layer_idx, remote_slot))
                     if cached_pair is None:
                         raise RuntimeError(
@@ -4964,14 +5107,15 @@ class NPUWorker(WorkerBase):
                             f"expert_id={_expert_id} "
                             f"send_w13_device={send_w13.device} "
                             f"send_w2_device={send_w2.device}")
-                    send_batches.append((send_w13, send_w2, layer_idx,
-                                         remote_slot, _expert_id))
-                if not send_batches:
+                    if first_w13 is None:
+                        first_w13, first_w2 = send_w13, send_w2
+                        first_layer = layer_idx
+                        first_slot = remote_slot
+                        first_expert = _expert_id
+                if first_w13 is None or first_w2 is None:
                     continue
-                first_w13, first_w2, first_layer, first_slot, first_expert = (
-                    send_batches[0])
                 send_cache = self._mode4_remote_send_buffer_cache
-                rows = len(send_batches)
+                rows = len(request_rows)
                 send_key_flat = ("send_flat", owner_rank,
                                  _mode4_flat_payload_signature(
                                      first_w13, first_w2, rows))
@@ -4984,12 +5128,16 @@ class NPUWorker(WorkerBase):
                 batch_w2 = flat_payload[rows * w13_elems:rows *
                                         (w13_elems + w2_elems)].view(
                                             (rows, ) + tuple(first_w2.shape))
-                for row_idx, (send_w13, send_w2, _layer_idx,
-                              _remote_slot, _expert_id) in enumerate(send_batches):
-                    batch_w13[row_idx:row_idx + 1].copy_(send_w13,
-                                                         non_blocking=False)
-                    batch_w2[row_idx:row_idx + 1].copy_(send_w2,
-                                                        non_blocking=False)
+                _mode4_pack_remote_request_rows_to_flat_payload(
+                    batch_w13,
+                    batch_w2,
+                    [(int(request[row_idx, 0].item()),
+                      int(request[row_idx, 1].item()),
+                      int(request[row_idx, 2].item()))
+                     for row_idx in range(int(rows))],
+                    layers,
+                    expert_cache,
+                )
                 if not getattr(self, "_mode4_cache_send_logged", False):
                     logger.info(
                         "%s remote cache device flat send begin: rank=%s owner_rank=%s layer=%s first_remote_slot=%s first_expert_id=%s rows=%s payload_device=%s payload_shape=%s w13_shape=%s w2_shape=%s",
@@ -4999,7 +5147,7 @@ class NPUWorker(WorkerBase):
                         first_layer,
                         first_slot,
                         first_expert,
-                        len(send_batches),
+                        int(rows),
                         flat_payload.device,
                         tuple(flat_payload.shape),
                         tuple(batch_w13.shape),
