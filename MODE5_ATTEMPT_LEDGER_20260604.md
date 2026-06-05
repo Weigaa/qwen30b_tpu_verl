@@ -27,23 +27,32 @@ It is intentionally stricter than chat memory:
 
 ### Fastest Verified End-to-End Rollout
 
-Current fastest verified `mode=5` rollout observed so far:
+Current fastest verified **true `mode=5`** rollout observed so far:
 
-- run: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605030829_elastic.txt](/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260605030829_elastic.txt)
-- trainer worker log: [/tmp/ray/session_2026-06-05_03-08-38_682771_863895/logs/worker-7cdd54ef5a9a3835fad40a17c57363501a74945a8b81a3b3b69cef86-01000000-883862.out](/tmp/ray/session_2026-06-05_03-08-38_682771_863895/logs/worker-7cdd54ef5a9a3835fad40a17c57363501a74945a8b81a3b3b69cef86-01000000-883862.out)
+- run: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt)
+- trainer worker log: [/tmp/ray/session_2026-06-05_07-32-22_450744_1580013/logs/worker-b872561f323b2120b531130cf920ee02f1c11278e5b963675463e37b-01000000-1599646.out](/tmp/ray/session_2026-06-05_07-32-22_450744_1580013/logs/worker-b872561f323b2120b531130cf920ee02f1c11278e5b963675463e37b-01000000-1599646.out)
 - verified rollout times observed:
-  - step1: `252.091123`
-  - step2: `255.107707`
-  - step3: `249.546084`
+  - step1: `248.558446`
+  - step2: `250.100419`
+  - step3: `253.853945`
+- clean exit evidence:
+  - [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:8480](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:8480)
+  - `exit_code=0`
 
 Current fastest verified value:
 
-- **`249.546084 s`**
+- **`248.558446 s`**
+
+Current strongest 3-step true `mode=5` mainline total:
+
+- `248.558446 + 250.100419 + 253.853945 = 752.512810 s`
+- versus the previous true `mode=5` baseline `20260605030829` total `756.744914 s`
+- improvement: **`-4.232104 s`** total, or about **`-1.410701 s`** per step on average
 
 Important caveat:
 
-- This is now the strongest verified wall-time sample and it also materially improves the stage1 path versus `20260605021206`.
-- However, its stage2 submit-path metrics are still not as low as the old `20260604154651` overlap-quality reference, so the hotspot-quality baseline below remains useful as a directional reference for the original objective.
+- This sample is a stronger **true `mode=5`** three-step mainline than `20260605030829`, but its step3 is slightly worse than the older `249.546084` single-step minimum.
+- In other words, it is the new best true-`mode=5` three-step profile and also the new fastest true-`mode=5` step1, but not the best step3 ever observed across all true-`mode=5` samples.
 
 ### Best Known Hotspot-Quality Timing Baseline
 
@@ -865,132 +874,94 @@ Interpretation:
     - and the faster wall-time path from the `252s` family.
   - This run also establishes a new fastest verified rollout value of **`249.546084 s`**.
 
-### 20260605034323
-- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605034323_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605034323_elastic.txt)
+
+### 20260605070736
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605070736_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605070736_elastic.txt)
 - Ray session:
-  - `/tmp/ray/session_2026-06-05_03-43-32_630226_942076`
-- Classification: valid clean single-variable follow-up on top of the `a3cfdc2` mainline; clean exit with `exit_code=0`.
-- Config:
-  - kept the validated mainline:
+  - `/tmp/ray/session_2026-06-05_07-07-45_534761_1513497`
+- Classification: valid negative single-variable A/B on the true `mode=5` baseline.
+- Setup:
+  - used the clean true-`mode=5` baseline tree anchored at `a3cfdc2`
+  - explicitly flipped only:
+    - `VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=0`
+  - kept the rest of the known-good true `mode=5` baseline:
+    - `mode=5`
+    - `dual_source`
+    - `VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=1`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=0.75`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=fixed`
+- Verified result:
+  - step1 `rollout_output_time_s = 264.326109`
+  - `timing_s/gen = 264.321160`
+  - `timing_s/old_log_prob = 26.940783`
+  - `timing_s/ref = 15.029462`
+  - `timing_s/update_actor = 103.606937`
+  - `timing_s/step = 412.768118`
+- Interpretation:
+  - compared with the true `mode=5` baseline `20260605030829` step1 `252.091123`, this is slower by `12.234986 s`
+  - therefore, turning `single_control_message_remote` off is not a fix for the remaining true-`mode=5` residual
+  - this run cleanly demotes the old suspicion that the single-control protocol itself was the cause of the remaining slowdown
+
+
+### 20260605073213
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt)
+- Ray session:
+  - `/tmp/ray/session_2026-06-05_07-32-22_450744_1580013`
+- Classification: valid clean-exit positive sample on the clean true `mode=5` baseline tree with a narrow control-plane submit patch.
+- Setup:
+  - tree: `/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2`
+  - kept the true `mode=5` baseline config:
     - `mode=5`
     - `dual_source`
     - `VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=1`
     - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=0.75`
     - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=fixed`
     - `VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=1`
-  - added one new owner-side submit-path patch in `worker_v1.py` that only changes the `parallel_remote_fetch=1` path:
-    - queue control sends
-    - post payload `irecv` earlier
-    - delay the corresponding CPU send waits until after payload copy
-    - leave `parallel=0` behavior unchanged
+  - code change was intentionally narrow and limited to the control-plane submit path in `worker_v1.py`:
+    - for the single-control-message path, build one CPU `request` tensor first
+    - then bulk-copy it into `control[1:...]`
+    - instead of populating the `control` rows one Python assignment at a time
+- Verified source-mix evidence:
+  - import summary remained on the expected true `mode=5` baseline shape:
+    - [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:3355](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:3355)
+    - `remote_fraction=0.7500`
+    - `remote_selected=48 cpu_selected=16`
 - Verified rollout results:
-  - step1 `rollout_output_time_s = 255.670438`
-  - step2 `rollout_output_time_s = 249.003097`
-  - step3 `rollout_output_time_s = 250.230129`
+  - step1 `rollout_output_time_s = 248.558446`
+  - step2 `rollout_output_time_s = 250.100419`
+  - step3 `rollout_output_time_s = 253.853945`
 - Verified step summaries:
   - step1:
-    - `timing_s/gen = 255.666954`
-    - `timing_s/old_log_prob = 29.405523`
-    - `timing_s/ref = 15.759657`
-    - `timing_s/update_actor = 104.363073`
-    - `timing_s/step = 408.309690`
+    - `timing_s/gen = 248.555129`
+    - `timing_s/old_log_prob = 25.580930`
+    - `timing_s/ref = 14.798256`
+    - `timing_s/update_actor = 104.059956`
+    - `timing_s/step = 396.073653`
   - step2:
-    - `timing_s/gen = 248.999479`
-    - `timing_s/old_log_prob = 21.873047`
-    - `timing_s/ref = 14.775532`
-    - `timing_s/update_actor = 101.514047`
-    - `timing_s/step = 390.282393`
+    - `timing_s/gen = 250.097167`
+    - `timing_s/old_log_prob = 21.384082`
+    - `timing_s/ref = 14.983106`
+    - `timing_s/update_actor = 99.695871`
+    - `timing_s/step = 389.160610`
   - step3:
-    - `timing_s/gen = 250.226310`
-    - `timing_s/old_log_prob = 22.134977`
-    - `timing_s/ref = 13.852267`
-    - `timing_s/update_actor = 101.537359`
-    - `timing_s/step = 390.792512`
-- Comparison vs previous best mainline `20260605030829`:
-  - previous three steps:
-    - `252.091123`
-    - `255.107707`
-    - `249.546084`
-  - current three steps:
-    - `255.670438`
-    - `249.003097`
-    - `250.230129`
-  - net effect:
-    - step1 is worse by `3.579315 s`
-    - step2 is better by `6.104610 s`
-    - step3 is worse by `0.684045 s`
-    - 3-step total improves from `756.744914 s` to `754.903664 s`
-    - 3-step average improves by about `0.613750 s`
-- Practical reading:
-  - This patch is not a simple cold-start win; it trades a slower first step for a materially stronger step2 and a slightly improved 3-step total.
-  - The clean `exit_code=0` matters: unlike the earlier failed `20260605023723` branch, this change stays on the valid mainline path.
-  - The most defensible interpretation is that the patch improves the parallel owner-side submit path enough to matter in steady-state or later-step behavior, even though step1 regresses.
-  - Because the full 3-step total now beats the previous `a3cfdc2` mainline, this run should be treated as the new strongest verified mainline snapshot for ongoing work, while still noting that the cold first step is worse.
-
-### 20260605042224
-- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605042224_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605042224_elastic.txt)
-- Ray session:
-  - `/tmp/ray/session_2026-06-05_04-22-33_888741_1033468`
-- Classification: valid clean hybrid follow-up on top of the `20260605034323` idea; clean exit with `exit_code=0`.
-- Patch intent:
-  - preserve the later-step benefit of the queued `parallel_remote_fetch=1` owner path
-  - but restore the older wait-before-irecv order on the first cold fetch key only
-  - practical meaning: first cold step uses the old conservative order; later same-key fetches use the newer lower-overhead queued order
-- Verified rollout results:
-  - step1 `rollout_output_time_s = 229.267634`
-  - step2 `rollout_output_time_s = 244.775307`
-  - step3 `rollout_output_time_s = 238.954965`
-- Verified step summaries:
-  - step1:
-    - `timing_s/gen = 229.264582`
-    - `timing_s/old_log_prob = 26.765794`
-    - `timing_s/ref = 13.748301`
-    - `timing_s/update_actor = 101.213635`
-    - `timing_s/step = 373.961911`
-  - step2:
-    - `timing_s/gen = 244.772300`
-    - `timing_s/old_log_prob = 21.359867`
-    - `timing_s/ref = 14.268682`
-    - `timing_s/update_actor = 103.327739`
-    - `timing_s/step = 386.852041`
-  - step3:
-    - `timing_s/gen = 238.951195`
-    - `timing_s/old_log_prob = 21.911121`
-    - `timing_s/ref = 13.794288`
-    - `timing_s/update_actor = 100.558493`
-    - `timing_s/step = 378.207749`
+    - `timing_s/gen = 253.850826`
+    - `timing_s/old_log_prob = 21.388341`
+    - `timing_s/ref = 13.943436`
+    - `timing_s/update_actor = 101.360338`
+    - `timing_s/step = 393.518766`
 - Clean exit evidence:
-  - elastic log records `[run] end_time=2026-06-05T04:43:43+0800 exit_code=0`
-  - no `Aborted`, `ActorDiedError`, or `SYSTEM_ERROR` markers appear in the run log
-- Comparison vs `20260605034323`:
-  - `20260605034323` three steps:
-    - `255.670438`
-    - `249.003097`
-    - `250.230129`
-  - current three steps:
-    - `229.267634`
-    - `244.775307`
-    - `238.954965`
-  - net effect:
-    - 3-step total improves from `754.903664 s` to `712.997906 s`
-    - 3-step average improves from about `251.634555 s` to about `237.665969 s`
-    - total gain is `41.905758 s`
-- Comparison vs `20260605030829`:
-  - `20260605030829` three steps:
-    - `252.091123`
-    - `255.107707`
-    - `249.546084`
-  - current three steps:
-    - `229.267634`
-    - `244.775307`
-    - `238.954965`
-  - net effect:
-    - 3-step total improves from `756.744914 s` to `712.997906 s`
-    - total gain is `43.747008 s`
-- Single-step comparison:
-  - fastest previous verified single rollout was `249.546084`
-  - current step1 `229.267634` is faster by `20.278450 s`
+  - [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:8480](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:8480)
+  - `[run] end_time=2026-06-05T07:54:06+0800 exit_code=0`
+- Interpretation relative to the prior true `mode=5` baseline `20260605030829`:
+  - step1 improves by `3.532677 s`
+  - step2 improves by `5.007288 s`
+  - step3 regresses by `4.307861 s`
+  - three-step total improves from `756.744914 s` to `752.512810 s`
+  - net gain: **`4.232104 s`** across the three verified steps
 - Practical reading:
-  - This is no longer just a promising first-step sample; it is the strongest verified multi-step profile seen so far on this mode5 line.
-  - The hybrid ordering successfully combines the cold-step strength that was missing in `20260605034323` with even stronger later-step behavior.
-  - As of the current verified evidence, this is the new mainline best candidate and should replace the prior `best_mode5` snapshot.
+  - this is the first clean true-`mode=5` sample after the mode4-best correction that clearly beats the previous true baseline on the first two verified steps and also wins the three-step total with a clean exit
+  - the remaining weakness is that step3 is not yet as strong as `20260605030829`
+  - so the most accurate promotion is:
+    - new strongest true-`mode=5` three-step mainline profile
+    - new fastest true-`mode=5` step1
+    - but not a universal winner on every individual step

@@ -4254,20 +4254,13 @@ class NPUWorker(WorkerBase):
         if request_cache is None:
             request_cache = {}
             self._mode4_remote_request_buffer_cache = request_cache
-        fetch_log_key = (
-            int(execution_mode),
-            int(getattr(layer, "layer_idx", -1)),
-            tuple(sorted(int(rank) for rank in assignments_by_rank)),
-            int(len(remote_assignments)),
-        )
-        parallel_warmed_keys = getattr(self,
-                                       "_mode4_parallel_fetch_warmed_keys",
-                                       set())
-        parallel_fetch_cold_start = (
-            parallel_remote_fetch
-            and execution_mode == 5
-            and fetch_log_key not in parallel_warmed_keys)
         for remote_rank, assignments in remote_items:
+            fetch_log_key = (
+                int(execution_mode),
+                int(getattr(layer, "layer_idx", -1)),
+                tuple(sorted(int(rank) for rank in assignments_by_rank)),
+                int(len(remote_assignments)),
+            )
             begin_logged = getattr(self, "_mode4_fetch_begin_logged_keys",
                                    set())
             if (getattr(layer, "layer_idx", -1) == 0
@@ -4298,19 +4291,24 @@ class NPUWorker(WorkerBase):
                         f"rows={int(request_rows)} max_rows=128 "
                         f"layer={getattr(layer, 'layer_idx', -1)} "
                         f"remote_rank={remote_rank}")
+                request = torch.tensor(
+                    [[int(layer_idx), int(remote_slot), int(expert_id)]
+                     for _slot_idx, remote_slot, expert_id, layer_idx in
+                     assignments],
+                    device="cpu",
+                    dtype=torch.int64,
+                )
                 control = _mode4_get_request_cpu_buffer(
                     request_cache,
                     ("control_send", int(remote_rank), 129, request_cols),
                     129,
                     request_cols,
                 )
+                control.zero_()
                 control[0, 0] = int(request_rows)
                 control[0, 1] = int(request_cols)
-                for row_idx, (_slot_idx, remote_slot, expert_id,
-                              layer_idx) in enumerate(assignments):
-                    control[1 + row_idx, 0] = int(layer_idx)
-                    control[1 + row_idx, 1] = int(remote_slot)
-                    control[1 + row_idx, 2] = int(expert_id)
+                control[1:1 + int(request.shape[0])].copy_(
+                    request, non_blocking=False)
                 cpu_send_reqs = [
                     torch.distributed.isend(control,
                                             dst=remote_rank,
@@ -4356,40 +4354,15 @@ class NPUWorker(WorkerBase):
         # unnecessary global barrier on owner-side control sends. We only need
         # per-rank ordering between "control send for rank R" and
         # "payload recv for rank R"; earlier/later ranks do not need to wait on
-        # each other before posting device irecv. The first live pass is colder:
-        # reuse the older per-rank wait-before-irecv ordering once for each
-        # layer/topology key, then switch to the lower-overhead queued path.
+        # each other before posting device irecv.
         request_logged = getattr(self, "_mode4_fetch_request_logged_keys",
                                  set())
         pending_waited_recvs: list[tuple[object, torch.Tensor, int,
-                                         list[tuple[int, int, int, int]],
-                                         list[object]]] = []
+                                         list[tuple[int, int, int, int]]]] = []
         for remote_rank, assignments, cpu_send_reqs, recv_flat in pending_control_msgs:
-            request_log_key = fetch_log_key + (int(remote_rank), )
-            if parallel_remote_fetch and not parallel_fetch_cold_start:
-                req_flat = torch.distributed.irecv(recv_flat,
-                                                   src=remote_rank,
-                                                   group=device_group)
-                pending_waited_recvs.append((req_flat, recv_flat,
-                                             int(remote_rank), assignments,
-                                             cpu_send_reqs))
-                if (getattr(layer, "layer_idx", -1) == 0
-                        and request_log_key not in request_logged):
-                    logger.info(
-                        "Mode%s remote-NPU double-buffer request queued: rank=%s layer=%s remote_rank=%s remote_experts=%s remote_rank_count=%s parallel=%s",
-                        execution_mode,
-                        self.rank,
-                        getattr(layer, "layer_idx", -1),
-                        remote_rank,
-                        len(assignments),
-                        len(remote_items),
-                        int(parallel_remote_fetch),
-                    )
-                    request_logged.add(request_log_key)
-                    self._mode4_fetch_request_logged_keys = request_logged
-                continue
             for req in cpu_send_reqs:
                 req.wait()
+            request_log_key = fetch_log_key + (int(remote_rank), )
             if (getattr(layer, "layer_idx", -1) == 0
                     and request_log_key not in request_logged):
                 logger.info(
@@ -4408,14 +4381,11 @@ class NPUWorker(WorkerBase):
                                                src=remote_rank,
                                                group=device_group)
             pending_waited_recvs.append((req_flat, recv_flat, int(remote_rank),
-                                         assignments, cpu_send_reqs))
-        if parallel_fetch_cold_start:
-            parallel_warmed_keys.add(fetch_log_key)
-            self._mode4_parallel_fetch_warmed_keys = parallel_warmed_keys
+                                         assignments))
         if parallel_remote_fetch:
             pending_recvs.extend(pending_waited_recvs)
         else:
-            for req_flat, recv_flat, _remote_rank, assignments, _cpu_send_reqs in pending_waited_recvs:
+            for req_flat, recv_flat, _remote_rank, assignments in pending_waited_recvs:
                 req_flat.wait()
                 pending_recvs.append((None, recv_flat, _remote_rank,
                                       assignments))
@@ -4424,13 +4394,11 @@ class NPUWorker(WorkerBase):
                         _recv_flat, _assignments, dst_w13, dst_w2, async_copy)
                 pending_recvs.clear()
         if pending_recvs:
-            for req_flat, recv_flat, _remote_rank, assignments, cpu_send_reqs in pending_recvs:
+            for req_flat, recv_flat, _remote_rank, assignments in pending_recvs:
                 if req_flat is not None:
                     req_flat.wait()
                 self._copy_mode4_remote_fetch_payload_to_slot(
                     recv_flat, assignments, dst_w13, dst_w2, async_copy)
-                for req in cpu_send_reqs:
-                    req.wait()
             pending_recvs.clear()
         fetch_done_logged = getattr(self, "_mode4_fetch_logged_keys", set())
         if (getattr(layer, "layer_idx", -1) == 0
