@@ -43,6 +43,10 @@ def get_moe_comm_method(
     return _MoECommMethods.get(moe_comm_type)
 
 
+def reset_moe_comm_method_cache() -> None:
+    _MoECommMethods.clear()
+
+
 def _resolve_model_type(moe_config: FusedMoEConfig) -> str:
     vllm_config = get_current_vllm_config()
     if (vllm_config is not None and vllm_config.model_config is not None

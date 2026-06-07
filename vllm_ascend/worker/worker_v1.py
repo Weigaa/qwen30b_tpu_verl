@@ -168,6 +168,19 @@ def _mode4_get_request_cpu_buffer(
     return request
 
 
+def _mode4_build_request_cpu_tensor(
+        rows: list[tuple[int, int, int]] | list[tuple[int, int, int, int]],
+        *,
+        mode5_assignments: bool = False) -> torch.Tensor:
+    if mode5_assignments:
+        payload = [[int(layer_idx), int(remote_slot), int(expert_id)]
+                   for _slot_idx, remote_slot, expert_id, layer_idx in rows]
+    else:
+        payload = [[int(layer_idx), int(remote_slot), int(expert_id)]
+                   for layer_idx, remote_slot, expert_id in rows]
+    return torch.tensor(payload, device="cpu", dtype=torch.int64)
+
+
 def _mode4_pack_remote_request_rows_to_flat_payload(
         batch_w13: torch.Tensor,
         batch_w2: torch.Tensor,
@@ -2043,10 +2056,19 @@ class NPUWorker(WorkerBase):
                              "1").lower() not in ("0", "false", "no", "off")
         sync = os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_SYNC",
                          "1").lower() not in ("0", "false", "no", "off")
+        contents = [
+            item.strip().lower()
+            for item in os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_CONTENTS",
+                                  "npu,cpu").split(",") if item.strip()
+        ]
+        enable_mstx = "mstx" in contents
+        marker_only = (enable_mstx and "npu" not in contents
+                       and "cpu" not in contents)
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=level,
-            msprof_tx=False,
+            msprof_tx=not marker_only,
+            mstx=enable_mstx,
             aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
             l2_cache=False,
             op_attr=False,
@@ -2054,11 +2076,14 @@ class NPUWorker(WorkerBase):
             record_op_args=False,
             gc_detect_threshold=None,
         )
+        activities = []
+        if not marker_only:
+            if "cpu" in contents:
+                activities.append(torch_npu.profiler.ProfilerActivity.CPU)
+            if "npu" in contents:
+                activities.append(torch_npu.profiler.ProfilerActivity.NPU)
         with torch_npu.profiler.profile(
-                activities=[
-                    torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU,
-                ],
+                activities=activities,
                 with_stack=False,
                 profile_memory=False,
                 with_modules=False,
@@ -4291,19 +4316,24 @@ class NPUWorker(WorkerBase):
                         f"rows={int(request_rows)} max_rows=128 "
                         f"layer={getattr(layer, 'layer_idx', -1)} "
                         f"remote_rank={remote_rank}")
+                request = torch.tensor(
+                    [[int(layer_idx), int(remote_slot), int(expert_id)]
+                     for _slot_idx, remote_slot, expert_id, layer_idx in
+                     assignments],
+                    device="cpu",
+                    dtype=torch.int64,
+                )
                 control = _mode4_get_request_cpu_buffer(
                     request_cache,
                     ("control_send", int(remote_rank), 129, request_cols),
                     129,
                     request_cols,
                 )
+                control.zero_()
                 control[0, 0] = int(request_rows)
                 control[0, 1] = int(request_cols)
-                for row_idx, (_slot_idx, remote_slot, expert_id,
-                              layer_idx) in enumerate(assignments):
-                    control[1 + row_idx, 0] = int(layer_idx)
-                    control[1 + row_idx, 1] = int(remote_slot)
-                    control[1 + row_idx, 2] = int(expert_id)
+                control[1:1 + int(request.shape[0])].copy_(
+                    request, non_blocking=False)
                 cpu_send_reqs = [
                     torch.distributed.isend(control,
                                             dst=remote_rank,
@@ -4317,11 +4347,9 @@ class NPUWorker(WorkerBase):
                                                         request_key,
                                                         request_rows,
                                                         request_cols)
-                for row_idx, (_slot_idx, remote_slot, expert_id,
-                              layer_idx) in enumerate(assignments):
-                    request[row_idx, 0] = int(layer_idx)
-                    request[row_idx, 1] = int(remote_slot)
-                    request[row_idx, 2] = int(expert_id)
+                request_src = _mode4_build_request_cpu_tensor(
+                    assignments, mode5_assignments=True)
+                request.copy_(request_src, non_blocking=False)
                 shape = torch.tensor([int(request.shape[0]),
                                       int(request.shape[1])],
                                      device="cpu",
@@ -4550,11 +4578,8 @@ class NPUWorker(WorkerBase):
                                                 ("warmup_request",
                                                  int(remote_rank), rows, 3),
                                                 rows, 3)
-        for row_idx, (layer_idx, remote_slot, expert_id) in enumerate(
-                request_rows):
-            request[row_idx, 0] = int(layer_idx)
-            request[row_idx, 1] = int(remote_slot)
-            request[row_idx, 2] = int(expert_id)
+        request_src = _mode4_build_request_cpu_tensor(request_rows)
+        request.copy_(request_src, non_blocking=False)
         warmup_start_t = time.perf_counter()
         if (int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) == 5
                 and _mode5_single_control_message_remote()):
