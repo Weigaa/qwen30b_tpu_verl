@@ -129,6 +129,48 @@ def _dummy_profile_range(message: str):
             pass
 
 
+def _stage_decode_profile_message(kind: str,
+                                  layer: Any,
+                                  *,
+                                  path: str = "",
+                                  extra: str = "") -> str:
+    mode = int(getattr(layer, "elastic_execution_mode", 0))
+    stage = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+    layer_idx = int(getattr(layer, "layer_idx", -1))
+    parts = [
+        f"vllm_stage_decode_{kind}",
+        f"rank={_profile_rank()}",
+        f"mode={mode}",
+        f"stage={stage}",
+        f"layer={layer_idx}",
+    ]
+    if path:
+        parts.append(f"path={path}")
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
+
+def _stage_decode_profile_range_start(message: str) -> Optional[Any]:
+    if not _env_flag("VLLM_ASCEND_STAGE_DECODE_PROFILE_MARKERS", "0"):
+        return None
+    try:
+        from torch_npu.npu import mstx
+        return mstx.range_start(message=message)
+    except Exception:
+        return None
+
+
+def _stage_decode_profile_range_end(range_id: Optional[Any]) -> None:
+    if range_id is None:
+        return
+    try:
+        from torch_npu.npu import mstx
+        mstx.range_end(range_id)
+    except Exception:
+        pass
+
+
 def _profile_rank() -> int:
     try:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -617,6 +659,10 @@ class Mode3DoubleBufferManager:
         self.prefetch_hit = defaultdict(int)
         self.prefetch_wait_count = defaultdict(int)
         self.last_bind_timing: dict[str, Any] = {}
+        self.last_prefetch_timing_by_target_layer: dict[int, dict[str, Any]] = {}
+        self.last_ffn_enter_wall_ts_by_layer: dict[int, float] = {}
+        self._stage_decode_compute_ranges_by_target_layer: dict[int, Any] = {}
+        self._stage_decode_comm_ranges_by_target_layer: dict[int, Any] = {}
         self._logged_slot_bindings: set[tuple[int, int, int]] = set()
         self._logged_prefetches: set[tuple[int, int]] = set()
         self._logged_prefetch_deferrals: set[tuple[int, int]] = set()
@@ -1983,6 +2029,12 @@ class Mode3DoubleBufferManager:
         if self._slot_matches(slot, layer):
             return slot
         submit_start = time.perf_counter()
+        prefetch_submit_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "prefetch_submit",
+                layer,
+                path=reason,
+                extra=f"slot={slot_id} async={int(async_copy)}"))
         host_timing: Optional[dict[str, float]] = (
             {} if self.enable_timing_logs else None)
         event_alloc_start = time.perf_counter()
@@ -2113,6 +2165,7 @@ class Mode3DoubleBufferManager:
                 list(slot.expert_ids[:8]),
             )
             self._logged_prefetches.add((int(layer.layer_idx), slot_id))
+        _stage_decode_profile_range_end(prefetch_submit_range)
         return slot
 
     def prepare_mode4_block_slot(self,
@@ -2130,6 +2183,14 @@ class Mode3DoubleBufferManager:
             raise RuntimeError(
                 f"Mode4 block prefetch found no active layers at start={block_start}.")
         submit_start = time.perf_counter()
+        prefetch_submit_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "prefetch_submit",
+                layer,
+                path=reason,
+                extra=(f"slot={slot_id} async={int(async_copy)} "
+                       f"block_start={block_start} "
+                       f"block_layers={len(block_layers)}")))
         host_timing: Optional[dict[str, float]] = (
             {} if self.enable_timing_logs else None)
         event_alloc_start = time.perf_counter()
@@ -2234,6 +2295,7 @@ class Mode3DoubleBufferManager:
                 slot.source_from_remote_npu,
             )
             self._logged_mode4_block_prefetch.add(log_key)
+        _stage_decode_profile_range_end(prefetch_submit_range)
         return slot
 
     def bind_current_layer(self, layer: Any) -> _Mode3DoubleBufferSlot:
@@ -2252,6 +2314,16 @@ class Mode3DoubleBufferManager:
                     f"layer={getattr(layer, 'layer_idx', -1)} "
                     f"block_start={slot.block_start_layer}")
         wait_start = time.perf_counter()
+        bind_wait_begin_wall_ts = wait_start
+        current_layer_idx = int(layer.layer_idx)
+        _stage_decode_profile_range_end(
+            self._stage_decode_compute_ranges_by_target_layer.pop(
+                current_layer_idx, None))
+        bind_wait_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "bind_wait",
+                layer,
+                extra=f"prefetched_hit={int(prefetched_hit)}"))
         ready_wait_start_event = None
         ready_wait_end_event = None
         # Ensure the current layer never starts computing before every expert
@@ -2273,6 +2345,11 @@ class Mode3DoubleBufferManager:
         cpu_fill_start = time.perf_counter()
         self._fill_pending_cpu_rows(slot, layer)
         cpu_fill_us = (time.perf_counter() - cpu_fill_start) * 1e6
+        bind_ready_wall_ts = time.perf_counter()
+        _stage_decode_profile_range_end(bind_wait_range)
+        _stage_decode_profile_range_end(
+            self._stage_decode_comm_ranges_by_target_layer.pop(
+                current_layer_idx, None))
         self.prefetch_wait_us[int(layer.layer_idx)] += wait_us
         self.prefetch_wait_count[int(layer.layer_idx)] += 1
         if prefetched_hit:
@@ -2306,6 +2383,39 @@ class Mode3DoubleBufferManager:
             "prefetched_hit": bool(prefetched_hit),
             "prefetch_hit_count": int(self.prefetch_hit[int(layer.layer_idx)]),
         }
+        prefetch_timing = self.last_prefetch_timing_by_target_layer.get(
+            current_layer_idx, {})
+        source_layer_idx = current_layer_idx - 1
+        ffn_enter_wall_ts = float(
+            self.last_ffn_enter_wall_ts_by_layer.get(source_layer_idx, -1.0))
+        prefetch_start_wall_ts = float(
+            prefetch_timing.get(
+                "prefetch_start_wall_ts",
+                prefetch_timing.get("prefetch_issue_wall_ts", -1.0)))
+        prefetch_issue_wall_ts = prefetch_start_wall_ts
+        strict_overlap_start_wall_ts = prefetch_issue_wall_ts
+        strict_compute_wall_ms = -1.0
+        strict_comm_wall_ms = -1.0
+        strict_wait_wall_ms = -1.0
+        if strict_overlap_start_wall_ts > 0:
+            strict_compute_wall_ms = (
+                bind_wait_begin_wall_ts - strict_overlap_start_wall_ts) * 1e3
+            strict_comm_wall_ms = (
+                bind_ready_wall_ts - strict_overlap_start_wall_ts) * 1e3
+        if bind_ready_wall_ts >= bind_wait_begin_wall_ts:
+            strict_wait_wall_ms = (
+                bind_ready_wall_ts - bind_wait_begin_wall_ts) * 1e3
+        self.last_bind_timing.update({
+            "ffn_enter_wall_ts": ffn_enter_wall_ts,
+            "prefetch_start_wall_ts": prefetch_start_wall_ts,
+            "prefetch_issue_wall_ts": prefetch_issue_wall_ts,
+            "strict_overlap_start_wall_ts": strict_overlap_start_wall_ts,
+            "bind_wait_begin_wall_ts": bind_wait_begin_wall_ts,
+            "bind_ready_wall_ts": bind_ready_wall_ts,
+            "strict_compute_wall_ms": strict_compute_wall_ms,
+            "strict_comm_wall_ms": strict_comm_wall_ms,
+            "strict_wait_wall_ms": strict_wait_wall_ms,
+        })
         layer.runtime_w13_weight = slot.w13[row_base:row_base +
                                             valid_expert_count]
         layer.runtime_w2_weight = slot.w2[row_base:row_base +
@@ -2376,6 +2486,27 @@ class Mode3DoubleBufferManager:
                 list(tuple(self._ordered_mode3_slot_expert_ids(layer))[:8]),
             )
             self._logged_slot_bindings.add(log_key)
+        if self.should_profile_layer(layer, "strict-ffn"):
+            logger.info(
+                "Mode%s strict-ffn-timing: rank=%s layer=%s stage=%s ffn_enter_wall_ts=%.6f prefetch_issue_wall_ts=%.6f strict_overlap_start_wall_ts=%.6f bind_wait_begin_wall_ts=%.6f bind_ready_wall_ts=%.6f strict_compute_wall_ms=%.3f strict_comm_wall_ms=%.3f strict_wait_wall_ms=%.3f bind_wait_us=%.1f prefetched_hit=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s",
+                int(getattr(layer, "elastic_execution_mode", 3)),
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                ffn_enter_wall_ts,
+                prefetch_issue_wall_ts,
+                strict_overlap_start_wall_ts,
+                bind_wait_begin_wall_ts,
+                bind_ready_wall_ts,
+                strict_compute_wall_ms,
+                strict_comm_wall_ms,
+                strict_wait_wall_ms,
+                wait_us,
+                int(prefetched_hit),
+                source_from_npu,
+                source_from_remote_npu,
+                source_from_cpu,
+            )
         return slot
 
     def _prefetch_layer(self, target_layer: Any, reason: str) -> dict[str, Any]:
@@ -2424,12 +2555,41 @@ class Mode3DoubleBufferManager:
             }
         next_slot_id = self._slot_id_for_runtime_layer(target_layer)
         was_match = self._slot_matches(self.slots[next_slot_id], target_layer)
+        prefetch_start_wall_ts = float(time.perf_counter())
+        target_layer_idx = int(target_layer.layer_idx)
+        _stage_decode_profile_range_end(
+            self._stage_decode_compute_ranges_by_target_layer.pop(
+                target_layer_idx, None))
+        _stage_decode_profile_range_end(
+            self._stage_decode_comm_ranges_by_target_layer.pop(
+                target_layer_idx, None))
+        self._stage_decode_compute_ranges_by_target_layer[
+            target_layer_idx] = _stage_decode_profile_range_start(
+                _stage_decode_profile_message(
+                    "compute_window",
+                    target_layer,
+                    path="prefetch_to_bind_wait",
+                    extra=f"target_layer={target_layer_idx} slot={next_slot_id} hit={int(was_match)}"))
+        self._stage_decode_comm_ranges_by_target_layer[
+            target_layer_idx] = _stage_decode_profile_range_start(
+                _stage_decode_profile_message(
+                    "comm_window",
+                    target_layer,
+                    path="prefetch_to_bind_ready",
+                    extra=f"target_layer={target_layer_idx} slot={next_slot_id} hit={int(was_match)}"))
         slot = self.prepare_slot(target_layer,
                                  next_slot_id,
                                  async_copy=True,
                                  reason=reason)
         timing = dict(getattr(slot, "prefetch_timing", {}))
         timing["status"] = "hit" if was_match else "scheduled"
+        timing["target_layer_idx"] = target_layer_idx
+        timing["prefetch_start_wall_ts"] = prefetch_start_wall_ts
+        # Backward compatibility: older analysis scripts used the issue field.
+        # It now intentionally means the real prefetch-start wall timestamp.
+        timing["prefetch_issue_wall_ts"] = prefetch_start_wall_ts
+        self.last_prefetch_timing_by_target_layer[target_layer_idx] = dict(
+            timing)
         return timing
 
     def prefetch_next_layer(self, current_layer: Any) -> dict[str, Any]:
@@ -2899,12 +3059,20 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             raise RuntimeError(
                 "Mode3/4 single-rank AllGather path requires forward-context "
                 f"model instance and prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
         profile_timing = manager.should_profile_layer(layer,
                                                       "single_rank_allgather")
         bound_slot = manager.bind_current_layer(layer)
         bind_timing = dict(manager.last_bind_timing)
         next_prefetch_timing = manager.prefetch_next_layer(layer)
         compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="single_rank_allgather"))
         compute_start_event = manager.new_timing_event() if profile_timing else None
         compute_end_event = manager.new_timing_event() if profile_timing else None
         remap_start_event = manager.new_timing_event() if profile_timing else None
@@ -2975,6 +3143,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 token_dispatcher.num_experts_local = old_num_experts_local
         fused_wall_ms = (time.perf_counter() - fused_wall_start) * 1e3
         _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
         compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
         layer.lossless_hybrid_last_stats = {
@@ -3126,6 +3295,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             raise RuntimeError(
                 "Mode3 fused-experts path requires forward-context model "
                 f"instance and moe prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
         profile_timing = manager.should_profile_layer(layer, "fused_experts")
         bound_slot = manager.bind_current_layer(layer)
         bind_timing = dict(manager.last_bind_timing)
@@ -3162,6 +3336,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
 
         compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="fused_experts"))
         compute_start_event = manager.new_timing_event() if profile_timing else None
         compute_end_event = manager.new_timing_event() if profile_timing else None
         fused_start_event = manager.new_timing_event() if profile_timing else None
@@ -3214,6 +3391,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 token_dispatcher.expert_token_nums_type = (
                     old_expert_token_nums_type)
         _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
         compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
         layer.lossless_hybrid_last_stats = {
@@ -3397,11 +3575,19 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 enable_force_load_balance=enable_force_load_balance,
                 kwargs=kwargs,
                 manager=manager)
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
         profile_timing = manager.should_profile_layer(layer, "single_dispatch")
         bound_slot = manager.bind_current_layer(layer)
         bind_timing = dict(manager.last_bind_timing)
         next_prefetch_timing = manager.prefetch_next_layer(layer)
         compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="single_dispatch"))
         compute_start_event = manager.new_timing_event() if profile_timing else None
         compute_end_event = manager.new_timing_event() if profile_timing else None
         remap_start_event = manager.new_timing_event() if profile_timing else None
@@ -3576,6 +3762,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 token_dispatcher.num_experts_local = old_dispatch_num_experts_local
             token_dispatcher.expert_token_nums_type = old_expert_token_nums_type
         _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
         compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
         layer.lossless_hybrid_last_stats = {

@@ -47,6 +47,33 @@ logger = init_logger(__name__)
 _R = TypeVar("_R", default=Any)
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+def _parse_int_set(value: str) -> Optional[set[int]]:
+    value = value.strip().lower()
+    if value in ("", "all", "*"):
+        return None
+    result: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.add(int(item))
+        except ValueError:
+            logger.warning("Ignoring invalid integer in env list: %s", item)
+    return result
+
+
 class LLMEngine:
     """Legacy LLMEngine for backwards compatibility."""
 
@@ -198,6 +225,13 @@ class LLMEngine:
             }
         else:
             self._elastic_op_profile_buckets = None
+        self._elastic_op_profile_by_stage = _env_flag(
+            "VLLM_ASCEND_BUCKET_OP_PROFILE_BY_STAGE", "0")
+        self._elastic_op_profile_stage_samples = _env_int(
+            "VLLM_ASCEND_BUCKET_OP_PROFILE_STAGE_SAMPLES", 5, minimum=1)
+        self._elastic_op_profile_stage_targets = _parse_int_set(
+            os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_STAGES", "8,4,2,1"))
+        self._elastic_op_profile_stage_seen: dict[int, int] = {}
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
         self._logged_mc2_delay = False
@@ -467,24 +501,44 @@ class LLMEngine:
     def _maybe_arm_elastic_op_profile(self, kind: str) -> None:
         if not getattr(self, "_elastic_op_profile_enabled", False):
             return
-        step = int(getattr(self, "total_step_times", 0))
-        buckets = getattr(self, "_elastic_op_profile_buckets", None)
-        if buckets is not None:
-            if step not in buckets:
-                return
-            bucket = step
-        else:
-            start = int(getattr(self, "_elastic_op_profile_start", 0))
-            end = int(getattr(self, "_elastic_op_profile_end", 0))
-            interval = int(getattr(self, "_elastic_op_profile_interval", 500))
-            if step <= 0 or (start and step < start) or (end and step > end):
-                return
-            if step % interval != 0:
-                return
-            bucket = step
-
         active_count, compute_world_size, active_ranks = (
             self._active_rank_context())
+        step = int(getattr(self, "total_step_times", 0))
+
+        if getattr(self, "_elastic_op_profile_by_stage", False):
+            if kind != "live":
+                return
+            targets = getattr(self, "_elastic_op_profile_stage_targets", None)
+            if targets is not None and active_count not in targets:
+                return
+            seen = getattr(self, "_elastic_op_profile_stage_seen", {})
+            sample_idx = int(seen.get(active_count, 0))
+            max_samples = int(getattr(self,
+                                      "_elastic_op_profile_stage_samples", 5))
+            if sample_idx >= max_samples:
+                return
+            sample_idx += 1
+            seen[active_count] = sample_idx
+            self._elastic_op_profile_stage_seen = seen
+            bucket = f"stage{active_count}_sample{sample_idx}_step{step}"
+        else:
+            buckets = getattr(self, "_elastic_op_profile_buckets", None)
+            if buckets is not None:
+                if step not in buckets:
+                    return
+                bucket = step
+            else:
+                start = int(getattr(self, "_elastic_op_profile_start", 0))
+                end = int(getattr(self, "_elastic_op_profile_end", 0))
+                interval = int(
+                    getattr(self, "_elastic_op_profile_interval", 500))
+                if step <= 0 or (start and step < start) or (end
+                                                            and step > end):
+                    return
+                if step % interval != 0:
+                    return
+                bucket = step
+
         context = {
             "bucket": bucket,
             "step": step,
@@ -492,6 +546,10 @@ class LLMEngine:
             "active_count": active_count,
             "compute_world_size": compute_world_size,
             "active_ranks": active_ranks,
+            "stage_profile_sample": (
+                getattr(self, "_elastic_op_profile_stage_seen", {}).get(
+                    active_count, 0)
+                if getattr(self, "_elastic_op_profile_by_stage", False) else 0),
         }
         self.engine_core.collective_rpc("set_elastic_op_profile_context",
                                         args=(context, ))

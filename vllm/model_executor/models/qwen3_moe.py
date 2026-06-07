@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 import typing
+import os
 from collections.abc import Callable, Iterable
 from itertools import islice
 from typing import Any, Optional, Union
@@ -68,6 +69,53 @@ import torch.distributed as dist
 import time
 
 logger = init_logger(__name__)
+
+_STAGE_DECODE_PROFILE_MARKERS = os.getenv(
+    "VLLM_ASCEND_STAGE_DECODE_PROFILE_MARKERS", "0").lower() in (
+        "1", "true", "yes", "on")
+
+
+def _profile_rank() -> int:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return -1
+
+
+def _stage_decode_profile_range_start(message: str):
+    if not _STAGE_DECODE_PROFILE_MARKERS:
+        return None
+    try:
+        from torch_npu.npu import mstx
+        return mstx.range_start(message=message)
+    except Exception:
+        return None
+
+
+def _stage_decode_profile_range_end(range_id) -> None:
+    if range_id is None:
+        return
+    try:
+        from torch_npu.npu import mstx
+        mstx.range_end(range_id)
+    except Exception:
+        pass
+
+
+def _stage_decode_attention_profile_message(layer_idx: int,
+                                            runtime_layer: Any) -> str:
+    mode = int(getattr(runtime_layer, "elastic_execution_mode", 0))
+    stage = len(getattr(runtime_layer, "lossless_hybrid_active_ranks", []))
+    return " ".join([
+        "vllm_stage_decode_attention_compute",
+        f"rank={_profile_rank()}",
+        f"mode={mode}",
+        f"stage={stage}",
+        f"layer={int(layer_idx)}",
+        "path=self_attn",
+    ])
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -404,6 +452,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # `mlp_only_layers` in the config.
         layer_idx = extract_layer_index(prefix)
+        self.layer_idx = int(layer_idx)
         mlp_only_layers = ([] if not hasattr(config, "mlp_only_layers") else
                            config.mlp_only_layers)
         if (layer_idx not in mlp_only_layers) and (
@@ -444,15 +493,27 @@ class Qwen3MoeDecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(
                     hidden_states, residual)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
+            attention_profile_range = _stage_decode_profile_range_start(
+                _stage_decode_attention_profile_message(
+                    self.layer_idx, getattr(self.mlp, "experts", self.mlp)))
+            try:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+            finally:
+                _stage_decode_profile_range_end(attention_profile_range)
             hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         # Fully Connected
         # if hidden_states.shape[0] == 32:
         #     self._attn_end.record()
+        ffn_enter_wall_ts = time.perf_counter()
+        if isinstance(self.mlp, Qwen3MoeSparseMoeBlock):
+            self.mlp.experts.lossless_ffn_enter_wall_ts = ffn_enter_wall_ts
+            self.mlp.experts.lossless_ffn_tokens = int(hidden_states.shape[0])
+            self.mlp.experts.lossless_ffn_seq = int(
+                getattr(self.mlp.experts, "lossless_ffn_seq", 0)) + 1
         hidden_states = self.mlp(hidden_states, is_dummy)
         # if hidden_states.shape[0] == 32:
         #     self._attn_end_moe.record()
@@ -460,7 +521,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
         #     attn_ms = self._attn_start.elapsed_time(self._attn_end)
         #     moe_ms = self._attn_end.elapsed_time(self._attn_end_moe)
         #     print("rank", self.ep_group.rank(), "layer_idx", self.layer_idx, "self attn ms:", attn_ms, "moe ms:", moe_ms)
-
         return hidden_states, residual
 
 

@@ -168,6 +168,19 @@ def _mode4_get_request_cpu_buffer(
     return request
 
 
+def _mode4_build_request_cpu_tensor(
+        rows: list[tuple[int, int, int]] | list[tuple[int, int, int, int]],
+        *,
+        mode5_assignments: bool = False) -> torch.Tensor:
+    if mode5_assignments:
+        payload = [[int(layer_idx), int(remote_slot), int(expert_id)]
+                   for _slot_idx, remote_slot, expert_id, layer_idx in rows]
+    else:
+        payload = [[int(layer_idx), int(remote_slot), int(expert_id)]
+                   for layer_idx, remote_slot, expert_id in rows]
+    return torch.tensor(payload, device="cpu", dtype=torch.int64)
+
+
 def _mode4_pack_remote_request_rows_to_flat_payload(
         batch_w13: torch.Tensor,
         batch_w2: torch.Tensor,
@@ -2043,10 +2056,19 @@ class NPUWorker(WorkerBase):
                              "1").lower() not in ("0", "false", "no", "off")
         sync = os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_SYNC",
                          "1").lower() not in ("0", "false", "no", "off")
+        contents = [
+            item.strip().lower()
+            for item in os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_CONTENTS",
+                                  "npu,cpu").split(",") if item.strip()
+        ]
+        enable_mstx = "mstx" in contents
+        marker_only = (enable_mstx and "npu" not in contents
+                       and "cpu" not in contents)
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
             profiler_level=level,
-            msprof_tx=False,
+            msprof_tx=not marker_only,
+            mstx=enable_mstx,
             aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
             l2_cache=False,
             op_attr=False,
@@ -2054,11 +2076,14 @@ class NPUWorker(WorkerBase):
             record_op_args=False,
             gc_detect_threshold=None,
         )
+        activities = []
+        if not marker_only:
+            if "cpu" in contents:
+                activities.append(torch_npu.profiler.ProfilerActivity.CPU)
+            if "npu" in contents:
+                activities.append(torch_npu.profiler.ProfilerActivity.NPU)
         with torch_npu.profiler.profile(
-                activities=[
-                    torch_npu.profiler.ProfilerActivity.CPU,
-                    torch_npu.profiler.ProfilerActivity.NPU,
-                ],
+                activities=activities,
                 with_stack=False,
                 profile_memory=False,
                 with_modules=False,
@@ -4254,13 +4279,20 @@ class NPUWorker(WorkerBase):
         if request_cache is None:
             request_cache = {}
             self._mode4_remote_request_buffer_cache = request_cache
+        fetch_log_key = (
+            int(execution_mode),
+            int(getattr(layer, "layer_idx", -1)),
+            tuple(sorted(int(rank) for rank in assignments_by_rank)),
+            int(len(remote_assignments)),
+        )
+        parallel_warmed_keys = getattr(self,
+                                       "_mode4_parallel_fetch_warmed_keys",
+                                       set())
+        parallel_fetch_cold_start = (
+            parallel_remote_fetch
+            and execution_mode == 5
+            and fetch_log_key not in parallel_warmed_keys)
         for remote_rank, assignments in remote_items:
-            fetch_log_key = (
-                int(execution_mode),
-                int(getattr(layer, "layer_idx", -1)),
-                tuple(sorted(int(rank) for rank in assignments_by_rank)),
-                int(len(remote_assignments)),
-            )
             begin_logged = getattr(self, "_mode4_fetch_begin_logged_keys",
                                    set())
             if (getattr(layer, "layer_idx", -1) == 0
@@ -4280,7 +4312,8 @@ class NPUWorker(WorkerBase):
                 self._mode4_fetch_begin_logged_keys = begin_logged
             request_rows = len(assignments)
             request_cols = 3
-            if execution_mode == 5:
+            if (execution_mode == 5
+                    and _mode5_single_control_message_remote()):
                 # Mode5 requests are always 3-column rows. Collapse shape and
                 # payload into a single CPU control message to reduce host-side
                 # send/wait overhead per remote cache rank.
@@ -4296,13 +4329,13 @@ class NPUWorker(WorkerBase):
                     129,
                     request_cols,
                 )
+                request = _mode4_build_request_cpu_tensor(
+                    assignments, mode5_assignments=True)
+                control.zero_()
                 control[0, 0] = int(request_rows)
                 control[0, 1] = int(request_cols)
-                for row_idx, (_slot_idx, remote_slot, expert_id,
-                              layer_idx) in enumerate(assignments):
-                    control[1 + row_idx, 0] = int(layer_idx)
-                    control[1 + row_idx, 1] = int(remote_slot)
-                    control[1 + row_idx, 2] = int(expert_id)
+                control[1:1 + int(request.shape[0])].copy_(
+                    request, non_blocking=False)
                 cpu_send_reqs = [
                     torch.distributed.isend(control,
                                             dst=remote_rank,
@@ -4316,11 +4349,9 @@ class NPUWorker(WorkerBase):
                                                         request_key,
                                                         request_rows,
                                                         request_cols)
-                for row_idx, (_slot_idx, remote_slot, expert_id,
-                              layer_idx) in enumerate(assignments):
-                    request[row_idx, 0] = int(layer_idx)
-                    request[row_idx, 1] = int(remote_slot)
-                    request[row_idx, 2] = int(expert_id)
+                request_src = _mode4_build_request_cpu_tensor(
+                    assignments, mode5_assignments=True)
+                request.copy_(request_src, non_blocking=False)
                 shape = torch.tensor([int(request.shape[0]),
                                       int(request.shape[1])],
                                      device="cpu",
@@ -4344,15 +4375,44 @@ class NPUWorker(WorkerBase):
                                                 dst_w13, dst_w2, rows)
             pending_control_msgs.append((int(remote_rank), assignments,
                                          cpu_send_reqs, recv_flat))
-        # Post all CPU-side control messages first so their progress can
-        # overlap across cache ranks. We still wait before any HCCL receive to
-        # preserve the deadlock avoidance contract with the cache thread.
+        # Keep stage-8/4 build-sources behavior intact while avoiding an
+        # unnecessary global barrier on owner-side control sends. We only need
+        # per-rank ordering between "control send for rank R" and
+        # "payload recv for rank R"; earlier/later ranks do not need to wait on
+        # each other before posting device irecv. The first live pass is colder:
+        # reuse the older per-rank wait-before-irecv ordering once for each
+        # layer/topology key, then switch to the lower-overhead queued path.
         request_logged = getattr(self, "_mode4_fetch_request_logged_keys",
                                  set())
+        pending_waited_recvs: list[tuple[object, torch.Tensor, int,
+                                         list[tuple[int, int, int, int]],
+                                         list[object]]] = []
         for remote_rank, assignments, cpu_send_reqs, recv_flat in pending_control_msgs:
+            request_log_key = fetch_log_key + (int(remote_rank), )
+            if parallel_remote_fetch and not parallel_fetch_cold_start:
+                req_flat = torch.distributed.irecv(recv_flat,
+                                                   src=remote_rank,
+                                                   group=device_group)
+                pending_waited_recvs.append((req_flat, recv_flat,
+                                             int(remote_rank), assignments,
+                                             cpu_send_reqs))
+                if (getattr(layer, "layer_idx", -1) == 0
+                        and request_log_key not in request_logged):
+                    logger.info(
+                        "Mode%s remote-NPU double-buffer request queued: rank=%s layer=%s remote_rank=%s remote_experts=%s remote_rank_count=%s parallel=%s",
+                        execution_mode,
+                        self.rank,
+                        getattr(layer, "layer_idx", -1),
+                        remote_rank,
+                        len(assignments),
+                        len(remote_items),
+                        int(parallel_remote_fetch),
+                    )
+                    request_logged.add(request_log_key)
+                    self._mode4_fetch_request_logged_keys = request_logged
+                continue
             for req in cpu_send_reqs:
                 req.wait()
-            request_log_key = fetch_log_key + (int(remote_rank), )
             if (getattr(layer, "layer_idx", -1) == 0
                     and request_log_key not in request_logged):
                 logger.info(
@@ -4370,23 +4430,30 @@ class NPUWorker(WorkerBase):
             req_flat = torch.distributed.irecv(recv_flat,
                                                src=remote_rank,
                                                group=device_group)
-            if parallel_remote_fetch:
-                pending_recvs.append((req_flat, recv_flat, int(remote_rank),
+            pending_waited_recvs.append((req_flat, recv_flat, int(remote_rank),
+                                         assignments, cpu_send_reqs))
+        if parallel_fetch_cold_start:
+            parallel_warmed_keys.add(fetch_log_key)
+            self._mode4_parallel_fetch_warmed_keys = parallel_warmed_keys
+        if parallel_remote_fetch:
+            pending_recvs.extend(pending_waited_recvs)
+        else:
+            for req_flat, recv_flat, _remote_rank, assignments, _cpu_send_reqs in pending_waited_recvs:
+                req_flat.wait()
+                pending_recvs.append((None, recv_flat, _remote_rank,
                                       assignments))
-                continue
-            req_flat.wait()
-            pending_recvs.append((None, recv_flat, int(remote_rank),
-                                  assignments))
-            for _req, _recv_flat, _remote_rank, _assignments in pending_recvs:
-                self._copy_mode4_remote_fetch_payload_to_slot(
-                    _recv_flat, _assignments, dst_w13, dst_w2, async_copy)
-            pending_recvs.clear()
+                for _req, _recv_flat, _remote_rank2, _assignments in pending_recvs:
+                    self._copy_mode4_remote_fetch_payload_to_slot(
+                        _recv_flat, _assignments, dst_w13, dst_w2, async_copy)
+                pending_recvs.clear()
         if pending_recvs:
-            for req_flat, recv_flat, _remote_rank, assignments in pending_recvs:
+            for req_flat, recv_flat, _remote_rank, assignments, cpu_send_reqs in pending_recvs:
                 if req_flat is not None:
                     req_flat.wait()
                 self._copy_mode4_remote_fetch_payload_to_slot(
                     recv_flat, assignments, dst_w13, dst_w2, async_copy)
+                for req in cpu_send_reqs:
+                    req.wait()
             pending_recvs.clear()
         fetch_done_logged = getattr(self, "_mode4_fetch_logged_keys", set())
         if (getattr(layer, "layer_idx", -1) == 0
@@ -4543,11 +4610,8 @@ class NPUWorker(WorkerBase):
                                                 ("warmup_request",
                                                  int(remote_rank), rows, 3),
                                                 rows, 3)
-        for row_idx, (layer_idx, remote_slot, expert_id) in enumerate(
-                request_rows):
-            request[row_idx, 0] = int(layer_idx)
-            request[row_idx, 1] = int(remote_slot)
-            request[row_idx, 2] = int(expert_id)
+        request_src = _mode4_build_request_cpu_tensor(request_rows)
+        request.copy_(request_src, non_blocking=False)
         warmup_start_t = time.perf_counter()
         if (int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) == 5
                 and _mode5_single_control_message_remote()):
@@ -5044,6 +5108,9 @@ class NPUWorker(WorkerBase):
                                            group=cpu_group,
                                            tag=0)
                 if not getattr(self, "_mode4_cache_request_logged", False):
+                    first_row = ([int(request[0, col].item())
+                                  for col in range(int(cols))]
+                                 if rows > 0 else [])
                     logger.info(
                         "%s remote cache request received: rank=%s owner_rank=%s rows=%s cols=%s first=%s",
                         mode_name,
@@ -5051,16 +5118,15 @@ class NPUWorker(WorkerBase):
                         owner_rank,
                         rows,
                         cols,
-                        request[0].tolist() if rows > 0 else [],
+                        first_row,
                     )
                     self._mode4_cache_request_logged = True
-                request_rows = None
+                request_rows = tuple(
+                    (int(request[row_idx, 0].item()),
+                     int(request[row_idx, 1].item()),
+                     int(request[row_idx, 2].item()))
+                    for row_idx in range(int(rows)))
                 if execution_mode != 5:
-                    request_rows = tuple(
-                        (int(request[row_idx, 0].item()),
-                         int(request[row_idx, 1].item()),
-                         int(request[row_idx, 2].item()))
-                        for row_idx in range(int(rows)))
                     prepacked_payload = (
                         self._mode4_remote_prepacked_payload_cache.get(
                             (int(owner_rank), request_rows)))
@@ -5082,40 +5148,37 @@ class NPUWorker(WorkerBase):
                             group=device_group)
                         req_flat.wait()
                         continue
+                rows = len(request_rows)
                 first_w13 = None
                 first_w2 = None
                 first_layer = None
                 first_slot = None
                 first_expert = None
-                for row_idx in range(int(rows)):
-                    layer_idx = int(request[row_idx, 0].item())
-                    remote_slot = int(request[row_idx, 1].item())
-                    _expert_id = int(request[row_idx, 2].item())
+                for layer_idx, remote_slot, expert_id in request_rows:
                     cached_pair = expert_cache.get((layer_idx, remote_slot))
                     if cached_pair is None:
                         raise RuntimeError(
                             f"{mode_name} cache rank missing NPU snapshot: "
                             f"rank={self.rank} owner_rank={owner_rank} "
                             f"layer={layer_idx} remote_slot={remote_slot} "
-                            f"expert_id={_expert_id}")
+                            f"expert_id={expert_id}")
                     send_w13, send_w2 = cached_pair
                     if send_w13.device.type != "npu" or send_w2.device.type != "npu":
                         raise RuntimeError(
                             f"{mode_name} remote cache send tensor is not NPU-resident: "
                             f"rank={self.rank} owner_rank={owner_rank} "
                             f"layer={layer_idx} remote_slot={remote_slot} "
-                            f"expert_id={_expert_id} "
+                            f"expert_id={expert_id} "
                             f"send_w13_device={send_w13.device} "
                             f"send_w2_device={send_w2.device}")
                     if first_w13 is None:
                         first_w13, first_w2 = send_w13, send_w2
                         first_layer = layer_idx
                         first_slot = remote_slot
-                        first_expert = _expert_id
+                        first_expert = expert_id
                 if first_w13 is None or first_w2 is None:
                     continue
                 send_cache = self._mode4_remote_send_buffer_cache
-                rows = len(request_rows)
                 send_key_flat = ("send_flat", owner_rank,
                                  _mode4_flat_payload_signature(
                                      first_w13, first_w2, rows))
@@ -5131,10 +5194,7 @@ class NPUWorker(WorkerBase):
                 _mode4_pack_remote_request_rows_to_flat_payload(
                     batch_w13,
                     batch_w2,
-                    [(int(request[row_idx, 0].item()),
-                      int(request[row_idx, 1].item()),
-                      int(request[row_idx, 2].item()))
-                     for row_idx in range(int(rows))],
+                    list(request_rows),
                     layers,
                     expert_cache,
                 )
@@ -5243,7 +5303,14 @@ class NPUWorker(WorkerBase):
             # stage-4/2/1 can leave some requests unmatched on the HCCL path.
             # Wake the local listener with a self-sentinel; setting the event
             # alone is not enough because the service is blocked in recv().
-            sentinel = torch.zeros((2, ), device="cpu", dtype=torch.int64)
+            if _mode5_single_control_message_remote():
+                sentinel = torch.zeros((129, 3),
+                                       device="cpu",
+                                       dtype=torch.int64)
+            else:
+                sentinel = torch.zeros((2, ),
+                                       device="cpu",
+                                       dtype=torch.int64)
             try:
                 req = torch.distributed.isend(sentinel,
                                               dst=int(self.rank),
