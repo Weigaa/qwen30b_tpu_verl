@@ -32,6 +32,16 @@ PPO_RAY_RUNTIME_ENV = {
     },
 }
 
+PPO_RUNTIME_ENV_PASSTHROUGH_KEYS = (
+    "VERL_STANDALONE_ROLLOUT_SKIP_ACTOR_BUILD",
+    "VERL_STANDALONE_ROLLOUT_KEEP_ENGINE_LOADED",
+    "VERL_STANDALONE_ROLLOUT_FORCE_GEN_RNG",
+    "VERL_ROLLOUT_ONLY_SKIP_TRAINING",
+    "VERL_ROLLOUT_USE_TQDM",
+    "VERL_DEBUG_ACTOR_ROLLOUT_CONTEXT",
+    "VLLM_REUSE_WORLD_GROUP_FOR_FULL_MODEL_PARALLEL",
+)
+
 
 def get_ppo_ray_runtime_env():
     """
@@ -49,4 +59,8 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    for key in PPO_RUNTIME_ENV_PASSTHROUGH_KEYS:
+        value = os.environ.get(key)
+        if value is not None:
+            runtime_env["env_vars"][key] = value
     return runtime_env

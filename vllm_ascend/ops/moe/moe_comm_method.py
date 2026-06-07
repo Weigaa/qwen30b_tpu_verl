@@ -38,6 +38,10 @@ from vllm_ascend.ops.moe.token_dispatcher import (TokenDispatcherWithAll2AllV,
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
 
 
+def reset_moe_comm_method_cache() -> None:
+    _MoECommMethods.clear()
+
+
 def get_moe_comm_method(
         moe_comm_type: Optional[MoECommType]) -> Optional[MoECommMethod]:
     return _MoECommMethods.get(moe_comm_type)

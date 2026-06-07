@@ -363,114 +363,6 @@ class RayPPOTrainer:
         self.rollout_early_stop_factor = float(os.getenv("VLLM_ROLLOUT_EARLY_STOP_FACTOR", "2.0"))
         self.rollout_early_stop_min_tokens = int(os.getenv("VLLM_ROLLOUT_EARLY_STOP_MIN_TOKENS", "10000"))
 
-    @staticmethod
-    def _read_sidecar_pid(lease_log: str) -> Optional[int]:
-        if not lease_log or not os.path.exists(lease_log):
-            return None
-        pid = None
-        try:
-            with open(lease_log, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if line.startswith("sidecar_pid="):
-                        value = line.split("=", 1)[1].strip()
-                        if value:
-                            pid = int(value)
-        except Exception:
-            logger.warning("Failed to read sidecar pid from lease log: %s", lease_log, exc_info=True)
-        return pid
-
-    @staticmethod
-    def _pid_alive(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
-
-    @staticmethod
-    def _float_env(name: str, default: float) -> float:
-        value = os.getenv(name, "")
-        if value == "":
-            return default
-        try:
-            return float(value)
-        except ValueError:
-            logger.warning("Invalid float env %s=%r, fallback to %s", name, value, default)
-            return default
-
-    def _request_sidecar_release_before_restore(self) -> None:
-        if os.getenv("VERL_SIDECAR_ENABLE", "0").lower() not in ("1", "true", "yes", "on"):
-            return
-
-        stop_file = os.getenv("VERL_SIDECAR_STOP_FILE", "").strip()
-        if not stop_file:
-            output_file = os.getenv("VERL_SIDECAR_OUTPUT_FILE", "").strip()
-            if output_file:
-                stop_file = f"{output_file}.stop_requested"
-        lease_log = os.getenv("VERL_SIDECAR_LEASE_LOG", "").strip()
-        wait_seconds = self._float_env("VERL_SIDECAR_RESTORE_WAIT_SECONDS", 0.0)
-        extra_grace_seconds = self._float_env("VERL_SIDECAR_RESTORE_EXTRA_GRACE_SECONDS", 0.0)
-
-        sidecar_pid = self._read_sidecar_pid(lease_log)
-        if stop_file:
-            try:
-                stop_dir = os.path.dirname(os.path.abspath(stop_file))
-                if stop_dir:
-                    os.makedirs(stop_dir, exist_ok=True)
-                with open(stop_file, "w", encoding="utf-8") as f:
-                    f.write(f"time={time.time():.9f}\n")
-                    f.write("reason=training_restore_preflight\n")
-                    if sidecar_pid is not None:
-                        f.write(f"pid={sidecar_pid}\n")
-                logger.info(
-                    "Sidecar stop requested before rollout restore: stop_file=%s pid=%s wait_seconds=%.3f "
-                    "extra_grace_seconds=%.3f",
-                    stop_file,
-                    sidecar_pid,
-                    wait_seconds,
-                    extra_grace_seconds,
-                )
-            except Exception:
-                logger.warning("Failed to request sidecar stop before rollout restore", exc_info=True)
-
-        if wait_seconds <= 0 and extra_grace_seconds <= 0:
-            return
-
-        start = time.monotonic()
-        deadline = start + max(wait_seconds, 0.0)
-        saw_pid = sidecar_pid is not None
-        while wait_seconds > 0 and time.monotonic() < deadline:
-            if sidecar_pid is None:
-                sidecar_pid = self._read_sidecar_pid(lease_log)
-                saw_pid = sidecar_pid is not None
-                if sidecar_pid is None and time.monotonic() - start >= min(2.0, wait_seconds):
-                    logger.info("No running sidecar pid observed before rollout restore; skip sidecar wait")
-                    break
-            if sidecar_pid is not None and not self._pid_alive(sidecar_pid):
-                logger.info(
-                    "Sidecar process exited before rollout restore: pid=%s waited_s=%.3f",
-                    sidecar_pid,
-                    time.monotonic() - start,
-                )
-                break
-            time.sleep(0.2)
-        else:
-            if sidecar_pid is not None and self._pid_alive(sidecar_pid):
-                logger.warning(
-                    "Sidecar process still alive before rollout restore after %.3fs: pid=%s",
-                    wait_seconds,
-                    sidecar_pid,
-                )
-
-        if saw_pid and extra_grace_seconds > 0:
-            logger.info(
-                "Sleeping %.3fs before rollout restore to let sidecar NPU resources settle",
-                extra_grace_seconds,
-            )
-            time.sleep(extra_grace_seconds)
-
     def _restore_rollout_elastic_parallel_groups_if_needed(self) -> None:
         if self.async_rollout_mode:
             return
@@ -479,7 +371,6 @@ class RayPPOTrainer:
         if restore_fn is None:
             return
         logger.info("Elastic parallel restore requested before rollout restore rpc")
-        self._request_sidecar_release_before_restore()
         restore_fn()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -1409,6 +1300,58 @@ class RayPPOTrainer:
                     logger.info("global_token_num: %s", batch.meta_info["global_token_num"])
                     logger.info("rollout_output_time_s: %.6f", batch_time)
                     logger.info("rollouts speed tokens/s: %.6f", rollout_tokens_per_sec)
+                    print(f"rollout_output_time_s: {batch_time:.6f}", flush=True)
+                    print(f"rollouts speed tokens/s: {rollout_tokens_per_sec:.6f}", flush=True)
+                    if os.getenv("VERL_ROLLOUT_ONLY_SKIP_TRAINING", "0").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    ):
+                        response_mask = batch.batch["response_mask"]
+                        responses = batch.batch["responses"]
+                        response_length = responses.size(1)
+                        attention_mask = batch.batch["attention_mask"]
+                        response_lengths = response_mask.sum(dim=-1).float()
+                        prompt_lengths = attention_mask[:, :-response_length].sum(dim=-1).float()
+                        response_len_mean = response_lengths.mean().item()
+                        response_len_max = response_lengths.max().item()
+                        response_len_min = response_lengths.min().item()
+                        prompt_len_mean = prompt_lengths.mean().item()
+                        prompt_len_max = prompt_lengths.max().item()
+                        prompt_len_min = prompt_lengths.min().item()
+                        logger.info(
+                            "rollout_only_response_length mean=%.6f max=%.6f min=%.6f",
+                            response_len_mean,
+                            response_len_max,
+                            response_len_min,
+                        )
+                        logger.info(
+                            "rollout_only_prompt_length mean=%.6f max=%.6f min=%.6f",
+                            prompt_len_mean,
+                            prompt_len_max,
+                            prompt_len_min,
+                        )
+                        print(
+                            "rollout_only_response_length "
+                            f"mean={response_len_mean:.6f} max={response_len_max:.6f} min={response_len_min:.6f}",
+                            flush=True,
+                        )
+                        print(
+                            "rollout_only_prompt_length "
+                            f"mean={prompt_len_mean:.6f} max={prompt_len_max:.6f} min={prompt_len_min:.6f}",
+                            flush=True,
+                        )
+                        progress_bar.update(1)
+                        self.global_steps += 1
+                        if is_last_step:
+                            progress_bar.close()
+                            end_epoch_time = time.time()
+                            epoch_duration = end_epoch_time - beginning_epoch_time
+                            print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")
+                            self._dump_moe_pattern_csvs(epoch)
+                            return
+                        continue
                     ######
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score

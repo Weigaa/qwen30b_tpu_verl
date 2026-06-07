@@ -74,7 +74,7 @@ def chunk_moe_decorator(fused_experts_func):
                 **kwargs
             )
             return mlp_hidden_states
-            
+
         num_tokens = hidden_states.size(0)
         for chunk_start in range(0, max_tokens, chunk_moe_size):
             chunk_end = min(chunk_start + chunk_moe_size, max_tokens)
@@ -86,7 +86,7 @@ def chunk_moe_decorator(fused_experts_func):
             update_kwargs = dict(**kwargs)
             if update_kwargs.get('shared_experts'):
                 update_kwargs['shared_experts'] = update_kwargs['shared_experts'][chunk_start:chunk_end]
-            
+
             mlp_hidden_states = fused_experts_func(
                 hidden_states=chunk_hidden_states,
                 topk_weights=chunk_topk_weights,
@@ -1106,20 +1106,8 @@ class TorchairAscendFusedMoE(FusedMoE):
         else:
             # init moe.
             # print("use code in torchair_fused_moe to init expert_map")
-            expert_map_result = determine_expert_map(
-                self.ep_size,
-                self.ep_rank,
-                self.global_num_experts,
-                layer_idx=self.layer_idx)
-            if len(expert_map_result) == 3:
-                self.local_num_experts, self.expert_map, self.log2phy = expert_map_result
-            elif len(expert_map_result) == 2:
-                self.local_num_experts, self.expert_map = expert_map_result
-                self.log2phy = determine_default_log2phy_map(
-                    self.global_num_experts, self.ep_size, self.ep_rank, 0)
-            else:
-                raise ValueError(
-                    f"Unexpected determine_expert_map return arity={len(expert_map_result)}")
+            self.local_num_experts, self.expert_map, self.log2phy = determine_expert_map(
+                self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
                 self.global_redundant_expert_num = ascend_config.init_redundancy_expert

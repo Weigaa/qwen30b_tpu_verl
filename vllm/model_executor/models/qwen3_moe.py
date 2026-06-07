@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 import typing
+import os
 from collections.abc import Callable, Iterable
 from itertools import islice
 from typing import Any, Optional, Union
@@ -68,6 +69,11 @@ import torch.distributed as dist
 import time
 
 logger = init_logger(__name__)
+
+
+_ENABLE_NATIVE_MOE_TOPK_DEBUG = os.getenv(
+    "VLLM_ASCEND_NATIVE_MOE_TOPK_DEBUG", "0").lower() in (
+        "1", "true", "yes", "on")
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -124,6 +130,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.ep_rank = self.ep_group.rank()
         self.ep_size = self.ep_group.size()
         self.n_routed_experts = config.num_experts
+        self.layer_idx = extract_layer_index(prefix)
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
@@ -243,17 +250,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        #graph和eager模式NPU都没有走到这个方法
-        # add record
-        topk_ids = self.compute_topk(router_logits)
-        self.layer_idx = extract_layer_index(self.prefix)
-        # moe_stats.record_layer_topk(self.layer_idx, topk_ids)
-        # self._ep_same_input_guard(topk_ids, self.layer_idx, note=f"(run={getattr(self,'total_run',-1)})")
-        # moe_stats.record(
-        #     layer_idx=extract_layer_index(self.prefix),
-        #     topk_ids=topk_ids,
-        #     num_experts=128,
-        # )
+        if _ENABLE_NATIVE_MOE_TOPK_DEBUG:
+            topk_ids = self.compute_topk(router_logits)
+            moe_stats.record_layer_topk(self.layer_idx, topk_ids)
+            # self._ep_same_input_guard(topk_ids, self.layer_idx, note=f"(run={getattr(self,'total_run',-1)})")
+            # moe_stats.record(
+            #     layer_idx=self.layer_idx,
+            #     topk_ids=topk_ids,
+            #     num_experts=128,
+            # )
         if hasattr(self.experts, "elastic_execution_mode"):
             forward_context = get_forward_context()
             final_hidden_states = self.experts(

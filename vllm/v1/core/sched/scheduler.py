@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import itertools
-import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -290,22 +289,8 @@ class Scheduler(SchedulerInterface):
                     if self.log_stats:
                         preempted_req.record_event(
                             EngineCoreEventType.PREEMPTED, scheduled_timestamp)
-                    if os.getenv("VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG",
-                                 "0").lower() in ("1", "true", "yes", "on"):
-                        logger.warning(
-                            "Elastic redundancy KV preemption: preempted=%s "
-                            "request=%s running=%s waiting=%s "
-                            "kv_cache_usage=%.6f",
-                            preempted_req.request_id,
-                            request.request_id,
-                            len(self.running),
-                            len(self.waiting),
-                            self.kv_cache_manager.usage,
-                        )
-                    else:
-                        logger.info("Preempting request %s for request %s",
-                                    preempted_req.request_id,
-                                    request.request_id)
+                    logger.info("Preempting request %s for request %s",
+                                preempted_req.request_id, request.request_id)
                     self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:

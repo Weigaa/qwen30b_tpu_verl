@@ -261,12 +261,8 @@ class AscendFusedMoE(FusedMoE):
         else:
             # init moe.
             print("use code in vllm_ascend_ops_fused_moe to init expert_map")
-            expert_map_result = determine_expert_map(
-                self.ep_size,
-                self.ep_rank,
-                self.global_num_experts,
-                layer_idx=self.layer_idx)
-            self.local_num_experts, self.expert_map = expert_map_result[:2]
+            self.local_num_experts, self.expert_map = determine_expert_map(
+                self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
                 self.global_redundant_expert_num = ascend_config.init_redundancy_expert

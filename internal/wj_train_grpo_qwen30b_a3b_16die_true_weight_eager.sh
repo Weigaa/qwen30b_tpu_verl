@@ -1,7 +1,7 @@
 set -ex
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-"expandable_segments:True"}
+export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -19,12 +19,35 @@ export ASCEND_GLOBAL_EVENT_ENABLE=0
 export ASCEND_SLOG_PRINT_TO_STDOUT=0       
 export ASCEND_GLOBAL_LOG_LEVEL=3           
 
-export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-360}
-export HCCL_IF_BASE_PORT=64021
-export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-360}
+export HCCL_CONNECT_TIMEOUT=360
+export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-64021}
+export HCCL_EXEC_TIMEOUT=360
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-export MASTER_PORT=23300    # vllm port error
+if [[ -z "${GLOO_SOCKET_IFNAME:-}" ]]; then
+    default_gloo_ifname=$(
+        awk '$2 == "00000000" && $1 != "lo" { print $1; exit }' \
+            /proc/net/route 2>/dev/null || true
+    )
+    if [[ -z "${default_gloo_ifname}" ]]; then
+        default_gloo_ifname=$(
+            for iface_path in /sys/class/net/*; do
+                iface=$(basename "${iface_path}")
+                [[ "${iface}" == "lo" ]] && continue
+                [[ -r "${iface_path}/operstate" ]] || continue
+                [[ "$(cat "${iface_path}/operstate")" == "up" ]] || continue
+                echo "${iface}"
+                break
+            done
+        )
+    fi
+    if [[ -n "${default_gloo_ifname}" ]]; then
+        export GLOO_SOCKET_IFNAME="${default_gloo_ifname}"
+    fi
+fi
+echo "[gloo] GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-}"
+
+export MASTER_PORT=${MASTER_PORT:-23300}    # vllm port error
 export D2D_DATA_TRANSFER=1
 export VLLM_USE_V1=1
 export PRINT_MEMORY=1
@@ -37,17 +60,17 @@ if [[ "${VLLM_ASCEND_FORCE_ALLTOALL_MOE}" == "1" ]]; then
 else
 export VLLM_ENABLE_MC2=1
 fi
-export VLLM_DP_SIZE=16                        # world_size // rollout.tp_sizebaseline dummy-run, 1: redundant experts only, 2: redundant experts + CPU/NPU hybrid tail
+export VLLM_DP_SIZE=${VLLM_DP_SIZE:-16}                        # world_size // rollout.tp_sizebaseline dummy-run, 1: redundant experts only, 2: redundant experts + CPU/NPU hybrid tail
 export HCCL_BUFFSIZE=800
 
-export TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-2}
+export TASK_QUEUE_ENABLE=2
 
 export VLLM_ENABLE_FIX_ROUTE=0    
 export VLLM_MODEL_EXECUTE_TIME_OBSERVE=0     # decode prefill的耗时打印
 
 #extra env in qwen3_235b_env.sh
 # Recipe features
-export VLLM_ENABLE_GRAPH_MODE=${VLLM_ENABLE_GRAPH_MODE:-0}  # 0: eager mode, 1: graph mode
+export VLLM_ENABLE_GRAPH_MODE=0             # 0: eager mode, 1: graph mode
 export VLLM_ENABLE_EXPERT_PARALLEL=1        # Enable EP in vLLM rollout.
 export VLLM_CHUNK_MOE_SIZE=512              # The minimum block size set for prefill computation partition.
 export ALL_TO_ALL_RESHARD=1                 # Enable EP to reshard parameters with AllToAllV (without communication redundancy).
@@ -57,7 +80,7 @@ export USE_HDP=0                            # 0: disable hdp, 1: enable hdp
 export ROLLOUT_REBALANCE_ENABLE=0          # 0: disable rollout rebalance, 1: enable rollout rebalance
 
 #关闭看门狗
-export HCCL_ASYNC_ERROR_HANDLING=${HCCL_ASYNC_ERROR_HANDLING:-1}
+export HCCL_ASYNC_ERROR_HANDLING=1
 
 #Train Drafter开关
 export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=0
@@ -103,8 +126,22 @@ export VLLM_ASCEND_DRAFT_PROFILE_BREAKDOWN=1
 export VLLM_ASCEND_DRAFT_PROFILE_SYNC=0
 export VLLM_ASCEND_DRAFT_ASYNC_TRAIN=0
 #配置native模式还是custom模式
-export VLLM_ASCEND_REGISTER_CUSTOM_MODELS=${VLLM_ASCEND_REGISTER_CUSTOM_MODELS:-0}
+# 默认走 custom 注册路径；只有用户显式导出
+# VLLM_ASCEND_REGISTER_CUSTOM_MODELS=0 时才回退到 native。
+# 用户显式导出该变量时始终以用户值为准。
+if [[ -z "${VLLM_ASCEND_REGISTER_CUSTOM_MODELS+x}" ]]; then
+    export VLLM_ASCEND_REGISTER_CUSTOM_MODELS=1
+else
+    export VLLM_ASCEND_REGISTER_CUSTOM_MODELS
+fi
 export VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES=0
+export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS=${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS:-377344}
+export VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE=${VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE:-1}
+export VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE=${VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE:-0}
+export VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK:-0}
+export VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP=${VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP:-0}
+export VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE=${VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE:-0}
+export VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP=${VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP:-0}
 export VLLM_ASCEND_CUSTOM_MODE1_DEBUG=0
 export VLLM_ASCEND_CUSTOM_MODE1_TIMING_EVENTS=0
 export VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG=1
@@ -114,23 +151,33 @@ export VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG=1
 # 1: 冗余专家模式
 # 2: CPU/NPU 混合模式
 # 3: 无冗余专家 + 跨层双缓冲 hybrid tail
+# 4: 无冗余专家 + 远程 NPU expert cache 双缓冲
+# 5: 无冗余专家 + CPU shadow 和远程 NPU cache 混合双缓冲
 #    使用建议:
 #    - mode=3 主要面向 shrink 到 <=8 rank 之后的 MoE 主路径
-#    - mode=3 下 floor 是阈值控制边界；默认 shrink 到该 floor 后停止
+#    - 若希望允许 2 -> 1 的 single-rank no-EP tail，保持
+#      VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=1
 #    - mode=3 不依赖冗余专家；运行时 expert double buffer 固定为 128 expert slots
 #    - VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS 在 mode=3 下只保留
 #      primary prefix 语义，不再决定运行时 buffer 容量
-export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE:-0}
+export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE:-1}
+VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE_WAS_SET=0
+if [[ -n "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE+x}" ]]; then
+    VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE_WAS_SET=1
+fi
 # 弹性缩容的最小计算组:
 #   1  -> 允许在 2-rank 阶段后进入 single-rank no-EP tail
-#   2/4/8/16 -> 最多缩到该 floor
-export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE:-8}
+#   2/4/8/16 -> 最多缩到该 floor 结束，不再进入 1-rank tail
+export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE:-2}
 # mode=2 时每个 rank 固定保留的 NPU resident expert 槽位数
 # mode=3 时该值不控制双缓冲大小；当前 runtime double buffer 固定为 128 experts
 export VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS:-8}
 # mode=3 step-1: allow next-layer NPU resident experts to prefetch into the
 # alternate runtime buffer. CPU-only experts still fill synchronously at bind.
 export VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH:-1}
+# mode=3 keeps the configured floor for the first shrink, but the tail can
+# continue shrinking below that floor when MC2-compatible active ranks remain.
+export VLLM_ASCEND_MODE3_ALLOW_BELOW_FLOOR_TAIL=${VLLM_ASCEND_MODE3_ALLOW_BELOW_FLOOR_TAIL:-0}
 # mode=3 step-2: prefetch CPU-only experts into a plain NPU staging buffer on
 # a separate stream.
 export VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE:-1}
@@ -166,6 +213,14 @@ export VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFF
 export VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH:-1}
 export VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE:-0}
 export VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC:-0}
+# mode=3 deeper shrink stages lazily allocate MC2/HCCL dispatcher resources.
+# Prime the dispatcher after each shrink without running full MoE/KV warmup.
+export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP:-1}
+export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS:-32}
+# mode=3 floor=1 hits a large low-floor MC2/HCCL workspace at the 4->2
+# transition. Keep this reservation mode3-only so mode1/mode2/mode4 KV sizing
+# is untouched, and prefer stable MC2 over falling back to all2all.
+export VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=${VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-5368709120}
 # mode=3 profile controls:
 #   TRANSFER_LOG=0 closes high-frequency binding/prefetch logs.
 #   TIMING_LOG/TIMING_SYNC default off for performance runs. Override them to
@@ -173,8 +228,8 @@ export VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC:-
 export VLLM_ASCEND_MODE3_TRANSFER_LOG=${VLLM_ASCEND_MODE3_TRANSFER_LOG:-0}
 export VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG:-0}
 export VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N:-4}
-export VLLM_ASCEND_MODE3_TIMING_LOG=${VLLM_ASCEND_MODE3_TIMING_LOG:-1}
-export VLLM_ASCEND_MODE3_TIMING_SYNC=${VLLM_ASCEND_MODE3_TIMING_SYNC:-1}
+export VLLM_ASCEND_MODE3_TIMING_LOG=${VLLM_ASCEND_MODE3_TIMING_LOG:-0}
+export VLLM_ASCEND_MODE3_TIMING_SYNC=${VLLM_ASCEND_MODE3_TIMING_SYNC:-0}
 export VLLM_ASCEND_MODE3_TIMING_EVERY=${VLLM_ASCEND_MODE3_TIMING_EVERY:-1024}
 export VLLM_ASCEND_MODE3_TIMING_FIRST_N=${VLLM_ASCEND_MODE3_TIMING_FIRST_N:-1}
 export VLLM_ASCEND_MODE3_TIMING_LAYERS=${VLLM_ASCEND_MODE3_TIMING_LAYERS:-all}
@@ -197,14 +252,78 @@ export VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS=${VLLM_ASCEND_DUMMY_WASTE_PROFILE
 export VLLM_ASCEND_ELASTIC_UTIL_LOG=${VLLM_ASCEND_ELASTIC_UTIL_LOG:-0}
 export VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS:-500}
 export VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG=${VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG:-0}
-# KV cache is materialized lazily when rollout resumes. Keep the mode=1 custom
-# path off the allocator cliff seen with only 512 MiB free during KV init.
-export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-0}
-echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} dummy_waste_timing=${VLLM_ASCEND_DUMMY_WASTE_TIMING} dummy_waste_sync=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC} dummy_waste_profile=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE} dummy_waste_markers=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS} elastic_util_log=${VLLM_ASCEND_ELASTIC_UTIL_LOG} elastic_util_bucket_steps=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES}"
+# Mode=4 is still experimental. For validation runs, prefer a small, targeted
+# stability budget instead of enabling broad generic elastic headrooms, which
+# can over-shrink KV cache and introduce preemption.
+export VLLM_ASCEND_MODE4_STABILITY_PROFILE=${VLLM_ASCEND_MODE4_STABILITY_PROFILE:-1}
+if [[ ("${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "4" || "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "5") && "${VLLM_ASCEND_MODE4_STABILITY_PROFILE}" == "1" ]]; then
+    # Keep mode=4 validation at floor=8 by default. This preserves the compact
+    # loaded-slot capacity used by the stable run (16 slots/rank). Lowering the
+    # configured floor also lowers the initialization-time expert placement
+    # floor, which expands loaded_capacity (floor=4 -> 32 slots/rank) and cuts
+    # KV cache enough to dominate the rollout time. Follow-up shrink below 8
+    # needs a separate runtime-only floor, not this initialization knob.
+    VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR_WAS_SET=0
+    if [[ -n "${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR+x}" ]]; then
+        VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR_WAS_SET=1
+    fi
+    export VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR=${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR:-8}
+    # If the caller explicitly provides the configured floor, respect it.
+    # Otherwise keep the conservative floor=8 default for mode=4 validation.
+    if [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE_WAS_SET}" == "1" && "${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR_WAS_SET}" == "0" ]]; then
+        echo "[mode4 stability] respect explicit elastic floor: ${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}"
+    elif [[ -n "${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR}" && "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" != "${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR}" ]]; then
+        echo "[mode4 stability] override elastic floor: ${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} -> ${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR}"
+        export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR}
+    fi
+    export VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE=${VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-1}
+    export VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE=${VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-${VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE}}
+    export VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=${VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION:-0.75}
+    # Derive the mode=5 remote/cpu split from the recorded pure-NPU vs pure-CPU
+    # communication timings when requested. The fixed default matches the
+    # best_mode5_withprofile validation branch.
+    export VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=${VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY:-fixed}
+    export VLLM_ASCEND_MODE5_REMOTE_COMM_MS_SERIES=${VLLM_ASCEND_MODE5_REMOTE_COMM_MS_SERIES:-2.494,3.031,5.075,5.458,8.973,9.809,17.944,19.030}
+    export VLLM_ASCEND_MODE5_CPU_COMM_MS_SERIES=${VLLM_ASCEND_MODE5_CPU_COMM_MS_SERIES:-4.970,6.558,9.802,11.629,18.657,18.788,37.956,38.132}
+    export VLLM_ASCEND_MODE5_BALANCE_REMOTE_SOURCE_FANOUT=${VLLM_ASCEND_MODE5_BALANCE_REMOTE_SOURCE_FANOUT:-0}
+    export VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=${VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC:-1}
+    export VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=${VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE:-1}
+    export VLLM_ASCEND_MODE4_ENABLE_GENERIC_HEADROOM=${VLLM_ASCEND_MODE4_ENABLE_GENERIC_HEADROOM:-0}
+    export VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES=${VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES:-4294967296}
+    export VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=${VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-2147483648}
+    export VLLM_ASCEND_MODE5_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=${VLLM_ASCEND_MODE5_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-6442450944}
+    export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-1073741824}
+    export VLLM_ASCEND_MODE4_FORCE_POST_SHRINK_MOE_WARMUP=${VLLM_ASCEND_MODE4_FORCE_POST_SHRINK_MOE_WARMUP:-0}
+    export VLLM_ASCEND_REPEAT_POST_SHRINK_MOE_DISPATCH_WARMUP=${VLLM_ASCEND_REPEAT_POST_SHRINK_MOE_DISPATCH_WARMUP:-0}
+    # Keep shrink-time DP/EP/MC2 cache disabled by default. A later step may
+    # choose a different active-rank set, and retained HCCL groups occupy HBM.
+    # Enable these only for diagnostics that explicitly measure group-cache
+    # impact, not for fair custom-vs-custom performance comparisons.
+    export VLLM_ASCEND_MODE4_KEEP_STALE_DP_GROUP_CACHE=${VLLM_ASCEND_MODE4_KEEP_STALE_DP_GROUP_CACHE:-0}
+    export VLLM_ASCEND_MODE4_KEEP_STALE_MC2_GROUP_CACHE=${VLLM_ASCEND_MODE4_KEEP_STALE_MC2_GROUP_CACHE:-0}
+    export VLLM_ASCEND_MODE4_KEEP_STALE_EP_GROUP_CACHE=${VLLM_ASCEND_MODE4_KEEP_STALE_EP_GROUP_CACHE:-0}
+    export VLLM_ASCEND_MODE5_KEEP_STALE_DP_GROUP_CACHE=${VLLM_ASCEND_MODE5_KEEP_STALE_DP_GROUP_CACHE:-0}
+    export VLLM_ASCEND_MODE5_KEEP_STALE_MC2_GROUP_CACHE=${VLLM_ASCEND_MODE5_KEEP_STALE_MC2_GROUP_CACHE:-0}
+    export VLLM_ASCEND_MODE5_KEEP_STALE_EP_GROUP_CACHE=${VLLM_ASCEND_MODE5_KEEP_STALE_EP_GROUP_CACHE:-0}
+    export VLLM_ASCEND_MODE4_DROP_STALE_GROUP_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE4_DROP_STALE_GROUP_CACHE_AFTER_SHRINK:-0}
+    export VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS=${VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS:-1}
+else
+    if [[ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "3" ]]; then
+        # Mode=3 keeps CPU-shadow + double-buffer state across shrink/restore.
+        # Reserve a small KV re-init cushion so the next rollout step does not
+        # fail on the final KV block after allocator/workspace fragmentation.
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-1073741824}
+    else
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-0}
+    fi
+    export VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES=${VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES:-2147483648}
+fi
+echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_post_shrink_warmup=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP} mode3_post_shrink_warmup_tokens=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS} mode3_low_floor_mc2_workspace=${VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} dummy_waste_timing=${VLLM_ASCEND_DUMMY_WASTE_TIMING} dummy_waste_sync=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC} dummy_waste_profile=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE} dummy_waste_markers=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS} elastic_util_log=${VLLM_ASCEND_ELASTIC_UTIL_LOG} elastic_util_bucket_steps=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES} mode1_native_kv_cap=${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS} mode1_keep_fullworld_ep_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE} mode1_keep_mc2_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE} mode1_drop_stale_after_shrink=${VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK} mode1_single_live_mc2=${VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP} disable_elastic_mc2_cache=${VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE} mode1_post_restore_alltoall_warmup=${VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP} mode4_stability=${VLLM_ASCEND_MODE4_STABILITY_PROFILE} mode4_force_floor=${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR:-} mode4_runtime_floor=${VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode5_runtime_floor=${VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode5_runtime_strategy=$(if [[ "${VLLM_ASCEND_MODE5_USE_LEGACY_CPU_SHADOW_RUNTIME:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then echo legacy_cpu_shadow; else echo dual_source; fi) mode5_remote_fraction=${VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION:-} mode5_fraction_policy=${VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY:-} mode5_balance_remote_source_fanout=${VLLM_ASCEND_MODE5_BALANCE_REMOTE_SOURCE_FANOUT:-} mode5_cpu_dp_metadata_sync=${VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC:-} mode5_single_control_message_remote=${VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE:-} mode4_generic_headroom=${VLLM_ASCEND_MODE4_ENABLE_GENERIC_HEADROOM:-0} mode4_moe_dispatch_headroom=${VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES} mode4_low_floor_mc2_headroom=${VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-} mode5_low_floor_mc2_headroom=${VLLM_ASCEND_MODE5_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-} mode4_block_prefetch_layers=${VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS:-1}"
+echo "[mode4 group cache] keep_stale_dp=${VLLM_ASCEND_MODE4_KEEP_STALE_DP_GROUP_CACHE:-} keep_stale_ep=${VLLM_ASCEND_MODE4_KEEP_STALE_EP_GROUP_CACHE:-} keep_stale_mc2=${VLLM_ASCEND_MODE4_KEEP_STALE_MC2_GROUP_CACHE:-} drop_after_shrink=${VLLM_ASCEND_MODE4_DROP_STALE_GROUP_CACHE_AFTER_SHRINK:-}"
 #模拟样本缩短规则
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
-export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
-echo "[elastic tail validate] VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=${VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS}"
+export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=${VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS-256,512,640,768,896}
+echo "[elastic tail validate] VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=${VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS:-}"
 
 if [ "${DRAFT_PROFILE_MODE}" = "profile_only" ]; then
     # 只关注 draft train 的耗时拆分，不进入整套 RL 训练
@@ -237,14 +356,55 @@ ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${ROLLOUT_MAX_M
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.85}
 ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-4}
 REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-8}
-TRAINER_TOTAL_EPOCHS=${TRAINER_TOTAL_EPOCHS:-3}
+TRAINER_TOTAL_EPOCHS=${TRAINER_TOTAL_EPOCHS:-1}
+TRAINER_N_GPUS_PER_NODE=${TRAINER_N_GPUS_PER_NODE:-16}
+# Keep the rollout-only trainer path on the same Megatron family as the trusted
+# 16-card baseline: preserve PP=4 whenever the card count still allows it, then
+# shrink both TP and EP with the remaining per-pipeline width.
+if [[ -z "${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE+x}" ]]; then
+    if (( TRAINER_N_GPUS_PER_NODE >= 4 )); then
+        ACTOR_PIPELINE_MODEL_PARALLEL_SIZE=4
+    else
+        ACTOR_PIPELINE_MODEL_PARALLEL_SIZE=${TRAINER_N_GPUS_PER_NODE}
+    fi
+fi
+if (( TRAINER_N_GPUS_PER_NODE % ACTOR_PIPELINE_MODEL_PARALLEL_SIZE != 0 )); then
+    echo "[actor parallel config] invalid: TRAINER_N_GPUS_PER_NODE=${TRAINER_N_GPUS_PER_NODE} is not divisible by ACTOR_PIPELINE_MODEL_PARALLEL_SIZE=${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE}" >&2
+    exit 1
+fi
+ACTOR_PARALLEL_WIDTH=$(( TRAINER_N_GPUS_PER_NODE / ACTOR_PIPELINE_MODEL_PARALLEL_SIZE ))
+if [[ -z "${ACTOR_TENSOR_MODEL_PARALLEL_SIZE+x}" ]]; then
+    ACTOR_TENSOR_MODEL_PARALLEL_SIZE=${ACTOR_PARALLEL_WIDTH}
+fi
+if [[ -z "${ACTOR_EXPERT_MODEL_PARALLEL_SIZE+x}" ]]; then
+    ACTOR_EXPERT_MODEL_PARALLEL_SIZE=${ACTOR_PARALLEL_WIDTH}
+fi
+ACTOR_TRANSFORMER_OVERRIDE_ARGS=(
+    +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_num_transformer_layers=[[11],[13],[13],[11]]
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type='alltoall'
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_alltoall_overlap_comm=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_rotary_pos_emb=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_swiglu=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048
+    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True
+)
+# The explicit first/last-stage layer hints only match the validated 4-stage
+# baseline topology. Reusing them for PP=1/2 collapses the middle-stage count
+# to zero and breaks Megatron config construction before rollout starts.
+if (( ACTOR_PIPELINE_MODEL_PARALLEL_SIZE >= 4 )); then
+    ACTOR_TRANSFORMER_OVERRIDE_ARGS+=(
+        +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11
+        +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11
+    )
+fi
 if (( ROLLOUT_MAX_NUM_BATCHED_TOKENS < ROLLOUT_MAX_MODEL_LEN )); then
     echo "[rollout config] bump ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS} to ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN}"
     ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_MODEL_LEN}
 fi
 mkdir -p "${RECORD_DIR}"
 
-time=$(date +%Y%m%d%H%M%S)
+time=$(date +%Y%m%d%H%M%S%N)
 elastic_suffix=""
 if [ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" != "0" ]; then
     elastic_suffix="_elastic"
@@ -298,91 +458,87 @@ fi
 
 {
     echo "[run] start_time=$(date '+%Y-%m-%dT%H:%M:%S%z') logfile=${logfile}"
-    echo "[full redundancy experiment] enabled=${VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG} sidecar=${VERL_SIDECAR_ENABLE} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} dp_size=${VLLM_DP_SIZE} draft_profile_mode=${DRAFT_PROFILE_MODE} model_path=${MODEL_PATH} train_file=${TRAIN_FILE} test_file=${TEST_FILE} train_batch_size=${TRAIN_BATCH_SIZE} max_num_seqs=${ROLLOUT_MAX_NUM_SEQS} max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS} max_prompt_length=${MAX_PROMPT_LENGTH} max_response_length=${MAX_RESPONSE_LENGTH} rollout_n=${ROLLOUT_N} gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION} total_epochs=${TRAINER_TOTAL_EPOCHS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES}"
+    echo "[full redundancy experiment] enabled=${VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG} sidecar=${VERL_SIDECAR_ENABLE} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} mode4_runtime_floor=${VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode4_keep_stale_dp=${VLLM_ASCEND_MODE4_KEEP_STALE_DP_GROUP_CACHE:-} mode4_keep_stale_ep=${VLLM_ASCEND_MODE4_KEEP_STALE_EP_GROUP_CACHE:-} mode4_keep_stale_mc2=${VLLM_ASCEND_MODE4_KEEP_STALE_MC2_GROUP_CACHE:-} gloo_socket_ifname=${GLOO_SOCKET_IFNAME:-} dp_size=${VLLM_DP_SIZE} draft_profile_mode=${DRAFT_PROFILE_MODE} model_path=${MODEL_PATH} train_file=${TRAIN_FILE} test_file=${TEST_FILE} train_batch_size=${TRAIN_BATCH_SIZE} max_num_seqs=${ROLLOUT_MAX_NUM_SEQS} max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS} max_prompt_length=${MAX_PROMPT_LENGTH} max_response_length=${MAX_RESPONSE_LENGTH} rollout_n=${ROLLOUT_N} gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION} total_epochs=${TRAINER_TOTAL_EPOCHS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES} mode1_native_kv_cap=${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS} mode1_keep_fullworld_ep_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE} mode1_keep_mc2_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE} mode1_drop_stale_after_shrink=${VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK} mode1_single_live_mc2=${VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP} disable_elastic_mc2_cache=${VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE} mode1_post_restore_alltoall_warmup=${VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP}"
 } | tee -a "${logfile}"
 
 set -x
 
 set +e
-python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
-    --config-name='ppo_megatron_trainer.yaml'\
-    algorithm.adv_estimator=grpo \
-    data.train_files="${TRAIN_FILE}" \
-    data.val_files="${TEST_FILE}" \
-    data.train_batch_size="${TRAIN_BATCH_SIZE}" \
-    data.max_prompt_length="${MAX_PROMPT_LENGTH}" \
-    data.max_response_length="${MAX_RESPONSE_LENGTH}" \
-    data.filter_overlong_prompts=True \
-    data.truncation='error' \
-    data.shuffle=False \
-    +data.dataset_fraction=0.003\
-    custom_reward_function.path=deepscaler.py \
-    custom_reward_function.name=compute_score  \
-    actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.clip_grad=10000 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.megatron.sequence_parallel=True \
-    actor_rollout_ref.actor.megatron.expert_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=4 \
-    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 \
-    actor_rollout_ref.actor.megatron.param_offload=True \
-    actor_rollout_ref.actor.megatron.grad_offload=True \
-    actor_rollout_ref.actor.megatron.optimizer_offload=False \
-    actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
-    actor_rollout_ref.actor.megatron.dist_checkpointing_path="${DISTCP_PATH}" \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
-    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.load_weight=True \
-    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
-    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=block \
-    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
-    actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}" \
-    actor_rollout_ref.rollout.enforce_eager=True \
-    actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}" \
-    actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
-    actor_rollout_ref.rollout.temperature=0.9 \
-    actor_rollout_ref.rollout.top_k=50 \
-    actor_rollout_ref.rollout.top_p=0.9 \
-    actor_rollout_ref.rollout.ignore_eos=False \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
-    actor_rollout_ref.ref.megatron.param_offload=True \
-    actor_rollout_ref.ref.load_weight=True \
-    actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
-    actor_rollout_ref.ref.megatron.dist_checkpointing_path="${DISTCP_PATH}" \
-    algorithm.kl_ctrl.kl_coef=0.001 \
-    trainer.balance_batch=False \
-    trainer.device=npu \
-    trainer.val_before_train=False \
-    trainer.critic_warmup=0 \
-    trainer.logger=['console','tensorboard'] \
-    trainer.project_name='verl_grpo_example' \
-    trainer.experiment_name='qwen3_30_verl_mindspeedllm_vllm' \
-    trainer.n_gpus_per_node=16 \
-    trainer.nnodes=1 \
-    trainer.save_freq=-1 \
-    trainer.test_freq=-1 \
-    trainer.total_epochs="${TRAINER_TOTAL_EPOCHS}" \
-    +trainer.rollout_data_dir="${RECORD_DIR}" \
-    +trainer.rollout_length_dir="${RECORD_DIR}" \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_num_transformer_layers=[[11],[13],[13],[11]] \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type='alltoall' \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_alltoall_overlap_comm=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_rotary_pos_emb=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_swiglu=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True \
-    "$@" >> "${logfile}" 2>&1
+cmd=(
+    python3 -m verl.trainer.main_ppo
+    --config-path="${CONFIG_DIR}"
+    --config-name='ppo_megatron_trainer.yaml'
+    algorithm.adv_estimator=grpo
+    data.train_files="${TRAIN_FILE}"
+    data.val_files="${TEST_FILE}"
+    data.train_batch_size="${TRAIN_BATCH_SIZE}"
+    data.max_prompt_length="${MAX_PROMPT_LENGTH}"
+    data.max_response_length="${MAX_RESPONSE_LENGTH}"
+    data.filter_overlong_prompts=True
+    data.truncation='error'
+    data.shuffle=False
+    +data.dataset_fraction=0.003
+    custom_reward_function.path=deepscaler.py
+    custom_reward_function.name=compute_score
+    actor_rollout_ref.model.path="${MODEL_PATH}"
+    actor_rollout_ref.actor.optim.lr=1e-6
+    actor_rollout_ref.actor.optim.clip_grad=10000
+    actor_rollout_ref.actor.ppo_mini_batch_size=32
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+    actor_rollout_ref.actor.megatron.sequence_parallel=True
+    actor_rollout_ref.actor.megatron.expert_model_parallel_size="${ACTOR_EXPERT_MODEL_PARALLEL_SIZE}"
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size="${ACTOR_TENSOR_MODEL_PARALLEL_SIZE}"
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size="${ACTOR_PIPELINE_MODEL_PARALLEL_SIZE}"
+    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1
+    actor_rollout_ref.actor.megatron.param_offload=True
+    actor_rollout_ref.actor.megatron.grad_offload=True
+    actor_rollout_ref.actor.megatron.optimizer_offload=False
+    actor_rollout_ref.actor.megatron.use_dist_checkpointing=True
+    actor_rollout_ref.actor.megatron.dist_checkpointing_path="${DISTCP_PATH}"
+    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.kl_loss_coef=0.001
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl
+    actor_rollout_ref.actor.load_weight=True
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=block
+    actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}"
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1
+    actor_rollout_ref.rollout.name=vllm
+    actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}"
+    actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
+    actor_rollout_ref.rollout.enforce_eager=True
+    actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}"
+    actor_rollout_ref.rollout.n="${ROLLOUT_N}"
+    actor_rollout_ref.rollout.temperature=0.9
+    actor_rollout_ref.rollout.top_k=50
+    actor_rollout_ref.rollout.top_p=0.9
+    actor_rollout_ref.rollout.ignore_eos=False
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}"
+    actor_rollout_ref.ref.megatron.param_offload=True
+    actor_rollout_ref.ref.load_weight=True
+    actor_rollout_ref.ref.megatron.use_dist_checkpointing=True
+    actor_rollout_ref.ref.megatron.dist_checkpointing_path="${DISTCP_PATH}"
+    algorithm.kl_ctrl.kl_coef=0.001
+    trainer.balance_batch=False
+    trainer.device=npu
+    trainer.val_before_train=False
+    trainer.critic_warmup=0
+    trainer.logger=['console','tensorboard']
+    trainer.project_name='verl_grpo_example'
+    trainer.experiment_name='qwen3_30_verl_mindspeedllm_vllm'
+    trainer.n_gpus_per_node="${TRAINER_N_GPUS_PER_NODE}"
+    trainer.nnodes=1
+    trainer.save_freq=-1
+    trainer.test_freq=-1
+    trainer.total_epochs="${TRAINER_TOTAL_EPOCHS}"
+    +trainer.rollout_data_dir="${RECORD_DIR}"
+    +trainer.rollout_length_dir="${RECORD_DIR}"
+)
+cmd+=("${ACTOR_TRANSFORMER_OVERRIDE_ARGS[@]}")
+cmd+=("$@")
+
+"${cmd[@]}" >> "${logfile}" 2>&1
 run_exit_code=$?
 set -e
 

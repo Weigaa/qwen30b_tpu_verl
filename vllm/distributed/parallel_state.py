@@ -26,6 +26,7 @@ import contextlib
 import gc
 import os
 import pickle
+import time
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -103,6 +104,11 @@ _groups: dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
 
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
+
+
+def _elastic_group_rebuild_timing_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_ELASTIC_GROUP_REBUILD_TIMING",
+                     "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -234,14 +240,35 @@ class GroupCoordinator:
             self._owns_process_groups = False
             logger.info("Reusing world process groups for %s group ranks=%s",
                         group_name, self.ranks)
+            logger.warning(
+                "GroupCoordinator reuse_world_group=1 rank=%s group_name=%s local_rank=%s "
+                "world_size=%s ranks=%s",
+                self.rank,
+                group_name,
+                self.local_rank,
+                self.world_size,
+                self.ranks,
+            )
 
         if not reuse_world_group:
             for ranks in group_ranks:
+                device_group_start_t = time.perf_counter()
                 device_group = torch.distributed.new_group(
                     ranks, backend=torch_distributed_backend)
+                device_group_ms = (
+                    time.perf_counter() - device_group_start_t) * 1000.0
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
+                cpu_group_start_t = time.perf_counter()
                 cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                cpu_group_ms = (
+                    time.perf_counter() - cpu_group_start_t) * 1000.0
+                if _elastic_group_rebuild_timing_enabled():
+                    logger.info(
+                        "GroupCoordinator new_group timing: rank=%s group_name=%s unique_name=%s ranks=%s member=%s backend=%s device_ms=%.2f cpu_ms=%.2f",
+                        self.rank, group_name, self.unique_name, ranks,
+                        self.rank in ranks, torch_distributed_backend,
+                        device_group_ms, cpu_group_ms)
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)
@@ -269,7 +296,9 @@ class GroupCoordinator:
 
         self.use_device_communicator = use_device_communicator
         self.device_communicator = None
+        device_comm_ms = 0.0
         if use_device_communicator and self.world_size > 1:
+            device_comm_start_t = time.perf_counter()
             device_comm_cls = resolve_obj_by_qualname(
                 current_platform.get_device_communicator_cls())
             self.device_communicator = device_comm_cls(
@@ -278,6 +307,15 @@ class GroupCoordinator:
                 device_group=self.device_group,
                 unique_name=self.unique_name,
             )
+            device_comm_ms = (
+                time.perf_counter() - device_comm_start_t) * 1000.0
+        if _elastic_group_rebuild_timing_enabled():
+            logger.info(
+                "GroupCoordinator init timing: rank=%s group_name=%s unique_name=%s ranks=%s world_size=%s use_device_communicator=%s device_comm_ms=%.2f owns_pg=%s",
+                self.rank, group_name, self.unique_name,
+                getattr(self, "ranks", None), getattr(self, "world_size", None),
+                use_device_communicator, device_comm_ms,
+                self._owns_process_groups)
 
         from vllm.distributed.device_communicators.shm_broadcast import (
             MessageQueue)
@@ -876,7 +914,6 @@ class GroupCoordinator:
     def destroy(self):
         if self.device_communicator is not None:
             self.device_communicator.destroy()
-            self.device_communicator = None
         if self._owns_process_groups and hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
@@ -889,11 +926,6 @@ class GroupCoordinator:
             del self.cpu_group
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
-        # Break any lingering references so backend/HCCL resources can be
-        # reclaimed promptly between elastic shrink/restore stages.
-        self.ranks = []
-        self.world_size = 0
-        self.rank_in_group = -1
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
         if self.device_communicator is not None:

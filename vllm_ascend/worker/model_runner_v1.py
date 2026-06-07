@@ -222,6 +222,18 @@ def _module_has_mode1_native_parity_ready(module: Any) -> bool:
     return bool(getattr(module, "lossless_mode1_native_parity_ready", False))
 
 
+def _module_is_mode4_remote_npu(module: Any) -> bool:
+    return (getattr(module, "elastic_execution_mode", 0) == 4
+            and getattr(module, "elastic_moe_mode", None) == "lossless")
+
+
+def _module_is_mode3_cpu_npu_double_buffer(module: Any) -> bool:
+    return (getattr(module, "elastic_execution_mode", 0) == 3
+            and getattr(module, "elastic_moe_mode", None) == "lossless"
+            and bool(getattr(module, "lossless_hybrid_active", False))
+            and bool(getattr(module, "lossless_hybrid_cpu_swap_enabled", False)))
+
+
 def _dummy_waste_sync() -> None:
     if not _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC", "0"):
         return
@@ -364,7 +376,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.prefetch_stream = torch.npu.Stream(device=device)
         else:
             self.prefetch_stream = None
-        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 3:
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (3, 4, 5):
             self.moe_prefetch_stream = torch.npu.Stream(device=device)
         else:
             self.moe_prefetch_stream = None
@@ -924,35 +936,72 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if self.dp_size == 1:
             return num_tokens, None, with_prefill, enable_dbo
 
+        elastic_mode = int(
+            getattr(envs_ascend, "VLLM_ASCEND_ELASTIC_EXECUTION_MODE", 0))
+        # Elastic shrink paths depend on the DP metadata result to keep the
+        # post-shrink decode path on MC2. A stale/corrupted NPU all-reduce here
+        # can inflate synced token counts to O(1e9), which incorrectly selects
+        # AllToAll and trips the double-buffer guards. Use the CPU group by
+        # default for these lightweight paths; callers can opt out for focused
+        # experiments. Mode 5 is especially sensitive because bogus synced
+        # counts immediately poison the hybrid local/remote/cpu prefetch plan.
+        use_cpu_dp_metadata_sync = (
+            elastic_mode == 5
+            and _env_flag("VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC", "1")) or (
+                elastic_mode == 4
+                and _env_flag("VLLM_ASCEND_MODE4_CPU_DP_METADATA_SYNC", "1")) or (
+                    elastic_mode == 3
+                    and _env_flag("VLLM_ASCEND_MODE3_CPU_DP_METADATA_SYNC", "1"))
+        sync_device = "cpu" if use_cpu_dp_metadata_sync else "npu"
+        sync_group = (get_dp_group().cpu_group
+                      if use_cpu_dp_metadata_sync else
+                      get_dp_group().device_group)
+
         # Sync num_tokens, with_prefill, enable_dbo across dp ranks
         num_tokens_tensor = torch.tensor([
             num_tokens if i == self.dp_rank else 0 for i in range(self.dp_size)
         ],
                                          dtype=torch.int32,
-                                         device="npu")
+                                         device=sync_device)
 
         flags_tensor = torch.tensor(
             [int(with_prefill), int(not enable_dbo)],
             dtype=torch.int32,
-            device="npu")
+            device=sync_device)
 
         packed_tensor = torch.cat([num_tokens_tensor, flags_tensor])
 
-        dist.all_reduce(packed_tensor, group=get_dp_group().device_group)
+        dist.all_reduce(packed_tensor, group=sync_group)
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[:-2]
         # print("real num_tokens_across_dp is", num_tokens_across_dp)
         synced_flags = packed_tensor[-2:]
 
-        max_tokens_across_dp = torch.max(num_tokens_across_dp).item()
+        max_tokens_across_dp = int(torch.max(num_tokens_across_dp).item())
         global_with_prefill = bool(synced_flags[0])
         global_enable_dbo = not bool(synced_flags[1])
+
+        max_config_tokens = int(
+            getattr(self.scheduler_config, "max_num_batched_tokens", 0) or 0)
+        sanity_limit = max(max_config_tokens * 4, int(num_tokens) * 4, 1_000_000)
+        if max_tokens_across_dp < 0 or max_tokens_across_dp > sanity_limit:
+            group_size = dist.get_world_size(sync_group)
+            raise RuntimeError(
+                "Invalid DP metadata sync result: "
+                f"mode={elastic_mode} dp_rank={self.dp_rank} "
+                f"use_cpu_sync={use_cpu_dp_metadata_sync} "
+                f"group_size={group_size} local_num_tokens={num_tokens} "
+                f"max_tokens_across_dp={max_tokens_across_dp} "
+                f"num_tokens_across_dp={num_tokens_across_dp.detach().cpu().tolist()} "
+                f"flags={synced_flags.detach().cpu().tolist()} "
+                f"sanity_limit={sanity_limit}. This would otherwise force "
+                "a bogus post-shrink AllToAll path.")
 
         # Create a tensor for num_tokens_after_padding
         num_tokens_after_padding = torch.tensor([max_tokens_across_dp] *
                                                 self.dp_size,
-                                                device="npu",
+                                                device=sync_device,
                                                 dtype=torch.int32)
 
         return max_tokens_across_dp, num_tokens_after_padding, global_with_prefill, global_enable_dbo
@@ -3143,6 +3192,168 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     @torch.inference_mode()
+    def warmup_mode4_remote_npu_moe_compute_only(
+            self, num_tokens: int) -> None:
+        """Warm up mode=4 post-shrink MoE compute without attention/KV/all2all.
+
+        Mode=4 fetches missing experts from inactive NPU cache ranks. The first
+        live layer after shrink can otherwise pay lazy MC2/MoE kernel and TBE
+        setup cost inside rollout timing. This helper uses the real MLP path
+        under a decode/MC2 forward context, but avoids full dummy-run attention,
+        KV, prefill, and alltoall warmup paths.
+        """
+        if num_tokens <= 0:
+            logger.info(
+                "Mode4 remote-NPU MoE-only warmup skipped: "
+                "reason=no_tokens tokens=%s",
+                num_tokens,
+            )
+            return
+        model = self.get_model()
+        if model is None:
+            logger.info(
+                "Mode4 remote-NPU MoE-only warmup skipped: reason=no_model")
+            return
+
+        warm_all_layers = _env_flag(
+            "VLLM_ASCEND_MODE4_WARMUP_ALL_LAYERS", "0")
+        sync_each_layer = _env_flag(
+            "VLLM_ASCEND_MODE4_WARMUP_SYNC_EACH_LAYER", "1")
+        target_mlps = []
+        modules_with_experts = 0
+        mode4_ready_experts = 0
+        for mlp in model.modules():
+            experts = getattr(mlp, "experts", None)
+            if experts is None:
+                continue
+            modules_with_experts += 1
+            if (_module_is_mode4_remote_npu(experts)
+                    and getattr(experts, "lossless_hybrid_active", False)):
+                mode4_ready_experts += 1
+                target_mlps.append(mlp)
+                if not warm_all_layers:
+                    break
+
+        if not target_mlps:
+            logger.info(
+                "Mode4 remote-NPU MoE-only warmup skipped: "
+                "reason=no_target_mlps model_type=%s modules_with_experts=%s "
+                "mode4_ready_experts=%s",
+                type(model).__name__,
+                modules_with_experts,
+                mode4_ready_experts,
+            )
+            return
+
+        first_experts = getattr(target_mlps[0], "experts", None)
+        hidden_size = int(
+            getattr(target_mlps[0], "hidden_size",
+                    getattr(first_experts, "hidden_size", 0)))
+        if hidden_size <= 0:
+            logger.info(
+                "Mode4 remote-NPU MoE-only warmup skipped: "
+                "reason=no_hidden_size first_mlp_type=%s first_experts_type=%s",
+                type(target_mlps[0]).__name__,
+                type(first_experts).__name__ if first_experts is not None else None,
+            )
+            return
+
+        num_tokens = int(num_tokens)
+        moe_comm_type = self._select_moe_comm_method(num_tokens, False)
+        if moe_comm_type != MoECommType.MC2:
+            logger.info(
+                "Mode4 remote-NPU MoE-only warmup skipped: "
+                "reason=not_mc2 tokens=%s selected=%s",
+                num_tokens,
+                moe_comm_type,
+            )
+            return
+
+        hidden_states = torch.zeros(
+            (num_tokens, hidden_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        num_tokens_across_dp = torch.full(
+            (self.dp_size, ), num_tokens, dtype=torch.int64)
+        rank = dist.get_rank() if dist.is_initialized() else self.dp_rank
+        logger.info(
+            "Mode4 remote-NPU MoE-only warmup start: rank=%s tokens=%s "
+            "layers=%s warm_all_layers=%s sync_each_layer=%s "
+            "moe_comm_type=%s model_type=%s hidden_size=%s",
+            rank,
+            num_tokens,
+            len(target_mlps),
+            warm_all_layers,
+            sync_each_layer,
+            moe_comm_type,
+            type(model).__name__,
+            hidden_size,
+        )
+
+        with set_ascend_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=False,
+                reserved_mc2_mask=self.reserved_mc2_mask,
+                moe_comm_type=moe_comm_type,
+                num_actual_tokens=num_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=num_tokens, uniform_decode=False),
+                prefetch_stream=self.prefetch_stream,
+                moe_prefetch_stream=self.moe_prefetch_stream,
+                model_instance=self.model):
+            for warmup_idx, target_mlp in enumerate(target_mlps):
+                experts = getattr(target_mlp, "experts", None)
+                layer_idx = int(getattr(experts, "layer_idx", warmup_idx))
+                if warmup_idx == 0 or warmup_idx == len(target_mlps) - 1:
+                    logger.info(
+                        "Mode4 remote-NPU MoE-only warmup layer: rank=%s "
+                        "warmup_idx=%s layer=%s tokens=%s experts_type=%s "
+                        "ep_size=%s runtime_num_experts=%s",
+                        rank,
+                        warmup_idx,
+                        layer_idx,
+                        num_tokens,
+                        type(experts).__name__ if experts is not None else None,
+                        int(getattr(getattr(experts, "moe_parallel_config", None),
+                                    "ep_size", -1)),
+                        int(getattr(getattr(experts, "moe_config", None),
+                                    "num_experts", -1)),
+                    )
+                try:
+                    output = target_mlp(hidden_states, is_dummy=False)
+                    del output
+                    if sync_each_layer and torch.npu.is_available():
+                        torch.npu.synchronize()
+                except Exception:
+                    logger.exception(
+                        "Mode4 remote-NPU MoE-only warmup failed: rank=%s "
+                        "warmup_idx=%s layer=%s tokens=%s",
+                        rank,
+                        warmup_idx,
+                        layer_idx,
+                        num_tokens,
+                    )
+                    raise
+
+        del hidden_states
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        logger.info(
+            "Mode4 remote-NPU MoE-only warmup complete: rank=%s tokens=%s "
+            "layers_warmed=%s",
+            rank,
+            num_tokens,
+            len(target_mlps),
+        )
+
+    @torch.inference_mode()
     def warmup_mode1_parity_moe_dispatch_only(self, num_tokens: int) -> None:
         """Warm up old custom mode=1 MC2 MoE dispatch without attention/KV.
 
@@ -3298,6 +3509,390 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             num_tokens,
             len(target_mlps),
             warmup_is_dummy,
+        )
+
+    @torch.inference_mode()
+    def warmup_mode3_cpu_npu_moe_compute_only(self, num_tokens: int) -> None:
+        """Warm up mode=3 post-shrink MoE compute without attention/KV.
+
+        Mode=3 is intentionally a decode-only MC2 path after shrink. A full
+        dummy run can accidentally exercise attention, KV, or prefill/alltoall
+        resources; this helper only calls the active MoE MLP layers under the
+        same decode/MC2 forward context used by live rollout. It pulls the first
+        runtime-buffer materialization and MC2 dispatch setup out of the live
+        rollout step.
+        """
+        if num_tokens <= 0:
+            logger.info(
+                "Mode3 CPU/NPU MoE-only warmup skipped: reason=no_tokens tokens=%s",
+                num_tokens,
+            )
+            return
+        model = self.get_model()
+        if model is None:
+            logger.info("Mode3 CPU/NPU MoE-only warmup skipped: reason=no_model")
+            return
+
+        warm_all_layers = _env_flag("VLLM_ASCEND_MODE3_WARMUP_ALL_LAYERS",
+                                    "0")
+        sync_each_layer = _env_flag(
+            "VLLM_ASCEND_MODE3_WARMUP_SYNC_EACH_LAYER", "1")
+        target_mlps = []
+        modules_with_experts = 0
+        mode3_ready_experts = 0
+        for mlp in model.modules():
+            experts = getattr(mlp, "experts", None)
+            if experts is None:
+                continue
+            modules_with_experts += 1
+            if _module_is_mode3_cpu_npu_double_buffer(experts):
+                mode3_ready_experts += 1
+                target_mlps.append(mlp)
+                if not warm_all_layers:
+                    break
+
+        if not target_mlps:
+            logger.info(
+                "Mode3 CPU/NPU MoE-only warmup skipped: reason=no_target_mlps "
+                "model_type=%s modules_with_experts=%s mode3_ready_experts=%s",
+                type(model).__name__,
+                modules_with_experts,
+                mode3_ready_experts,
+            )
+            return
+
+        first_experts = getattr(target_mlps[0], "experts", None)
+        hidden_size = int(
+            getattr(target_mlps[0], "hidden_size",
+                    getattr(first_experts, "hidden_size", 0)))
+        if hidden_size <= 0:
+            logger.info(
+                "Mode3 CPU/NPU MoE-only warmup skipped: reason=no_hidden_size "
+                "model_type=%s first_mlp_type=%s first_experts_type=%s",
+                type(model).__name__,
+                type(target_mlps[0]).__name__,
+                type(first_experts).__name__ if first_experts is not None else None,
+            )
+            return
+
+        num_tokens = int(num_tokens)
+        moe_comm_type = self._select_moe_comm_method(num_tokens, False)
+        if moe_comm_type != MoECommType.MC2:
+            logger.info(
+                "Mode3 CPU/NPU MoE-only warmup skipped: reason=not_mc2 "
+                "tokens=%s selected=%s",
+                num_tokens,
+                moe_comm_type,
+            )
+            return
+
+        hidden_states = torch.zeros(
+            (num_tokens, hidden_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        num_tokens_across_dp = torch.full(
+            (self.dp_size, ), num_tokens, dtype=torch.int64)
+        rank = dist.get_rank() if dist.is_initialized() else self.dp_rank
+        logger.info(
+            "Mode3 CPU/NPU MoE-only warmup start: rank=%s tokens=%s "
+            "layers=%s warm_all_layers=%s sync_each_layer=%s moe_comm_type=%s "
+            "model_type=%s hidden_size=%s",
+            rank,
+            num_tokens,
+            len(target_mlps),
+            warm_all_layers,
+            sync_each_layer,
+            moe_comm_type,
+            type(model).__name__,
+            hidden_size,
+        )
+
+        with set_ascend_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=False,
+                reserved_mc2_mask=self.reserved_mc2_mask,
+                moe_comm_type=moe_comm_type,
+                num_actual_tokens=num_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=num_tokens, uniform_decode=False),
+                prefetch_stream=self.prefetch_stream,
+                moe_prefetch_stream=self.moe_prefetch_stream,
+                model_instance=self.model):
+            for warmup_idx, target_mlp in enumerate(target_mlps):
+                experts = getattr(target_mlp, "experts", None)
+                layer_idx = int(getattr(experts, "layer_idx", warmup_idx))
+                if warmup_idx == 0 or warmup_idx == len(target_mlps) - 1:
+                    logger.info(
+                        "Mode3 CPU/NPU MoE-only warmup layer: rank=%s "
+                        "warmup_idx=%s layer=%s tokens=%s experts_type=%s "
+                        "ep_size=%s runtime_num_experts=%s",
+                        rank,
+                        warmup_idx,
+                        layer_idx,
+                        num_tokens,
+                        type(experts).__name__ if experts is not None else None,
+                        int(getattr(getattr(experts, "moe_parallel_config", None),
+                                    "ep_size", -1)),
+                        int(getattr(getattr(experts, "moe_config", None),
+                                    "num_experts", -1)),
+                    )
+                try:
+                    output = target_mlp(hidden_states, is_dummy=False)
+                    del output
+                    if sync_each_layer and torch.npu.is_available():
+                        torch.npu.synchronize()
+                except Exception:
+                    logger.exception(
+                        "Mode3 CPU/NPU MoE-only warmup failed: rank=%s "
+                        "warmup_idx=%s layer=%s tokens=%s",
+                        rank,
+                        warmup_idx,
+                        layer_idx,
+                        num_tokens,
+                    )
+                    raise
+
+        del hidden_states
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        logger.info(
+            "Mode3 CPU/NPU MoE-only warmup complete: rank=%s tokens=%s "
+            "layers_warmed=%s",
+            rank,
+            num_tokens,
+            len(target_mlps),
+        )
+
+    @torch.inference_mode()
+    def warmup_mode3_mc2_dispatcher_only(self, num_tokens: int) -> None:
+        """Prime mode=3 MC2 dispatcher state without loading CPU experts.
+
+        A full mode=3 MoE/MLP warmup materializes runtime slots from the CPU
+        shadow copy and can turn a shrink into a multi-minute critical path at
+        low floor. The heavy first-use cost we need to move out of live decode
+        is the MC2/HCCL dispatcher setup, so this helper exercises only
+        token_dispatch/token_combine and deliberately avoids expert MLP kernels.
+        """
+        if num_tokens <= 0:
+            logger.info(
+                "Mode3 MC2 dispatcher-only warmup skipped: reason=no_tokens tokens=%s",
+                num_tokens,
+            )
+            return
+        model = self.get_model()
+        if model is None:
+            logger.info(
+                "Mode3 MC2 dispatcher-only warmup skipped: reason=no_model")
+            return
+
+        target_experts = None
+        modules_with_experts = 0
+        mode3_ready_experts = 0
+        for mlp in model.modules():
+            experts = getattr(mlp, "experts", None)
+            if experts is None:
+                continue
+            modules_with_experts += 1
+            if _module_is_mode3_cpu_npu_double_buffer(experts):
+                mode3_ready_experts += 1
+                target_experts = experts
+                break
+
+        if target_experts is None:
+            logger.info(
+                "Mode3 MC2 dispatcher-only warmup skipped: "
+                "reason=no_target_experts model_type=%s modules_with_experts=%s "
+                "mode3_ready_experts=%s",
+                type(model).__name__,
+                modules_with_experts,
+                mode3_ready_experts,
+            )
+            return
+
+        hidden_size = int(getattr(target_experts, "hidden_size", 0))
+        top_k = int(getattr(target_experts, "top_k", 0))
+        rank_owned = getattr(target_experts,
+                             "lossless_hybrid_rank_owned_expert_ids", None)
+        if rank_owned:
+            dispatch_num_experts = int(
+                sum(len(expert_ids) for expert_ids in rank_owned))
+        else:
+            moe_config = getattr(target_experts, "moe_config", None)
+            dispatch_num_experts = int(
+                getattr(moe_config, "num_experts", 0) if moe_config else 0)
+            if dispatch_num_experts <= 0:
+                dispatch_num_experts = int(
+                    getattr(target_experts, "num_experts", 0))
+        if hidden_size <= 0 or top_k <= 0 or dispatch_num_experts <= 0:
+            logger.info(
+                "Mode3 MC2 dispatcher-only warmup skipped: "
+                "reason=invalid_shape hidden_size=%s top_k=%s "
+                "dispatch_num_experts=%s experts_type=%s",
+                hidden_size,
+                top_k,
+                dispatch_num_experts,
+                type(target_experts).__name__,
+            )
+            return
+
+        num_tokens = int(num_tokens)
+        moe_comm_type = self._select_moe_comm_method(num_tokens, False)
+        if moe_comm_type != MoECommType.MC2:
+            logger.info(
+                "Mode3 MC2 dispatcher-only warmup skipped: reason=not_mc2 "
+                "tokens=%s selected=%s",
+                num_tokens,
+                moe_comm_type,
+            )
+            return
+
+        hidden_states = torch.zeros(
+            (num_tokens, hidden_size),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        topk_ids = (
+            torch.arange(num_tokens * top_k,
+                         dtype=torch.int32,
+                         device=self.device) % dispatch_num_experts).reshape(
+                             num_tokens, top_k).contiguous()
+        topk_weights = torch.full(
+            (num_tokens, top_k),
+            1.0 / float(top_k),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        row_idx = (torch.arange(0,
+                                num_tokens * top_k,
+                                dtype=torch.int32,
+                                device=self.device).view(
+                                    top_k, -1).permute(1, 0).contiguous())
+        expert_map = getattr(target_experts, "expert_map", None)
+        if expert_map is None:
+            expert_map = torch.arange(dispatch_num_experts,
+                                      dtype=torch.int32,
+                                      device=self.device)
+
+        num_tokens_across_dp = torch.full(
+            (self.dp_size, ), num_tokens, dtype=torch.int64)
+        warmup_expert_token_nums_type = int(
+            os.getenv("VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE", "0"))
+        if warmup_expert_token_nums_type not in (0, 1):
+            warmup_expert_token_nums_type = 0
+        rank = dist.get_rank() if dist.is_initialized() else self.dp_rank
+        logger.info(
+            "Mode3 MC2 dispatcher-only warmup start: rank=%s tokens=%s "
+            "hidden_size=%s top_k=%s dispatch_num_experts=%s ep_size=%s "
+            "layer=%s expert_token_nums_type=%s",
+            rank,
+            num_tokens,
+            hidden_size,
+            top_k,
+            dispatch_num_experts,
+            int(getattr(getattr(target_experts, "moe_parallel_config", None),
+                        "ep_size", -1)),
+            int(getattr(target_experts, "layer_idx", -1)),
+            warmup_expert_token_nums_type,
+        )
+
+        old_num_experts = None
+        old_top_k = None
+        old_expert_token_nums_type = None
+        with set_ascend_forward_context(
+                None,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                with_prefill=False,
+                reserved_mc2_mask=self.reserved_mc2_mask,
+                moe_comm_type=moe_comm_type,
+                num_actual_tokens=num_tokens,
+                aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                batch_descriptor=BatchDescriptor(
+                    num_tokens=num_tokens, uniform_decode=False),
+                prefetch_stream=self.prefetch_stream,
+                moe_prefetch_stream=self.moe_prefetch_stream,
+                model_instance=self.model):
+            forward_context = get_forward_context()
+            moe_comm_method = getattr(forward_context, "moe_comm_method", None)
+            if moe_comm_method is None:
+                raise RuntimeError(
+                    "Mode3 MC2 dispatcher-only warmup missing moe_comm_method.")
+            token_dispatcher = getattr(moe_comm_method, "token_dispatcher",
+                                       None)
+            if token_dispatcher is None:
+                raise RuntimeError(
+                    "Mode3 MC2 dispatcher-only warmup missing token_dispatcher.")
+
+            forward_context.elastic_debug_info = {
+                "layer_idx": int(getattr(target_experts, "layer_idx", -1)),
+                "phase": "post_shrink_mode3_mc2_dispatcher_only_warmup",
+            }
+            old_num_experts = int(getattr(token_dispatcher, "num_experts", 0))
+            old_top_k = int(getattr(token_dispatcher, "top_k", 0))
+            old_expert_token_nums_type = int(
+                getattr(token_dispatcher, "expert_token_nums_type", 0))
+            token_dispatcher.num_experts = dispatch_num_experts
+            token_dispatcher.top_k = top_k
+            if hasattr(token_dispatcher, "expert_token_nums_type"):
+                token_dispatcher.expert_token_nums_type = (
+                    warmup_expert_token_nums_type)
+            try:
+                dispatch_results = token_dispatcher.token_dispatch(
+                    hidden_states=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    row_idx=row_idx,
+                    expert_map=expert_map,
+                    log2phy=None,
+                    global_redundant_expert_num=0,
+                    shared_experts=None,
+                    quantized_x_for_share=None,
+                    dynamic_scale_for_share=None,
+                    mc2_mask=getattr(forward_context, "mc2_mask", None),
+                    apply_router_weight_on_input=False,
+                    with_quant=False)
+                combined = token_dispatcher.token_combine(
+                    dispatch_results["hidden_states"])
+                del combined, dispatch_results
+            finally:
+                token_dispatcher.num_experts = old_num_experts
+                token_dispatcher.top_k = old_top_k
+                if hasattr(token_dispatcher, "expert_token_nums_type"):
+                    token_dispatcher.expert_token_nums_type = (
+                        old_expert_token_nums_type)
+                for attr in (
+                        "output",
+                        "assist_info_for_combine",
+                        "ep_recv_counts",
+                        "topk_ids",
+                        "topk_weights",
+                        "mc2_mask",
+                        "expert_map",
+                        "shared_experts",
+                        "shared_act",
+                ):
+                    if hasattr(token_dispatcher, attr):
+                        setattr(token_dispatcher, attr, None)
+
+        del hidden_states, topk_ids, topk_weights, row_idx, expert_map
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        logger.info(
+            "Mode3 MC2 dispatcher-only warmup complete: rank=%s tokens=%s "
+            "dispatch_num_experts=%s",
+            rank,
+            num_tokens,
+            dispatch_num_experts,
         )
 
     @torch.inference_mode()

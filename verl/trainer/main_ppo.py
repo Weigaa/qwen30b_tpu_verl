@@ -39,6 +39,10 @@ def _env_enabled(name: str, default: str = "0") -> bool:
         "0", "false", "no", "off")
 
 
+def _rollout_only_skip_training_enabled() -> bool:
+    return _env_enabled("VERL_ROLLOUT_ONLY_SKIP_TRAINING", "0")
+
+
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     """Main entry point for PPO training with Hydra configuration management.
@@ -173,6 +177,9 @@ class TaskRunner:
 
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
+        if _rollout_only_skip_training_enabled():
+            print("[rollout_only] skip critic worker creation", flush=True)
+            return
         if config.critic.strategy in {"fsdp", "fsdp2"}:
             use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
             if use_legacy_worker_impl in ["auto", "enable"]:
@@ -223,6 +230,10 @@ class TaskRunner:
         """Add reward model worker if enabled."""
         from verl.trainer.ppo.ray_trainer import Role
 
+        if _rollout_only_skip_training_enabled():
+            print("[rollout_only] skip reward model worker creation", flush=True)
+            return
+
         if config.reward_model.enable:
             use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
             if use_legacy_worker_impl in ["auto", "enable"]:
@@ -248,6 +259,10 @@ class TaskRunner:
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
         from verl.trainer.ppo.ray_trainer import Role
+
+        if _rollout_only_skip_training_enabled():
+            print("[rollout_only] skip reference policy worker creation", flush=True)
+            return
 
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)

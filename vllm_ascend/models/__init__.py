@@ -1,3 +1,5 @@
+import os
+
 from vllm import ModelRegistry
 
 import vllm_ascend.envs as envs_ascend
@@ -45,9 +47,11 @@ def register_model():
         "DeepSeekMTPModel",
         "vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP")
 
-    ModelRegistry.register_model(
-        "Qwen3MoeForCausalLM",
-        "vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM")
+    if os.getenv("VLLM_ASCEND_USE_NATIVE_QWEN3_MOE",
+                 "0").lower() not in ("1", "true", "yes", "on"):
+        ModelRegistry.register_model(
+            "Qwen3MoeForCausalLM",
+            "vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM")
 
     # There is no PanguProMoEForCausalLM in vLLM, so we should register it before vLLM config initialization
     # to make sure the model can be loaded correctly. This register step can be removed once vLLM support PanguProMoEForCausalLM.

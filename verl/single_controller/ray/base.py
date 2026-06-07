@@ -13,6 +13,7 @@
 # limitations under the License.
 import inspect
 import logging
+import os
 import socket
 import threading
 from copy import deepcopy
@@ -35,6 +36,7 @@ _HCCL_IF_BASE_PORT_LOCK = threading.Lock()
 _HCCL_IF_BASE_PORT_NEXT = 20000
 _HCCL_IF_BASE_PORT_BLOCK = 12288
 _HCCL_IF_BASE_PORT_LIMIT = 65535 - _HCCL_IF_BASE_PORT_BLOCK
+_HCCL_IF_BASE_PORT_ENV_SEEDED = False
 
 
 def get_random_string(length: int) -> str:
@@ -46,8 +48,18 @@ def get_random_string(length: int) -> str:
 
 
 def _alloc_hccl_if_base_port() -> str:
-    global _HCCL_IF_BASE_PORT_NEXT
+    global _HCCL_IF_BASE_PORT_NEXT, _HCCL_IF_BASE_PORT_ENV_SEEDED
     with _HCCL_IF_BASE_PORT_LOCK:
+        if not _HCCL_IF_BASE_PORT_ENV_SEEDED:
+            env_port = os.environ.get("HCCL_IF_BASE_PORT")
+            if env_port:
+                try:
+                    candidate = int(env_port)
+                    if 0 < candidate <= _HCCL_IF_BASE_PORT_LIMIT:
+                        _HCCL_IF_BASE_PORT_NEXT = candidate
+                except ValueError:
+                    pass
+            _HCCL_IF_BASE_PORT_ENV_SEEDED = True
         port = _HCCL_IF_BASE_PORT_NEXT
         if port > _HCCL_IF_BASE_PORT_LIMIT:
             port = 20000

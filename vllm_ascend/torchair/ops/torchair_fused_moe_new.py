@@ -74,7 +74,7 @@ def chunk_moe_decorator(fused_experts_func):
                 **kwargs
             )
             return mlp_hidden_states
-            
+
         num_tokens = hidden_states.size(0)
         for chunk_start in range(0, max_tokens, chunk_moe_size):
             chunk_end = min(chunk_start + chunk_moe_size, max_tokens)
@@ -86,7 +86,7 @@ def chunk_moe_decorator(fused_experts_func):
             update_kwargs = dict(**kwargs)
             if update_kwargs.get('shared_experts'):
                 update_kwargs['shared_experts'] = update_kwargs['shared_experts'][chunk_start:chunk_end]
-            
+
             mlp_hidden_states = fused_experts_func(
                 hidden_states=chunk_hidden_states,
                 topk_weights=chunk_topk_weights,
@@ -921,45 +921,45 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             #  # =======================================================
             #  # 核心思想：不要 create tensor，而是 compute tensor
             #  # 只有计算出来的 tensor，编译器才承认它继承了输入的 shape 符号
-             
+
             #  # 1. 拿 x 做"种马"，生成全 0 的 Tensor
             #  # 选取前 top_k 列，此时 shape 为 [N, top_k] (符号为 S0)
             #  # 乘以 0 确保数值为 0，但图连接关系保留了！
             #  # .to(int32) 这一步 Cast 操作也会保留符号传播
             #  topk_ids = (x[:, :top_k] * 0).to(torch.int32)
-             
+
             #  # 同理生成 weights (保持 dtype)
             #  topk_weights = (x[:, :top_k] * 0)
 
             #  # 2. 构造 Pattern (这部分是纯静态的，或者是基于 arange 的)
             #  # 这里的计算必须非常小心，不能破坏动态维度
-             
+
             #  # 2.1 构造行偏移： [0, top_k, 2*top_k ...]
             #  # 利用 topk_ids 的第0列来生成 range，确保长度一致
             #  # (N, 1)
             #  num_tokens_tensor = torch.ones_like(topk_ids[:, 0]).cumsum(0) - 1
             #  row_offsets = (num_tokens_tensor * top_k).unsqueeze(1).to(torch.int32)
-             
+
             #  # 2.2 构造列基础: [0, 1, ... top_k-1]
             #  base_col = torch.arange(top_k, device=x.device, dtype=torch.int32).unsqueeze(0)
-             
+
             #  # 2.3 计算 Pattern
             #  # 假设 global_num_experts 是 64
             #  g_experts = global_num_experts if global_num_experts > 0 else 64
             #  pattern = (row_offsets + base_col) % g_experts
-             
+
             #  # 3. 【注入灵魂的一步】
             #  # 将 Pattern 加到那个"带有血缘关系"的 topk_ids 上
             #  # 在图上：topk_ids = (x * 0) + pattern
             #  # 编译器看到这个加法，必然承认结果的 shape 等于 x 的 shape
             #  topk_ids = topk_ids + pattern
-             
+
             #  # weights 同理，全0 + 均值
             #  topk_weights = topk_weights + (1.0 / top_k)
-             
+
             #  # 4. 确保连续
             #  topk_ids = topk_ids.contiguous()
-            # topk_weights = topk_weights.contiguous()
+            topk_weights = topk_weights.contiguous()
         else:
             # ==========================================
             # 路径 B: 正常计算 (执行 Router)
@@ -968,13 +968,13 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             if is_deepseek_v3_r1:
                 topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
                     router_logits,
-                    k=top_k, 
+                    k=top_k,
                     bias=e_score_correction_bias,
-                    k_group=topk_group, 
-                    group_count=num_expert_group, 
-                    group_select_mode=1, 
-                    renorm=0, 
-                    norm_type=1, 
+                    k_group=topk_group,
+                    group_count=num_expert_group,
+                    group_select_mode=1,
+                    renorm=0,
+                    norm_type=1,
                     routed_scaling_factor=1,
                     eps=float(1e-20))
             else:
@@ -990,7 +990,7 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     scoring_func=scoring_func,
                     e_score_correction_bias=e_score_correction_bias,
                 )
-            
+
             # 正常路径的数据类型转换
             topk_weights = topk_weights.to(x.dtype)
             if log2phy is not None:
@@ -1101,37 +1101,37 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     #     # 确保你能拿到 hidden_states (x) 以及 原始的 topk_ids, topk_weights
     #     if (enable_force_load_balance and not self.use_aclgraph) or is_dummy:
     #         hidden_states = x
-            
+
     #         # --- 核心修正 ---
     #         # 绝对不要重新定义 topk_ids = ... (这会切断图的连接)
     #         # 我们直接修改外部传入的那个 topk_ids 对象的内存
-            
+
     #         # 1. 构造 dummy 数据 (Pattern)
     #         # 这里的 pattern 是临时的，不管它产生什么符号都没关系
     #         base_col = torch.arange(8, device=hidden_states.device, dtype=torch.int32)
-            
+
     #         # 使用 hidden_states.shape[0] 来构造行，确保动态维度匹配
     #         num_tokens = hidden_states.shape[0]
     #         row_offsets = (torch.arange(num_tokens, device=hidden_states.device, dtype=torch.int32) * 8).unsqueeze(1)
-            
+
     #         # 计算目标数据: (N, 8)
     #         target_ids = (row_offsets + base_col.unsqueeze(0)) % 128
-            
+
     #         # 2. 原地写入 (In-Place Update)
     #         # 这一步是通关的关键！
     #         # 我们把数据塞进"原始的" topk_ids 里，而不是创建一个新的 topk_ids
     #         # 这样下游算子看到的还是原来的那个 Tensor 对象，校验直接通过
     #         topk_ids.copy_(target_ids)
-            
+
     #         # 3. 同样处理 Weights
     #         # 均分权重 1/8
     #         topk_weights.fill_(1.0 / 8)
-            
-    #         # 注意：最后不要再写 topk_ids = topk_ids.contiguous() 
+
+    #         # 注意：最后不要再写 topk_ids = topk_ids.contiguous()
     #         # 因为这又会产生新变量。topk() 输出原本就是连续的，copy_() 后依然保持连续。
     #         # 如果实在担心不连续，只做检查，不做赋值：
     #         # assert topk_ids.is_contiguous()
-        
+
 
     #     fused_moe_state = get_forward_context().fused_moe_state
     #     if self.enable_shared_expert_dp and fused_moe_state == FusedMoEState.MC2:
@@ -1290,20 +1290,8 @@ class TorchairAscendFusedMoE(FusedMoE):
         else:
             # init moe.
             # print("use code in torchair_fused_moe to init expert_map")
-            expert_map_result = determine_expert_map(
-                self.ep_size,
-                self.ep_rank,
-                self.global_num_experts,
-                layer_idx=self.layer_idx)
-            if len(expert_map_result) == 3:
-                self.local_num_experts, self.expert_map, self.log2phy = expert_map_result
-            elif len(expert_map_result) == 2:
-                self.local_num_experts, self.expert_map = expert_map_result
-                self.log2phy = determine_default_log2phy_map(
-                    self.global_num_experts, self.ep_size, self.ep_rank, 0)
-            else:
-                raise ValueError(
-                    f"Unexpected determine_expert_map return arity={len(expert_map_result)}")
+            self.local_num_experts, self.expert_map, self.log2phy = determine_expert_map(
+                self.ep_size, self.ep_rank, self.global_num_experts, layer_idx=self.layer_idx)
             # dynamic eplb initializing with not expert_map_path
             if self.dynamic_eplb:
                 self.global_redundant_expert_num = ascend_config.init_redundancy_expert
