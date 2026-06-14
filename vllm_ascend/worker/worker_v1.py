@@ -92,6 +92,41 @@ def _is_ascend_fused_moe_module(module: nn.Module) -> bool:
         return False
 
 
+_missing_moe_runtime_method_warnings: set[tuple[type, str]] = set()
+
+
+def _call_optional_moe_runtime_method(module: nn.Module, method_name: str,
+                                      *args) -> None:
+    method = getattr(module, method_name, None)
+    if callable(method):
+        method(*args)
+        return
+
+    warning_key = (type(module), method_name)
+    if warning_key in _missing_moe_runtime_method_warnings:
+        return
+    _missing_moe_runtime_method_warnings.add(warning_key)
+    logger.warning(
+        "Ascend fused MoE module lacks optional elastic runtime method: "
+        "module_type=%s module_file=%s method=%s",
+        type(module).__qualname__,
+        getattr(type(module), "__module__", "<unknown>"),
+        method_name,
+    )
+
+
+def _set_moe_active_expert_mask(
+        module: nn.Module, active_expert_mask: Optional[torch.Tensor]) -> None:
+    _call_optional_moe_runtime_method(module, "set_active_expert_mask",
+                                      active_expert_mask)
+
+
+def _set_moe_elastic_runtime_log2phy(
+        module: nn.Module, log2phy: Optional[torch.Tensor]) -> None:
+    _call_optional_moe_runtime_method(module, "set_elastic_runtime_log2phy",
+                                      log2phy)
+
+
 def _mode4_new_like_rows(reference: torch.Tensor,
                          rows: int) -> torch.Tensor:
     """Allocate a same-format NPU batch for mode4 expert P2P payloads."""
@@ -2243,8 +2278,8 @@ class NPUWorker(WorkerBase):
                         self._post_shrink_moe_dispatch_warmed_active_signatures.clear()
                         current_dp_group = get_dp_group()
                         current_ep_group = get_ep_group()
-                        module.set_active_expert_mask(None)
-                        module.set_elastic_runtime_log2phy(None)
+                        _set_moe_active_expert_mask(module, None)
+                        _set_moe_elastic_runtime_log2phy(module, None)
                         module.ep_group = current_ep_group
                         module.moe_parallel_config.dp_size = current_dp_group.world_size
                         module.moe_parallel_config.dp_rank = current_dp_group.rank_in_group
@@ -2320,8 +2355,8 @@ class NPUWorker(WorkerBase):
                         mode4_remote_sources[expert_id] = (
                             int(remote_source_rank), int(source_slot))
                 if participate_only:
-                    module.set_active_expert_mask(None)
-                    module.set_elastic_runtime_log2phy(None)
+                    _set_moe_active_expert_mask(module, None)
+                    _set_moe_elastic_runtime_log2phy(module, None)
                     module.moe_config.num_experts = module.elastic_original_num_experts
                     continue
                 logical_num_experts = int(module.elastic_original_num_experts)
@@ -2334,9 +2369,9 @@ class NPUWorker(WorkerBase):
                 # warmup. Mode=3 still manages active experts through its own
                 # double-buffer metadata and therefore keeps this mask unset.
                 if getattr(module, "elastic_execution_mode", 0) == 3:
-                    module.set_active_expert_mask(None)
+                    _set_moe_active_expert_mask(module, None)
                 else:
-                    module.set_active_expert_mask(None)
+                    _set_moe_active_expert_mask(module, None)
                 assignments = payload["assignments"]
                 my_rank_idx = active_ranks.index(current_rank)
                 ordered_assignments = payload["ordered_assignments"]
@@ -2562,13 +2597,15 @@ class NPUWorker(WorkerBase):
                         active_expert_mask = (new_log2phy_cpu >= 0).to(
                             device=module.expert_map.device,
                             dtype=torch.bool)
-                        module.set_active_expert_mask(active_expert_mask)
+                        _set_moe_active_expert_mask(module, active_expert_mask)
                 if module.log2phy is not None and new_log2phy_cpu is not None:
-                    module.set_elastic_runtime_log2phy(
+                    _set_moe_elastic_runtime_log2phy(
+                        module,
                         new_log2phy_cpu.to(device=module.log2phy.device,
-                                           dtype=module.log2phy.dtype))
+                                           dtype=module.log2phy.dtype),
+                    )
                 else:
-                    module.set_elastic_runtime_log2phy(None)
+                    _set_moe_elastic_runtime_log2phy(module, None)
                 hybrid_t4 = time.perf_counter() if use_hybrid_cpu_swap else None
                 # Rebuild the token dispatcher with the post-shrink local expert
                 # count before decode resumes on the new 8-rank EP group.
@@ -2685,13 +2722,13 @@ class NPUWorker(WorkerBase):
                 continue
 
             if not is_active_rank:
-                module.set_active_expert_mask(None)
-                module.set_elastic_runtime_log2phy(None)
+                _set_moe_active_expert_mask(module, None)
+                _set_moe_elastic_runtime_log2phy(module, None)
                 module.moe_config.num_experts = module.elastic_original_num_experts
                 continue
             if module.expert_map is None:
-                module.set_active_expert_mask(None)
-                module.set_elastic_runtime_log2phy(None)
+                _set_moe_active_expert_mask(module, None)
+                _set_moe_elastic_runtime_log2phy(module, None)
                 module.moe_config.num_experts = module.elastic_original_num_experts
                 module.refresh_elastic_groups()
                 continue
@@ -2731,7 +2768,7 @@ class NPUWorker(WorkerBase):
                                                       dtype=torch.bool)
                 for rank_expert_map in gathered_expert_map:
                     active_expert_mask |= (rank_expert_map != -1)
-                module.set_active_expert_mask(active_expert_mask.to(
+                _set_moe_active_expert_mask(module, active_expert_mask.to(
                     device=module.expert_map.device))
 
                 if module.log2phy is not None:
@@ -2770,11 +2807,13 @@ class NPUWorker(WorkerBase):
                         if old_phy_id is None:
                             continue
                         new_log2phy_cpu[expert_id] = old_phy_to_dense[old_phy_id]
-                    module.set_elastic_runtime_log2phy(
+                    _set_moe_elastic_runtime_log2phy(
+                        module,
                         new_log2phy_cpu.to(device=module.log2phy.device,
-                                           dtype=module.log2phy.dtype))
+                                           dtype=module.log2phy.dtype),
+                    )
                 else:
-                    module.set_elastic_runtime_log2phy(None)
+                    _set_moe_elastic_runtime_log2phy(module, None)
                     module.set_runtime_num_experts(sum(local_expert_counts))
 
                 module.refresh_elastic_groups()
@@ -8595,8 +8634,8 @@ class NPUWorker(WorkerBase):
                 continue
             if hasattr(module, "clear_lossless_hybrid_state"):
                 module.clear_lossless_hybrid_state()
-            module.set_active_expert_mask(None)
-            module.set_elastic_runtime_log2phy(None)
+            _set_moe_active_expert_mask(module, None)
+            _set_moe_elastic_runtime_log2phy(module, None)
             module.moe_config.num_experts = module.elastic_original_num_experts
             module.ep_group = None
             module.moe_config.dp_group = None
