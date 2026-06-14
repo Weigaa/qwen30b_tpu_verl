@@ -1510,6 +1510,15 @@ class NPUWorker(WorkerBase):
         safety_margin_bytes = int(
             os.getenv("VLLM_ASCEND_FLOOR_PREALLOC_HEADROOM_SAFETY_BYTES",
                       str(1024 * 1024 * 1024)))
+        if mode3_double_buffer_bytes > 0 and mode3_cpu_stage_bytes == 0:
+            # Mode=4/5 remote-cache runtime only needs the shared NPU double
+            # buffer accounted before KV sizing. Do not charge the generic
+            # 1GiB floor-prealloc cushion by default; callers can set this env
+            # explicitly when investigating allocator fragmentation.
+            safety_margin_bytes = int(
+                os.getenv(
+                    "VLLM_ASCEND_MODE4_DOUBLE_BUFFER_HEADROOM_SAFETY_BYTES",
+                    "0"))
 
         # For mode3 double buffer slots, they are NOT pre-allocated during
         # memory profiling (allocated lazily on first forward), so we need to
