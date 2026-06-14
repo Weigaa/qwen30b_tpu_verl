@@ -122,6 +122,373 @@ def _log_custom_mode1_rollout_memory(tag: str) -> None:
         logger.exception("Failed to log custom mode=1 rollout memory at %s", tag)
 
 
+def _tensor_nbytes(tensor: Any) -> int:
+    if not isinstance(tensor, torch.Tensor):
+        return 0
+    try:
+        return int(tensor.numel()) * int(tensor.element_size())
+    except Exception:
+        return 0
+
+
+def _tensor_storage_ptr(tensor: Any) -> int | None:
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    try:
+        return int(tensor.untyped_storage().data_ptr())
+    except Exception:
+        try:
+            return int(tensor.data_ptr())
+        except Exception:
+            return None
+
+
+def _get_npu_buffer_format(tensor: Any):
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    if tensor.device.type != "npu":
+        return None
+    try:
+        import torch_npu  # type: ignore
+        return torch_npu.get_npu_format(tensor)
+    except Exception:
+        return None
+
+
+def _len_if_present(obj: Any) -> int:
+    if obj is None:
+        return 0
+    try:
+        return int(len(obj))
+    except Exception:
+        return 0
+
+
+def _collect_tensor_entries(obj: Any,
+                            prefix: str,
+                            depth: int = 0,
+                            max_depth: int = 1,
+                            visited: set[int] | None = None):
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return
+    visited.add(obj_id)
+
+    if isinstance(obj, torch.Tensor):
+        yield prefix, obj
+        return
+    if depth >= max_depth:
+        return
+    if isinstance(obj, (list, tuple)):
+        for idx, item in enumerate(obj):
+            yield from _collect_tensor_entries(item, f"{prefix}[{idx}]",
+                                               depth + 1, max_depth, visited)
+        return
+    if isinstance(obj, dict):
+        for key, item in obj.items():
+            yield from _collect_tensor_entries(item, f"{prefix}[{key!r}]",
+                                               depth + 1, max_depth, visited)
+
+
+def _custom_mode1_global_tensor_scan_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_CUSTOM_MODE1_GLOBAL_TENSOR_SCAN", "0")
+
+
+def _log_custom_mode1_rollout_state(owner: Any, tag: str) -> None:
+    if not _custom_mode1_rollout_reload_diag_enabled():
+        return
+    if int(getattr(envs_ascend, "VLLM_ASCEND_ELASTIC_EXECUTION_MODE", 0)) != 1:
+        return
+
+    model = getattr(owner, "model", None)
+    if model is None:
+        return
+
+    gpu_buffers = getattr(owner, "gpu_buffers", None)
+    if not isinstance(gpu_buffers, dict):
+        gpu_buffers = {}
+
+    total_params = 0
+    param_npu_count = 0
+    param_npu_bytes = 0
+    param_cpu_count = 0
+    param_storage_ptrs: set[int] = set()
+    named_buffer_npu_count = 0
+    named_buffer_npu_bytes = 0
+    named_buffer_storage_ptrs: set[int] = set()
+    gpu_buffer_count = 0
+    gpu_buffer_bytes = 0
+    alias_match_count = 0
+    stale_gpu_buffer_count = 0
+    stale_gpu_buffer_bytes = 0
+    stale_gpu_buffer_samples: list[str] = []
+    gpu_buffer_storage_ptrs: set[int] = set()
+
+    for name, param in model.named_parameters():
+        total_params += 1
+        data = param.data
+        ptr = _tensor_storage_ptr(data)
+        if ptr is not None:
+            param_storage_ptrs.add(ptr)
+        if data.device.type == "npu":
+            param_npu_count += 1
+            param_npu_bytes += _tensor_nbytes(data)
+        elif data.device.type == "cpu":
+            param_cpu_count += 1
+
+        gpu_buffer = gpu_buffers.get(name)
+        if isinstance(gpu_buffer, torch.Tensor):
+            gpu_buffer_count += 1
+            gpu_buffer_bytes += _tensor_nbytes(gpu_buffer)
+            gpu_ptr = _tensor_storage_ptr(gpu_buffer)
+            if gpu_ptr is not None:
+                gpu_buffer_storage_ptrs.add(gpu_ptr)
+            same_ptr = (_tensor_storage_ptr(gpu_buffer)
+                        == _tensor_storage_ptr(data))
+            if same_ptr:
+                alias_match_count += 1
+            else:
+                stale_gpu_buffer_count += 1
+                stale_gpu_buffer_bytes += _tensor_nbytes(gpu_buffer)
+                if len(stale_gpu_buffer_samples) < 6:
+                    stale_gpu_buffer_samples.append(
+                        f"{name}:gpu_dev={gpu_buffer.device.type}"
+                        f"/gpu_fmt={_get_npu_buffer_format(gpu_buffer)}"
+                        f"/param_dev={data.device.type}"
+                        f"/param_fmt={_get_npu_buffer_format(data)}")
+
+    for _name, buffer in model.named_buffers():
+        if not isinstance(buffer, torch.Tensor):
+            continue
+        ptr = _tensor_storage_ptr(buffer)
+        if ptr is not None:
+            named_buffer_storage_ptrs.add(ptr)
+        if buffer.device.type == "npu":
+            named_buffer_npu_count += 1
+            named_buffer_npu_bytes += _tensor_nbytes(buffer)
+
+    extra_tensor_attr_npu_count = 0
+    extra_tensor_attr_npu_bytes = 0
+    extra_tensor_attr_samples: list[str] = []
+    extra_tensor_attr_storage_ptrs: set[int] = set()
+
+    for module_name, module in model.named_modules():
+        safe_module_name = module_name or "<root>"
+        for attr_name, attr_value in vars(module).items():
+            if attr_name in ("_parameters", "_buffers", "_modules"):
+                continue
+            attr_prefix = f"{safe_module_name}.{attr_name}"
+            for tensor_path, tensor in _collect_tensor_entries(
+                    attr_value, attr_prefix, max_depth=1):
+                if tensor.device.type != "npu" or tensor.numel() <= 0:
+                    continue
+                ptr = _tensor_storage_ptr(tensor)
+                if ptr is None:
+                    continue
+                if (ptr in param_storage_ptrs or ptr in named_buffer_storage_ptrs
+                        or ptr in gpu_buffer_storage_ptrs
+                        or ptr in extra_tensor_attr_storage_ptrs):
+                    continue
+                extra_tensor_attr_storage_ptrs.add(ptr)
+                extra_tensor_attr_npu_count += 1
+                extra_tensor_attr_npu_bytes += _tensor_nbytes(tensor)
+                if len(extra_tensor_attr_samples) < 10:
+                    extra_tensor_attr_samples.append(
+                        f"{tensor_path}:shape={tuple(tensor.shape)}"
+                        f":bytes={_tensor_nbytes(tensor)}"
+                        f":fmt={_get_npu_buffer_format(tensor)}")
+
+    kv_cache_module_refs = 0
+    kv_cache_npu_tensors = 0
+    attn_cache_layers = 0
+    mla_cache_layers = 0
+    fused_runtime_weight_layers = 0
+    fused_runtime_buffer_layers = 0
+    fused_cpu_shadow_layers = 0
+    fused_saved_prefix_layers = 0
+    fused_runtime_samples: list[str] = []
+
+    for module in model.modules():
+        kv_cache = getattr(module, "kv_cache", None)
+        if kv_cache is not None:
+            kv_cache_module_refs += 1
+            if isinstance(kv_cache, (list, tuple)):
+                for item in kv_cache:
+                    if (isinstance(item, torch.Tensor)
+                            and item.device.type == "npu"
+                            and item.numel() > 0):
+                        kv_cache_npu_tensors += 1
+            elif (isinstance(kv_cache, torch.Tensor)
+                  and kv_cache.device.type == "npu" and kv_cache.numel() > 0):
+                kv_cache_npu_tensors += 1
+
+        runtime_w13 = getattr(module, "runtime_w13_weight", None)
+        runtime_w2 = getattr(module, "runtime_w2_weight", None)
+        runtime_buffer_w13 = getattr(module, "runtime_w13_buffer", None)
+        runtime_buffer_w2 = getattr(module, "runtime_w2_buffer", None)
+        cpu_w13 = getattr(module, "lossless_cpu_w13_weight", None)
+        cpu_w2 = getattr(module, "lossless_cpu_w2_weight", None)
+        saved_prefix_w13 = getattr(module, "lossless_saved_primary_prefix_w13",
+                                   None)
+        saved_prefix_w2 = getattr(module, "lossless_saved_primary_prefix_w2",
+                                  None)
+
+        has_runtime_weight = (runtime_w13 is not None or runtime_w2 is not None)
+        has_runtime_buffer = (runtime_buffer_w13 is not None
+                              or runtime_buffer_w2 is not None)
+        has_cpu_shadow = (cpu_w13 is not None or cpu_w2 is not None)
+        has_saved_prefix = (saved_prefix_w13 is not None
+                            or saved_prefix_w2 is not None)
+        if has_runtime_weight:
+            fused_runtime_weight_layers += 1
+        if has_runtime_buffer:
+            fused_runtime_buffer_layers += 1
+        if has_cpu_shadow:
+            fused_cpu_shadow_layers += 1
+        if has_saved_prefix:
+            fused_saved_prefix_layers += 1
+        if (has_runtime_weight or has_runtime_buffer) and len(
+                fused_runtime_samples) < 6:
+            fused_runtime_samples.append(
+                f"layer={getattr(module, 'layer_idx', -1)}"
+                f":runtime_weight={has_runtime_weight}"
+                f":runtime_buffer={has_runtime_buffer}"
+                f":cpu_shadow={has_cpu_shadow}"
+                f":saved_prefix={has_saved_prefix}")
+
+        self_attn = getattr(module, "self_attn", None)
+        if self_attn is None:
+            continue
+        attn_impl = getattr(getattr(self_attn, "attn", None), "impl", None)
+        if (attn_impl is not None and
+                (getattr(attn_impl, "key_cache", None) is not None
+                 or getattr(attn_impl, "value_cache", None) is not None)):
+            attn_cache_layers += 1
+        mla_impl = getattr(getattr(self_attn, "mla_attn", None), "impl", None)
+        if (mla_impl is not None and
+                (getattr(mla_impl, "key_cache", None) is not None
+                 or getattr(mla_impl, "value_cache", None) is not None
+                 or getattr(mla_impl, "w_kc", None) is not None
+                 or getattr(mla_impl, "w_vc", None) is not None
+                 or getattr(mla_impl, "W_UV", None) is not None
+                 or getattr(mla_impl, "W_UK_T", None) is not None)):
+            mla_cache_layers += 1
+
+    mode3_slots = getattr(model, "_mode3_cpu_npu_double_buffer_slots", None)
+    mode4_slots = getattr(model, "_mode4_remote_npu_double_buffer_slots", None)
+    global_unowned_npu_count = 0
+    global_unowned_npu_bytes = 0
+    global_unowned_npu_samples: list[str] = []
+    if _custom_mode1_global_tensor_scan_enabled():
+        known_ptrs = (param_storage_ptrs | named_buffer_storage_ptrs
+                      | gpu_buffer_storage_ptrs
+                      | extra_tensor_attr_storage_ptrs)
+        global_seen_ptrs: set[int] = set()
+        try:
+            for obj in gc.get_objects():
+                if not isinstance(obj, torch.Tensor):
+                    continue
+                if obj.device.type != "npu" or obj.numel() <= 0:
+                    continue
+                ptr = _tensor_storage_ptr(obj)
+                if ptr is None or ptr in known_ptrs or ptr in global_seen_ptrs:
+                    continue
+                global_seen_ptrs.add(ptr)
+                global_unowned_npu_count += 1
+                global_unowned_npu_bytes += _tensor_nbytes(obj)
+                if len(global_unowned_npu_samples) < 10:
+                    global_unowned_npu_samples.append(
+                        f"type={type(obj).__name__}:shape={tuple(obj.shape)}"
+                        f":bytes={_tensor_nbytes(obj)}"
+                        f":fmt={_get_npu_buffer_format(obj)}")
+        except Exception:
+            logger.exception(
+                "Failed global tensor scan for custom mode=1 rollout state: tag=%s",
+                tag)
+
+    logger.warning(
+        "Custom mode=1 rollout state: tag=%s total_params=%s "
+        "param_npu_count=%s param_npu_bytes=%s param_cpu_count=%s "
+        "named_buffer_npu_count=%s named_buffer_npu_bytes=%s "
+        "gpu_buffer_count=%s gpu_buffer_bytes=%s gpu_buffer_alias_match=%s "
+        "stale_gpu_buffer_count=%s stale_gpu_buffer_bytes=%s "
+        "extra_tensor_attr_npu_count=%s extra_tensor_attr_npu_bytes=%s "
+        "global_unowned_npu_count=%s global_unowned_npu_bytes=%s "
+        "kv_cache_module_refs=%s kv_cache_npu_tensors=%s "
+        "attn_cache_layers=%s mla_cache_layers=%s "
+        "fused_runtime_weight_layers=%s fused_runtime_buffer_layers=%s "
+        "fused_cpu_shadow_layers=%s fused_saved_prefix_layers=%s "
+        "mode3_slot_containers=%s mode4_slot_containers=%s",
+        tag,
+        total_params,
+        param_npu_count,
+        param_npu_bytes,
+        param_cpu_count,
+        named_buffer_npu_count,
+        named_buffer_npu_bytes,
+        gpu_buffer_count,
+        gpu_buffer_bytes,
+        alias_match_count,
+        stale_gpu_buffer_count,
+        stale_gpu_buffer_bytes,
+        extra_tensor_attr_npu_count,
+        extra_tensor_attr_npu_bytes,
+        global_unowned_npu_count,
+        global_unowned_npu_bytes,
+        kv_cache_module_refs,
+        kv_cache_npu_tensors,
+        attn_cache_layers,
+        mla_cache_layers,
+        fused_runtime_weight_layers,
+        fused_runtime_buffer_layers,
+        fused_cpu_shadow_layers,
+        fused_saved_prefix_layers,
+        _len_if_present(mode3_slots),
+        _len_if_present(mode4_slots),
+    )
+    if stale_gpu_buffer_samples:
+        logger.warning(
+            "Custom mode=1 rollout stale gpu buffer samples: tag=%s samples=%s",
+            tag,
+            stale_gpu_buffer_samples,
+        )
+    if fused_runtime_samples:
+        logger.warning(
+            "Custom mode=1 rollout fused runtime samples: tag=%s samples=%s",
+            tag,
+            fused_runtime_samples,
+        )
+    if extra_tensor_attr_samples:
+        logger.warning(
+            "Custom mode=1 rollout extra tensor attr samples: tag=%s samples=%s",
+            tag,
+            extra_tensor_attr_samples,
+        )
+    if global_unowned_npu_samples:
+        logger.warning(
+            "Custom mode=1 rollout global unowned NPU tensor samples: tag=%s samples=%s",
+            tag,
+            global_unowned_npu_samples,
+        )
+
+
+def _materialize_rollout_weight_staging(
+        weights: list[tuple[str, torch.Tensor]]
+) -> list[tuple[str, torch.Tensor]]:
+    """Create rollout-owned tensors for weight reload.
+
+    Mode=1 repeatedly reloads rollout weights while elastic groups and runtime
+    views are being rebuilt. Cloning cuts loader-side aliases to caller-owned
+    tensors so the rollout can release temporary NPU allocations promptly.
+    """
+    staged: list[tuple[str, torch.Tensor]] = []
+    for name, weight in weights:
+        staged.append((name, weight.detach().clone()))
+    return staged
+
+
 def _load_model_num_experts(model_path: str) -> int:
     config_path = Path(model_path) / "config.json"
     if not config_path.exists():
@@ -335,7 +702,7 @@ class vLLMRollout(BaseRollout):
         self.gpu_buffers = None
         for name, params in self.model.named_parameters():
             self.cpu_model[name] = torch.empty_like(params, device="cpu")
-            self.gpu_buffer_formats[name] = self._get_npu_buffer_format(params)
+            self.gpu_buffer_formats[name] = _get_npu_buffer_format(params)
         self.free_cache_engine()
         self.offload_model_weights()
 
@@ -413,23 +780,14 @@ class vLLMRollout(BaseRollout):
             )
         for name, param in self.model.named_parameters():
             param.data = self.gpu_buffers[name]
+        _log_custom_mode1_rollout_state(self, "after_onload_model_weights")
         _log_custom_mode1_rollout_memory("after_onload_model_weights")
-
-    @staticmethod
-    def _get_npu_buffer_format(tensor: torch.Tensor):
-        if tensor is None or tensor.device.type != "npu":
-            return None
-        try:
-            import torch_npu  # type: ignore
-            return torch_npu.get_npu_format(tensor)
-        except Exception:
-            return None
 
     def _refresh_gpu_buffer_format_metadata(self) -> None:
         if not hasattr(self, "gpu_buffer_formats"):
             self.gpu_buffer_formats = {}
         for name, param in self.model.named_parameters():
-            fmt = self._get_npu_buffer_format(param.data)
+            fmt = _get_npu_buffer_format(param.data)
             if fmt is not None:
                 self.gpu_buffer_formats[name] = fmt
 
@@ -444,7 +802,11 @@ class vLLMRollout(BaseRollout):
 
     def offload_model_weights(self):
         _log_custom_mode1_rollout_memory("before_offload_model_weights")
-        self._refresh_gpu_buffer_format_metadata()
+        _log_custom_mode1_rollout_state(self, "before_offload_model_weights")
+        refresh_gpu_buffer_format_metadata = getattr(
+            self, "_refresh_gpu_buffer_format_metadata", None)
+        if callable(refresh_gpu_buffer_format_metadata):
+            refresh_gpu_buffer_format_metadata()
         invalidated_layers = 0
         invalidated_runtime_layers = 0
         for module in self.model.modules():
@@ -488,9 +850,11 @@ class vLLMRollout(BaseRollout):
                 invalidated_layers,
                 invalidated_runtime_layers,
             )
+        _log_custom_mode1_rollout_state(self, "after_offload_model_weights")
         _log_custom_mode1_rollout_memory("after_offload_model_weights")
 
     def free_cache_engine(self):
+        _log_custom_mode1_rollout_state(self, "before_free_cache_engine")
         if os.environ['VLLM_USE_V1'] == '1':
             worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
             ctx = worker.model_runner.vllm_config.compilation_config.static_forward_context
@@ -551,6 +915,8 @@ class vLLMRollout(BaseRollout):
 
         gc.collect()
         torch.npu.empty_cache()
+        _log_custom_mode1_rollout_state(self, "after_free_cache_engine")
+        _log_custom_mode1_rollout_memory("after_free_cache_engine")
 
     def eplb_start(self):
         # Restart the EPLB process before switching from training to inference.
@@ -907,6 +1273,7 @@ class vLLMRollout(BaseRollout):
                 self.elastic_execution_mode)
             self._lossless_weight_update_sync_logged = True
         _log_custom_mode1_rollout_memory("before_update_weights_load")
+        _log_custom_mode1_rollout_state(self, "before_update_weights_load")
         if (self.elastic_execution_mode == 1
                 and int(os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE",
                                   "0") or "0") <= 2):
@@ -918,12 +1285,18 @@ class vLLMRollout(BaseRollout):
                 pass
             _log_custom_mode1_rollout_memory(
                 "before_update_weights_load_after_trim")
-        model.load_weights(weights)
-        self._refresh_gpu_buffer_aliases()
+        staged_weights = _materialize_rollout_weight_staging(weights)
+        model.load_weights(staged_weights)
+        refresh_gpu_buffer_aliases = getattr(self, "_refresh_gpu_buffer_aliases",
+                                             None)
+        if callable(refresh_gpu_buffer_aliases):
+            refresh_gpu_buffer_aliases()
+        staged_weights = []
         weights = []
         filtered_weights = []
         gc.collect()
         torch.npu.empty_cache()
+        _log_custom_mode1_rollout_state(self, "after_update_weights_load")
         _log_custom_mode1_rollout_memory("after_update_weights_load")
         ###new wj
     def get_record(self):
@@ -1083,7 +1456,11 @@ class vLLMAsyncRollout(BaseRollout):
 
             model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            model.load_weights(weights)
+            staged_weights = _materialize_rollout_weight_staging(list(weights))
+            model.load_weights(staged_weights)
+            staged_weights = []
+            gc.collect()
+            torch.npu.empty_cache()
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode."""

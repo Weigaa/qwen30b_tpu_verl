@@ -31,8 +31,21 @@ def _determine_primary_rank(global_expert_num, world_size, expert_id):
     return expert_id // local_num_experts
 
 
-def build_redundant_replica_expert_map(global_expert_num, world_size,
-                                       global_redundant_expert_num):
+def _can_use_balanced_cyclic_replica_layout(global_expert_num, world_size,
+                                            global_redundant_expert_num):
+    redundant = max(int(global_redundant_expert_num), 0)
+    if (global_expert_num <= 0 or world_size <= 1 or redundant <= 0
+            or global_expert_num % world_size != 0
+            or redundant % global_expert_num != 0):
+        return False
+    replica_rounds = redundant // global_expert_num
+    return replica_rounds <= (world_size - 1)
+
+
+def build_redundant_replica_expert_map(global_expert_num,
+                                       world_size,
+                                       global_redundant_expert_num,
+                                       prefer_balanced_cyclic: bool = False):
     expert_map_all = torch.full((world_size, global_expert_num),
                                 -1,
                                 dtype=torch.int32)
@@ -43,6 +56,32 @@ def build_redundant_replica_expert_map(global_expert_num, world_size,
                                                expert_id)
         expert_map_all[primary_rank, expert_id] = next_local_ids[primary_rank]
         next_local_ids[primary_rank] += 1
+
+    # Mode=1 floor-targeted redundancy wants an exact loaded-slot capacity on
+    # every rank. When the number of primary experts is already evenly split
+    # and the requested replica rounds are integral, assign each replica round
+    # with a fixed cyclic shift away from the primary rank. This preserves the
+    # per-expert uniqueness constraint while keeping every rank's slot count
+    # exactly aligned to the floor target (e.g. 32 for floor=4, 64 for floor=2).
+    if (prefer_balanced_cyclic
+            and _can_use_balanced_cyclic_replica_layout(
+                global_expert_num, world_size, global_redundant_expert_num)):
+        replica_rounds = max(int(global_redundant_expert_num), 0) // global_expert_num
+        for replica_round in range(replica_rounds):
+            shift = replica_round + 1
+            for expert_id in range(global_expert_num):
+                primary_rank = _determine_primary_rank(global_expert_num,
+                                                       world_size, expert_id)
+                target_rank = (primary_rank + shift) % world_size
+                if int(expert_map_all[target_rank, expert_id].item()) >= 0:
+                    raise RuntimeError(
+                        "Balanced cyclic replica placement hit a duplicate "
+                        f"assignment for expert_id={expert_id}, "
+                        f"primary_rank={primary_rank}, target_rank={target_rank}, "
+                        f"replica_round={replica_round}.")
+                expert_map_all[target_rank, expert_id] = next_local_ids[target_rank]
+                next_local_ids[target_rank] += 1
+        return expert_map_all
 
     for replica_idx in range(max(int(global_redundant_expert_num), 0)):
         expert_id = replica_idx % global_expert_num
@@ -102,9 +141,13 @@ def determine_default_expert_map(global_expert_num, world_size, rank_id,
 
 def determine_redundant_replica_expert_map(global_expert_num, world_size,
                                            rank_id,
-                                           global_redundant_expert_num):
+                                           global_redundant_expert_num,
+                                           prefer_balanced_cyclic: bool = False):
     expert_map_all = build_redundant_replica_expert_map(
-        global_expert_num, world_size, global_redundant_expert_num)
+        global_expert_num,
+        world_size,
+        global_redundant_expert_num,
+        prefer_balanced_cyclic=prefer_balanced_cyclic)
     local_count = int((expert_map_all[rank_id] != -1).sum().item())
     return local_count, expert_map_all[rank_id]
 
@@ -191,8 +234,12 @@ def determine_default_log2phy_map(global_expert_num, world_size, rank_id,
 
 def determine_redundant_replica_log2phy_map(global_expert_num, world_size,
                                             rank_id,
-                                            global_redundant_expert_num):
+                                            global_redundant_expert_num,
+                                            prefer_balanced_cyclic: bool = False):
     expert_map_all = build_redundant_replica_expert_map(
-        global_expert_num, world_size, global_redundant_expert_num)
+        global_expert_num,
+        world_size,
+        global_redundant_expert_num,
+        prefer_balanced_cyclic=prefer_balanced_cyclic)
     log2phy_map_all = generate_log2phy_map(expert_map_all)
     return log2phy_map_all[rank_id]
