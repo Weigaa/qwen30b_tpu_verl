@@ -1,0 +1,423 @@
+From dc34dd75f999717ddd77bc1255f6dc77bcfedeff Mon Sep 17 00:00:00 2001
+From: huiyingchen <chenhuiying4@huawei.com>
+Date: Thu, 27 Nov 2025 12:34:59 +0800
+Subject: [PATCH 2/2] Update vllm_ascend: support EPLB
+
+Enabling the EPLB feature requires setting the VLLM_ENABLE_EPLB environment variable to 1.
+---
+ .../vllm_ascend/eplb/adaptor/vllm_adaptor.py  | 39 +++++++++++++-----
+ .../eplb/core/eplb_device_transfer_loader.py  |  8 +++-
+ .../vllm_ascend/eplb/core/eplb_worker.py      | 12 +++---
+ .../qwen3/vllm_ascend/eplb/eplb_updator.py    |  7 +++-
+ llm_rl/qwen3/vllm_ascend/eplb/utils.py      |  8 ++++
+ llm_rl/qwen3/vllm_ascend/ops/fused_moe.py   | 16 +++++++-
+ .../torchair/ops/torchair_fused_moe.py        | 41 +++++++++++++++----
+ 7 files changed, 103 insertions(+), 28 deletions(-)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/eplb/adaptor/vllm_adaptor.py b/llm_rl/qwen3/vllm_ascend/eplb/adaptor/vllm_adaptor.py
+index d5ac509..896b068 100644
+--- a/llm_rl/qwen3/vllm_ascend/eplb/adaptor/vllm_adaptor.py
++++ b/llm_rl/qwen3/vllm_ascend/eplb/adaptor/vllm_adaptor.py
+@@ -20,6 +20,7 @@ from typing import Any
+ 
+ import torch
+ import torch.distributed as dist
++from vllm.distributed.parallel_state import get_ep_group
+ from vllm.logger import logger
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+@@ -33,6 +34,7 @@ class VllmEplbAdaptor(EplbAdaptor):
+         self.model = model
+         self.rank_id = dist.get_rank()
+         self.world_size = dist.get_world_size()
++        self.ep_size = get_ep_group().world_size
+         self.param_dict = dict(self.model.named_parameters())
+         if self.model.config.model_type == "qwen3_moe":
+             self.num_dense_layers = 0
+@@ -124,7 +126,7 @@ class VllmEplbAdaptor(EplbAdaptor):
+ 
+         for layer_idx in range(num_moe_layers):
+             self.expert_map_per_layer_cpu[self.num_dense_layers + layer_idx] = \
+-                all_expert_maps[layer_idx][self.rank_id]
++                all_expert_maps[layer_idx][self.rank_id % self.ep_size]
+ 
+         return all_expert_maps
+ 
+@@ -140,7 +142,7 @@ class VllmEplbAdaptor(EplbAdaptor):
+         for layer_idx in range(num_moe_layers):
+             if self.model.config.model_type == "qwen3_moe":
+                 self.expert_map_per_layer_cpu[layer_idx] = \
+-                    expert_map_all[layer_idx][self.rank_id]
++                    expert_map_all[layer_idx][self.rank_id % self.ep_size]
+             else:
+                 self.expert_map_per_layer_cpu[layer_idx + self.num_dense_layers] = \
+                     expert_map_all[layer_idx][self.rank_id]
+@@ -199,11 +201,11 @@ class VllmEplbAdaptor(EplbAdaptor):
+ 
+     def do_update_expert_weight(self, layer_id, local_expert_to_replace,
+                                 buffer_tensor_id):
+-        for expert_tensor, buffer_tensor in zip(
+-                self.expert_param_per_layer[layer_id][local_expert_to_replace],
+-                self.buffer_tensor_list[buffer_tensor_id]):
+-            expert_tensor = buffer_tensor.clone()
+-            logger.debug(f"Expert tensor shape is :{expert_tensor.shape}")
++        expert_params = self.expert_param_per_layer[layer_id][local_expert_to_replace]
++
++        for i, buffer_tensor in enumerate(self.buffer_tensor_list[buffer_tensor_id]):
++            expert_params[i].copy_(buffer_tensor)
++            logger.debug(f"Expert tensor shape is :{expert_params[i].shape}")
+ 
+     def do_update_log2phy_map(self, layer_id, updated_log2phy_map):
+         if self.log2phy_map_per_layer[layer_id] is not None:
+@@ -258,15 +260,15 @@ class VllmEplbAdaptor(EplbAdaptor):
+             local_ids = torch.arange(self.global_expert_num, dtype=torch.int32)
+             return local_ids.view(1, 1, -1).expand(self.num_moe_layers, 1, -1)
+ 
+-        local_num_experts = self.global_expert_num // self.world_size
++        local_num_experts = self.global_expert_num // self.ep_size
+ 
+         expert_map_all = torch.full(
+-            (self.num_moe_layers, self.world_size, self.global_expert_num),
++            (self.num_moe_layers, self.ep_size, self.global_expert_num),
+             -1,
+             dtype=torch.int32)
+ 
+-        for r in range(self.world_size):
+-            if r < self.world_size - 1:
++        for r in range(self.ep_size):
++            if r < self.ep_size - 1:
+                 start = r * local_num_experts
+                 end = (r + 1) * local_num_experts
+                 local_count = local_num_experts
+@@ -287,3 +289,18 @@ class VllmEplbAdaptor(EplbAdaptor):
+                 self.num_moe_layers, -1)
+ 
+         return expert_map_all
++
++    def release_memory(self):
++        if hasattr(self, 'buffer_tensor_list'):
++            for sub_list in self.buffer_tensor_list:
++                sub_list.clear()
++            self.buffer_tensor_list.clear()
++            del self.buffer_tensor_list
++
++        if hasattr(self, 'expert_param_per_layer'):
++            self.expert_param_per_layer.clear()
++            del self.expert_param_per_layer
++
++        if hasattr(self, 'log2phy_map_per_layer'):
++            self.log2phy_map_per_layer.clear()
++            del self.log2phy_map_per_layer
+diff --git a/llm_rl/qwen3/vllm_ascend/eplb/core/eplb_device_transfer_loader.py b/llm_rl/qwen3/vllm_ascend/eplb/core/eplb_device_transfer_loader.py
+index a170987..9427375 100644
+--- a/llm_rl/qwen3/vllm_ascend/eplb/core/eplb_device_transfer_loader.py
++++ b/llm_rl/qwen3/vllm_ascend/eplb/core/eplb_device_transfer_loader.py
+@@ -18,6 +18,7 @@ from enum import Enum
+ 
+ import torch.distributed as dist
+ from vllm.logger import logger
++from vllm.distributed.parallel_state import get_ep_group
+ 
+ 
+ class ExpertWeightUpdateState(Enum):
+@@ -36,6 +37,9 @@ class D2DExpertWeightLoader:
+         self.state = ExpertWeightUpdateState.WAITING
+         self.recv_expert_list = []
+         self.mock_flag = True
++        self.rank = dist.get_rank()
++        self.ep_size = get_ep_group().world_size
++        self.instance_id = (self.rank // self.ep_size)
+ 
+     def set_adator(self, eplb_adaptor):
+         self.eplb_adaptor = eplb_adaptor
+@@ -65,7 +69,7 @@ class D2DExpertWeightLoader:
+             for src_tensor in self.eplb_adaptor.expert_param_per_layer[
+                     layer_id][local_expert_id]:
+                 self.comm_op_list.append(
+-                    dist.P2POp(dist.isend, src_tensor, dst_rank))
++                    dist.P2POp(dist.isend, src_tensor, dst_rank + self.instance_id * self.ep_size))
+ 
+         buffer_tensor_id = 0
+         for recv_info in expert_recv_info:
+@@ -73,7 +77,7 @@ class D2DExpertWeightLoader:
+             for buffer_tensor in self.eplb_adaptor.buffer_tensor_list[
+                     buffer_tensor_id]:
+                 self.comm_op_list.append(
+-                    dist.P2POp(dist.irecv, buffer_tensor, recv_rank))
++                    dist.P2POp(dist.irecv, buffer_tensor, recv_rank + self.instance_id * self.ep_size))
+             local_expert_to_replace = self.updated_expert_map[
+                 global_expert_id_to_recv].item()
+             self.recv_expert_list.append(
+diff --git a/llm_rl/qwen3/vllm_ascend/eplb/core/eplb_worker.py b/llm_rl/qwen3/vllm_ascend/eplb/core/eplb_worker.py
+index cd460f8..0c61186 100644
+--- a/llm_rl/qwen3/vllm_ascend/eplb/core/eplb_worker.py
++++ b/llm_rl/qwen3/vllm_ascend/eplb/core/eplb_worker.py
+@@ -26,6 +26,7 @@ from vllm.logger import logger
+ from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map
+ from vllm_ascend.eplb.core.policy.policy_factory import (DynamicConfig,
+                                                          PolicyFactory)
++from vllm.distributed.parallel_state import get_ep_group
+ 
+ 
+ class EplbWorker:
+@@ -38,6 +39,7 @@ class EplbWorker:
+         self.old_expert_maps = None
+         self.enable_d2d = enable_d2d
+         self.rank_id = dist.get_rank()
++        self.ep_size = get_ep_group().world_size
+ 
+     def do_update(self):
+         # put data in to queue
+@@ -363,18 +365,18 @@ class EplbWorker:
+         layer_ids = []
+ 
+         for send_info, recv_info, new_expert_map, layer_id in update_info_generator:
+-
++            single_instance_rank = self.rank_id % self.ep_size
+             send_info_this_rank = send_info[
+-                self.rank_id] if self.rank_id in send_info else []
++                single_instance_rank] if single_instance_rank in send_info else []
+             recv_info_this_rank = recv_info[
+-                self.rank_id] if self.rank_id in recv_info else []
++                single_instance_rank] if single_instance_rank in recv_info else []
+             send_all.append(send_info_this_rank)
+             recv_all.append(recv_info_this_rank)
+ 
+-            maps.append(new_expert_map[self.rank_id].numpy().tolist())
++            maps.append(new_expert_map[single_instance_rank].numpy().tolist())
+ 
+             log2phy_map = generate_log2phy_map(new_expert_map)
+-            log2phy_all.append(log2phy_map[self.rank_id].numpy().tolist())
++            log2phy_all.append(log2phy_map[single_instance_rank].numpy().tolist())
+ 
+             layer_ids.append(layer_id)
+ 
+diff --git a/llm_rl/qwen3/vllm_ascend/eplb/eplb_updator.py b/llm_rl/qwen3/vllm_ascend/eplb/eplb_updator.py
+index 1f25f8f..3c157cb 100644
+--- a/llm_rl/qwen3/vllm_ascend/eplb/eplb_updator.py
++++ b/llm_rl/qwen3/vllm_ascend/eplb/eplb_updator.py
+@@ -19,6 +19,7 @@ import numpy
+ import torch
+ import torch.distributed as dist
+ import vllm.envs as envs
++from vllm.distributed.parallel_state import get_ep_group
+ from vllm.logger import logger
+ 
+ from vllm_ascend.eplb.core.eplb_worker import EplbProcess
+@@ -33,6 +34,8 @@ class EplbUpdator:
+         self.eplb_loader = loader
+         self.eplb_process = eplb_process
+         self.shared_dict = self.eplb_process.shared_dict
++        self.ep_size = get_ep_group().world_size
++        self.instance_num = (dist.get_world_size() // self.ep_size)
+ 
+     def set_adaptor(self, adaptor):
+         self.adaptor = adaptor
+@@ -150,12 +153,12 @@ class EplbUpdator:
+             self.world_size = dist.get_world_size()
+             self.device = local_load.device
+             if self._gather_buffer is None:
+-                shape = (self.world_size, *local_load.shape)
++                shape = (self.world_size // self.instance_num, *local_load.shape)
+                 self._gather_buffer = torch.empty(shape,
+                                                   dtype=local_load.dtype,
+                                                   device=self.device)
+ 
+-            dist.all_gather_into_tensor(self._gather_buffer, local_load)
++            dist.all_gather_into_tensor(self._gather_buffer, local_load, group=get_ep_group().device_group)
+ 
+             moe_load = self._gather_buffer.permute(1, 0, 2)
+             self.shared_dict["moe_load"] = moe_load.cpu()
+diff --git a/llm_rl/qwen3/vllm_ascend/eplb/utils.py b/llm_rl/qwen3/vllm_ascend/eplb/utils.py
+index 71b4487..0406c31 100644
+--- a/llm_rl/qwen3/vllm_ascend/eplb/utils.py
++++ b/llm_rl/qwen3/vllm_ascend/eplb/utils.py
+@@ -58,6 +58,13 @@ def clear_all_moe_loads(self):
+         self.model.layers[layer_id +
+                           num_dense_layers].mlp.experts.clear_moe_load()
+ 
++def reset_all_expert_map_and_log2phy(self):
++    num_dense_layers = self.num_dense_layers if hasattr(
++        self, "num_dense_layers") else 0
++    for layer_id in range(self.num_moe_layers):
++        self.model.layers[layer_id +
++                          num_dense_layers].mlp.experts.reset_expert_map_and_log2phy()
++
+ 
+ def model_register(model, model_config):
+     model.get_expert_map = types.MethodType(get_expert_map, model)
+@@ -65,6 +72,7 @@ def model_register(model, model_config):
+     model.get_all_expert_map = types.MethodType(get_all_expert_map, model)
+     model.get_all_moe_loads = types.MethodType(get_all_moe_loads, model)
+     model.clear_all_moe_loads = types.MethodType(clear_all_moe_loads, model)
++    model.reset_all_expert_map_and_log2phy = types.MethodType(reset_all_expert_map_and_log2phy, model)
+ 
+     config = model_config.hf_config
+ 
+diff --git a/llm_rl/qwen3/vllm_ascend/ops/fused_moe.py b/llm_rl/qwen3/vllm_ascend/ops/fused_moe.py
+index 97489f9..787f111 100644
+--- a/llm_rl/qwen3/vllm_ascend/ops/fused_moe.py
++++ b/llm_rl/qwen3/vllm_ascend/ops/fused_moe.py
+@@ -102,6 +102,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         is_prefill: bool = False,
+         enable_force_load_balance: bool = False,
+         shared_experts: Optional[Any] = None,
++        log2phy: Optional[Any] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+ 
+@@ -125,6 +126,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         if enable_force_load_balance and not self.use_aclgraph:
+             topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
+ 
++        if log2phy is not None:
++            topk_ids = log2phy[topk_ids]
+         moe_comm_method = get_forward_context().moe_comm_method
+         return moe_comm_method.fused_experts(
+             hidden_states=x,
+@@ -345,7 +348,7 @@ class AscendFusedMoE(FusedMoE):
+         return self.expert_map
+ 
+     def get_log2phy_map(self):
+-        return self.logical_to_physical_map
++        return self.log2phy
+ 
+     def clear_moe_load(self):
+         if self.moe_load is not None:
+@@ -436,6 +439,17 @@ class AscendFusedMoE(FusedMoE):
+         else:
+             return final_hidden_states
+ 
++    def reset_expert_map_and_log2phy(self):
++        _, expert_map = determine_default_expert_map(
++            self.global_num_experts, self.ep_size, self.ep_rank,
++            self.global_redundant_expert_num)
++        log2phy = determine_default_log2phy_map(
++            self.global_num_experts, self.ep_size, self.ep_rank,
++            self.global_redundant_expert_num).npu()
++
++        self.expert_map.copy_(expert_map)
++        self.log2phy.copy_(log2phy)
++
+     # ----------------------------------------- TBO-related --------------------------------------------
+ 
+     def _forward_ms_fused_moe_comp(
+diff --git a/llm_rl/qwen3/vllm_ascend/torchair/ops/torchair_fused_moe.py b/llm_rl/qwen3/vllm_ascend/torchair/ops/torchair_fused_moe.py
+index a58b281..56d5c51 100644
+--- a/llm_rl/qwen3/vllm_ascend/torchair/ops/torchair_fused_moe.py
++++ b/llm_rl/qwen3/vllm_ascend/torchair/ops/torchair_fused_moe.py
+@@ -116,6 +116,7 @@ def torchair_fused_experts_with_mc2(
+     shared_experts: Optional[Any] = None,
+     is_torchair: bool = False,
+     mc2_mask: Optional[torch.Tensor] = None,
++    dynamic_eplb: bool = False,
+ ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+     quant_mode = 0
+     ep_rank_id = moe_parallel_config.ep_rank
+@@ -245,6 +246,9 @@ def torchair_fused_experts_with_mc2(
+         **kwargs_mc2)
+ 
+     if shared_experts is None:
++        if dynamic_eplb:
++            # The second return value is group_list_type, which is 1.
++            return (hidden_states, 1, group_list)
+         return hidden_states
+     else:
+         with npu_stream_switch("moe_secondary", 0):
+@@ -437,6 +441,7 @@ def torchair_fused_experts_with_all2all(
+         )
+     if len(original_shape) == 3:
+         final_hidden_states = final_hidden_states.view(original_shape)
++
+     return final_hidden_states
+ 
+ 
+@@ -854,6 +859,7 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         self.max_model_len = vllm_config.model_config.max_model_len
+ 
+         ascend_config = get_ascend_config()
++        self.dynamic_eplb = ascend_config.dynamic_eplb
+         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
+         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
+ 
+@@ -895,6 +901,7 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         is_prefill: bool = False,
+         enable_force_load_balance: bool = False,
+         shared_experts: Optional[Any] = None,
++        log2phy: Optional[Any] = None,
+         **kwargs,
+     ) -> torch.Tensor:
+ 
+@@ -936,6 +943,9 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+         if enable_force_load_balance and not self.use_aclgraph:
+             topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
+ 
++        if log2phy is not None:
++            topk_ids = log2phy[topk_ids]
++
+         fused_moe_state = get_forward_context().fused_moe_state
+         if self.enable_shared_expert_dp and fused_moe_state == FusedMoEState.MC2:
+             fused_moe_state = FusedMoEState.All2All
+@@ -952,7 +962,8 @@ class TorchairAscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+                 expert_map=expert_map,
+                 moe_all_to_all_group_name=self.moe_all_to_all_group_name,
+                 shared_experts=shared_experts,
+-                mc2_mask=kwargs.get("mc2_mask", None))
++                mc2_mask=kwargs.get("mc2_mask", None),
++                dynamic_eplb=self.dynamic_eplb)
+         elif fused_moe_state in [
+                 FusedMoEState.AllGather, FusedMoEState.NaiveMulticast
+         ]:
+@@ -1335,14 +1346,19 @@ class TorchairAscendFusedMoE(FusedMoE):
+             dynamic_scale_for_share=dynamic_scale_for_share,
+         )
+ 
++        group_list_type = None
++
+         if shared_experts:
+-            if isinstance(e_hidden_states, tuple):
++            if isinstance(e_hidden_states,
++                          tuple) and len(e_hidden_states) == 2:
+                 e_hidden_states, shared_hidden_states = e_hidden_states
+ 
+-        if self.dynamic_eplb and isinstance(
+-                e_hidden_states, tuple) and len(e_hidden_states) == 3:
+-            self.moe_load += e_hidden_states[2] if e_hidden_states[1] == 0 else \
+-                torch.cat(e_hidden_states[2][:1], e_hidden_states[2][1:] - e_hidden_states[2][:-1])
++        if isinstance(e_hidden_states, tuple) and len(e_hidden_states) == 3:
++            e_hidden_states, group_list_type, expert_tokens = e_hidden_states
++
++        if self.dynamic_eplb and group_list_type is not None:
++            self.moe_load += expert_tokens if group_list_type else \
++                torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
+ 
+         if (fused_moe_state not in [
+                 FusedMoEState.AllGather, FusedMoEState.AllGatherEP,
+@@ -1395,12 +1411,23 @@ class TorchairAscendFusedMoE(FusedMoE):
+         return self.expert_map
+ 
+     def get_log2phy_map(self):
+-        return self.logical_to_physical_map
++        return self.log2phy
+ 
+     def clear_moe_load(self):
+         if self.moe_load is not None:
+             self.moe_load.zero_()
+ 
++    def reset_expert_map_and_log2phy(self):
++        _, expert_map = determine_default_expert_map(
++            self.global_num_experts, self.ep_size, self.ep_rank,
++            self.global_redundant_expert_num)
++        log2phy = determine_default_log2phy_map(
++            self.global_num_experts, self.ep_size, self.ep_rank,
++            self.global_redundant_expert_num).npu()
++
++        self.expert_map.copy_(expert_map)
++        self.log2phy.copy_(log2phy)
++
+     # ----------------------------------------- TBO-related --------------------------------------------
+ 
+     def _forward_ms_fused_moe_comp(
+-- 
+2.28.0.windows.1
+

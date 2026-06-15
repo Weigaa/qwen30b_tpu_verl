@@ -1,0 +1,57 @@
+From 4a0835dbfd635d9d318283d7c26df51cc0da549b Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi2@huawei.com>
+Date: Fri, 5 Dec 2025 10:56:07 +0800
+Subject: [PATCH] Fix DataProto concat bug
+
+DataProto concat bug when timing generate_sequences is sightly different
+https://github.com/volcengine/verl/pull/4030
+---
+ llm_rl/qwen3/verl/protocol.py | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/llm_rl/qwen3/verl/protocol.py b/llm_rl/qwen3/verl/protocol.py
+index e0b1aff..fda1e7c 100644
+--- a/llm_rl/qwen3/verl/protocol.py
++++ b/llm_rl/qwen3/verl/protocol.py
+@@ -940,6 +940,24 @@ class DataProto:
+         for key, val in non_tensor_batch.items():
+             non_tensor_batch[key] = np.concatenate(val, axis=0)
+ 
++        def meta_info_equal(a, b):
++            if type(a) is not type(b):
++                return False
++            if isinstance(a, dict):
++                if a.keys() != b.keys():
++                    return False
++                for key, val_a in a.items():
++                    val_b = b[key]
++                    # generate_sequences in different meta_info may be slightly different;
++                    # allow a 10% tolerance for the generate_sequences field.
++                    if key == "generate_sequences" and isinstance(val_a, float) and isinstance(val_b, float):
++                        if not math.isclose(val_a, val_b, rel_tol=0.1):
++                            return False
++                    elif not meta_info_equal(val_a, val_b):
++                        return False
++                return True
++            return a == b
++
+         # Merge meta_info with special handling for metrics
+         merged_meta_info = {}
+         if data:
+@@ -956,7 +974,12 @@ class DataProto:
+                     else:
+                         if k in merged_meta_info:
+                             # Ensure consistency for overlapping non-metric keys
+-                            assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
++                            if k == "timing":
++                                assert meta_info_equal(merged_meta_info[k], v), (
++                                    f"Conflicting values for meta_info key '{k}'"
++                                )
++                            else:
++                                assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
+                         else:
+                             merged_meta_info[k] = v
+ 
+-- 
+2.50.1.windows.1
+

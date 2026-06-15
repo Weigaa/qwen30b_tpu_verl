@@ -1,0 +1,37 @@
+From 233fadd6ac6259494429fe104f66c49a90ddaaf9 Mon Sep 17 00:00:00 2001
+From: qushiyi <qushiyi@huawei.com>
+Date: Wed, 26 Nov 2025 18:19:26 +0800
+Subject: [PATCH] megatron-feature-enable_hdp
+
+---
+ .../megatron/core/models/common/embeddings/rope_utils.py   | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/llm_rl/qwen3/megatron/core/models/common/embeddings/rope_utils.py b/llm_rl/qwen3/megatron/core/models/common/embeddings/rope_utils.py
+index 08c9457..b38a6ca 100644
+--- a/llm_rl/qwen3/megatron/core/models/common/embeddings/rope_utils.py
++++ b/llm_rl/qwen3/megatron/core/models/common/embeddings/rope_utils.py
+@@ -43,6 +43,8 @@ try:
+ except ImportError:
+     apply_rotary_emb_flash = None
+ 
++from patches.verl.utils.hybrid_data_parallel.utils import set_batch_hdp_group, get_batch_hdp_group
++
+ 
+ __all__ = ['apply_rotary_emb_flash']
+ 
+@@ -159,6 +161,11 @@ def _apply_rotary_pos_emb_thd(
+ 
+     cp_size = parallel_state.get_context_parallel_world_size()
+     cp_rank = parallel_state.get_context_parallel_rank()
++    batch_hdp_group = get_batch_hdp_group()
++    if batch_hdp_group is not None:
++        hdp_group = next(group for group in batch_hdp_group if cp_rank in group)
++        cp_size = len(hdp_group)
++        cp_rank = hdp_group.index(cp_rank)
+     cu_seqlens = cu_seqlens // cp_size
+     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+ 
+-- 
+2.50.1.windows.1
+
