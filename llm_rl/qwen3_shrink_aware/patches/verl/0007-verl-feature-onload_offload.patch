@@ -1,0 +1,254 @@
+From c2b90d7c7f5affb6cfdffd650a03c696844a122c Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Wed, 12 Nov 2025 15:33:07 +0800
+Subject: [PATCH] Update verl: vllm_rollout_spmd
+
+Add configurations related to TorchAir graph mode, to adapt to the usage requirements of graph mode.
+
+To address the issue where vLLM's sleep mode on NPU may cause incomplete memory offloading,
+add functions such as `init_cache_engine`, `onload_model_weights`, `offload_model_weights`,
+and `free_cache_engine` to manually implement the offloading of models and KV cache.
+
+---
+ .../rollout/vllm_rollout/vllm_rollout_spmd.py | 150 ++++++++++++++++--
+ 1 file changed, 133 insertions(+), 17 deletions(-)
+
+diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index 990e90d..133160e 100644
+--- a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -28,6 +28,7 @@ When working with Megatron:
+ 
+ import asyncio
+ import getpass
++import gc
+ import inspect
+ import logging
+ import os
+@@ -100,7 +101,12 @@ class vLLMRollout(BaseRollout):
+         model_config: HFModelConfig,
+         device_mesh: DeviceMesh,
+     ):
+-        super().__init__(config, model_config, device_mesh)
++        self.config = config
++        self.model_config = model_config
++        self.device_mesh = device_mesh
++
++        from vllm_ascend.patch import platform
++        from vllm_ascend.patch import worker
+ 
+         if config.layered_summon:
+             self.sleep_level = 1
+@@ -123,6 +129,11 @@ class vLLMRollout(BaseRollout):
+         )
+         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+ 
++        #If VLLM_DP_SIZE is configured, the DP communication domain needs to be explicitly initialized.
++        if int(os.environ.get("VLLM_DP_SIZE", "1")) > 1:
++            from r1_ascend.vllm_parallel_state import init_parallel_state
++            init_parallel_state(tensor_parallel_size)
++
+         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+         if not rope_scaling_config:
+             max_position_embeddings = None
+@@ -158,12 +169,6 @@ class vLLMRollout(BaseRollout):
+ 
+         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
+ 
+-        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+-            raise ValueError(
+-                "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+-                             please increase max_num_batched_tokens or disable chunked prefill"
+-            )
+-
+         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+ 
+         # copy it to avoid secretly modifying the engine config
+@@ -191,13 +196,14 @@ class vLLMRollout(BaseRollout):
+ 
+         self.inference_engine = LLM(
+             model=model_path,
+-            enable_sleep_mode=config.free_cache_engine,
++            enable_sleep_mode=False,
+             tensor_parallel_size=tensor_parallel_size,
+             distributed_executor_backend="external_launcher",
+             dtype=config.dtype,
+             enforce_eager=config.enforce_eager,
+             gpu_memory_utilization=config.gpu_memory_utilization,
+             disable_custom_all_reduce=True,
++            enable_expert_parallel=True,
+             skip_tokenizer_init=False,
+             max_model_len=max_model_len,
+             max_num_seqs=config.max_num_seqs,
+@@ -205,14 +211,41 @@ class vLLMRollout(BaseRollout):
+             disable_log_stats=config.disable_log_stats,
+             max_num_batched_tokens=max_num_batched_tokens,
+             enable_chunked_prefill=config.enable_chunked_prefill,
+-            enable_prefix_caching=config.enable_prefix_caching,
++            enable_prefix_caching=False,
+             trust_remote_code=trust_remote_code,
+             seed=config.get("seed", 0),
++            additional_config={
++                "torchair_graph_config": {
++                    "enabled": int(os.environ.get("VLLM_ENABLE_GRAPH_MODE", "0")),
++                    "use_cached_graph": False,
++                    "graph_batch_sizes_init": True,
++                    "enable_multistream_mla": False,
++                    "enable_zero_tp_to_ep": True,
++                    "enable_view_optimize": False,
++                    "enable_kv_nz": False,
++                    "enable_frozen_parameter": False,
++                },
++                "ascend_scheduler_config": {
++                    "enabled": True,
++                    "enable_chunked_prefill": False,
++                },
++                "refresh": True,
++            },
+             **compilation_config,
+             **self.lora_kwargs,
+             **engine_kwargs,
+         )
+ 
++        # Offload vllm model to reduce peak memory usage
++        self.model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
++        self.kv_cache_configs = None
++        self.cpu_model = {}
++        self.gpu_buffers = None
++        for name, params in self.model.named_parameters():
++            self.cpu_model[name] = torch.empty_like(params, device="cpu")
++        self.free_cache_engine()
++        self.offload_model_weights()
++
+         kwargs = dict(
+             n=1,
+             logprobs=0,  # can be set to 0 and let actor to recompute
+@@ -232,6 +265,90 @@ class vLLMRollout(BaseRollout):
+ 
+         self.pad_token_id = tokenizer.pad_token_id
+ 
++    def init_cache_engine(self):
++        if os.environ['VLLM_USE_V1'] == '1':
++            worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
++            if not worker.model_runner.kv_caches:
++                # v1 Use Explicit Initialization Method
++                self.inference_engine.llm_engine.engine_core.engine_core.model_executor.initialize_from_config(
++                    self.inference_engine.llm_engine.engine_core.engine_core.kv_cache_configs)
++                self.inference_engine.llm_engine.reset_prefix_cache()
++        else:
++            if self.inference_engine.llm_engine.model_executor.driver_worker.worker.cache_engine is None:
++                self.inference_engine.llm_engine.model_executor.driver_worker.worker._init_cache_engine()
++
++    def onload_model_weights(self):
++        """
++        Advantages over model.cuda():
++        1) Avoids CPU to GPU data transfer entirely, leveraging pre-allocated GPU buffers
++        instead of copying data from CPU tensors.
++        2) Eliminates the recursive traversal of submodules inherent in .cuda(),
++        which can be particularly slow for deeply nested model architectures.
++        """
++        self.gpu_buffers = {}
++        for name, param in self.model.named_parameters():
++            self.gpu_buffers[name] = torch.empty_like(
++                param, device='cuda'
++            )
++        for name, param in self.model.named_parameters():
++            param.data = self.gpu_buffers[name]
++
++    def offload_model_weights(self):
++        for name, params in self.model.named_parameters():
++            params.data = self.cpu_model[name]
++
++        if hasattr(self.model.model.layers[0].self_attn, "mla_attn"):
++            for i in range(self.model.model.start_layer, self.model.model.end_layer):
++                mla = self.model.model.layers[i].self_attn.mla_attn.impl
++                if hasattr(mla, "w_kc"):
++                    mla.w_kc = None
++                    mla.w_vc = None
++                if hasattr(mla, "W_UV"):
++                    mla.W_UV = None
++                    mla.W_UK_T = None
++        self.gpu_buffers = None
++        gc.collect()
++        torch.npu.empty_cache()
++
++    def free_cache_engine(self):
++        if os.environ['VLLM_USE_V1'] == '1':
++            worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
++            ctx = worker.model_runner.vllm_config.compilation_config.static_forward_context
++        else:
++            ctx = self.inference_engine.llm_engine.model_executor.driver_worker.worker.compilation_config.static_forward_context
++        from vllm.attention import AttentionType
++
++        layer_need_kv_cache = []
++        for layer_name in ctx:
++            if hasattr(ctx[layer_name], 'attn_type') and ctx[layer_name].attn_type in (AttentionType.DECODER, AttentionType.ENCODER_DECODER):
++                layer_need_kv_cache.append(layer_name)
++
++        pipeline_parallel_size = self.inference_engine.llm_engine.vllm_config.parallel_config.pipeline_parallel_size
++        for layer_name in layer_need_kv_cache:
++            kv_cache = []
++            for _ in range(pipeline_parallel_size):
++                kv_cache.append(torch.tensor([]))
++            ctx[layer_name].kv_cache = kv_cache
++
++        if os.environ['VLLM_USE_V1'] == '1':
++            worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
++
++            # Clearing the cache engine
++            worker.model_runner.kv_caches = []
++        else:
++            self.inference_engine.llm_engine.model_executor.driver_worker.worker.cache_engine = None
++            self.inference_engine.llm_engine.model_executor.driver_worker.worker.gpu_cache = None
++
++        if hasattr(self.model.model.layers[0].self_attn, "attn"):
++            for i in range(self.model.model.start_layer, self.model.model.end_layer):
++                attn_impl = self.model.model.layers[i].self_attn.attn.impl
++                if hasattr(attn_impl, "key_cache"):
++                    attn_impl.key_cache = None
++                    attn_impl.value_cache = None
++
++        gc.collect()
++        torch.npu.empty_cache()
++
+     @contextmanager
+     def update_sampling_params(self, **kwargs):
+         # update sampling params
+@@ -417,19 +534,18 @@ class vLLMRollout(BaseRollout):
+         if not self.config.free_cache_engine:
+             return
+ 
+-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+-            self.inference_engine.wake_up(tags=tags)
+-        else:
+-            self.inference_engine.wake_up()
++        if "weights" in tags:
++            self.onload_model_weights()
++        elif "kv_cache" in tags:
++            self.init_cache_engine()
+ 
+     async def release(self):
+         """Release weights and kv cache in GPU memory."""
+-        self.inference_engine.reset_prefix_cache()
+-
+         if not self.config.free_cache_engine:
+             return
+ 
+-        self.inference_engine.sleep(level=self.sleep_level)
++        self.free_cache_engine()
++        self.offload_model_weights()
+ 
+     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
+         """Update the weights of the rollout model.
+@@ -452,7 +568,7 @@ class vLLMRollout(BaseRollout):
+         else:
+             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+ 
+-            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
++            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
+             patch_vllm_moe_model_weight_loader(model)
+             model.load_weights(weights)
+ 
+-- 
+2.50.1.windows.1
+

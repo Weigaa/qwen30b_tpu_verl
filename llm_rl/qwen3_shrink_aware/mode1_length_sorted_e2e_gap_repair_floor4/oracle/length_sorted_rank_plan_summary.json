@@ -1,0 +1,167 @@
+[
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 91628.4,
+    "max_rank_peak_tokens": 78990.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 3768.0,
+    "rank_adjusted_peak_range": [
+      29751.68,
+      91628.4
+    ],
+    "rank_load_gap_range": [
+      4.0,
+      182.0
+    ],
+    "rank_load_gap_sum": 1172.0,
+    "rank_load_range": [
+      1624.0,
+      3768.0
+    ],
+    "rank_matching_objective": "minimize sum |m_i-m_j| among pairings with adjusted peak <= kv_cap; fallback to minimum feasible adjusted peak only when no cap-feasible perfect matching exists",
+    "rank_peak_range": [
+      25648.0,
+      78990.0
+    ],
+    "rank_token_sum_range": [
+      36579.0,
+      96414.0
+    ],
+    "step": 1
+  },
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 119955.59999999998,
+    "max_rank_peak_tokens": 103410.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 5881.0,
+    "rank_adjusted_peak_range": [
+      68115.2,
+      119955.59999999998
+    ],
+    "rank_load_gap_range": [
+      8.0,
+      208.0
+    ],
+    "rank_load_gap_sum": 1309.0,
+    "rank_load_range": [
+      3925.0,
+      5881.0
+    ],
+    "rank_matching_objective": "minimize sum |m_i-m_j| among pairings with adjusted peak <= kv_cap; fallback to minimum feasible adjusted peak only when no cap-feasible perfect matching exists",
+    "rank_peak_range": [
+      58720.0,
+      103410.0
+    ],
+    "rank_token_sum_range": [
+      87864.0,
+      147500.0
+    ],
+    "step": 2
+  },
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 199787.96,
+    "max_rank_peak_tokens": 172231.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 8396.0,
+    "rank_adjusted_peak_range": [
+      94359.04,
+      199787.96
+    ],
+    "rank_load_gap_range": [
+      0.0,
+      292.0
+    ],
+    "rank_load_gap_sum": 1269.0,
+    "rank_load_range": [
+      6071.0,
+      8396.0
+    ],
+    "rank_matching_objective": "minimize sum |m_i-m_j| among pairings with adjusted peak <= kv_cap; fallback to minimum feasible adjusted peak only when no cap-feasible perfect matching exists",
+    "rank_peak_range": [
+      81344.0,
+      172231.0
+    ],
+    "rank_token_sum_range": [
+      133293.0,
+      219824.0
+    ],
+    "step": 3
+  },
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 271102.44,
+    "max_rank_peak_tokens": 262144.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 16384.0,
+    "rank_adjusted_peak_range": [
+      165891.59999999998,
+      271102.44
+    ],
+    "rank_load_gap_range": [
+      14.0,
+      5094.0
+    ],
+    "rank_load_gap_sum": 21929.0,
+    "rank_load_range": [
+      9080.0,
+      16384.0
+    ],
+    "rank_matching_objective": "minimize sum |m_i-m_j| among pairings with adjusted peak <= kv_cap; fallback to minimum feasible adjusted peak only when no cap-feasible perfect matching exists",
+    "rank_peak_range": [
+      143010.0,
+      262144.0
+    ],
+    "rank_token_sum_range": [
+      200462.0,
+      400415.0
+    ],
+    "step": 4
+  },
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 278673.75999999995,
+    "max_rank_peak_tokens": 240236.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 16384.0,
+    "rank_adjusted_peak_range": [
+      166693.16,
+      278673.75999999995
+    ],
+    "rank_load_gap_range": [
+      0.0,
+      7551.0
+    ],
+    "rank_load_gap_sum": 41159.0,
+    "rank_load_range": [
+      12552.0,
+      16384.0
+    ],
+    "rank_matching_objective": "minimize sum |m_i-m_j| among pairings with adjusted peak <= kv_cap; fallback to minimum feasible adjusted peak only when no cap-feasible perfect matching exists",
+    "rank_peak_range": [
+      143701.0,
+      240236.0
+    ],
+    "rank_token_sum_range": [
+      243264.0,
+      385915.0
+    ],
+    "step": 5
+  }
+]

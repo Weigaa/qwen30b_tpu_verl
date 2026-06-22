@@ -1,0 +1,162 @@
+[
+  {
+    "donor_peak_range": [
+      27325.0,
+      42363.0
+    ],
+    "donor_range": [
+      2177.0,
+      2698.0
+    ],
+    "expect_16_to_8": true,
+    "expect_8_to_4": true,
+    "feasible": true,
+    "final_peak_range": [
+      163557.0,
+      266944.0
+    ],
+    "final_range": [
+      16384.0,
+      16384.0
+    ],
+    "max_rank_peak_tokens": 266944.0,
+    "objective": 720.0,
+    "step": 1,
+    "wave_peak_range": [
+      87536.0,
+      126360.0
+    ],
+    "wave_range": [
+      7595.0,
+      7794.0
+    ]
+  },
+  {
+    "donor_peak_range": [
+      46764.0,
+      59616.0
+    ],
+    "donor_range": [
+      3166.0,
+      3768.0
+    ],
+    "expect_16_to_8": true,
+    "expect_8_to_4": true,
+    "feasible": true,
+    "final_peak_range": [
+      194964.0,
+      262144.0
+    ],
+    "final_range": [
+      16384.0,
+      16384.0
+    ],
+    "max_rank_peak_tokens": 262144.0,
+    "objective": 975.0,
+    "step": 2,
+    "wave_peak_range": [
+      135098.0,
+      161550.0
+    ],
+    "wave_range": [
+      8023.0,
+      8396.0
+    ]
+  },
+  {
+    "donor_peak_range": [
+      61282.0,
+      69570.0
+    ],
+    "donor_range": [
+      4499.0,
+      4892.0
+    ],
+    "expect_16_to_8": true,
+    "expect_8_to_4": true,
+    "feasible": true,
+    "final_peak_range": [
+      171717.0,
+      255456.0
+    ],
+    "final_range": [
+      16384.0,
+      16384.0
+    ],
+    "max_rank_peak_tokens": 255456.0,
+    "objective": 699.0,
+    "step": 3,
+    "wave_peak_range": [
+      150904.0,
+      172318.0
+    ],
+    "wave_range": [
+      8843.0,
+      9149.0
+    ]
+  },
+  {
+    "donor_peak_range": [
+      70128.0,
+      94016.0
+    ],
+    "donor_range": [
+      5394.0,
+      5881.0
+    ],
+    "expect_16_to_8": true,
+    "expect_8_to_4": true,
+    "feasible": true,
+    "final_peak_range": [
+      182080.0,
+      254388.0
+    ],
+    "final_range": [
+      16384.0,
+      16384.0
+    ],
+    "max_rank_peak_tokens": 254388.0,
+    "objective": 1321.0,
+    "step": 4,
+    "wave_peak_range": [
+      143010.0,
+      166779.0
+    ],
+    "wave_range": [
+      9616.0,
+      10450.0
+    ]
+  },
+  {
+    "donor_peak_range": [
+      97300.0,
+      111188.0
+    ],
+    "donor_range": [
+      6757.0,
+      7094.0
+    ],
+    "expect_16_to_8": true,
+    "expect_8_to_4": true,
+    "feasible": true,
+    "final_peak_range": [
+      177990.0,
+      225370.0
+    ],
+    "final_range": [
+      16384.0,
+      16384.0
+    ],
+    "max_rank_peak_tokens": 225370.0,
+    "objective": 677.0,
+    "step": 5,
+    "wave_peak_range": [
+      194670.0,
+      209250.0
+    ],
+    "wave_range": [
+      10881.0,
+      11221.0
+    ]
+  }
+]

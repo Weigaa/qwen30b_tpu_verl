@@ -1,0 +1,137 @@
+[
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 58578.84,
+    "max_rank_peak_tokens": 50499.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 3768.0,
+    "rank_adjusted_peak_range": [
+      31696.999999999996,
+      58578.84
+    ],
+    "rank_load_range": [
+      2327.0,
+      3768.0
+    ],
+    "rank_peak_range": [
+      27325.0,
+      50499.0
+    ],
+    "rank_token_sum_range": [
+      50089.0,
+      77996.0
+    ],
+    "step": 1
+  },
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 95166.4,
+    "max_rank_peak_tokens": 82040.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 5881.0,
+    "rank_adjusted_peak_range": [
+      72755.2,
+      95166.4
+    ],
+    "rank_load_range": [
+      4651.0,
+      5881.0
+    ],
+    "rank_peak_range": [
+      62720.0,
+      82040.0
+    ],
+    "rank_token_sum_range": [
+      103713.0,
+      119001.0
+    ],
+    "step": 2
+  },
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 144072.0,
+    "max_rank_peak_tokens": 124200.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 8396.0,
+    "rank_adjusted_peak_range": [
+      94133.99999999999,
+      144072.0
+    ],
+    "rank_load_range": [
+      6846.0,
+      8396.0
+    ],
+    "rank_peak_range": [
+      81150.0,
+      124200.0
+    ],
+    "rank_token_sum_range": [
+      144784.0,
+      179736.0
+    ],
+    "step": 3
+  },
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 262144.0,
+    "max_rank_peak_tokens": 262144.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 16384.0,
+    "rank_adjusted_peak_range": [
+      165891.59999999998,
+      262144.0
+    ],
+    "rank_load_range": [
+      9616.0,
+      16384.0
+    ],
+    "rank_peak_range": [
+      143010.0,
+      262144.0
+    ],
+    "rank_token_sum_range": [
+      228761.0,
+      400100.0
+    ],
+    "step": 4
+  },
+  {
+    "active_peak_safety_factor": 1.16,
+    "adjusted_peak_definition": "A(min(mu * response_len, max_response_len))",
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_adjusted_rank_peak_tokens": 278673.75999999995,
+    "max_rank_peak_tokens": 240236.0,
+    "max_response_len": 16384.0,
+    "predicted_step_exit": 16384.0,
+    "rank_adjusted_peak_range": [
+      166693.16,
+      278673.75999999995
+    ],
+    "rank_load_range": [
+      12552.0,
+      16384.0
+    ],
+    "rank_peak_range": [
+      143701.0,
+      240236.0
+    ],
+    "rank_token_sum_range": [
+      243264.0,
+      388381.0
+    ],
+    "step": 5
+  }
+]

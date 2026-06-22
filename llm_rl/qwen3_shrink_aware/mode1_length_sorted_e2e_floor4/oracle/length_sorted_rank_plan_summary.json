@@ -1,0 +1,97 @@
+[
+  {
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_rank_peak_tokens": 52320.0,
+    "predicted_step_exit": 3768.0,
+    "rank_load_range": [
+      2327.0,
+      3768.0
+    ],
+    "rank_peak_range": [
+      27325.0,
+      52320.0
+    ],
+    "rank_token_sum_range": [
+      50089.0,
+      81081.0
+    ],
+    "step": 1
+  },
+  {
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_rank_peak_tokens": 82264.0,
+    "predicted_step_exit": 5881.0,
+    "rank_load_range": [
+      4651.0,
+      5881.0
+    ],
+    "rank_peak_range": [
+      62720.0,
+      82264.0
+    ],
+    "rank_token_sum_range": [
+      102856.0,
+      126298.0
+    ],
+    "step": 2
+  },
+  {
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_rank_peak_tokens": 130740.0,
+    "predicted_step_exit": 8396.0,
+    "rank_load_range": [
+      6846.0,
+      8396.0
+    ],
+    "rank_peak_range": [
+      81150.0,
+      130740.0
+    ],
+    "rank_token_sum_range": [
+      144784.0,
+      184250.0
+    ],
+    "step": 3
+  },
+  {
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_rank_peak_tokens": 191313.0,
+    "predicted_step_exit": 11939.0,
+    "rank_load_range": [
+      9616.0,
+      11939.0
+    ],
+    "rank_peak_range": [
+      143010.0,
+      191313.0
+    ],
+    "rank_token_sum_range": [
+      227510.0,
+      260340.0
+    ],
+    "step": 4
+  },
+  {
+    "feasible": true,
+    "kv_cap": 280576.0,
+    "max_rank_peak_tokens": 271422.0,
+    "predicted_step_exit": 16384.0,
+    "rank_load_range": [
+      15837.0,
+      16384.0
+    ],
+    "rank_peak_range": [
+      158304.0,
+      271422.0
+    ],
+    "rank_token_sum_range": [
+      285150.0,
+      433936.0
+    ],
+    "step": 5
+  }
+]

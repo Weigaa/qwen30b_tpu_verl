@@ -1,0 +1,35 @@
+
+# large experiment logs
+wjeagerqwen30b-a3b-eager_*.txt
+*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# HuggingFace and vllm cache
+.cache/
+
+# Lock files
+Ascend/latest/.lock/
+
+# ATC kernel cache
+atc_data/
+
+# IDE settings
+.vscode/
+
+# External repos
+fastrl/
+
+# Kernel meta
+kernel_meta/
+
+# Experiment results and outputs
+noresample_baseline/
+noresample_result_*/
+resample_result_*/
+save4eagle3resampler/
+outputs/
+tensorboard_log/

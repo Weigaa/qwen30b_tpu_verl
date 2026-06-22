@@ -1,0 +1,518 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+from dataclasses import dataclass
+from typing import Any, Optional
+
+import numpy as np
+import torch
+from omegaconf import DictConfig, OmegaConf
+
+from verl import DataProto
+from vllm_ascend.shrink_aware import (
+    PromptAssignment,
+    PromptAssignmentPlan,
+    assign_prompts_to_ranks,
+    build_reorder_indices,
+    parse_rank_list,
+    parse_rank_topology,
+    plan_survivor_ranks,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ShrinkAwareScheduleResult:
+    enabled: bool
+    reorder_indices: list[int]
+    restore_indices: list[int]
+    assignment_plan: Optional[PromptAssignmentPlan]
+    role_plan: Any
+    fallback_reason: Optional[str] = None
+
+
+def maybe_apply_shrink_aware_schedule(
+    gen_batch: DataProto,
+    rollout_config: Any,
+    sampler: Any = None,
+    *,
+    world_size: Optional[int] = None,
+) -> ShrinkAwareScheduleResult:
+    shrink_cfg = _get_shrink_aware_config(rollout_config)
+    if not _cfg_bool(shrink_cfg, "enable_shrink_aware_scheduling", False):
+        return ShrinkAwareScheduleResult(False, [], [], None, None, "disabled")
+    mode = str(_cfg_get(shrink_cfg, "shrink_aware_mode", "off")).lower()
+    if mode == "off":
+        return ShrinkAwareScheduleResult(False, [], [], None, None, "mode_off")
+
+    batch_size = len(gen_batch)
+    if batch_size <= 0:
+        return ShrinkAwareScheduleResult(False, [], [], None, None, "empty_batch")
+
+    world_size = int(world_size or _infer_world_size(rollout_config))
+    role_plan = plan_survivor_ranks(
+        world_size=world_size,
+        shrink_stages=_cfg_get(shrink_cfg, "shrink_stages", [8, 4]),
+        package_topology=parse_rank_topology(
+            _cfg_get(shrink_cfg, "package_topology", None),
+            world_size=world_size),
+        policy=str(_cfg_get(
+            shrink_cfg, "survivor_selection_policy", "topology_aware")),
+        intermediate_survivor_ranks=parse_rank_list(
+            _cfg_get(shrink_cfg, "intermediate_survivor_ranks", None)),
+        final_survivor_ranks=parse_rank_list(
+            _cfg_get(shrink_cfg, "final_survivor_ranks", None)),
+    )
+    predicted = predict_lengths(
+        gen_batch,
+        shrink_cfg,
+        sampler=sampler,
+        default_length=float(_cfg_get(
+            shrink_cfg, "default_length",
+            _cfg_get(rollout_config, "response_length", 1))),
+    )
+    assignment_plan = _maybe_assign_optimized_rank_plan(
+        gen_batch, predicted, role_plan, shrink_cfg)
+    if assignment_plan is None:
+        assignment_plan = _maybe_assign_manual_5_2_1(
+            gen_batch, predicted, role_plan, shrink_cfg)
+    if assignment_plan is None:
+        assignment_plan = assign_prompts_to_ranks(predicted, role_plan)
+    full_rank_order = (
+        role_plan.donor_ranks +
+        role_plan.wave2_ranks +
+        role_plan.final_survivor_ranks)
+    reorder_indices, restore_indices = build_reorder_indices(
+        assignment_plan.assignments, full_rank_order)
+
+    dry_run = _cfg_bool(shrink_cfg, "dry_run_shrink_aware_schedule", False)
+    if not dry_run and reorder_indices != list(range(batch_size)):
+        gen_batch.reorder(torch.tensor(reorder_indices, dtype=torch.long))
+
+    gen_batch.meta_info["shrink_aware_role_plan"] = {
+        "donor_ranks": role_plan.donor_ranks,
+        "wave2_ranks": role_plan.wave2_ranks,
+        "intermediate_survivor_ranks": role_plan.intermediate_survivor_ranks,
+        "final_survivor_ranks": role_plan.final_survivor_ranks,
+        "package_locality_score": role_plan.package_locality_score,
+        "fallback_reason": role_plan.fallback_reason,
+    }
+    gen_batch.meta_info["shrink_aware_rank_assignment"] = [
+        assignment.rank for assignment in assignment_plan.assignments
+    ]
+    gen_batch.meta_info["shrink_aware_rank_assignment_reordered"] = [
+        assignment_plan.assignments[idx].rank for idx in reorder_indices
+    ]
+    gen_batch.meta_info["shrink_aware_predicted_load"] = list(map(float, predicted))
+    gen_batch.meta_info["shrink_aware_dry_run"] = dry_run
+    gen_batch.meta_info["shrink_aware_runtime"] = {
+        "mode": mode,
+        "shrink_stages": [
+            len(role_plan.intermediate_survivor_ranks),
+            len(role_plan.final_survivor_ranks),
+        ],
+        "survivor_selection_policy": "manual",
+        "max_rollout_overhead_ratio": float(_cfg_get(
+            shrink_cfg, "max_rollout_overhead_ratio", 1.10)),
+        "min_shrink_window_seconds": float(_cfg_get(
+            shrink_cfg, "min_shrink_window_seconds", 1.0)),
+        "enable_shrink_aware_logging": _cfg_bool(
+            shrink_cfg, "enable_shrink_aware_logging", False),
+        "dry_run_shrink_aware_schedule": dry_run,
+    }
+
+    if _cfg_bool(shrink_cfg, "enable_shrink_aware_logging", False):
+        logger.info(
+            "Shrink-aware schedule: mode=%s dry_run=%s world_size=%s donor=%s wave2=%s final=%s "
+            "counts=%s predicted_load=%s assignment_policy=%s fallback=%s",
+            mode,
+            dry_run,
+            world_size,
+            role_plan.donor_ranks,
+            role_plan.wave2_ranks,
+            role_plan.final_survivor_ranks,
+            assignment_plan.per_rank_counts,
+            assignment_plan.per_rank_predicted_load,
+            _cfg_get(shrink_cfg, "assignment_policy", "default"),
+            role_plan.fallback_reason,
+        )
+
+    return ShrinkAwareScheduleResult(
+        enabled=not dry_run,
+        reorder_indices=[] if dry_run else reorder_indices,
+        restore_indices=[] if dry_run else restore_indices,
+        assignment_plan=assignment_plan,
+        role_plan=role_plan,
+        fallback_reason="dry_run" if dry_run else role_plan.fallback_reason,
+    )
+
+
+def _maybe_assign_manual_5_2_1(
+    gen_batch: DataProto,
+    predicted: list[float],
+    role_plan: Any,
+    shrink_cfg: Any,
+) -> Optional[PromptAssignmentPlan]:
+    policy = str(_cfg_get(shrink_cfg, "assignment_policy", "default")).lower()
+    if policy not in ("manual_5_2_1", "fixed_5_2_1", "521"):
+        return None
+
+    if len(role_plan.donor_ranks) != 8 or len(role_plan.wave2_ranks) != 4 \
+            or len(role_plan.final_survivor_ranks) != 4:
+        raise ValueError(
+            "manual_5_2_1 assignment requires 8 donor ranks, 4 wave2 ranks, "
+            f"and 4 final ranks; got donor={role_plan.donor_ranks}, "
+            f"wave2={role_plan.wave2_ranks}, final={role_plan.final_survivor_ranks}")
+
+    sample_ids = _extract_sample_ids(gen_batch)
+    if sample_ids is None or len(sample_ids) != len(predicted):
+        raise ValueError(
+            "manual_5_2_1 assignment requires dataset_item_idx/index for every "
+            "repeated rollout row")
+
+    grouped_positions = _group_repeated_prompts(sample_ids, predicted)
+    prompt_groups: list[dict[str, Any]] = []
+    for sample_id, positions in grouped_positions.items():
+        prompt_groups.append({
+            "sample_id": int(sample_id),
+            "positions": positions,
+            "first_pos": int(min(positions)),
+            "length_sum": sum(float(predicted[pos]) for pos in positions),
+        })
+
+    for group in prompt_groups:
+        group["mean_length"] = (
+            group["length_sum"] / max(1, len(group["positions"])))
+
+    sorted_groups = sorted(
+        prompt_groups,
+        key=lambda group: (float(group["mean_length"]), int(group["first_pos"])))
+    short_bucket = sorted_groups[:20]
+    medium_bucket = sorted_groups[20:28]
+    long_bucket = sorted_groups[28:32]
+
+    donor_ranks = list(map(int, role_plan.donor_ranks))
+    wave2_ranks = list(map(int, role_plan.wave2_ranks))
+    final_ranks = list(map(int, role_plan.final_survivor_ranks))
+
+    prompt_rank: dict[int, int] = {}
+    for group, rank in zip(short_bucket[:16],
+                           [rank for rank in donor_ranks for _ in range(2)],
+                           strict=True):
+        prompt_rank[int(group["sample_id"])] = rank
+    for group, rank in zip(short_bucket[16:20], final_ranks, strict=True):
+        prompt_rank[int(group["sample_id"])] = rank
+    for group, rank in zip(medium_bucket,
+                           [rank for rank in wave2_ranks for _ in range(2)],
+                           strict=True):
+        prompt_rank[int(group["sample_id"])] = rank
+    for group, rank in zip(long_bucket, final_ranks, strict=True):
+        prompt_rank[int(group["sample_id"])] = rank
+
+    role_by_rank = {
+        **{int(rank): "donor" for rank in donor_ranks},
+        **{int(rank): "wave2" for rank in wave2_ranks},
+        **{int(rank): "survivor" for rank in final_ranks},
+    }
+    assignments: list[PromptAssignment] = []
+    per_rank_counts = {rank: 0 for rank in role_by_rank}
+    per_rank_load = {rank: 0.0 for rank in role_by_rank}
+    for prompt_group in prompt_groups:
+        rank = prompt_rank[int(prompt_group["sample_id"])]
+        role = role_by_rank[rank]
+        for pos in prompt_group["positions"]:
+            load = float(predicted[pos])
+            assignments.append(PromptAssignment(
+                prompt_index=int(pos),
+                rank=int(rank),
+                role=role,
+                predicted_load=load,
+            ))
+            per_rank_counts[rank] += 1
+            per_rank_load[rank] += load
+
+    assignments.sort(key=lambda item: item.prompt_index)
+    return PromptAssignmentPlan(
+        assignments=assignments,
+        per_rank_counts=per_rank_counts,
+        per_rank_predicted_load=per_rank_load,
+        role_by_rank=role_by_rank,
+    )
+
+
+def _maybe_assign_optimized_rank_plan(
+    gen_batch: DataProto,
+    predicted: list[float],
+    role_plan: Any,
+    shrink_cfg: Any,
+) -> Optional[PromptAssignmentPlan]:
+    policy = str(_cfg_get(shrink_cfg, "assignment_policy", "default")).lower()
+    if policy not in ("optimized_rank_plan", "rank_plan", "optimized"):
+        return None
+
+    plan_path = _cfg_get(shrink_cfg, "optimized_rank_plan_path", None)
+    if not plan_path:
+        raise ValueError(
+            "optimized_rank_plan assignment requires "
+            "shrink_aware.optimized_rank_plan_path")
+
+    sample_ids = _extract_sample_ids(gen_batch)
+    if sample_ids is None or len(sample_ids) != len(predicted):
+        raise ValueError(
+            "optimized_rank_plan assignment requires dataset_item_idx/index "
+            "for every repeated rollout row")
+
+    prompt_groups = _group_repeated_prompts(sample_ids, predicted)
+    plan_entry = _load_matching_rank_plan(plan_path, set(prompt_groups))
+    raw_rank_map = plan_entry.get("rank_to_dataset_item_idx")
+    if not isinstance(raw_rank_map, dict):
+        raise ValueError(
+            f"optimized rank plan entry missing rank_to_dataset_item_idx: "
+            f"{plan_path}")
+
+    prompt_rank: dict[int, int] = {}
+    for rank_key, ids in raw_rank_map.items():
+        rank = int(rank_key)
+        if not isinstance(ids, list):
+            raise ValueError(
+                f"rank_to_dataset_item_idx[{rank_key!r}] must be a list")
+        for sample_id in ids:
+            sample_id = int(sample_id)
+            if sample_id in prompt_rank:
+                raise ValueError(
+                    f"duplicate dataset_item_idx={sample_id} in optimized plan")
+            prompt_rank[sample_id] = rank
+
+    missing = sorted(set(prompt_groups) - set(prompt_rank))
+    extra = sorted(set(prompt_rank) - set(prompt_groups))
+    if missing or extra:
+        raise ValueError(
+            "optimized rank plan does not match current batch: "
+            f"missing={missing[:8]} extra={extra[:8]} path={plan_path}")
+
+    role_by_rank = {
+        **{int(rank): "donor" for rank in role_plan.donor_ranks},
+        **{int(rank): "wave2" for rank in role_plan.wave2_ranks},
+        **{int(rank): "survivor" for rank in role_plan.final_survivor_ranks},
+    }
+    assignments: list[PromptAssignment] = []
+    per_rank_counts = {rank: 0 for rank in role_by_rank}
+    per_rank_load = {rank: 0.0 for rank in role_by_rank}
+    for sample_id, positions in prompt_groups.items():
+        rank = int(prompt_rank[int(sample_id)])
+        if rank not in role_by_rank:
+            raise ValueError(
+                f"optimized rank plan assigned dataset_item_idx={sample_id} "
+                f"to rank={rank}, which is not in the shrink-aware role plan")
+        role = role_by_rank[rank]
+        for pos in positions:
+            load = float(predicted[int(pos)])
+            assignments.append(PromptAssignment(
+                prompt_index=int(pos),
+                rank=rank,
+                role=role,
+                predicted_load=load,
+            ))
+            per_rank_counts[rank] += 1
+            per_rank_load[rank] += load
+
+    assignments.sort(key=lambda item: item.prompt_index)
+    return PromptAssignmentPlan(
+        assignments=assignments,
+        per_rank_counts=per_rank_counts,
+        per_rank_predicted_load=per_rank_load,
+        role_by_rank=role_by_rank,
+    )
+
+
+def _group_repeated_prompts(sample_ids: np.ndarray,
+                            predicted: list[float]) -> dict[int, list[int]]:
+    prompt_groups: dict[int, list[int]] = {}
+    for pos, sample_id in enumerate(sample_ids):
+        prompt_groups.setdefault(int(sample_id), []).append(int(pos))
+    if len(prompt_groups) != 32:
+        raise ValueError(
+            "optimized/manual shrink-aware assignment is defined for 32 "
+            f"prompts per train batch; got {len(prompt_groups)} unique prompts")
+    copies_per_prompt = {len(positions) for positions in prompt_groups.values()}
+    if copies_per_prompt != {16}:
+        raise ValueError(
+            "optimized/manual shrink-aware assignment expects each prompt to "
+            f"have 16 rollout responses; got copies_per_prompt={sorted(copies_per_prompt)}")
+    if len(sample_ids) != len(predicted):
+        raise ValueError(
+            f"sample_ids/predicted length mismatch: {len(sample_ids)} vs {len(predicted)}")
+    return prompt_groups
+
+
+_OPTIMIZED_RANK_PLAN_CACHE: dict[str, list[dict[str, Any]]] = {}
+
+
+def _load_matching_rank_plan(path: str,
+                             sample_ids: set[int]) -> dict[str, Any]:
+    path = os.path.abspath(os.path.expanduser(str(path)))
+    payload = _OPTIMIZED_RANK_PLAN_CACHE.get(path)
+    if payload is None:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, list):
+            raise ValueError(f"optimized rank plan must be a list: {path}")
+        _OPTIMIZED_RANK_PLAN_CACHE[path] = payload
+    for entry in payload:
+        raw_rank_map = entry.get("rank_to_dataset_item_idx")
+        if not isinstance(raw_rank_map, dict):
+            continue
+        planned_ids: set[int] = set()
+        for ids in raw_rank_map.values():
+            if isinstance(ids, list):
+                planned_ids.update(int(item) for item in ids)
+        if planned_ids == sample_ids:
+            return entry
+    raise ValueError(
+        f"no optimized rank plan entry matches current batch ids "
+        f"{sorted(sample_ids)[:8]}... in {path}")
+
+
+def restore_shrink_aware_order(data: DataProto,
+                               result: ShrinkAwareScheduleResult) -> None:
+    if not result.enabled or not result.restore_indices:
+        return
+    if result.restore_indices == list(range(len(result.restore_indices))):
+        return
+    data.reorder(torch.tensor(result.restore_indices, dtype=torch.long))
+
+
+def predict_lengths(
+    gen_batch: DataProto,
+    shrink_cfg: Any,
+    *,
+    sampler: Any = None,
+    default_length: float = 1.0,
+) -> list[float]:
+    source = str(_cfg_get(
+        shrink_cfg, "length_prediction_source", "existing_regroup")).lower()
+    batch_size = len(gen_batch)
+    if source in ("existing_regroup", "history"):
+        values = _lengths_from_sampler(gen_batch, sampler)
+        if values is not None:
+            return values
+        if source == "history":
+            return [float(default_length)] * batch_size
+        source = "prompt_length"
+    if source == "prompt_length":
+        return _prompt_lengths(gen_batch)
+    if source == "oracle_trace":
+        values = _lengths_from_oracle(gen_batch, _cfg_get(
+            shrink_cfg, "oracle_trace_path", None))
+        if values is not None:
+            return values
+        return [float(default_length)] * batch_size
+    return [float(default_length)] * batch_size
+
+
+def _lengths_from_sampler(gen_batch: DataProto,
+                          sampler: Any) -> Optional[list[float]]:
+    length_est = getattr(sampler, "_length_estimate", None)
+    if length_est is None:
+        return None
+    sample_ids = None
+    for key in ("dataset_item_idx", "index"):
+        if key in gen_batch.non_tensor_batch:
+            sample_ids = np.asarray(gen_batch.non_tensor_batch[key], dtype=np.int64)
+            break
+    if sample_ids is None or sample_ids.size == 0:
+        return None
+    result: list[float] = []
+    for sample_id in sample_ids:
+        if 0 <= int(sample_id) < len(length_est):
+            result.append(float(length_est[int(sample_id)]))
+        else:
+            result.append(float(np.mean(length_est)))
+    return result
+
+
+def _prompt_lengths(gen_batch: DataProto) -> list[float]:
+    if gen_batch.batch is not None and "attention_mask" in gen_batch.batch:
+        mask = gen_batch.batch["attention_mask"]
+        if isinstance(mask, torch.Tensor):
+            return [float(x) for x in mask.sum(dim=-1).detach().cpu().tolist()]
+    raw_prompt_ids = gen_batch.non_tensor_batch.get("raw_prompt_ids")
+    if raw_prompt_ids is not None:
+        return [float(len(item)) for item in raw_prompt_ids]
+    if gen_batch.batch is not None and "input_ids" in gen_batch.batch:
+        return [float(gen_batch.batch["input_ids"].shape[-1])] * len(gen_batch)
+    return [1.0] * len(gen_batch)
+
+
+def _extract_sample_ids(batch: DataProto) -> Optional[np.ndarray]:
+    for key in ("dataset_item_idx", "index"):
+        if key in batch.non_tensor_batch:
+            return np.asarray(batch.non_tensor_batch[key], dtype=np.int64)
+    return None
+
+
+def _lengths_from_oracle(gen_batch: DataProto,
+                         path: Optional[str]) -> Optional[list[float]]:
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except OSError:
+        logger.warning("Failed to read shrink-aware oracle trace: %s", path)
+        return None
+
+    values: list[float] = []
+    for key in ("request_id", "uid", "dataset_item_idx", "index"):
+        if key not in gen_batch.non_tensor_batch:
+            continue
+        for item in gen_batch.non_tensor_batch[key]:
+            lookup = str(item)
+            if lookup in payload:
+                values.append(float(payload[lookup]))
+            else:
+                values.append(float(np.mean(list(payload.values()))))
+        return values
+    if isinstance(payload, list):
+        return [float(item) for item in payload[:len(gen_batch)]]
+    return None
+
+
+def _get_shrink_aware_config(rollout_config: Any) -> Any:
+    cfg = _cfg_get(rollout_config, "shrink_aware", None)
+    if cfg is None:
+        return {}
+    return cfg
+
+
+def _infer_world_size(rollout_config: Any) -> int:
+    env_world_size = os.getenv("VLLM_DP_SIZE", "").strip()
+    if env_world_size:
+        try:
+            return max(1, int(env_world_size))
+        except ValueError:
+            logger.warning("Ignoring invalid VLLM_DP_SIZE=%s", env_world_size)
+    dp = int(_cfg_get(rollout_config, "data_parallel_size", 1) or 1)
+    tp = int(_cfg_get(rollout_config, "tensor_model_parallel_size", 1) or 1)
+    ep = int(_cfg_get(rollout_config, "expert_parallel_size", 1) or 1)
+    return max(1, dp * max(1, ep // max(tp, 1)))
+
+
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    if cfg is None:
+        return default
+    if isinstance(cfg, DictConfig):
+        return cfg.get(key, default)
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _cfg_bool(cfg: Any, key: str, default: bool = False) -> bool:
+    value = _cfg_get(cfg, key, default)
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "on")
+    return bool(value)

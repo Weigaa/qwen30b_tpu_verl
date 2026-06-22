@@ -1,0 +1,109 @@
+From 4b1b40ec82f48cf0afb13d92ee7a2c5f8b00aace Mon Sep 17 00:00:00 2001
+From: huiyingchen <chenhuiying4@huawei.com>
+Date: Thu, 27 Nov 2025 12:33:56 +0800
+Subject: [PATCH 1/2] Update verl: support EPLB
+
+Enabling the EPLB feature requires setting the VLLM_ENABLE_EPLB environment variable to 1.
+---
+ .../qwen3/verl/workers/megatron_workers.py    |  2 ++
+ .../rollout/vllm_rollout/vllm_rollout_spmd.py | 33 ++++++++++++++++++-
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/llm_rl/qwen3/verl/workers/megatron_workers.py b/llm_rl/qwen3/verl/workers/megatron_workers.py
+index 9d20ca6..6cb8086 100644
+--- a/llm_rl/qwen3/verl/workers/megatron_workers.py
++++ b/llm_rl/qwen3/verl/workers/megatron_workers.py
+@@ -599,9 +599,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         # important: need to manually set the random states of each tp to be identical.
+         self.torch_random_states = get_torch_device().get_rng_state()
+         get_torch_device().set_rng_state(self.gen_random_states)
++        self.rollout.eplb_start()
+ 
+     async def trainer_mode(self):
+         """Context switch hybridengine to trainer mode."""
++        self.rollout.eplb_end()
+         if self.config.rollout.free_cache_engine:
+             log_gpu_memory_usage("Before rollout offload", logger=logger)
+             await self.rollout.release()
+diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index 943ac79..8bd3ed3 100644
+--- a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -53,6 +53,7 @@ from torch.distributed.device_mesh import DeviceMesh
+ from vllm import LLM, SamplingParams
+ from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
+ from vllm.lora.request import LoRARequest
++from vllm_ascend.ascend_config import get_ascend_config
+ 
+ try:
+     from vllm.worker.worker_base import WorkerWrapperBase
+@@ -194,6 +195,7 @@ class vLLMRollout(BaseRollout):
+             else:
+                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+ 
++        self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1
+         self.inference_engine = LLM(
+             model=model_path,
+             enable_sleep_mode=False,
+@@ -230,6 +232,10 @@ class vLLMRollout(BaseRollout):
+                     "enable_chunked_prefill": False,
+                 },
+                 "refresh": True,
++                "dynamic_eplb": self.dynamic_eplb,
++                "num_iterations_eplb_update": 400,  # gather stable workload over 400 iterations
++                "gate_eplb": True,
++                "num_wait_worker_iterations": 30,  # wait for 30 iterations to complete the EPLB calculation
+             },
+             **compilation_config,
+             **self.lora_kwargs,
+@@ -237,7 +243,8 @@ class vLLMRollout(BaseRollout):
+         )
+ 
+         # Offload vllm model to reduce peak memory usage
+-        self.model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
++        self.model_runner = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
++        self.model = self.model_runner.get_model()
+         self.kv_cache_configs = None
+         self.cpu_model = {}
+         self.gpu_buffers = None
+@@ -265,6 +272,8 @@ class vLLMRollout(BaseRollout):
+ 
+         self.pad_token_id = tokenizer.pad_token_id
+ 
++        self.eplb_end()
++
+     def init_cache_engine(self):
+         if os.environ['VLLM_USE_V1'] == '1':
+             worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
+@@ -349,6 +358,28 @@ class vLLMRollout(BaseRollout):
+         gc.collect()
+         torch.npu.empty_cache()
+ 
++    def eplb_start(self):
++        # Restart the EPLB process before switching from training to inference.
++        if self.dynamic_eplb:
++            model = self.model_runner.get_model()
++            model.clear_all_moe_loads()
++            model.reset_all_expert_map_and_log2phy()
++            self.model_runner.eplb_adaptor.__init__(model)
++            self.model_runner.eplb_loader.__init__()
++            self.model_runner.eplb_process.__init__(shared_dict=self.model_runner.shared_dict, policy_type=1, enable_d2d=True)
++            ascend_config = get_ascend_config()
++            self.model_runner.process = self.model_runner.eplb_process._launch_process()
++            self.model_runner.eplb_updator.__init__(ascend_config, self.model_runner.eplb_loader, self.model_runner.eplb_process,
++                                                    self.model_runner.process)
++            self.model_runner.eplb_updator.get_init_expert_map()
++            self.model_runner.eplb_updator.compute_and_set_moe_load()
++
++    def eplb_end(self):
++        # Shut down the EPLB service and release memory when switching from inference to training.
++        if self.dynamic_eplb:
++            self.model_runner.eplb_updator.adaptor.release_memory()
++            self.model_runner.eplb_updator.shutdown()
++
+     @contextmanager
+     def update_sampling_params(self, **kwargs):
+         # update sampling params
+-- 
+2.28.0.windows.1
+
