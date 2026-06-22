@@ -27,23 +27,32 @@ It is intentionally stricter than chat memory:
 
 ### Fastest Verified End-to-End Rollout
 
-Current fastest verified `mode=5` rollout observed so far:
+Current fastest verified **true `mode=5`** rollout observed so far:
 
-- run: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605030829_elastic.txt](/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260605030829_elastic.txt)
-- trainer worker log: [/tmp/ray/session_2026-06-05_03-08-38_682771_863895/logs/worker-7cdd54ef5a9a3835fad40a17c57363501a74945a8b81a3b3b69cef86-01000000-883862.out](/tmp/ray/session_2026-06-05_03-08-38_682771_863895/logs/worker-7cdd54ef5a9a3835fad40a17c57363501a74945a8b81a3b3b69cef86-01000000-883862.out)
+- run: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt)
+- trainer worker log: [/tmp/ray/session_2026-06-05_07-32-22_450744_1580013/logs/worker-b872561f323b2120b531130cf920ee02f1c11278e5b963675463e37b-01000000-1599646.out](/tmp/ray/session_2026-06-05_07-32-22_450744_1580013/logs/worker-b872561f323b2120b531130cf920ee02f1c11278e5b963675463e37b-01000000-1599646.out)
 - verified rollout times observed:
-  - step1: `252.091123`
-  - step2: `255.107707`
-  - step3: `249.546084`
+  - step1: `248.558446`
+  - step2: `250.100419`
+  - step3: `253.853945`
+- clean exit evidence:
+  - [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:8480](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:8480)
+  - `exit_code=0`
 
 Current fastest verified value:
 
-- **`249.546084 s`**
+- **`248.558446 s`**
+
+Current strongest 3-step true `mode=5` mainline total:
+
+- `248.558446 + 250.100419 + 253.853945 = 752.512810 s`
+- versus the previous true `mode=5` baseline `20260605030829` total `756.744914 s`
+- improvement: **`-4.232104 s`** total, or about **`-1.410701 s`** per step on average
 
 Important caveat:
 
-- This is now the strongest verified wall-time sample and it also materially improves the stage1 path versus `20260605021206`.
-- However, its stage2 submit-path metrics are still not as low as the old `20260604154651` overlap-quality reference, so the hotspot-quality baseline below remains useful as a directional reference for the original objective.
+- This sample is a stronger **true `mode=5`** three-step mainline than `20260605030829`, but its step3 is slightly worse than the older `249.546084` single-step minimum.
+- In other words, it is the new best true-`mode=5` three-step profile and also the new fastest true-`mode=5` step1, but not the best step3 ever observed across all true-`mode=5` samples.
 
 ### Best Known Hotspot-Quality Timing Baseline
 
@@ -864,3 +873,225 @@ Interpretation:
     - the old `270s` direction on stage2/1,
     - and the faster wall-time path from the `252s` family.
   - This run also establishes a new fastest verified rollout value of **`249.546084 s`**.
+
+
+### 20260605070736
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605070736_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605070736_elastic.txt)
+- Ray session:
+  - `/tmp/ray/session_2026-06-05_07-07-45_534761_1513497`
+- Classification: valid negative single-variable A/B on the true `mode=5` baseline.
+- Setup:
+  - used the clean true-`mode=5` baseline tree anchored at `a3cfdc2`
+  - explicitly flipped only:
+    - `VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=0`
+  - kept the rest of the known-good true `mode=5` baseline:
+    - `mode=5`
+    - `dual_source`
+    - `VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=1`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=0.75`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=fixed`
+- Verified result:
+  - step1 `rollout_output_time_s = 264.326109`
+  - `timing_s/gen = 264.321160`
+  - `timing_s/old_log_prob = 26.940783`
+  - `timing_s/ref = 15.029462`
+  - `timing_s/update_actor = 103.606937`
+  - `timing_s/step = 412.768118`
+- Interpretation:
+  - compared with the true `mode=5` baseline `20260605030829` step1 `252.091123`, this is slower by `12.234986 s`
+  - therefore, turning `single_control_message_remote` off is not a fix for the remaining true-`mode=5` residual
+  - this run cleanly demotes the old suspicion that the single-control protocol itself was the cause of the remaining slowdown
+
+
+### 20260605073213
+- Run log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt](./wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt)
+- Ray session:
+  - `/tmp/ray/session_2026-06-05_07-32-22_450744_1580013`
+- Classification: valid clean-exit positive sample on the clean true `mode=5` baseline tree with a narrow control-plane submit patch.
+- Setup:
+  - tree: `/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2`
+  - kept the true `mode=5` baseline config:
+    - `mode=5`
+    - `dual_source`
+    - `VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC=1`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION=0.75`
+    - `VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY=fixed`
+    - `VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=1`
+  - code change was intentionally narrow and limited to the control-plane submit path in `worker_v1.py`:
+    - for the single-control-message path, build one CPU `request` tensor first
+    - then bulk-copy it into `control[1:...]`
+    - instead of populating the `control` rows one Python assignment at a time
+- Verified source-mix evidence:
+  - import summary remained on the expected true `mode=5` baseline shape:
+    - [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:3355](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:3355)
+    - `remote_fraction=0.7500`
+    - `remote_selected=48 cpu_selected=16`
+- Verified rollout results:
+  - step1 `rollout_output_time_s = 248.558446`
+  - step2 `rollout_output_time_s = 250.100419`
+  - step3 `rollout_output_time_s = 253.853945`
+- Verified step summaries:
+  - step1:
+    - `timing_s/gen = 248.555129`
+    - `timing_s/old_log_prob = 25.580930`
+    - `timing_s/ref = 14.798256`
+    - `timing_s/update_actor = 104.059956`
+    - `timing_s/step = 396.073653`
+  - step2:
+    - `timing_s/gen = 250.097167`
+    - `timing_s/old_log_prob = 21.384082`
+    - `timing_s/ref = 14.983106`
+    - `timing_s/update_actor = 99.695871`
+    - `timing_s/step = 389.160610`
+  - step3:
+    - `timing_s/gen = 253.850826`
+    - `timing_s/old_log_prob = 21.388341`
+    - `timing_s/ref = 13.943436`
+    - `timing_s/update_actor = 101.360338`
+    - `timing_s/step = 393.518766`
+- Clean exit evidence:
+  - [wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:8480](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605073213_elastic.txt:8480)
+  - `[run] end_time=2026-06-05T07:54:06+0800 exit_code=0`
+- Interpretation relative to the prior true `mode=5` baseline `20260605030829`:
+  - step1 improves by `3.532677 s`
+  - step2 improves by `5.007288 s`
+  - step3 regresses by `4.307861 s`
+  - three-step total improves from `756.744914 s` to `752.512810 s`
+  - net gain: **`4.232104 s`** across the three verified steps
+- Practical reading:
+  - this is the first clean true-`mode=5` sample after the mode4-best correction that clearly beats the previous true baseline on the first two verified steps and also wins the three-step total with a clean exit
+  - the remaining weakness is that step3 is not yet as strong as `20260605030829`
+  - so the most accurate promotion is:
+    - new strongest true-`mode=5` three-step mainline profile
+    - new fastest true-`mode=5` step1
+    - but not a universal winner on every individual step
+
+## Run `20260605080431` - true mode=5 negative/hung sample for cached-request single-control patch
+- Tree: `qwen3_true_mode5_a3cfdc2` on top of true mode=5 baseline `a3cfdc2`
+- Code change under test:
+  - In `worker_v1.py` single-control-message path, replaced per-run `torch.tensor([...])` request construction + `control.zero_()` with a cached CPU request buffer filled row-by-row and bulk-copied into `control[1:...]`.
+- Execution mode evidence:
+  - Explicit foreground launch with `VLLM_ASCEND_ELASTIC_EXECUTION_MODE=5`
+  - Entered `trainer.fit()` and `Elastic first live step`
+  - `Elastic forward fingerprint ... moe_comm_type=MoECommType.ALLTOALL runtime_num_experts=128`
+- Runtime behavior:
+  - Main log reached `Elastic first live step` at `2026-06-05 08:06:55`
+  - By `2026-06-05 08:11:43`, main log still had `rollout_output_time_s=0` and `timing_s/gen=0`
+  - Tail of log repeatedly showed `torch_extensions` / `grouped_matmul` / `npu_rotary_position_embedding` load/build messages instead of step summary
+  - No first `rollout_output_time_s` or `timing_s/gen` was ever emitted before manual stop
+- Classification:
+  - Valid true `mode=5` run that progressed into deep first live step
+  - But effectively hung before first rollout summary; do not promote
+- Conclusion:
+  - Cached-request / no-zero variant does not beat current true mode=5 mainline and is a negative sample
+  - Keep current best true mode=5 baseline at `20260605073213` / branch `best_mode5@bf9343d`
+
+
+## 20260605082001
+- tree: `/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2`
+- config: true `mode=5`, `fixed/0.75`, `single_control_message_remote=1`
+- delta vs `bf9343d`: kept the `bf9343d` bulk CPU request construction/copy path but removed only `control.zero_()` in the single-control request pack path
+- outcome:
+  - valid true `mode=5` run
+  - entered deep runtime, including `Elastic first live step`
+  - produced stage=2 timing lines and later shrink/restore activity
+  - never produced first `rollout_output_time_s` / `timing_s/gen` before manual stop
+  - trainer/ray/NPU remained alive until stop, so this was a deep first-step hang rather than launcher failure
+- classification: negative / hung sample
+- decision:
+  - do not promote
+  - revert `worker_v1.py` to the `bf9343d` mainline state
+  - do not continue the `no-zero-only` direction
+
+## 20260605083443
+- tree: `/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2`
+- config: true `mode=5`, `fixed/0.75`, `single_control_message_remote=1`
+- delta vs `bf9343d`: tried a narrower single-control header-only variant, removing `control.zero_()` but explicitly writing `control[0,2]=0` while keeping the bulk request copy path
+- outcome:
+  - did not reach valid runtime bring-up
+  - exited very early with `exit_code=1`
+  - no `trainer.fit`, no `Elastic first live step`, no first rollout/gen summary
+- classification: negative / invalid early-failure sample
+- decision:
+  - do not promote
+  - revert `worker_v1.py` to the `bf9343d` mainline state
+  - fully deprioritize the header-only/no-zero direction
+
+## 20260605085926
+- tree: `/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2`
+- config: true `mode=5`, `fixed/0.75`, `single_control_message_remote=1`
+- delta vs `bf9343d`: added an owned-layout-signature cache for `mode5_full_remote_chain` in `worker_v1.py` to reduce repeated later-cycle source-build work and target the cycle3 `build_sources_ms` rebound
+- runtime evidence:
+  - valid true `mode=5` run
+  - entered `Before trainer.fit()` and `Elastic first live step`
+  - produced `Mode5 hybrid refresh aggregate` lines and a first verified rollout summary
+  - step1 rollout:
+    - `rollout_output_time_s = 254.380292`
+    - `timing_s/gen = 254.376933`
+    - `timing_s/old_log_prob = 25.928538`
+    - `timing_s/ref = 14.017186`
+    - `timing_s/update_actor = 106.907863`
+    - `timing_s/step = 404.099713`
+- failure evidence:
+  - later in the same run, rank10 hit a torch-npu `aclnnInplaceCopy` failure during rollout post-processing
+  - key error text:
+    - `Shape of broadcast result should be [1, 0, 1536, 2048], but self is [1, 1, 1536, 2048]`
+    - `RuntimeError ... current working operator name is aclnnInplaceCopy`
+  - run ended with:
+    - `[run] end_time=2026-06-05T09:10:13+0800 exit_code=1`
+- interpretation:
+  - although this patch reached a valid step1, that step1 is slower than current true mode=5 best `20260605073213` step1 (`248.558446`) by `5.821846 s`
+  - the later runtime failure also prevents promotion as a stable mainline candidate
+- classification: negative sample
+- decision:
+  - do not promote
+  - revert `worker_v1.py` to the `bf9343d` true mode=5 mainline state
+  - deprioritize the `mode5_full_remote_chain` layout-signature cache direction for now
+
+## 20260605092015
+- tree: `/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2`
+- config: true `mode=5`, `fixed/0.75`, `single_control_message_remote=1`
+- delta vs `bf9343d`: precomputed per-target remote source maps in shrink payload and reused them during hybrid refresh to avoid rebuilding `mode5_full_remote_chain` from the global expert->source dicts on every layer/cycle
+- runtime evidence:
+  - valid true `mode=5` run
+  - entered `Before trainer.fit()` and `Elastic first live step`
+  - progressed through `Mode5 hybrid refresh aggregate` for stage=8, stage=4, stage=2, and stage=1
+  - representative aggregates included:
+    - stage8 `build_sources_ms` around `200-247 ms` on most ranks, but one outlier rank reached `765.99 ms`
+    - stage4 `build_sources_ms` around `515-552 ms`
+    - stage2 `build_sources_ms` around `1041.41-1233.52 ms`
+    - stage1 `build_sources_ms` reached `2651.21 ms`
+- outcome:
+  - despite reaching stage1 aggregate, the run never emitted first `rollout_output_time_s` or `timing_s/gen`
+  - after repeated observation windows, it remained in deep runtime without a first rollout summary, matching the earlier hung-sample pattern
+  - manual stop was performed and devices were reclaimed cleanly
+- interpretation:
+  - this precomputed-remote-source-map direction did not produce a promotable runtime win
+  - it behaves like another deep first-step hang / no-first-gen negative sample rather than a clean improvement candidate
+- classification: negative / hung sample
+- decision:
+  - do not promote
+  - revert `worker_v1.py` back to `bf9343d`
+  - deprioritize the payload-level `mode5_full_remote_chain` precompute/cache direction for now
+
+## 20260605094827
+- Tree: `/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2`
+- Code delta vs `bf9343d`:
+  - [worker_v1.py](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/vllm_ascend/worker/worker_v1.py)
+  - keep the full `mode5_remote_source_chain_by_expert` semantics, but avoid the second mode5-only payload scan by constructing it in the same pass that builds `mode4_remote_sources`
+- Runtime: true `mode=5` foreground validation
+- Log: [wjeagerqwen30b-a3b-with_draft_breakdown_20260605094827_elastic.txt](/workspace/cann-recipes-train/llm_rl/qwen3_true_mode5_a3cfdc2/wjeagerqwen30b-a3b-with_draft_breakdown_20260605094827_elastic.txt)
+- Outcome:
+  - entered `Before trainer.fit()`
+  - entered `Elastic first live step`
+  - produced stage8/stage4/stage2/stage1 `Mode5 hybrid refresh aggregate`
+  - but never produced first `rollout_output_time_s` / `timing_s/gen` before manual stop
+- Representative aggregates:
+  - stage8 rank8 total `440.43 ms`
+  - stage4 rank13 total `716.90 ms`
+  - stage2 rank14 total `1326.95 ms`
+  - stage1 rank15 total `3196.27 ms`
+- Classification:
+  - negative / hung sample
+  - the attempt to remove the second mode5 payload scan by reusing the same-pass source-map construction still does not produce a first verified `gen`
+  - deprioritize this `build_sources`-path line and return to `bf9343d`

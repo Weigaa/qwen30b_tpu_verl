@@ -680,6 +680,11 @@ def _mode5_filter_cpu_payload(payload: dict) -> dict:
     return filtered
 
 
+def _execution_mode_uses_remote_npu_path(execution_mode: int) -> bool:
+    execution_mode = int(execution_mode)
+    return execution_mode in (4, 5)
+
+
 def _mode4_remote_source_rank_map(payload: dict) -> dict[int, int]:
     return {
         int(expert_id): int(source_rank)
@@ -767,15 +772,16 @@ def _module_is_custom_mode1_redundant_static(module: nn.Module) -> bool:
 def _module_is_mode4_remote_npu_lightweight(module: nn.Module) -> bool:
     if not _is_ascend_fused_moe_module(module):
         return False
-    if int(getattr(module, "elastic_execution_mode", 0) or 0) not in (4, 5):
+    mode = int(getattr(module, "elastic_execution_mode", 0) or 0)
+    if mode not in (4, 5):
         return False
     if not _module_uses_lossless_elastic(module):
         return False
-    # Mode 4 intentionally keeps missing experts resident on inactive/cache
-    # ranks and fetches them over NPU P2P. Treat it like the optimized mode=1
-    # path for KV-cache sizing: do not subtract generic CPU/offload/headroom
-    # budgets for workspaces that are either already profiled or lazily created
-    # by the real decode path.
+    # Remote-NPU modes intentionally keep missing experts resident on
+    # inactive/cache ranks and fetch them over NPU P2P. Treat them like the
+    # optimized mode=1 path for KV-cache sizing: do not subtract generic
+    # CPU/offload/headroom budgets for workspaces that are either already
+    # profiled or lazily created by the real decode path.
     return True
 
 
@@ -856,8 +862,9 @@ def _module_mode1_lightweight_parity_path(module: nn.Module) -> str:
 def _module_lightweight_no_headroom_path(module: nn.Module) -> str:
     if _module_is_mode4_remote_npu_lightweight(module):
         mode = int(getattr(module, "elastic_execution_mode", 0) or 0)
-        return ("mode5_cpu_remote_npu_cache"
-                if mode == 5 else "mode4_remote_npu_cache")
+        if mode == 5:
+            return "mode5_cpu_remote_npu_cache"
+        return "mode4_remote_npu_cache"
     if _module_is_mode3_cross_layer_lightweight(module):
         return "mode3_cross_layer_double_buffer"
     return _module_mode1_lightweight_parity_path(module)
@@ -868,7 +875,8 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 def _mode4_keep_weights_out_of_sleep_pool() -> bool:
-    return (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+    return (_execution_mode_uses_remote_npu_path(
+        envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
             and _env_flag("VLLM_ASCEND_MODE4_KEEP_WEIGHTS_OUT_OF_SLEEP_POOL",
                           "1"))
 
@@ -1379,12 +1387,15 @@ class NPUWorker(WorkerBase):
             # Mode 3 keeps additional experts in CPU shadow storage and only
             # needs HBM for the two runtime double-buffer slots. Do not charge
             # the mode=1/fixed-slot static expert delta here, but do reserve
-            # the final floor-sized runtime slots before KV cache sizing.
+            # the worst final floor-sized runtime slots before KV cache sizing.
+            # The actual mode3 runtime slots may still be allocated dynamically
+            # per shrink stage, matching mode4/5, while profiling keeps enough
+            # headroom for the deepest configured floor that may be reached.
             mode3_lightweight = (
                 execution_mode == 3
                 and _module_is_mode3_cross_layer_lightweight(module))
             mode4_lightweight = (
-                execution_mode in (4, 5)
+                _execution_mode_uses_remote_npu_path(execution_mode)
                 and _module_is_mode4_remote_npu_lightweight(module))
             mode5_lightweight = mode4_lightweight and execution_mode == 5
             if (not mode3_lightweight and not mode4_lightweight
@@ -1396,7 +1407,7 @@ class NPUWorker(WorkerBase):
             configured_floor = getattr(
                 module, "_get_configured_elastic_min_compute_group_size",
                 lambda: None)()
-            if mode4_lightweight:
+            if mode4_lightweight and execution_mode in (4, 5):
                 runtime_floor = _mode4_runtime_elastic_floor()
                 if runtime_floor is not None:
                     configured_floor = int(runtime_floor)
@@ -1434,32 +1445,54 @@ class NPUWorker(WorkerBase):
             # Mode3 double buffer slots: ALL layers share the same 2 slots
             # (double buffer). These slots are allocated lazily on first forward,
             # NOT during memory profiling, so we must account for them here.
-            # The CPU-shadow path also allocates one NPU staging buffer per
-            # runtime slot for CPU->NPU materialization, so reserve that too.
+            # The CPU-shadow path may also allocate an NPU staging buffer for
+            # CPU->NPU materialization. When direct CPU slot writes are enabled,
+            # keep the KV budget aligned with mode4/5 and do not reserve the
+            # staging buffer unless explicitly requested.
             # Only calculate once for the first mode3 layer we encounter.
             if mode3_lightweight and mode3_double_buffer_bytes == 0:
                 runtime_slot_experts = configured_capacity * 2
                 cpu_stage_experts = configured_capacity * 2
                 mode3_double_buffer_bytes = runtime_slot_experts * per_expert_bytes
-                mode3_cpu_stage_bytes = cpu_stage_experts * per_expert_bytes
+                dynamic_runtime_capacity = os.getenv(
+                    "VLLM_ASCEND_MODE3_DYNAMIC_RUNTIME_CAPACITY",
+                    "1").strip().lower() in ("1", "true", "yes", "on")
+                direct_cpu_slot_enabled = os.getenv(
+                    "VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT",
+                    "0").strip().lower() in ("1", "true", "yes", "on")
+                default_cpu_stage_bytes = 0 if direct_cpu_slot_enabled else (
+                    cpu_stage_experts * per_expert_bytes)
+                mode3_cpu_stage_bytes = int(
+                    os.getenv("VLLM_ASCEND_MODE3_CPU_STAGE_HEADROOM_BYTES",
+                              str(default_cpu_stage_bytes)))
                 logger.info(
-                    "Mode3 double buffer headroom (shared across all layers): configured_capacity=%s runtime_slot_experts=%s runtime_bytes=%.2fMB cpu_stage_experts=%s cpu_stage_bytes=%.2fMB",
+                    "Mode3 double buffer headroom (shared across all layers): configured_capacity=%s reserved_runtime_slot_experts=%s runtime_bytes=%.2fMB cpu_stage_experts=%s cpu_stage_bytes=%.2fMB direct_cpu_slot=%s dynamic_runtime_capacity=%s",
                     configured_capacity,
                     runtime_slot_experts,
                     mode3_double_buffer_bytes / (1024 * 1024),
                     cpu_stage_experts,
                     mode3_cpu_stage_bytes / (1024 * 1024),
+                    int(direct_cpu_slot_enabled),
+                    int(dynamic_runtime_capacity),
                 )
 
             # Even with the mode3 runtime slots and CPU staging buffers charged
             # up front, the real low-floor MC2 decode path can lazily request an
-            # additional HCCL workspace after shrink. If this is not reserved
-            # before KV sizing, the first stage=4/stage=2 decode can fail inside
-            # HcclAllocComResourceByTiling and poison later collectives. Keep the
-            # reservation mode3-only so mode1/mode2/mode4 KV sizing is untouched.
+            # additional HCCL workspace after shrink on some CANN/HCCL stacks.
+            # Do not reserve it by default: the fused-experts mode3 path should
+            # first be validated against the same KV budget class as mode4/5.
+            # Set VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES when
+            # a low-floor run proves this workspace is still required.
             if mode4_lightweight and mode3_double_buffer_bytes == 0:
                 runtime_slot_experts = configured_capacity * 2
-                mode3_double_buffer_bytes = runtime_slot_experts * per_expert_bytes
+                default_runtime_buffer_bytes = 0
+                if configured_floor < default_floor:
+                    default_runtime_buffer_bytes = (
+                        runtime_slot_experts * per_expert_bytes)
+                mode3_double_buffer_bytes = int(
+                    os.getenv(
+                        "VLLM_ASCEND_MODE4_RUNTIME_BUFFER_HEADROOM_BYTES",
+                        str(default_runtime_buffer_bytes)))
                 logger.info(
                     "Mode4 remote-NPU double buffer headroom (shared across all layers): runtime_floor=%s configured_capacity=%s runtime_slot_experts=%s runtime_bytes=%.2fMB",
                     configured_floor, configured_capacity, runtime_slot_experts,
@@ -1489,11 +1522,10 @@ class NPUWorker(WorkerBase):
 
             if (mode3_lightweight and configured_floor <= 2
                     and mode3_low_floor_mc2_workspace_bytes == 0):
-                default_workspace_bytes = int(2.5 * 1024 * 1024 * 1024)
                 mode3_low_floor_mc2_workspace_bytes = int(
                     os.getenv(
                         "VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES",
-                        str(default_workspace_bytes)))
+                        "0"))
                 logger.info(
                     "Mode3 low-floor MC2 workspace headroom: floor=%s bytes=%s (%.2fMB)",
                     configured_floor, mode3_low_floor_mc2_workspace_bytes,
@@ -1507,10 +1539,19 @@ class NPUWorker(WorkerBase):
                 and mode3_low_floor_mc2_workspace_bytes <= 0):
             return 0
 
+        default_safety_margin_bytes = str(1024 * 1024 * 1024)
+        if mode3_double_buffer_bytes > 0 and mode3_cpu_stage_bytes == 0:
+            default_safety_margin_bytes = "0"
         safety_margin_bytes = int(
             os.getenv("VLLM_ASCEND_FLOOR_PREALLOC_HEADROOM_SAFETY_BYTES",
-                      str(1024 * 1024 * 1024)))
-        if mode3_double_buffer_bytes > 0 and mode3_cpu_stage_bytes == 0:
+                      default_safety_margin_bytes))
+        if mode3_lightweight:
+            safety_margin_bytes = int(
+                os.getenv(
+                    "VLLM_ASCEND_MODE3_DOUBLE_BUFFER_HEADROOM_SAFETY_BYTES",
+                    str(safety_margin_bytes)))
+        if (mode4_lightweight and mode3_double_buffer_bytes > 0
+                and mode3_cpu_stage_bytes == 0):
             # Mode=4/5 remote-cache runtime only needs the shared NPU double
             # buffer accounted before KV sizing. Do not charge the generic
             # 1GiB floor-prealloc cushion by default; callers can set this env
@@ -2339,7 +2380,9 @@ class NPUWorker(WorkerBase):
                     module.layer_idx, {})
                 mode4_remote_sources: dict[int, tuple[int, int]] = {}
                 module_mode = int(getattr(module, "elastic_execution_mode", 0))
-                if module_mode in (4, 5):
+                module_uses_remote_npu = _execution_mode_uses_remote_npu_path(
+                    module_mode)
+                if module_uses_remote_npu:
                     source_rank_by_expert = payload.get(
                         "cpu_import_source_rank", {})
                     remote_source_rank_by_expert = _mode4_remote_source_rank_map(
@@ -2458,7 +2501,7 @@ class NPUWorker(WorkerBase):
                     use_hybrid_cpu_swap = True
                 if use_hybrid_cpu_swap:
                     hybrid_t0 = time.perf_counter()
-                    if int(getattr(module, "elastic_execution_mode", 0)) in (4, 5):
+                    if module_uses_remote_npu:
                         module.lossless_mode4_remote_source_by_expert = (
                             mode4_remote_sources)
                         if int(getattr(module, "elastic_execution_mode", 0)) == 5:
@@ -2489,7 +2532,13 @@ class NPUWorker(WorkerBase):
                                 mode5_full_remote_chain)
                         module.lossless_mode4_remote_fetcher = (
                             self._mode4_fetch_remote_experts_to_slot)
-                    if int(getattr(module, "elastic_execution_mode", 0)) == 5:
+                    mode_for_cpu_shadow_prepare = int(
+                        getattr(module, "elastic_execution_mode", 0))
+                    prepare_mode3_cpu_shadow = (
+                        mode_for_cpu_shadow_prepare == 3
+                        and _env_flag("VLLM_ASCEND_MODE3_MODE5_LIKE_CPU_SHADOW",
+                                      "1"))
+                    if mode_for_cpu_shadow_prepare == 5 or prepare_mode3_cpu_shadow:
                         prepare_mode5_shadow = getattr(
                             module, "prepare_lossless_mode5_cpu_shadow", None)
                         if callable(prepare_mode5_shadow):
@@ -2516,7 +2565,7 @@ class NPUWorker(WorkerBase):
                     hybrid_t3 = time.perf_counter()
                     if module.layer_idx == 0:
                         mode = int(getattr(module, "elastic_execution_mode", 0))
-                        if mode in (4, 5):
+                        if module_uses_remote_npu:
                             logger.info(
                                 "Mode%s remote-NPU hybrid activated: rank=%s layer=%s active_ranks=%s owned_local=%s resident_capacity=%s remote_npu_local=%s cpu_only_local=%s runtime_num_experts=%s",
                                 mode,
@@ -2901,6 +2950,8 @@ class NPUWorker(WorkerBase):
             logger.info(
                 "Elastic shrink payload source group: rank=%s active_ranks=%s source_ranks=%s previous_active_ranks=%s",
                 current_rank, active_ranks, source_ranks, previous_active_ranks)
+        remote_npu_execution_mode = _execution_mode_uses_remote_npu_path(
+            envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
         if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (2, 3, 4, 5):
             logger.info(
                 "Elastic shrink payload source barrier enter: rank=%s active_ranks=%s source_ranks=%s previous_active_ranks=%s",
@@ -3005,7 +3056,7 @@ class NPUWorker(WorkerBase):
                 int, dict[int, tuple[int, int]]] = {}
             gathered_mode4_owned_by_rank: dict[int, list[int]] = {}
             gathered_mode5_cpu_shadow_by_rank: dict[int, set[int]] = {}
-            if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5):
+            if remote_npu_execution_mode:
                 remote_state_gather_start_t = time.perf_counter()
                 remote_source_attr = "lossless_mode4_remote_source_by_expert"
                 if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 5:
@@ -3122,7 +3173,7 @@ class NPUWorker(WorkerBase):
                                           fallback_slot: int
                                           ) -> tuple[int, int]:
                 """Return the rank/slot that actually owns this expert on NPU."""
-                if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE not in (4, 5):
+                if not remote_npu_execution_mode:
                     return int(source_rank), int(fallback_slot)
                 remote_sources = gathered_mode4_remote_sources_by_rank.get(
                     int(source_rank), {})
@@ -3331,12 +3382,12 @@ class NPUWorker(WorkerBase):
                         and hybrid_resident_capacity > 0
                     )
                     or (
-                        envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+                        remote_npu_execution_mode
                         and hybrid_resident_capacity > 0
                         and target_per_rank <= hybrid_resident_capacity
                     )
                 ))
-            if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+            if (remote_npu_execution_mode
                     and hybrid_resident_capacity > 0
                     and len(previous_active_ranks) == 2 * len(active_ranks)
                     and set(active_ranks).issubset(set(previous_active_ranks))
@@ -3370,7 +3421,7 @@ class NPUWorker(WorkerBase):
                 pass  # debug log removed
                 logged_pairing_summary = True
 
-            if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+            if (remote_npu_execution_mode
                     and hybrid_resident_capacity > 0
                     and len(previous_active_ranks) == 2 * len(active_ranks)
                     and len(inactive_ranks) == len(active_ranks)
@@ -3525,8 +3576,10 @@ class NPUWorker(WorkerBase):
                 payload_store_ms += (
                     time.perf_counter() - module_store_start_t) * 1000.0
                 if module.layer_idx == 0 and current_rank == active_ranks[0]:
+                    mode = int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
                     logger.info(
-                        "Mode4 paired cascade shrink plan: rank=%s active_ranks=%s inactive_ranks=%s target_per_rank=%s remote_imports=%s assignment_counts=%s",
+                        "Mode%s paired cascade shrink plan: rank=%s active_ranks=%s inactive_ranks=%s target_per_rank=%s remote_imports=%s assignment_counts=%s",
+                        mode,
                         current_rank,
                         active_ranks,
                         inactive_ranks,
@@ -3786,7 +3839,7 @@ class NPUWorker(WorkerBase):
                     else:
                         selected_source_local_id = selected_resident_local_id
                     mode4_needs_remote_source = (
-                        envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
+                        remote_npu_execution_mode
                         and hybrid_resident_capacity > 0
                         and int(selected_source_local_id) >= hybrid_resident_capacity
                     )
@@ -4305,11 +4358,9 @@ class NPUWorker(WorkerBase):
                  int(layer_idx)))
         remote_items = list(sorted(assignments_by_rank.items()))
         execution_mode = int(getattr(layer, "elastic_execution_mode", 4))
-        # Mode5 has multiple remote cache ranks once the active group shrinks
-        # below 8. Serial fetch can deadlock because every owner waits for one
-        # HCCL payload before issuing the next cache-rank request. Keep all
-        # remote requests/recvs in flight so cache ranks can make progress
-        # independently.
+        # Keep all remote requests/recvs in flight so cache ranks can make
+        # progress independently.  The known-good mode4 floor=1 path also uses
+        # parallel fan-in from ranks 0..14; do not serialize it by default.
         parallel_remote_fetch_default = "1"
         parallel_remote_fetch_env = (
             "VLLM_ASCEND_MODE5_PARALLEL_REMOTE_FETCH"
@@ -4907,8 +4958,8 @@ class NPUWorker(WorkerBase):
                                          active_ranks: list[int],
                                          world_group) -> None:
         execution_mode = int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
-        mode_name = f"Mode{execution_mode}" if execution_mode in (4, 5) \
-            else "Mode4"
+        mode_name = f"Mode{execution_mode}" if _execution_mode_uses_remote_npu_path(
+            execution_mode) else "Mode4"
         cpu_group = world_group.cpu_group
         device_group = world_group.device_group
         model_runner = getattr(self, "model_runner", None)
@@ -5255,8 +5306,8 @@ class NPUWorker(WorkerBase):
     def _start_mode4_remote_cache_service(self, active_ranks: list[int],
                                           world_group) -> None:
         execution_mode = int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
-        mode_name = f"Mode{execution_mode}" if execution_mode in (4, 5) \
-            else "Mode4"
+        mode_name = f"Mode{execution_mode}" if _execution_mode_uses_remote_npu_path(
+            execution_mode) else "Mode4"
         current_rank = torch.distributed.get_rank()
         owner_to_cache: dict[int, set[int]] = {}
         cache_to_owner: dict[int, set[int]] = {}
@@ -5412,8 +5463,8 @@ class NPUWorker(WorkerBase):
         if world_group is None:
             return
         execution_mode = int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
-        mode_name = f"Mode{execution_mode}" if execution_mode in (4, 5) \
-            else "Mode4"
+        mode_name = f"Mode{execution_mode}" if _execution_mode_uses_remote_npu_path(
+            execution_mode) else "Mode4"
         active_attr = getattr(self, "_elastic_current_active_ranks", None)
         if active_attr is None:
             return
@@ -6670,11 +6721,13 @@ class NPUWorker(WorkerBase):
             if payload is None:
                 raise RuntimeError(
                     f"Missing lossless shrink payload for layer={module.layer_idx}.")
-            if int(getattr(module, "elastic_execution_mode", 0)) == 4:
+            module_mode = int(getattr(module, "elastic_execution_mode", 0))
+            if module_mode == 4:
                 remote_sources = payload.get("cpu_import_source_rank", {})
                 if module.layer_idx == 0:
                     logger.info(
-                        "Mode4 remote-NPU cache preload skipped: rank=%s active_ranks=%s remote_sources=%s",
+                        "Mode%s remote-NPU cache preload skipped: rank=%s active_ranks=%s remote_sources=%s",
+                        module_mode,
                         self.rank,
                         active_ranks,
                         len(remote_sources),
@@ -6685,12 +6738,11 @@ class NPUWorker(WorkerBase):
             filter_cpu_payload_start_t = time.perf_counter()
             cpu_payload = (
                 _mode5_filter_cpu_payload(payload)
-                if int(getattr(module, "elastic_execution_mode", 0)) == 5
+                if module_mode == 5
                 else payload)
             preload_filter_cpu_payload_ms += (
                 time.perf_counter() - filter_cpu_payload_start_t) * 1000.0
-            if (int(getattr(module, "elastic_execution_mode", 0)) == 5
-                    and module.layer_idx == 0):
+            if module_mode == 5 and module.layer_idx == 0:
                 logger.info(
                     "Mode5 shrink preload CPU-shadow plan: rank=%s active_ranks=%s total_missing=%s remote_npu=%s cpu_shadow_import=%s",
                     self.rank,
@@ -7006,9 +7058,11 @@ class NPUWorker(WorkerBase):
         reused but low-level PG destruction is not forced inside the shrink RPC.
 
         Device PG destruction is enabled by default to release HCCL/HBM
-        workspace. Only CPU/Gloo PG teardown is deferred, because the observed
-        350s stall comes from hot-path GroupCoordinator teardown while retaining
-        stale device PGs can OOM later HCCL collectives.
+        workspace and IPC/link resources. The critical part is not keeping the
+        device PG alive; it is keeping the retired GroupCoordinator wrapper
+        quarantined after its live/cache references are removed, so Python GC
+        cannot run wrapper teardown at an arbitrary point in the shrink RPC
+        response path.
         """
         retire_start_t = time.perf_counter()
         npu_sync_ms = 0.0
@@ -7082,8 +7136,13 @@ class NPUWorker(WorkerBase):
                 continue
             seen_pg_ids.add(device_pg_id)
             unique_device_pgs.append(device_pg)
-        destroy_device_pg = _env_flag(
-            "VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE", "1")
+        if (int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) == 3
+                and self._has_mode3_cross_layer_lightweight_module()):
+            destroy_device_pg = _env_flag(
+                "VLLM_ASCEND_MODE3_DESTROY_DEVICE_PG_ON_RETIRE", "1")
+        else:
+            destroy_device_pg = _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE", "1")
         if destroy_device_pg:
             destroy_start_t = time.perf_counter()
             for device_pg in unique_device_pgs:
@@ -7186,6 +7245,7 @@ class NPUWorker(WorkerBase):
         self._mark_retired_elastic_group(group)
         retire_stats = self._retire_group_wrapper_defer_pg_destroy(group)
         deferred.append({
+            "group": group,
             "device_pgs": retire_stats.get("device_pgs", []),
             "cpu_pgs": retire_stats.get("cpu_pgs", []),
             "group_id": group_id,
@@ -7233,6 +7293,42 @@ class NPUWorker(WorkerBase):
             return False
         raw_sizes = os.getenv(
             "VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES",
+            "1,2,4,8",
+        )
+        defer_sizes: set[int] = set()
+        for raw_size in raw_sizes.split(","):
+            raw_size = raw_size.strip()
+            if not raw_size:
+                continue
+            try:
+                defer_sizes.add(int(raw_size))
+            except ValueError:
+                continue
+        return len(group_ranks) in defer_sizes
+
+    def _should_defer_mode3_group_destroy(
+            self, group_kind: str, group_ranks: tuple[int, ...],
+            keep_group_ranks: tuple[int, ...], reason: str) -> bool:
+        if int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) != 3:
+            return False
+        if not self._has_mode3_cross_layer_lightweight_module():
+            return False
+        if not _env_flag("VLLM_ASCEND_MODE3_DEFER_GROUP_DESTROY", "0"):
+            return False
+        if group_kind != "mc2" and not _env_flag(
+                "VLLM_ASCEND_MODE3_DEFER_DP_EP_GROUP_DESTROY", "0"):
+            return False
+        if group_kind not in ("dp", "ep", "mc2"):
+            return False
+        if not group_ranks or group_ranks == keep_group_ranks:
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+        world_size = int(torch.distributed.get_world_size())
+        if group_ranks == tuple(range(world_size)):
+            return False
+        raw_sizes = os.getenv(
+            "VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES",
             "1,2,4,8",
         )
         defer_sizes: set[int] = set()
@@ -7606,6 +7702,17 @@ class NPUWorker(WorkerBase):
         if not self._has_mode3_cross_layer_lightweight_module():
             return False
         if group_kind == "mc2":
+            if (int(getattr(self, "rank", -1)) in keep_group_ranks
+                    and _env_flag(
+                        "VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS",
+                        "1")):
+                # A 300s-class stall was observed when active mode=3 ranks
+                # refreshed the new stage-4 MC2 runtime and then immediately
+                # retired the previous stage-8 MC2 cache in the same shrink
+                # RPC. This mirrors the mode=1 lifecycle pitfall documented in
+                # the deployment guide: avoid crossing active refresh/warmup
+                # with stale communicator teardown on the hot path.
+                return True
             # MC2/HCCL resources are the only stale groups that have shown
             # large low-floor allocation pressure when they are rebuilt after
             # every rollout step. Keep them by default for mode3 stability and
@@ -8268,6 +8375,13 @@ class NPUWorker(WorkerBase):
                     group_kind,
                     group_ranks,
                     destroy_reason,
+            ) or self._should_defer_mode3_group_destroy(
+                    group_kind,
+                    group_ranks,
+                    tuple(
+                        int(rank) for rank in getattr(
+                            self, "_elastic_rebuild_target_ranks", ()) or ()),
+                    destroy_reason,
             ):
                 self._quarantine_deferred_elastic_group(
                     group,
@@ -8394,6 +8508,11 @@ class NPUWorker(WorkerBase):
                                     f"stale_ranks={ranks} keep_ranks={keep_group_ranks}",
                                 )
                             if self._should_defer_mode1_group_destroy(
+                                    group_kind,
+                                    tuple(int(rank) for rank in ranks),
+                                    keep_group_ranks,
+                                    "drop_stale_cache",
+                            ) or self._should_defer_mode3_group_destroy(
                                     group_kind,
                                     tuple(int(rank) for rank in ranks),
                                     keep_group_ranks,
@@ -8676,7 +8795,12 @@ class NPUWorker(WorkerBase):
 
             should_cache_group = self._should_cache_elastic_parallel_group(
                 attr_name)
-            if should_cache_group:
+            bypass_cache_hit = (
+                group_kind == "mc2"
+                and bool(getattr(self,
+                                 "_elastic_force_rebuild_mc2_on_restore",
+                                 False)))
+            if should_cache_group and not bypass_cache_hit:
                 cached_groups = self._get_cached_elastic_parallel_groups()
                 cached_group = cached_groups.get(attr_name,
                                                  {}).get(local_group_ranks)
@@ -8691,6 +8815,10 @@ class NPUWorker(WorkerBase):
                             f"group_name={group_name} ranks={local_group_ranks}",
                         )
                     return
+            elif should_cache_group and bypass_cache_hit:
+                logger.info(
+                    "Elastic parallel group cache bypass: rank=%s attr=%s group_name=%s ranks=%s reason=mode3_restore_force_rebuild_mc2",
+                    self.rank, attr_name, group_name, local_group_ranks)
 
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
@@ -8731,6 +8859,15 @@ class NPUWorker(WorkerBase):
             logger.info(
                 "Elastic post-shrink DP all_reduce warmup skipped: "
                 "rank=%s dp_size=%s reason=mode1_default_disabled",
+                self.rank, dp_group.world_size)
+            return
+        if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 3
+                and not _env_flag(
+                    "VLLM_ASCEND_MODE3_ENABLE_POST_SHRINK_DP_WARMUP",
+                    "0")):
+            logger.info(
+                "Elastic post-shrink DP all_reduce warmup skipped: "
+                "rank=%s dp_size=%s reason=mode3_default_disabled",
                 self.rank, dp_group.world_size)
             return
         if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (4, 5)
@@ -8927,6 +9064,18 @@ class NPUWorker(WorkerBase):
                         active_signature)
                 logger.info(
                     "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode3_disabled",
+                    self.rank, list(active_signature))
+                return
+            mode3_uses_fused_experts = _env_flag(
+                "VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH", "1")
+            force_dispatcher_warmup = _env_flag(
+                "VLLM_ASCEND_MODE3_FORCE_DISPATCHER_WARMUP", "0")
+            if mode3_uses_fused_experts and not force_dispatcher_warmup:
+                if active_signature:
+                    self._post_shrink_moe_dispatch_warmed_active_signatures.add(
+                        active_signature)
+                logger.info(
+                    "Elastic post-shrink MoE dispatch warmup skipped: rank=%s active_ranks=%s reason=mode3_fused_experts_no_dispatcher_warmup",
                     self.rank, list(active_signature))
                 return
             if not hasattr(model_runner,
@@ -9689,18 +9838,31 @@ class NPUWorker(WorkerBase):
         self._reconcile_group_creation_sequence_before_restore(
             world_group, backend)
 
+        force_rebuild_restore_mc2 = (
+            int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) == 3
+            and _env_flag("VLLM_ASCEND_MODE3_REBUILD_MC2_ON_RESTORE", "0"))
+        previous_force_rebuild_mc2 = getattr(
+            self, "_elastic_force_rebuild_mc2_on_restore", False)
+
         rebuild_start_t = time.perf_counter()
-        with set_current_vllm_config(self.vllm_config):
-            self._rebuild_group(vllm_ps, "_DP",
-                                self._build_original_dp_group_ranks(world_size),
-                                world_group, backend, "dp")
-            self._rebuild_group(vllm_ps, "_EP",
-                                self._build_original_ep_group_ranks(world_size),
-                                world_group, backend, "ep")
-            self._rebuild_group(
-                ascend_ps, "_MC2",
-                self._build_original_mc2_group_ranks(world_size),
-                world_group, backend, "mc2")
+        self._elastic_force_rebuild_mc2_on_restore = force_rebuild_restore_mc2
+        try:
+            with set_current_vllm_config(self.vllm_config):
+                self._rebuild_group(
+                    vllm_ps, "_DP",
+                    self._build_original_dp_group_ranks(world_size),
+                    world_group, backend, "dp")
+                self._rebuild_group(
+                    vllm_ps, "_EP",
+                    self._build_original_ep_group_ranks(world_size),
+                    world_group, backend, "ep")
+                self._rebuild_group(
+                    ascend_ps, "_MC2",
+                    self._build_original_mc2_group_ranks(world_size),
+                    world_group, backend, "mc2")
+        finally:
+            self._elastic_force_rebuild_mc2_on_restore = (
+                previous_force_rebuild_mc2)
         rebuild_ms = (time.perf_counter() - rebuild_start_t) * 1000.0
 
         refresh_start_t = time.perf_counter()

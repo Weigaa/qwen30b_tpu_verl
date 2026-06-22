@@ -3776,11 +3776,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 dtype=torch.int32,
                                 device=self.device).view(
                                     top_k, -1).permute(1, 0).contiguous())
-        expert_map = getattr(target_experts, "expert_map", None)
-        if expert_map is None:
+        if _env_flag("VLLM_ASCEND_MODE3_DENSE_RUNTIME_EXPERT_MAP", "1"):
             expert_map = torch.arange(dispatch_num_experts,
                                       dtype=torch.int32,
                                       device=self.device)
+        else:
+            expert_map = getattr(target_experts, "expert_map", None)
+            if expert_map is None:
+                expert_map = torch.arange(dispatch_num_experts,
+                                          dtype=torch.int32,
+                                          device=self.device)
 
         num_tokens_across_dp = torch.full(
             (self.dp_size, ), num_tokens, dtype=torch.int64)
@@ -3792,7 +3797,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         logger.info(
             "Mode3 MC2 dispatcher-only warmup start: rank=%s tokens=%s "
             "hidden_size=%s top_k=%s dispatch_num_experts=%s ep_size=%s "
-            "layer=%s expert_token_nums_type=%s",
+            "layer=%s expert_token_nums_type=%s expert_map_shape=%s",
             rank,
             num_tokens,
             hidden_size,
@@ -3802,6 +3807,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         "ep_size", -1)),
             int(getattr(target_experts, "layer_idx", -1)),
             warmup_expert_token_nums_type,
+            tuple(expert_map.shape) if expert_map is not None else None,
         )
 
         old_num_experts = None

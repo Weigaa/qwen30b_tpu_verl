@@ -23,6 +23,7 @@
 
 from abc import ABC, abstractmethod
 import os
+import time
 from typing import Any, Optional
 
 import torch
@@ -39,6 +40,58 @@ from vllm_ascend.utils import AscendSocVersion, get_ascend_soc_version
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+def _env_int_or_none(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _npu_memory_snapshot() -> dict[str, int]:
+    try:
+        free_bytes, total_bytes = torch.npu.mem_get_info()
+        stats = torch_npu.npu.memory_stats()
+        torch_current = int(stats.get("allocated_bytes.all.current", 0))
+        torch_reserved = int(stats.get("reserved_bytes.all.current", 0))
+        total_allocated = int(total_bytes - free_bytes)
+        return {
+            "free_bytes": int(free_bytes),
+            "total_bytes": int(total_bytes),
+            "torch_current": torch_current,
+            "torch_reserved": torch_reserved,
+            "non_torch": max(total_allocated - torch_current, 0),
+            "total_allocated": total_allocated,
+        }
+    except Exception:
+        return {
+            "free_bytes": -1,
+            "total_bytes": -1,
+            "torch_current": -1,
+            "torch_reserved": -1,
+            "non_torch": -1,
+            "total_allocated": -1,
+        }
+
+
+def _dist_rank() -> int:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return -1
 
 
 def _log_mc2_memory(tag: str, layer_idx: int, ep_world_size: int,
@@ -153,6 +206,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.topk_weights = None
         self.shared_experts = None
         self.mc2_mask = None
+        self._last_use_dispatch_v2 = self.enable_dispatch_v2
+        self._dispatch_v2_diag_count = 0
         self.with_quant = False
         # Align old custom MC2 dispatch_v2 with the native/torchair default:
         # use per-expert token counts instead of cumulative counts.
@@ -171,6 +226,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                 self.enable_dispatch_v2,
                 self.a3_need_extra_args,
             )
+
+    def _current_dispatch_v2_enabled(self) -> bool:
+        if not self.enable_dispatch_v2:
+            return False
+        return True
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -213,7 +273,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                 "tp_world_size": 1,
                 "tp_rank_id": 0,
             })
-        if self.a3_need_extra_args and self.enable_dispatch_v2:
+        use_dispatch_v2 = self._current_dispatch_v2_enabled()
+        if self.a3_need_extra_args and use_dispatch_v2:
             stage1_kwargs.update({
                 "x_active_mask": self.mc2_mask,
             })
@@ -242,7 +303,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.topk_ids = topk_ids
         self.topk_weights = topk_weights
         self.shared_experts = shared_experts
-        if self.a3_need_extra_args and self.enable_dispatch_v2:
+        use_dispatch_v2 = self._current_dispatch_v2_enabled()
+        if self.a3_need_extra_args and use_dispatch_v2:
             if mc2_mask is None:
                 raise RuntimeError(
                     "MC2 dispatch_v2 on A3 requires x_active_mask/mc2_mask.")
@@ -271,7 +333,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                 "MC2 dispatch args: layer=%s ep_world_size=%s ep_rank=%s "
                 "hidden_tokens=%s topk_shape=%s moe_expert_num=%s "
                 "dispatcher_num_experts=%s expert_token_nums_type=%s "
-                "active_mask_count=%s topk_min=%s topk_max=%s topk_unique=%s",
+                "use_dispatch_v2=%s active_mask_count=%s expert_map_shape=%s "
+                "topk_min=%s "
+                "topk_max=%s topk_unique=%s",
                 debug_info.get("layer_idx", -1),
                 self.ep_world_size,
                 self.ep_rank_id,
@@ -283,7 +347,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                     ["moe_expert_num"]),
                 int(getattr(self, "num_experts", -1)),
                 int(getattr(self, "expert_token_nums_type", -1)),
+                int(use_dispatch_v2),
                 active_mask_count,
+                tuple(expert_map.shape) if expert_map is not None else None,
                 int(topk_ids.min().item()) if topk_ids.numel() > 0 else -1,
                 int(topk_ids.max().item()) if topk_ids.numel() > 0 else -1,
                 int(torch.unique(topk_ids).numel()) if topk_ids.numel() > 0 else 0,
@@ -292,14 +358,167 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(hidden_states, topk_weights,
                                                   topk_ids, expert_map,
                                                   global_redundant_expert_num)
+        self._last_use_dispatch_v2 = bool(use_dispatch_v2)
+        diag_enabled = _env_flag("VLLM_ASCEND_DISPATCH_V2_DIAG_LOG", "0")
+        diag_ep_world_size = _env_int_or_none(
+            "VLLM_ASCEND_DISPATCH_V2_DIAG_EP_WORLD_SIZE")
+        if diag_ep_world_size is not None and int(
+                self.ep_world_size) != diag_ep_world_size:
+            diag_enabled = False
+        diag_count = int(getattr(self, "_dispatch_v2_diag_count", 0))
+        diag_first_n = _env_int("VLLM_ASCEND_DISPATCH_V2_DIAG_FIRST_N", 4)
+        diag_all = _env_flag("VLLM_ASCEND_DISPATCH_V2_DIAG_ALL", "0")
+        diag_this = bool(diag_enabled and (diag_all or diag_count < diag_first_n))
+        if diag_enabled:
+            self._dispatch_v2_diag_count = diag_count + 1
+        if diag_this:
+            mem = _npu_memory_snapshot()
+            try:
+                topk_min = int(topk_ids.min().item()) if topk_ids.numel() else -1
+                topk_max = int(topk_ids.max().item()) if topk_ids.numel() else -1
+            except Exception:
+                topk_min = -1
+                topk_max = -1
+            try:
+                mask_count = (int(torch.count_nonzero(self.mc2_mask).item())
+                              if self.mc2_mask is not None else -1)
+            except Exception:
+                mask_count = -1
+            logger.info(
+                "MC2 DispatchV2 diag before: rank=%s dispatcher_id=%s "
+                "call=%s layer=%s ep_world_size=%s ep_rank=%s group=%s "
+                "use_dispatch_v2=%s moe_expert_num=%s "
+                "dispatcher_num_experts=%s dispatcher_num_experts_local=%s "
+                "expert_token_nums_type=%s hidden_shape=%s hidden_dtype=%s "
+                "topk_shape=%s topk_dtype=%s topk_min=%s topk_max=%s "
+                "mask_shape=%s mask_count=%s expert_map_shape=%s "
+                "free_bytes=%s total_bytes=%s torch_current=%s "
+                "torch_reserved=%s non_torch=%s total_allocated=%s",
+                _dist_rank(),
+                id(self),
+                diag_count,
+                layer_idx,
+                self.ep_world_size,
+                self.ep_rank_id,
+                self.moe_all_to_all_group_name,
+                int(use_dispatch_v2),
+                int(kwargs_mc2.get("moe_expert_num", -1)),
+                int(getattr(self, "num_experts", -1)),
+                int(getattr(self, "num_experts_local", -1)),
+                int(getattr(self, "expert_token_nums_type", -1)),
+                tuple(hidden_states.shape),
+                str(hidden_states.dtype),
+                tuple(topk_ids.shape),
+                str(topk_ids.dtype),
+                topk_min,
+                topk_max,
+                tuple(self.mc2_mask.shape) if self.mc2_mask is not None else None,
+                mask_count,
+                tuple(expert_map.shape) if expert_map is not None else None,
+                mem["free_bytes"],
+                mem["total_bytes"],
+                mem["torch_current"],
+                mem["torch_reserved"],
+                mem["non_torch"],
+                mem["total_allocated"],
+            )
         _log_mc2_memory("before_dispatch", layer_idx, self.ep_world_size,
                         self.ep_rank_id)
-        self.output = torch_npu.npu_moe_distribute_dispatch_v2(
-            **kwargs_mc2
-        ) if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
-            **kwargs_mc2)
+        dispatch_start_ts = time.perf_counter()
+        try:
+            self.output = torch_npu.npu_moe_distribute_dispatch_v2(
+                **kwargs_mc2
+            ) if use_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
+                **kwargs_mc2)
+        except Exception as exc:
+            if diag_this:
+                mem = _npu_memory_snapshot()
+                logger.error(
+                    "MC2 DispatchV2 diag error: rank=%s dispatcher_id=%s "
+                    "call=%s layer=%s ep_world_size=%s ep_rank=%s "
+                    "elapsed_ms=%.3f error=%r free_bytes=%s total_bytes=%s "
+                    "torch_current=%s torch_reserved=%s non_torch=%s "
+                    "total_allocated=%s",
+                    _dist_rank(),
+                    id(self),
+                    diag_count,
+                    layer_idx,
+                    self.ep_world_size,
+                    self.ep_rank_id,
+                    (time.perf_counter() - dispatch_start_ts) * 1000.0,
+                    exc,
+                    mem["free_bytes"],
+                    mem["total_bytes"],
+                    mem["torch_current"],
+                    mem["torch_reserved"],
+                    mem["non_torch"],
+                    mem["total_allocated"],
+                )
+            raise
         _log_mc2_memory("after_dispatch_submit", layer_idx, self.ep_world_size,
                         self.ep_rank_id)
+        dispatch_elapsed_ms = (time.perf_counter() - dispatch_start_ts) * 1000.0
+        host_timing_enabled = _env_flag("VLLM_ASCEND_MC2_HOST_TIMING_LOG", "1")
+        host_timing_threshold_ms = _env_int(
+            "VLLM_ASCEND_MC2_HOST_TIMING_THRESHOLD_MS", 1000)
+        host_timing_first_n = _env_int(
+            "VLLM_ASCEND_MC2_HOST_TIMING_FIRST_N", 4)
+        host_timing_count = int(getattr(self, "_mc2_host_timing_count", 0))
+        if host_timing_enabled and (host_timing_count < host_timing_first_n
+                                    or dispatch_elapsed_ms >=
+                                    host_timing_threshold_ms):
+            self._mc2_host_timing_count = host_timing_count + 1
+            logger.info(
+                "MC2 host timing: phase=dispatch rank=%s dispatcher_id=%s "
+                "call=%s layer=%s ep_world_size=%s ep_rank=%s "
+                "use_dispatch_v2=%s elapsed_ms=%.3f moe_expert_num=%s "
+                "dispatcher_num_experts=%s expert_map_shape=%s "
+                "hidden_shape=%s topk_shape=%s",
+                _dist_rank(),
+                id(self),
+                host_timing_count,
+                layer_idx,
+                self.ep_world_size,
+                self.ep_rank_id,
+                int(use_dispatch_v2),
+                dispatch_elapsed_ms,
+                int(kwargs_mc2.get("moe_expert_num", -1)),
+                int(getattr(self, "num_experts", -1)),
+                tuple(expert_map.shape) if expert_map is not None else None,
+                tuple(hidden_states.shape),
+                tuple(topk_ids.shape),
+            )
+        if diag_this:
+            mem = _npu_memory_snapshot()
+            output_shapes = []
+            try:
+                for item in self.output[:6]:
+                    output_shapes.append(
+                        tuple(item.shape) if hasattr(item, "shape") else
+                        type(item).__name__)
+            except Exception:
+                output_shapes = ["<unavailable>"]
+            logger.info(
+                "MC2 DispatchV2 diag after: rank=%s dispatcher_id=%s "
+                "call=%s layer=%s ep_world_size=%s ep_rank=%s "
+                "elapsed_ms=%.3f output_shapes=%s free_bytes=%s "
+                "total_bytes=%s torch_current=%s torch_reserved=%s "
+                "non_torch=%s total_allocated=%s",
+                _dist_rank(),
+                id(self),
+                diag_count,
+                layer_idx,
+                self.ep_world_size,
+                self.ep_rank_id,
+                (time.perf_counter() - dispatch_start_ts) * 1000.0,
+                tuple(output_shapes),
+                mem["free_bytes"],
+                mem["total_bytes"],
+                mem["torch_current"],
+                mem["torch_reserved"],
+                mem["non_torch"],
+                mem["total_allocated"],
+            )
         # comm_stream.wait_stream(torch.npu.current_stream())
         expand_x, dynamic_scale, self.assist_info_for_combine, \
             expert_token_nums, self.ep_recv_counts = self.output[0:5]
@@ -360,7 +579,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
             "ep_world_size": self.ep_world_size,
             "ep_rank_id": self.ep_rank_id,
         }
-        if self.enable_dispatch_v2:
+        use_dispatch_v2 = bool(getattr(self, "_last_use_dispatch_v2",
+                                       self._current_dispatch_v2_enabled()))
+        if use_dispatch_v2:
             stage3_kwargs.update({
                 "assist_info_for_combine":
                 self.assist_info_for_combine,
@@ -376,7 +597,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                 "tp_world_size": 1,
                 "tp_rank_id": 0,
             })
-        if self.a3_need_extra_args and self.enable_dispatch_v2:
+        if self.a3_need_extra_args and use_dispatch_v2:
             stage3_kwargs.update({
                 "x_active_mask": self.mc2_mask,
             })
@@ -389,12 +610,44 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states)
         _log_mc2_memory("before_combine", -1, self.ep_world_size,
                         self.ep_rank_id)
+        combine_start_ts = time.perf_counter()
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(
             **kwargs_mc2
-        ) if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_combine(
-            **kwargs_mc2)
+        ) if self._current_dispatch_v2_enabled(
+        ) else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
         _log_mc2_memory("after_combine_submit", -1, self.ep_world_size,
                         self.ep_rank_id)
+        combine_elapsed_ms = (time.perf_counter() - combine_start_ts) * 1000.0
+        host_timing_enabled = _env_flag("VLLM_ASCEND_MC2_HOST_TIMING_LOG", "1")
+        host_timing_threshold_ms = _env_int(
+            "VLLM_ASCEND_MC2_HOST_TIMING_THRESHOLD_MS", 1000)
+        host_timing_first_n = _env_int(
+            "VLLM_ASCEND_MC2_HOST_TIMING_FIRST_N", 4)
+        host_timing_count = int(getattr(self, "_mc2_combine_host_timing_count",
+                                        0))
+        if host_timing_enabled and (host_timing_count < host_timing_first_n
+                                    or combine_elapsed_ms >=
+                                    host_timing_threshold_ms):
+            self._mc2_combine_host_timing_count = host_timing_count + 1
+            logger.info(
+                "MC2 host timing: phase=combine rank=%s dispatcher_id=%s "
+                "call=%s ep_world_size=%s ep_rank=%s use_dispatch_v2=%s "
+                "elapsed_ms=%.3f moe_expert_num=%s dispatcher_num_experts=%s "
+                "expert_map_shape=%s hidden_shape=%s",
+                _dist_rank(),
+                id(self),
+                host_timing_count,
+                self.ep_world_size,
+                self.ep_rank_id,
+                int(bool(getattr(self, "_last_use_dispatch_v2",
+                                 self._current_dispatch_v2_enabled()))),
+                combine_elapsed_ms,
+                int(kwargs_mc2.get("moe_expert_num", -1)),
+                int(getattr(self, "num_experts", -1)),
+                tuple(self.expert_map.shape)
+                if self.expert_map is not None else None,
+                tuple(hidden_states.shape),
+            )
 
         # these values are no longer used, so they need to be set to None for memory release.
         self.output = None
@@ -404,6 +657,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.topk_weights = None
         self.mc2_mask = None
         self.expert_map = None
+        self._last_use_dispatch_v2 = self.enable_dispatch_v2
 
         if self.shared_experts is None:
             return hidden_states

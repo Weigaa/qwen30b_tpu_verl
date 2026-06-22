@@ -156,12 +156,15 @@ fi
 #   2/4/8/16 -> 最多缩到该 floor 结束，不再进入 1-rank tail
 export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE:-2}
 # mode=2 时每个 rank 固定保留的 NPU resident expert 槽位数
-# mode=3 时该值不控制双缓冲大小；当前 runtime double buffer 固定为 128 experts
+# mode=3 时该值不控制双缓冲大小；runtime double buffer 默认按当前
+# shrink 阶段动态申请，128 仅作为 logical expert 上限/兜底路径。
 export VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS:-8}
-# mode=1 floor=2 local-stability path:
+# mode=1 local-stability path:
 # keep payload transfer as direct NPU->NPU, but avoid the NPU scalar slot-map
 # lookup that can turn into a 350s runtime/HCCL synchronization on this host.
-export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS=${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS:-377344}
+# Use 0 to disable the native KV cap and let mode=1/floor=8 probe the real
+# allocator limit. kv_cache_utils.py treats max_tokens <= 0 as "no cap".
+export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS=${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS:-0}
 export VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE=${VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE:-1}
 export VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE=${VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE:-0}
 export VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK:-0}
@@ -172,8 +175,18 @@ export VLLM_ASCEND_MODE1_BATCH_DIRECT_NPU_IMPORT=${VLLM_ASCEND_MODE1_BATCH_DIREC
 export VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT=${VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT:-0}
 export VLLM_ASCEND_MODE1_ALLOW_BATCH_INDEX_SELECT_EXPORT=${VLLM_ASCEND_MODE1_ALLOW_BATCH_INDEX_SELECT_EXPORT:-0}
 export VLLM_ASCEND_MODE1_DIRECT_NPU_IMPORT_BATCH_EXPERTS=${VLLM_ASCEND_MODE1_DIRECT_NPU_IMPORT_BATCH_EXPERTS:-8}
-export VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_EMPTY_CACHE=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_EMPTY_CACHE:-0}
-export VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_SYNC=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_SYNC:-0}
+if [[ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "1" ]]; then
+    # mode=1 floor=2 can turn post-shrink empty_cache/synchronize into the
+    # 350s HCCL/NPU runtime stall. Keep it disabled there.
+    export VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_EMPTY_CACHE=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_EMPTY_CACHE:-0}
+    export VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_SYNC=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_SYNC:-0}
+else
+    # mode=3/4/5 need to return transient shrink/import allocations to the NPU
+    # allocator before the first post-shrink MC2 dispatch asks HCCL for
+    # workspace. This is the difference between matching KV budget and OOM.
+    export VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_EMPTY_CACHE=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_EMPTY_CACHE:-1}
+    export VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_SYNC=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_SYNC:-1}
+fi
 export VLLM_ASCEND_MODE1_PARITY_SYNC_AFTER_MC2_GROUP_DESTROY=${VLLM_ASCEND_MODE1_PARITY_SYNC_AFTER_MC2_GROUP_DESTROY:-0}
 export VLLM_ASCEND_MODE1_PARITY_GC_AFTER_MC2_GROUP_DESTROY=${VLLM_ASCEND_MODE1_PARITY_GC_AFTER_MC2_GROUP_DESTROY:-0}
 export VLLM_ASCEND_MODE1_PARITY_RELEASE_DP_WARMUP_CACHE=${VLLM_ASCEND_MODE1_PARITY_RELEASE_DP_WARMUP_CACHE:-0}
@@ -217,9 +230,17 @@ export VLLM_ASCEND_MODE3_DEVICE_READY_WAIT=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT
 # mode=3 step-5: try direct CPU shadow row copies into the final runtime
 # expert slots on the CPU prefetch stream, bypassing the staging buffer.
 #
-# Default to staging for the next A/B run so it can be compared with the
-# previous direct-slot run. Override to 1 to restore direct CPU -> runtime slot.
+# Default to direct CPU -> runtime slot. Override to 0 to restore the old
+# plain-NPU staging path for quality/performance A/B runs.
 export VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT:-1}
+# Keep the direct-slot path truly direct: when enabled, sync_current should not
+# allocate or retain the old plain NPU CPU-staging buffers. Also release stale
+# runtime slot/cache references across mode=3 shrink-stage activations so the
+# floor=4 DispatchV2 workspace sees real free memory.
+export VLLM_ASCEND_MODE3_RELEASE_CPU_STAGE_ON_DIRECT=${VLLM_ASCEND_MODE3_RELEASE_CPU_STAGE_ON_DIRECT:-1}
+export VLLM_ASCEND_MODE3_RELEASE_RUNTIME_ON_STAGE_CHANGE=${VLLM_ASCEND_MODE3_RELEASE_RUNTIME_ON_STAGE_CHANGE:-1}
+export VLLM_ASCEND_MODE3_DYNAMIC_RUNTIME_CAPACITY=${VLLM_ASCEND_MODE3_DYNAMIC_RUNTIME_CAPACITY:-1}
+export VLLM_ASCEND_MODE3_REBUILD_MC2_ON_RESTORE=${VLLM_ASCEND_MODE3_REBUILD_MC2_ON_RESTORE:-0}
 # mode=3 step-6: coalesce contiguous expert slot copies into larger slice
 # copies. CPU direct bulk is experimental because the runtime slot may use a
 # formatted layout; set it to 0 to fall back to the proven per-expert direct
@@ -227,6 +248,12 @@ export VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT:-1}
 export VLLM_ASCEND_MODE3_BULK_NPU_COPY=${VLLM_ASCEND_MODE3_BULK_NPU_COPY:-1}
 export VLLM_ASCEND_MODE3_BULK_CPU_STAGE=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE:-1}
 export VLLM_ASCEND_MODE3_BULK_CPU_DIRECT=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT:-1}
+export VLLM_ASCEND_MODE3_CPU_DIRECT_HOST_SYNC_BEFORE_DISPATCH=${VLLM_ASCEND_MODE3_CPU_DIRECT_HOST_SYNC_BEFORE_DISPATCH:-0}
+export VLLM_ASCEND_MODE3_CPU_DIRECT_EMPTY_CACHE_BEFORE_DISPATCH=${VLLM_ASCEND_MODE3_CPU_DIRECT_EMPTY_CACHE_BEFORE_DISPATCH:-0}
+# Diagnostic/stability mode: keep direct CPU slot semantics, but serialize CPU
+# sourced rows instead of posting many async H2D copies into formatted runtime
+# slots. Enable for mode=3 low-floor OOM bisects.
+export VLLM_ASCEND_MODE3_CPU_DIRECT_SYNC_COPY=${VLLM_ASCEND_MODE3_CPU_DIRECT_SYNC_COPY:-0}
 # mode=3 experimental: reuse each layer's resident prefix weight buffer as the
 # runtime buffer when resident NPU experts already occupy the required dense
 # prefix slots. Keep disabled by default to preserve the strict two-runtime-
@@ -237,16 +264,44 @@ export VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFF
 #   directly, avoiding a per-layer cumulative->counts conversion.
 #   ACTIVE_ROWS_SYNC=1 restores active_rows diagnostics but adds host sync.
 export VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH:-1}
-export VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE:-0}
+export VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE:-1}
 export VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC:-0}
-# mode=3 deeper shrink stages lazily allocate MC2/HCCL dispatcher resources.
-# Prime the dispatcher after each shrink without running full MoE/KV warmup.
-export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP:-1}
+# A/B default for mode=3: use compact dispatch domain to test whether the
+# floor=4 DispatchV2 1.56GiB HCCL tiling workspace is caused by full-domain
+# mode3 dispatch. Override to 1 to restore the previous full-domain behavior.
+export VLLM_ASCEND_MODE3_FULL_DISPATCH_DOMAIN=${VLLM_ASCEND_MODE3_FULL_DISPATCH_DOMAIN:-0}
+# Mode=3 remaps logical expert ids into a compact runtime domain before MC2.
+# Keep the expert_map in the same dense domain; using the original logical
+# expert_map with remapped topk ids can expose 300s-class DispatchV2 retries.
+export VLLM_ASCEND_MODE3_DENSE_RUNTIME_EXPERT_MAP=${VLLM_ASCEND_MODE3_DENSE_RUNTIME_EXPERT_MAP:-1}
+# A/B: keep token_dispatcher metadata at the active shrink dispatch domain
+# after each mode=3 call. This tests whether repeatedly restoring to the old
+# compact 32-domain is what leaves mode=3 with extra non_torch/HCCL workspace
+# pressure compared with mode=5 remote_fraction=0.00.
+export VLLM_ASCEND_MODE3_PERSIST_DISPATCHER_DOMAIN=${VLLM_ASCEND_MODE3_PERSIST_DISPATCHER_DOMAIN:-0}
+# Keep mode=3 local-only (resident NPU + local CPU shadow), but organize CPU
+# shadow rows like mode=5 dual-source: only CPU-only experts get CPU rows.
+export VLLM_ASCEND_MODE3_MODE5_LIKE_CPU_SHADOW=${VLLM_ASCEND_MODE3_MODE5_LIKE_CPU_SHADOW:-1}
+# Keep mode=3 communicator lifecycle aligned with mode=4/5 by default:
+# do not drop/destroy stale shrink groups in the shrink hot path. Restore will
+# clear stale cache entries after the rollout has finished.
+export VLLM_ASCEND_MODE3_DROP_STALE_GROUP_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE3_DROP_STALE_GROUP_CACHE_AFTER_SHRINK:-0}
+export VLLM_ASCEND_MODE3_DROP_STALE_MC2_GROUP_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE3_DROP_STALE_MC2_GROUP_CACHE_AFTER_SHRINK:-0}
+export VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS=${VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS:-0}
+export VLLM_ASCEND_MODE3_DEFER_GROUP_DESTROY=${VLLM_ASCEND_MODE3_DEFER_GROUP_DESTROY:-0}
+export VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES=${VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES:-1,2,4,8}
+export VLLM_ASCEND_MODE3_DESTROY_DEVICE_PG_ON_RETIRE=${VLLM_ASCEND_MODE3_DESTROY_DEVICE_PG_ON_RETIRE:-1}
+# mode=3 dispatcher-only warmup is diagnostic only. On this CANN/HCCL stack the
+# synthetic MC2 DispatchV2 warmup can hit a 300s-class runtime timeout at 8->4.
+export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP:-0}
+export VLLM_ASCEND_MODE3_FORCE_DISPATCHER_WARMUP=${VLLM_ASCEND_MODE3_FORCE_DISPATCHER_WARMUP:-0}
 export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS:-32}
-# mode=3 floor=1 hits a large low-floor MC2/HCCL workspace at the 4->2
-# transition. Keep this reservation mode3-only so mode1/mode2/mode4 KV sizing
-# is untouched, and prefer stable MC2 over falling back to all2all.
-export VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=${VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-5368709120}
+export VLLM_ASCEND_MODE3_ENABLE_POST_SHRINK_DP_WARMUP=${VLLM_ASCEND_MODE3_ENABLE_POST_SHRINK_DP_WARMUP:-0}
+# mode=3 floor<=2 may hit a low-floor MC2/HCCL workspace at the 4->2
+# transition, but the fused-experts mode3 path should be validated with the
+# same default KV budget as mode4/5 first. Keep this opt-in for stability
+# bisects, e.g. set it to 5368709120 to restore the old conservative budget.
+export VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=${VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-0}
 # mode=3 profile controls:
 #   TRANSFER_LOG=0 closes high-frequency binding/prefetch logs.
 #   TIMING_LOG/TIMING_SYNC default off for performance runs. Override them to
@@ -259,6 +314,24 @@ export VLLM_ASCEND_MODE3_TIMING_SYNC=${VLLM_ASCEND_MODE3_TIMING_SYNC:-0}
 export VLLM_ASCEND_MODE3_TIMING_EVERY=${VLLM_ASCEND_MODE3_TIMING_EVERY:-1024}
 export VLLM_ASCEND_MODE3_TIMING_FIRST_N=${VLLM_ASCEND_MODE3_TIMING_FIRST_N:-1}
 export VLLM_ASCEND_MODE3_TIMING_LAYERS=${VLLM_ASCEND_MODE3_TIMING_LAYERS:-all}
+# Stage<=4 mode=3 MoE forward phase timing. This is intentionally cheap by
+# default (no NPU sync) and logs first calls plus slow outliers.
+export VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING=${VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING:-1}
+export VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_SYNC=${VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_SYNC:-0}
+export VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_FIRST_N=${VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_FIRST_N:-4}
+export VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_THRESHOLD_MS=${VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_THRESHOLD_MS:-1000}
+export VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_LAYERS=${VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_LAYERS:-all}
+export VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_MAX_STAGE=${VLLM_ASCEND_MODE3_MOE_FORWARD_TIMING_MAX_STAGE:-4}
+# Cross-mode DispatchV2 diagnostics. Keep disabled for perf/stability runs:
+# the memory snapshot path can synchronize with the NPU runtime and perturb
+# exactly the low-free-memory floor=4 path we are trying to measure.
+export VLLM_ASCEND_DISPATCH_V2_DIAG_LOG=${VLLM_ASCEND_DISPATCH_V2_DIAG_LOG:-0}
+export VLLM_ASCEND_DISPATCH_V2_DIAG_FIRST_N=${VLLM_ASCEND_DISPATCH_V2_DIAG_FIRST_N:-8}
+export VLLM_ASCEND_MODE3_DISPATCH_BIND_DIAG_LOG=${VLLM_ASCEND_MODE3_DISPATCH_BIND_DIAG_LOG:-0}
+export VLLM_ASCEND_MODE3_DISPATCH_BIND_DIAG_FIRST_N=${VLLM_ASCEND_MODE3_DISPATCH_BIND_DIAG_FIRST_N:-8}
+export VLLM_ASCEND_MC2_HOST_TIMING_LOG=${VLLM_ASCEND_MC2_HOST_TIMING_LOG:-1}
+export VLLM_ASCEND_MC2_HOST_TIMING_FIRST_N=${VLLM_ASCEND_MC2_HOST_TIMING_FIRST_N:-4}
+export VLLM_ASCEND_MC2_HOST_TIMING_THRESHOLD_MS=${VLLM_ASCEND_MC2_HOST_TIMING_THRESHOLD_MS:-1000}
 #控制moe记录是否开启
 export VLLM_MOE_PATTERN_STATS=${VLLM_MOE_PATTERN_STATS:-0}  # 1: enable MoE pattern stats collection, 0: disable
 export VLLM_MOE_STATS=${VLLM_MOE_PATTERN_STATS}
@@ -321,7 +394,21 @@ export VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=${VLLM_ASCEND_MODE5_SINGL
     export VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=${VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-0}
     export VLLM_ASCEND_MODE5_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=${VLLM_ASCEND_MODE5_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-0}
     export VLLM_ASCEND_MODE4_DOUBLE_BUFFER_HEADROOM_SAFETY_BYTES=${VLLM_ASCEND_MODE4_DOUBLE_BUFFER_HEADROOM_SAFETY_BYTES:-0}
-    export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-0}
+    if [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "1" ]]; then
+        # floor=1 is tighter than floor=2. mode=4/floor=1 still stalled with
+        # 4GiB headroom, while 5GiB completed successfully; use 5GiB for both
+        # mode=4 and mode=5 low-floor remote-cache runs.
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-5368709120}
+    elif [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "2" ]]; then
+        # Low floor remote-cache modes can hit lazy DispatchV2/remote-cache
+        # runtime allocations after shrink. 2GiB is validated for mode=5/floor=2
+        # and is the current baseline for mode=4/floor=2.
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-2147483648}
+    elif [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "4" ]]; then
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-1073741824}
+    else
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-0}
+    fi
     export VLLM_ASCEND_MODE4_FORCE_POST_SHRINK_MOE_WARMUP=${VLLM_ASCEND_MODE4_FORCE_POST_SHRINK_MOE_WARMUP:-0}
     export VLLM_ASCEND_REPEAT_POST_SHRINK_MOE_DISPATCH_WARMUP=${VLLM_ASCEND_REPEAT_POST_SHRINK_MOE_DISPATCH_WARMUP:-0}
     # Keep the full-world communicator for remote-cache P2P, but do not keep
@@ -336,17 +423,41 @@ export VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE=${VLLM_ASCEND_MODE5_SINGL
     export VLLM_ASCEND_MODE4_DROP_STALE_GROUP_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE4_DROP_STALE_GROUP_CACHE_AFTER_SHRINK:-0}
     export VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS=${VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS:-1}
 else
-    if [[ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "3" ]]; then
-        # Mode=3 keeps CPU-shadow + double-buffer state across shrink/restore.
-        # Reserve a small KV re-init cushion so the next rollout step does not
-        # fail on the final KV block after allocator/workspace fragmentation.
+    if [[ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "1" ]]; then
+        # mode=1 pure runs use no extra KV-init headroom; the KV size should be
+        # determined by resident expert redundancy and the optional mode1 cap.
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-0}
+    elif [[ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "3" ]]; then
+        # mode=3 now defaults to direct CPU -> final runtime slot copies, so it
+        # should not pay the old CPU staging-buffer KV reservation. Use the same
+        # low-floor KV-init headroom ladder as mode=4/5 and validate whether the
+        # remaining mode=3 runtime allocations can fit. floor4 is intentionally
+        # set to 1GiB for the current A/B validation against the previous 3GiB
+        # stable setting.
+        if [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "1" ]]; then
+            export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-5368709120}
+        elif [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "2" ]]; then
+            export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-2147483648}
+        elif [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "4" ]]; then
+            export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-1073741824}
+        else
+            export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-0}
+        fi
+    elif [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "4" ]]; then
         export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-1073741824}
+    elif [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "2" ]]; then
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-2147483648}
+    elif [[ "${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE}" == "1" ]]; then
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-5368709120}
     else
         export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-0}
     fi
     export VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES=${VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES:-2147483648}
 fi
-echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_post_shrink_warmup=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP} mode3_post_shrink_warmup_tokens=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS} mode3_low_floor_mc2_workspace=${VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} dummy_waste_timing=${VLLM_ASCEND_DUMMY_WASTE_TIMING} dummy_waste_sync=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC} dummy_waste_profile=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE} dummy_waste_markers=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS} elastic_util_log=${VLLM_ASCEND_ELASTIC_UTIL_LOG} elastic_util_bucket_steps=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES} mode4_stability=${VLLM_ASCEND_MODE4_STABILITY_PROFILE} mode4_force_floor=${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR:-} mode4_runtime_floor=${VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode5_runtime_floor=${VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode5_runtime_strategy=$(if [[ "${VLLM_ASCEND_MODE5_USE_LEGACY_CPU_SHADOW_RUNTIME:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then echo legacy_cpu_shadow; else echo dual_source; fi) mode5_remote_fraction=${VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION:-} mode5_fraction_policy=${VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY:-} mode5_balance_remote_source_fanout=${VLLM_ASCEND_MODE5_BALANCE_REMOTE_SOURCE_FANOUT:-} mode5_cpu_dp_metadata_sync=${VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC:-} mode5_single_control_message_remote=${VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE:-} mode4_generic_headroom=${VLLM_ASCEND_MODE4_ENABLE_GENERIC_HEADROOM:-0} mode4_moe_dispatch_headroom=${VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES} mode4_low_floor_mc2_headroom=${VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-} mode5_low_floor_mc2_headroom=${VLLM_ASCEND_MODE5_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-} mode4_block_prefetch_layers=${VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS:-1}"
+echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_release_cpu_stage_on_direct=${VLLM_ASCEND_MODE3_RELEASE_CPU_STAGE_ON_DIRECT} mode3_release_runtime_on_stage_change=${VLLM_ASCEND_MODE3_RELEASE_RUNTIME_ON_STAGE_CHANGE} mode3_dynamic_runtime_capacity=${VLLM_ASCEND_MODE3_DYNAMIC_RUNTIME_CAPACITY} mode3_restore_rebuild_mc2=${VLLM_ASCEND_MODE3_REBUILD_MC2_ON_RESTORE} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_cpu_direct_host_sync=${VLLM_ASCEND_MODE3_CPU_DIRECT_HOST_SYNC_BEFORE_DISPATCH} mode3_cpu_direct_empty_cache=${VLLM_ASCEND_MODE3_CPU_DIRECT_EMPTY_CACHE_BEFORE_DISPATCH} mode3_cpu_direct_sync_copy=${VLLM_ASCEND_MODE3_CPU_DIRECT_SYNC_COPY} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_post_shrink_warmup=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP} mode3_post_shrink_warmup_tokens=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS} mode3_low_floor_mc2_workspace=${VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} dispatch_v2_diag=${VLLM_ASCEND_DISPATCH_V2_DIAG_LOG}/${VLLM_ASCEND_DISPATCH_V2_DIAG_FIRST_N} mode3_bind_diag=${VLLM_ASCEND_MODE3_DISPATCH_BIND_DIAG_LOG}/${VLLM_ASCEND_MODE3_DISPATCH_BIND_DIAG_FIRST_N} dummy_waste_timing=${VLLM_ASCEND_DUMMY_WASTE_TIMING} dummy_waste_sync=${VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC} dummy_waste_profile=${VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE} dummy_waste_markers=${VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS} elastic_util_log=${VLLM_ASCEND_ELASTIC_UTIL_LOG} elastic_util_bucket_steps=${VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES} mode4_stability=${VLLM_ASCEND_MODE4_STABILITY_PROFILE} mode4_force_floor=${VLLM_ASCEND_MODE4_STABILITY_FORCE_FLOOR:-} mode4_runtime_floor=${VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode5_runtime_floor=${VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode5_runtime_strategy=$(if [[ "${VLLM_ASCEND_MODE5_USE_LEGACY_CPU_SHADOW_RUNTIME:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then echo legacy_cpu_shadow; else echo dual_source; fi) mode5_remote_fraction=${VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION:-} mode5_fraction_policy=${VLLM_ASCEND_MODE5_REMOTE_EXPERT_FRACTION_POLICY:-} mode5_balance_remote_source_fanout=${VLLM_ASCEND_MODE5_BALANCE_REMOTE_SOURCE_FANOUT:-} mode5_cpu_dp_metadata_sync=${VLLM_ASCEND_MODE5_CPU_DP_METADATA_SYNC:-} mode5_single_control_message_remote=${VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE:-} mode4_generic_headroom=${VLLM_ASCEND_MODE4_ENABLE_GENERIC_HEADROOM:-0} mode4_moe_dispatch_headroom=${VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES} mode4_low_floor_mc2_headroom=${VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-} mode5_low_floor_mc2_headroom=${VLLM_ASCEND_MODE5_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES:-} mode4_block_prefetch_layers=${VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS:-1}"
+echo "[mode3 dispatch] full_dispatch_domain=${VLLM_ASCEND_MODE3_FULL_DISPATCH_DOMAIN} dense_runtime_expert_map=${VLLM_ASCEND_MODE3_DENSE_RUNTIME_EXPERT_MAP} persist_dispatcher_domain=${VLLM_ASCEND_MODE3_PERSIST_DISPATCHER_DOMAIN} mc2_host_timing=${VLLM_ASCEND_MC2_HOST_TIMING_LOG}/${VLLM_ASCEND_MC2_HOST_TIMING_FIRST_N}/${VLLM_ASCEND_MC2_HOST_TIMING_THRESHOLD_MS} mode5_like_cpu_shadow=${VLLM_ASCEND_MODE3_MODE5_LIKE_CPU_SHADOW} local_cpu_shadow=1"
+echo "[mode3 stale group] drop_group=${VLLM_ASCEND_MODE3_DROP_STALE_GROUP_CACHE_AFTER_SHRINK} drop_mc2=${VLLM_ASCEND_MODE3_DROP_STALE_MC2_GROUP_CACHE_AFTER_SHRINK} keep_active_mc2=${VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS} defer_destroy=${VLLM_ASCEND_MODE3_DEFER_GROUP_DESTROY} defer_sizes=${VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES} destroy_device_pg_on_retire=${VLLM_ASCEND_MODE3_DESTROY_DEVICE_PG_ON_RETIRE} restore_rebuild_mc2=${VLLM_ASCEND_MODE3_REBUILD_MC2_ON_RESTORE}"
+echo "[mode3 post-shrink dp warmup] enabled=${VLLM_ASCEND_MODE3_ENABLE_POST_SHRINK_DP_WARMUP}"
 #模拟样本缩短规则
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
 export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=${VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS-256,512,640,768,896}
