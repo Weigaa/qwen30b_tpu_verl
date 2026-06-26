@@ -7,7 +7,10 @@ export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/asdsip/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
+# ATB's set_env.sh can return non-zero under `set -e` when it auto-detects
+# torch's CXX ABI and an internal grep misses. Passing the ABI explicitly
+# avoids that false failure and keeps the environment initialization stable.
+source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
 
 export HYDRA_FULL_ERROR=1
 #export ASCEND_LAUNCH_BLOCKING=1         
@@ -55,7 +58,7 @@ export HCCL_CONNECT_TIMEOUT=7200
 export VLLM_ASCEND_LLM_PROFILE_ENABLE=0
 
 # Unified output root for checkpoints / rollout dumps / draft dumps / logs.
-OUTPUT_ROOT=${OUTPUT_ROOT:-/workspace/cann-recipes-train/llm_rl/qwen3}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/workspace/cann-recipes-train/llm_rl/qwen3_shrink_aware}
 OUTPUT_SUBDIR=${OUTPUT_SUBDIR:-resample_result_16k_bs32_n16_baseline_ft}
 OUTPUT_DIR="${OUTPUT_ROOT}/${OUTPUT_SUBDIR}"
 ROLL_OUT_DIR="${OUTPUT_DIR}/rollout_data"
@@ -135,19 +138,19 @@ MAX_ACTOR_CKPT_TO_KEEP=${MAX_ACTOR_CKPT_TO_KEEP:-3}
 MAX_CRITIC_CKPT_TO_KEEP=${MAX_CRITIC_CKPT_TO_KEEP:-1}
 
 if [ "${SAVE_CKPT_ENABLE}" = "1" ]; then
-    TRAINER_SAVE_FREQ=1
+    TRAINER_SAVE_FREQ=${TRAINER_SAVE_FREQ:-1}
     TRAINER_DEFAULT_LOCAL_DIR="${CKPT_DIR}"
 else
-    TRAINER_SAVE_FREQ=-1
+    TRAINER_SAVE_FREQ=${TRAINER_SAVE_FREQ:--1}
     TRAINER_DEFAULT_LOCAL_DIR="${OUTPUT_DIR}"
 fi
 
 HOME=$(pwd)
-MODEL_PATH=${MODEL_PATH:-"/home/data/Qwen3-30B-A3B"}
+MODEL_PATH=${MODEL_PATH:-"/data/Qwen3-30B-A3B"}
 CONFIG_DIR=${CONFIG_DIR:-"${HOME}/verl/trainer/config"}
-DISTCP_PATH="/home/data/Qwen3-30B-A3B_megatron"
-TRAIN_FILE=${TRAIN_FILE:-"/workspace/data/deepscaler/train.parquet"}
-TEST_FILE=${TEST_FILE:-"/workspace/data/deepscaler/test.parquet"}
+DISTCP_PATH=${DISTCP_PATH:-"/data/Qwen3-30B-A3B_megatron"}
+TRAIN_FILE=${TRAIN_FILE:-"/data/deepscaler/train.parquet"}
+TEST_FILE=${TEST_FILE:-"/data/deepscaler/test.parquet"}
     
 
 time=$(date +%Y%m%d%H%M%S)

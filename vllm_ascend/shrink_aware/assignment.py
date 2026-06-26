@@ -31,30 +31,24 @@ def assign_prompts_to_ranks(
     if any(load < 0 for load in loads):
         raise ValueError("predicted_lengths cannot contain negative values")
 
-    rank_roles: list[tuple[int, str]] = (
-        [(rank, "donor") for rank in role_plan.donor_ranks] +
-        [(rank, "wave2") for rank in role_plan.wave2_ranks] +
-        [(rank, "survivor") for rank in role_plan.final_survivor_ranks])
+    rank_roles = _rank_roles(role_plan)
     if not rank_roles and loads:
         raise ValueError("at least one target rank is required for prompt assignment")
 
     role_targets = _role_targets(len(loads), role_plan)
     sorted_items = sorted(
         enumerate(loads), key=lambda item: (item[1], item[0]))
-    role_buckets = {
-        "donor": sorted_items[:role_targets["donor"]],
-        "wave2": sorted_items[role_targets["donor"]:
-                              role_targets["donor"] + role_targets["wave2"]],
-        "survivor": sorted_items[role_targets["donor"] +
-                                 role_targets["wave2"]:],
-    }
+    role_order = list(role_targets)
+    role_buckets = {}
+    cursor = 0
+    for role in role_order:
+        next_cursor = cursor + role_targets[role]
+        role_buckets[role] = sorted_items[cursor:next_cursor]
+        cursor = next_cursor
 
     assignments: list[PromptAssignment] = []
-    for role, ranks in (
-        ("donor", role_plan.donor_ranks),
-        ("wave2", role_plan.wave2_ranks),
-        ("survivor", role_plan.final_survivor_ranks),
-    ):
+    for role in role_order:
+        ranks = [rank for rank, rank_role in rank_roles if rank_role == role]
         assignments.extend(_assign_role(role_buckets[role], ranks, role))
 
     assignments.sort(key=lambda item: item.prompt_index)
@@ -94,13 +88,12 @@ def build_reorder_indices(assignments: Sequence[PromptAssignment],
 
 
 def _role_targets(num_prompts: int, role_plan: RankRolePlan) -> dict[str, int]:
+    rank_roles = _rank_roles(role_plan)
+    active_counts: dict[str, int] = {}
+    for _rank, role in rank_roles:
+        active_counts[role] = active_counts.get(role, 0) + 1
     if num_prompts == 0:
-        return {"donor": 0, "wave2": 0, "survivor": 0}
-    active_counts = {
-        "donor": len(role_plan.donor_ranks),
-        "wave2": len(role_plan.wave2_ranks),
-        "survivor": len(role_plan.final_survivor_ranks),
-    }
+        return {role: 0 for role in active_counts}
     total_ranks = sum(active_counts.values())
     if total_ranks <= 0:
         raise ValueError("rank role plan contains no assignable ranks")
@@ -148,6 +141,38 @@ def _assign_role(items: Sequence[tuple[int, float]],
         ))
         heapq.heappush(heap, (rank_load + float(load), count + 1, rank))
     return result
+
+
+def _rank_roles(role_plan: RankRolePlan) -> list[tuple[int, str]]:
+    roles: list[tuple[int, str]] = [(int(rank), "donor") for rank in role_plan.donor_ranks]
+    seen = {int(rank) for rank in role_plan.donor_ranks}
+    stage_sets = getattr(role_plan, "stage_survivor_ranks", None) or [
+        role_plan.intermediate_survivor_ranks,
+        role_plan.final_survivor_ranks,
+    ]
+    prev_stage: set[int] = set()
+    for stage_idx, ranks in enumerate(stage_sets):
+        current_stage = {int(rank) for rank in ranks}
+        exiting_at_next_stage = sorted(current_stage - (
+            set(int(rank) for rank in stage_sets[stage_idx + 1])
+            if stage_idx + 1 < len(stage_sets) else set()))
+        if stage_idx == len(stage_sets) - 1:
+            role = "survivor"
+            role_ranks = sorted(current_stage)
+        elif len(stage_sets) == 2 and stage_idx == 0:
+            role = "wave2"
+            role_ranks = exiting_at_next_stage
+        else:
+            role = f"stage{stage_idx + 1}"
+            role_ranks = exiting_at_next_stage
+        for rank in role_ranks:
+            rank = int(rank)
+            if rank in seen:
+                continue
+            roles.append((rank, role))
+            seen.add(rank)
+        prev_stage = current_stage
+    return roles
 
 
 def rank_seconds_from_loads(

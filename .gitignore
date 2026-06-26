@@ -33,3 +33,15 @@ resample_result_*/
 save4eagle3resampler/
 outputs/
 tensorboard_log/
+mode0_*/
+mode1_*/
+record/
+*.log
+*.tsv
+rollout_data/
+rollout_length/
+logs/
+checkpoints/
+
+# Runtime/generated caches
+.triton/

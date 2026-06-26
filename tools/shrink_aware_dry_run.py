@@ -30,6 +30,9 @@ def main() -> None:
                         help="'synthetic', comma lengths, or a JSON file path")
     parser.add_argument("--num-prompts", type=int, default=64)
     parser.add_argument("--min-shrink-window-seconds", type=float, default=1.0)
+    parser.add_argument("--target-policy", default="natural",
+                        choices=("natural", "planned"),
+                        help="Use actual unfinished ranks or fixed planned survivor ranks as shrink targets.")
     args = parser.parse_args()
 
     stages = [int(item.strip()) for item in args.shrink_stages.split(",")
@@ -62,6 +65,7 @@ def main() -> None:
         role_plan=role_plan,
         min_window_seconds=args.min_shrink_window_seconds,
         estimated_window_seconds=args.min_shrink_window_seconds,
+        target_policy=args.target_policy,
     )
     wave2_decision = decide_staged_shrink(
         enabled=True,
@@ -71,6 +75,7 @@ def main() -> None:
         role_plan=role_plan,
         min_window_seconds=args.min_shrink_window_seconds,
         estimated_window_seconds=args.min_shrink_window_seconds,
+        target_policy=args.target_policy,
     )
 
     report = {
@@ -84,6 +89,7 @@ def main() -> None:
         "intermediate_survivor_packages": role_plan.intermediate_survivor_packages,
         "final_survivor_packages": role_plan.final_survivor_packages,
         "package_locality_score": role_plan.package_locality_score,
+        "target_policy": args.target_policy,
         "per_rank_prompt_count": assignment.per_rank_counts,
         "per_rank_predicted_load": assignment.per_rank_predicted_load,
         "estimated_completion_wave": {

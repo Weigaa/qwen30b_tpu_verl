@@ -11,6 +11,7 @@ from vllm_ascend.shrink_aware.planner import (
     default_package_topology,
     parse_rank_list,
     parse_rank_topology,
+    parse_stage_survivor_ranks,
     plan_survivor_ranks,
 )
 from vllm_ascend.shrink_aware.trigger import (
@@ -29,5 +30,6 @@ __all__ = [
     "default_package_topology",
     "parse_rank_list",
     "parse_rank_topology",
+    "parse_stage_survivor_ranks",
     "plan_survivor_ranks",
 ]

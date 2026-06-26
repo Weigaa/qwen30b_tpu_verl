@@ -216,3 +216,217 @@ bash internal/wj_train_grpo_qwen30b_a3b_16die_true_weight_eager_shrink8_util.sh
 3. `Elastic parallel restore done ... total_ms=2xxx`
 4. `rollout_output_time_s: ~100s`
 
+## 8. Adaptive KV resize 容量回不来的踩坑记录
+
+### 8.1 现象
+
+后续做 `mode=1` adaptive floor 规划时，step 5 需要从 floor-4 的 KV
+容量恢复到 full-world/no-shrink 容量：
+
+- 旧容量：`old_tokens=280576`
+- 目标容量：`target_tokens=380800`
+- 预期：`new_tokens=380800`
+
+但问题日志里实际只能恢复到约 `286k-291k tokens`，典型表现是：
+
+```text
+Mode1 adaptive KV resize phase=plan_new_kv_done target_tokens=380800 new_tokens=286976
+GPU KV cache size: 286,976 tokens
+```
+
+这会导致 step 5 即使规划上认为 KV-safe，运行时仍然没有足够 KV cache
+空间，容易出现 preempting 或 OOM。
+
+### 8.2 一开始容易误判的方向
+
+这个问题很容易被误判为：
+
+1. KV cache 没有释放干净；
+2. floor=16 的专家槽位没有恢复成 no-shrink 布局；
+3. communicator / HCCL group 没有释放；
+4. `mode=1 floor16` 本身比 `mode=0` 多占了不可避免的 non-torch 空间。
+
+但 live tensor scan 证明这些都不是主因。
+
+关键证据是：
+
+```text
+known_bytes={'model_runner.kv_caches': 0, ...}
+loaded_capacity_hist={8: 48}
+weight_shape_hist={'(8, 1536, 2048)/(8, 2048, 768)': 48}
+```
+
+这说明：
+
+- 旧 KV cache 已经清掉；
+- 当前 live MoE module 已经 compact 到 8-slot 物理权重；
+- 但可用空间仍然不足。
+
+### 8.3 真正根因
+
+真正根因是：旧的 32-slot MoE 参数张量已经不再属于当前 module，
+但仍然被一个 full-name parameter dict 持有引用。
+
+问题日志里的直接证据：
+
+```text
+stale_referrers=
+201326592:torch.bfloat16:(32, 1536, 2048):
+dict(keys=['model.layers.0.mlp.experts.w13_weight'], owners=[])
+```
+
+也就是说，`module.w13_weight / module.w2_weight` 已经被替换成新的
+8-slot Parameter，但旧的 32-slot Parameter 仍然存在于类似下面的缓存字典里：
+
+```python
+{
+    "model.layers.0.mlp.experts.w13_weight": old_32_slot_parameter,
+    "model.layers.0.mlp.experts.w2_weight": old_32_slot_parameter,
+    ...
+}
+```
+
+每个 rank 会残留 96 个这样的 full-name expert 参数条目：
+
+- 48 层 `w13_weight`
+- 48 层 `w2_weight`
+
+合计大约：
+
+```text
+cleared_stale_param_entries=96
+cleared_stale_param_bytes=14495514624
+```
+
+这约 14.5GB stale NPU storage 会直接挤占 KV cache 的可用空间，所以
+KV resize 规划阶段只能拿到约 28GB 可用空间，最终只能建出约 `286k`
+tokens，而不是 `380800` tokens。
+
+### 8.4 修复方法
+
+修复点在：
+
+- `vllm_ascend/worker/worker_v1.py`
+
+核心逻辑是在 step-floor KV resize 前，当 `target_floor == world_size`
+准备进入 full-world/no-shrink step 时，清理顺序必须保证“旧引用先断开，
+新 KV 后申请”：
+
+1. 先 compact 当前 MoE module 的物理权重到 8-slot；
+2. 在 floor prepare 阶段先扫描并清一次 stale full-name parameter dict；
+3. 清理旧 KV cache；
+4. 如果仍怀疑有额外 stale 引用，可设置
+   `VLLM_ASCEND_MODE1_CLEAR_STALE_PARAM_DICTS_AFTER_OLD_KV=1`，在旧 KV
+   已释放、申请新 KV 之前，再扫描并清一次 stale full-name parameter dict；
+5. 扫描 Python GC 中的 dict；
+6. 找到 key 形如：
+   - `model.layers.*.mlp.experts.w13_weight`
+   - `model.layers.*.mlp.experts.w2_weight`
+7. 如果 value 是 NPU tensor/Parameter，shape 第一维大于当前 compact 后的
+   8-slot，并且不是当前 `model.named_parameters()` 里的 live Parameter，
+   就从 dict 中 pop 掉；
+8. 再执行 `gc.collect()` / `torch.npu.empty_cache()` / `torch.npu.synchronize()`；
+9. 最后才重新规划并分配新 KV cache。
+
+默认快速路径下，关键 resize 阶段日志是：
+
+```text
+Mode1 adaptive KV resize phase=clear_old_kv_done
+Mode1 adaptive KV resize phase=clear_stale_param_dicts_skipped reason=disabled
+Mode1 adaptive KV resize phase=plan_new_kv_start
+```
+
+如果打开二次 stale 参数清理，关键日志是：
+
+```text
+Mode1 adaptive KV resize phase=clear_old_kv_done
+Mode1 adaptive KV resize phase=clear_stale_param_dicts_start
+Mode1 adaptive KV resize stale full-name parameter caches cleared:
+Mode1 adaptive KV resize phase=clear_stale_param_dicts_done
+Mode1 adaptive KV resize phase=plan_new_kv_start
+```
+
+也就是说，不再依赖“先保留旧参数、创建新参数、之后再检索冗余并删除”
+这种滞后流程。通常在 floor prepare 里就断开旧 32-slot Parameter 缓存引用；
+如果需要更保守的诊断路径，可以在旧 KV cache 释放窗口里再清一次，然后才
+进入 `plan_new_kv` / `allocate_new_kv`。
+
+性能注意：`shrink_lossless_loaded_weights_to_primary()` 默认不再每层执行
+`gc.collect()` / `torch.npu.empty_cache()` / `torch.npu.synchronize()`，而是
+依赖 floor prepare 末尾统一释放。若需要回退到逐层强同步清理，可设置：
+
+```bash
+export VLLM_ASCEND_MODE1_FULL_WORLD_COMPACT_EMPTY_CACHE_PER_LAYER=1
+```
+
+修复后的健康日志应看到：
+
+```text
+cleared_stale_param_dicts=1
+cleared_stale_param_entries=96
+cleared_stale_param_bytes=14495514624
+```
+
+然后在 `before_plan_new_kv` 阶段应看到：
+
+```text
+known_bytes={'model_runner.kv_caches': 0, ...}
+stale_referrers=
+```
+
+也就是旧 KV 已清空，旧 32-slot MoE 参数也没有 referrer 了。
+
+### 8.5 修复后的验证结果
+
+成功样本：
+
+- `mode1_length_sorted_e2e_adaptive_floor4_fast15_threshold/logs/wjqwen30b-a3b-record_graph_save4eagle3_20260624215127.txt`
+
+关键证据：
+
+```text
+Mode1 step floor preparation restored full-world layout:
+cleared_stale_param_dicts=1
+cleared_stale_param_entries=96
+cleared_stale_param_bytes=14495514624
+
+Mode1 adaptive KV resize phase=plan_new_kv_done
+target_tokens=380800 new_tokens=380800
+
+GPU KV cache size: 380,800 tokens
+```
+
+16 个 rank 都成功恢复到：
+
+```text
+GPU KV cache size: 380,800 tokens
+```
+
+并且本次日志没有：
+
+- `Preempting`
+- `Memory_Allocation_Failure`
+- `OOM`
+- `RuntimeError`
+
+最终正常结束：
+
+```text
+Epoch 0 completed in 406.10 seconds.
+response/aborted_ratio:0.0
+```
+
+### 8.6 经验结论
+
+如果 adaptive KV resize 目标容量回不来，不要只看 KV cache 本身。
+要同时检查：
+
+1. `known_bytes['model_runner.kv_caches']` 是否已经为 0；
+2. 当前 MoE module 的 `weight_shape_hist` 是否已经 compact；
+3. live tensor scan 里是否还有 `(32, 1536, 2048)` 或 `(32, 2048, 768)`
+   的旧 MoE 权重；
+4. `stale_referrers` 是否出现 full-name 参数字典。
+
+这类问题的本质是“旧参数对象仍被 Python 引用”，不是 KV allocator
+本身不会释放空间。只有把 stale Parameter 引用断开后，NPU allocator
+才能真正把空间还给后续 KV cache 扩容。

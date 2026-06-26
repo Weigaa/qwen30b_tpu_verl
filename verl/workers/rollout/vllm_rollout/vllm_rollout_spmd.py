@@ -102,7 +102,7 @@ def _sync_shrink_aware_env_from_meta(meta_info: dict) -> None:
     os.environ["VLLM_ASCEND_SHRINK_AWARE_MODE"] = str(
         runtime.get("mode", "staged"))
     stages = runtime.get("shrink_stages")
-    if isinstance(stages, (list, tuple)) and len(stages) == 2:
+    if isinstance(stages, (list, tuple)) and len(stages) >= 1:
         os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGES"] = ",".join(
             str(int(stage)) for stage in stages)
     os.environ["VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY"] = str(
@@ -111,6 +111,10 @@ def _sync_shrink_aware_env_from_meta(meta_info: dict) -> None:
         str(rank) for rank in plan.get("intermediate_survivor_ranks", []))
     os.environ["VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS"] = ",".join(
         str(rank) for rank in plan.get("final_survivor_ranks", []))
+    stage_ranks = plan.get("stage_survivor_ranks")
+    if isinstance(stage_ranks, list):
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS"] = json.dumps(
+            stage_ranks)
     if "max_rollout_overhead_ratio" in runtime:
         os.environ["VLLM_ASCEND_SHRINK_AWARE_MAX_OVERHEAD_RATIO"] = str(
             runtime["max_rollout_overhead_ratio"])
@@ -123,6 +127,29 @@ def _sync_shrink_aware_env_from_meta(meta_info: dict) -> None:
     if "dry_run_shrink_aware_schedule" in runtime:
         os.environ["VLLM_ASCEND_SHRINK_AWARE_DRY_RUN"] = (
             "1" if runtime["dry_run_shrink_aware_schedule"] else "0")
+    kv_plan = meta_info.get("shrink_aware_kv_plan", {})
+    if not isinstance(kv_plan, dict):
+        kv_plan = {}
+    kv_cap = runtime.get("kv_cap", kv_plan.get("kv_cap"))
+    if kv_cap is not None:
+        try:
+            os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_KV_TOKENS"] = str(
+                int(float(kv_cap)))
+        except (TypeError, ValueError):
+            logger.warning("Invalid shrink-aware kv_cap in meta_info: %r",
+                           kv_cap)
+    selected_floor = runtime.get(
+        "selected_floor",
+        kv_plan.get("selected_floor", runtime.get("floor",
+                                                  kv_plan.get("floor"))))
+    if selected_floor is not None:
+        try:
+            os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR"] = str(
+                int(float(selected_floor)))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid shrink-aware selected_floor in meta_info: %r",
+                selected_floor)
 
 
 def _custom_mode1_rollout_reload_diag_enabled() -> bool:
@@ -770,6 +797,99 @@ class vLLMRollout(BaseRollout):
 
         self.eplb_end()
 
+    def _mode1_adaptive_kv_resize_enabled(self) -> bool:
+        value = os.environ.get("VLLM_ASCEND_MODE1_ADAPTIVE_KV_RESIZE", "0")
+        return value.lower() in ("1", "true", "yes", "on")
+
+    def _target_mode1_kv_tokens_from_meta(self, meta_info: dict) -> int | None:
+        if not isinstance(meta_info, dict):
+            return None
+        runtime = meta_info.get("shrink_aware_runtime", {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+        kv_plan = meta_info.get("shrink_aware_kv_plan", {})
+        if not isinstance(kv_plan, dict):
+            kv_plan = {}
+        kv_cap = runtime.get("kv_cap", kv_plan.get("kv_cap"))
+        if kv_cap is None:
+            return None
+        try:
+            kv_tokens = int(float(kv_cap))
+        except (TypeError, ValueError):
+            logger.warning("Invalid mode1 adaptive KV token target: %r", kv_cap)
+            return None
+        return kv_tokens if kv_tokens > 0 else None
+
+    def _target_mode1_floor_from_meta(self, meta_info: dict) -> int | None:
+        if not isinstance(meta_info, dict):
+            return None
+        runtime = meta_info.get("shrink_aware_runtime", {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+        kv_plan = meta_info.get("shrink_aware_kv_plan", {})
+        if not isinstance(kv_plan, dict):
+            kv_plan = {}
+        floor = runtime.get("selected_floor",
+                            kv_plan.get("selected_floor",
+                                        runtime.get("floor", kv_plan.get("floor"))))
+        if floor is None:
+            return None
+        try:
+            floor_int = int(float(floor))
+        except (TypeError, ValueError):
+            logger.warning("Invalid mode1 adaptive floor target: %r", floor)
+            return None
+        return floor_int if floor_int > 0 else None
+
+    def _maybe_resize_mode1_kv_cache_from_meta(self, meta_info: dict) -> None:
+        if not self._mode1_adaptive_kv_resize_enabled():
+            return
+        if os.environ.get("VLLM_USE_V1") != "1":
+            return
+        if int(getattr(envs_ascend, "VLLM_ASCEND_ELASTIC_EXECUTION_MODE", 0)) != 1:
+            return
+        target_tokens = self._target_mode1_kv_tokens_from_meta(meta_info)
+        if target_tokens is None:
+            return
+        target_floor = self._target_mode1_floor_from_meta(meta_info)
+        os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_KV_TOKENS"] = str(
+            target_tokens)
+        if target_floor is not None:
+            os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR"] = str(
+                target_floor)
+        engine_core = self.inference_engine.llm_engine.engine_core.engine_core
+        resize_fn = getattr(engine_core, "resize_kv_cache_for_mode1_step",
+                            None)
+        if not callable(resize_fn):
+            logger.warning(
+                "Mode1 adaptive KV resize requested but engine core has no resize method"
+            )
+            return
+        changed = resize_fn(target_tokens, target_floor)
+        if changed:
+            self.inference_engine.llm_engine.reset_prefix_cache()
+            logger.info(
+                "Mode1 adaptive KV resize applied: target_tokens=%s target_floor=%s",
+                target_tokens,
+                target_floor,
+            )
+
+    def _maybe_log_mode1_comm_cache_state(self, tag: str) -> None:
+        value = os.environ.get("VLLM_ASCEND_MODE1_COMM_CACHE_STATE_LOG", "0")
+        if value.strip().lower() not in ("1", "true", "yes", "on"):
+            return
+        if os.environ.get("VLLM_USE_V1") != "1":
+            return
+        try:
+            engine_core = self.inference_engine.llm_engine.engine_core.engine_core
+            engine_core.collective_rpc("mode1_log_comm_cache_state",
+                                       args=(tag, ))
+        except Exception:
+            logger.exception(
+                "Failed to log mode1 comm cache state from rollout: tag=%s",
+                tag,
+            )
+
     def init_cache_engine(self):
         if os.environ['VLLM_USE_V1'] == '1':
             worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
@@ -1152,6 +1272,9 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         # 核心运行引擎调用
+        self._maybe_log_mode1_comm_cache_state("rollout_step_start")
+        self._maybe_resize_mode1_kv_cache_from_meta(prompts.meta_info)
+        self._maybe_log_mode1_comm_cache_state("rollout_step_after_resize")
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
@@ -1205,6 +1328,7 @@ class vLLMRollout(BaseRollout):
                     num_responses,
                 )
 
+        self._maybe_log_mode1_comm_cache_state("rollout_step_end")
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)

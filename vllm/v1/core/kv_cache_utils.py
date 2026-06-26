@@ -850,15 +850,30 @@ def maybe_cap_mode1_parity_num_blocks(
         "4": 277120,
         "8": 377344,
     }
+    adaptive_env = os.getenv("VLLM_ASCEND_MODE1_PARITY_CURRENT_KV_TOKENS")
     floor_specific_env = os.getenv(
         f"VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR{configured_floor}")
     legacy_env = os.getenv("VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS")
-    if floor_specific_env is not None:
-        max_tokens = int(floor_specific_env)
-    elif legacy_env is not None:
-        max_tokens = int(legacy_env)
+    cap_source = f"floor{configured_floor}"
+    if adaptive_env is not None and adaptive_env.strip():
+        try:
+            max_tokens = int(float(adaptive_env))
+            cap_source = "step_override"
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid mode1 adaptive KV token override: %r",
+                adaptive_env)
+            max_tokens = None
     else:
-        max_tokens = default_max_tokens_by_floor[configured_floor]
+        max_tokens = None
+    if max_tokens is None:
+        if floor_specific_env is not None:
+            max_tokens = int(floor_specific_env)
+        elif legacy_env is not None:
+            max_tokens = int(legacy_env)
+            cap_source = "legacy"
+        else:
+            max_tokens = default_max_tokens_by_floor[configured_floor]
     if max_tokens <= 0:
         return num_blocks
 
@@ -868,6 +883,44 @@ def maybe_cap_mode1_parity_num_blocks(
     tokens_per_block_group = min_block_size * max(int(dcp_world_size), 1)
     if tokens_per_block_group <= 0:
         return num_blocks
+
+    current_floor_env = os.getenv("VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR")
+    effective_floor = configured_floor
+    if current_floor_env is not None and current_floor_env.strip() in (
+            "2", "4", "8", "16"):
+        effective_floor = current_floor_env.strip()
+
+    planned_floor_headroom_tokens = 0
+    if (effective_floor in ("2", "4", "8", "16")
+            and (_env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_PRECREATE_PLANNED_FLOOR_GROUPS")
+                 or _env_flag(
+                     "VLLM_ASCEND_MODE1_PARITY_CACHE_PLANNED_FLOOR_GROUPS"))):
+        floor_headroom_key = (
+            "VLLM_ASCEND_MODE1_PARITY_PLANNED_FLOOR_GROUP_KV_HEADROOM_TOKENS"
+            f"_FLOOR{effective_floor}")
+        planned_floor_headroom_env = os.getenv(floor_headroom_key)
+        if planned_floor_headroom_env is None:
+            planned_floor_headroom_env = os.getenv(
+                "VLLM_ASCEND_MODE1_PARITY_PLANNED_FLOOR_GROUP_KV_HEADROOM_TOKENS",
+                "0")
+        try:
+            planned_floor_headroom_tokens = max(
+                0, int(float(planned_floor_headroom_env)))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid planned floor-group KV headroom: %s=%r",
+                floor_headroom_key,
+                planned_floor_headroom_env)
+            planned_floor_headroom_tokens = 0
+        step_override_includes_headroom = _env_flag(
+            "VLLM_ASCEND_MODE1_STEP_KV_CAP_INCLUDES_PLANNED_HEADROOM", "1")
+        if (planned_floor_headroom_tokens and cap_source == "step_override"
+                and step_override_includes_headroom):
+            cap_source = f"{cap_source}+planned_headroom_already_reserved"
+        elif planned_floor_headroom_tokens:
+            max_tokens = max(0, max_tokens - planned_floor_headroom_tokens)
+            cap_source = f"{cap_source}+planned_floor_headroom"
 
     num_groups = len(kv_cache_groups)
     max_blocks_per_group = max_tokens // tokens_per_block_group
@@ -880,11 +933,11 @@ def maybe_cap_mode1_parity_num_blocks(
     capped_tokens = (max_blocks // num_groups * min_block_size *
                      max(int(dcp_world_size), 1))
     logger.info(
-        "Capping mode1 parity KV blocks to floor%s budget: "
+        "Capping mode1 parity KV blocks to mode1 budget: "
         "requested_blocks=%s capped_blocks=%s block_size=%s groups=%s "
         "dcp_world_size=%s custom_models=%s requested_tokens=%s capped_tokens=%s "
-        "max_tokens=%s",
-        configured_floor,
+        "max_tokens=%s configured_floor=%s effective_floor=%s cap_source=%s "
+        "planned_floor_headroom_tokens=%s",
         num_blocks,
         max_blocks,
         min_block_size,
@@ -894,6 +947,10 @@ def maybe_cap_mode1_parity_num_blocks(
         requested_tokens,
         capped_tokens,
         max_tokens,
+        configured_floor,
+        effective_floor,
+        cap_source,
+        planned_floor_headroom_tokens,
     )
     return max_blocks
 

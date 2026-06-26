@@ -89,6 +89,8 @@ def _export_shrink_aware_role_plan(role_plan, shrink_cfg) -> None:
         str(rank) for rank in role_plan.intermediate_survivor_ranks)
     os.environ["VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS"] = ",".join(
         str(rank) for rank in role_plan.final_survivor_ranks)
+    os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS"] = json.dumps(
+        role_plan.stage_survivor_ranks)
     os.environ["VLLM_ASCEND_SHRINK_AWARE_MIN_WINDOW_SECONDS"] = str(
         _shrink_cfg_get(shrink_cfg, "min_shrink_window_seconds", 1.0))
 
@@ -1004,6 +1006,19 @@ class RayPPOTrainer:
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+
+        reset_progress_after_resume = (
+            os.getenv("VERL_RESET_TRAINER_PROGRESS_AFTER_RESUME", "0")
+            .lower() in ("1", "true", "yes", "on")
+        )
+        if reset_progress_after_resume:
+            print(
+                "VERL_RESET_TRAINER_PROGRESS_AFTER_RESUME=1: "
+                "loaded checkpoint weights but reset trainer global step and "
+                "skip dataloader state for this child epoch"
+            )
+            self.global_steps = 0
+            return
 
         # load dataloader,
         # TODO: from remote not implemented yet

@@ -89,8 +89,15 @@ TRUE_COMPILE = torch.compile
 DUMMY_COMPILE = dummy_compile
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _disable_ckpt_mismatch_validation_for_mode1() -> bool:
-    return os.getenv("VLLM_ASCEND_ELASTIC_EXECUTION_MODE", "0") == "1"
+    return (
+        os.getenv("VLLM_ASCEND_ELASTIC_EXECUTION_MODE", "0") == "1"
+        or _env_flag("VLLM_MCORE_DIST_CKPT_RELAXED_LOAD")
+    )
 
 
 def set_random_seed(seed):

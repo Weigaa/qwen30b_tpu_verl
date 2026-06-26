@@ -121,6 +121,8 @@ shrink_aware:
   final_survivor_ranks: null
   length_prediction_source: existing_regroup
   oracle_trace_path: null
+  assignment_policy: default
+  optimized_rank_plan_path: null
   max_rollout_overhead_ratio: 1.10
   min_shrink_window_seconds: 1.0
   enable_shrink_aware_logging: false

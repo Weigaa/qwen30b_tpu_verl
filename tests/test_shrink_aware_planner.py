@@ -1,6 +1,7 @@
 import pytest
 
-from vllm_ascend.shrink_aware import plan_survivor_ranks
+from vllm_ascend.shrink_aware import (parse_stage_survivor_ranks,
+                                      plan_survivor_ranks)
 
 
 def test_topology_aware_survivor_selection_16_ranks():
@@ -35,6 +36,54 @@ def test_manual_survivor_ranks_valid():
     assert plan.intermediate_survivor_ranks == [0, 1, 2, 3, 8, 9, 10, 11]
     assert plan.final_survivor_ranks == [8, 9, 10, 11]
     assert plan.donor_ranks == [4, 5, 6, 7, 12, 13, 14, 15]
+
+
+def test_manual_three_stage_survivor_ranks_valid():
+    plan = plan_survivor_ranks(
+        world_size=16,
+        shrink_stages=[8, 4, 2],
+        policy="manual",
+        stage_survivor_ranks=[
+            [8, 9, 10, 11, 12, 13, 14, 15],
+            [12, 13, 14, 15],
+            [14, 15],
+        ],
+    )
+
+    assert plan.stage_survivor_ranks == [
+        [8, 9, 10, 11, 12, 13, 14, 15],
+        [12, 13, 14, 15],
+        [14, 15],
+    ]
+    assert plan.intermediate_survivor_ranks == [8, 9, 10, 11, 12, 13, 14, 15]
+    assert plan.final_survivor_ranks == [14, 15]
+    assert plan.donor_ranks == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_parse_stage_survivor_ranks_allows_nested_sets():
+    parsed = parse_stage_survivor_ranks(
+        "[[8,9,10,11,12,13,14,15],[12,13,14,15],[14,15]]",
+        world_size=16,
+    )
+
+    assert parsed == [
+        [8, 9, 10, 11, 12, 13, 14, 15],
+        [12, 13, 14, 15],
+        [14, 15],
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[[8,8,10,11],[10,11]]",
+        "[[8,9,10,11],[12,13]]",
+        "[[8,9,10,99],[10,99]]",
+    ],
+)
+def test_parse_stage_survivor_ranks_invalid(value):
+    with pytest.raises(ValueError):
+        parse_stage_survivor_ranks(value, world_size=16)
 
 
 @pytest.mark.parametrize(

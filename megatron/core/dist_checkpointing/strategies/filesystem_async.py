@@ -175,7 +175,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         return (
             partial(self.write_preloaded_data_multiproc, transform_list),
             partial(self.preload_tensors, self.write_buckets, True),
-            [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+            [
+                torch.distributed.get_rank(),
+                self.write_buckets,
+                self.results_queue,
+                self.serialization_format,
+            ],
         )
 
     @staticmethod
@@ -201,7 +206,11 @@ class FileSystemWriterAsync(FileSystemWriter):
     @staticmethod
     @_disable_gc()
     def write_preloaded_data_multiproc(
-        transform_list, rank, write_buckets: List[WriteBucket], global_results_queue: mp.Queue
+        transform_list,
+        rank,
+        write_buckets: List[WriteBucket],
+        global_results_queue: mp.Queue,
+        serialization_format=None,
     ) -> None:
         """
         Performs saving data to storage with multiple processes.
@@ -237,7 +246,14 @@ class FileSystemWriterAsync(FileSystemWriter):
                 p_list.append(
                     ctx.Process(
                         target=partial(FileSystemWriterAsync.write_preloaded_data, transform_list),
-                        args=(i, write_bucket, local_results_queue, count_queue, True),
+                        args=(
+                            i,
+                            write_bucket,
+                            local_results_queue,
+                            count_queue,
+                            True,
+                            serialization_format,
+                        ),
                     )
                 )
             except Exception as e:
@@ -293,6 +309,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         results_queue: mp.SimpleQueue,
         count_queue: mp.JoinableQueue,
         use_fsync: bool,
+        serialization_format=None,
     ) -> None:
         """
         Performs actual data saving to storage.
@@ -316,15 +333,39 @@ class FileSystemWriterAsync(FileSystemWriter):
             file_name, storage_key, (bytes_data, tensor_data) = write_bucket
             with open(file_name, "wb") as stream:
                 for write_item, data in bytes_data:
-                    local_results.append(
-                        _write_item(*transform_list, stream, data, write_item, storage_key)
-                    )
+                    if serialization_format is None:
+                        local_results.append(
+                            _write_item(*transform_list, stream, data, write_item, storage_key)
+                        )
+                    else:
+                        local_results.append(
+                            _write_item(
+                                *transform_list,
+                                stream,
+                                data,
+                                write_item,
+                                storage_key,
+                                serialization_format,
+                            )
+                        )
 
                 for write_item, tensor in tensor_data:
                     assert tensor.is_cpu
-                    local_results.append(
-                        _write_item(*transform_list, stream, tensor, write_item, storage_key)
-                    )
+                    if serialization_format is None:
+                        local_results.append(
+                            _write_item(*transform_list, stream, tensor, write_item, storage_key)
+                        )
+                    else:
+                        local_results.append(
+                            _write_item(
+                                *transform_list,
+                                stream,
+                                tensor,
+                                write_item,
+                                storage_key,
+                                serialization_format,
+                            )
+                        )
 
                 if use_fsync:
                     os.fsync(stream.fileno())

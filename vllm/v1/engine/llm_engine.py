@@ -17,6 +17,7 @@ from vllm_ascend.shrink_aware import (
     decide_staged_shrink,
     parse_rank_list,
     parse_rank_topology,
+    parse_stage_survivor_ranks,
     plan_survivor_ranks,
 )
 from vllm.config import ParallelConfig, VllmConfig
@@ -324,8 +325,16 @@ class LLMEngine:
         intermediate = parse_rank_list(
             envs_ascend.VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS)
         final = parse_rank_list(envs_ascend.VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS)
+        stage_ranks = None
+        raw_stage_ranks = getattr(
+            envs_ascend, "VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS", "")
+        if raw_stage_ranks:
+            parsed_stage_ranks = parse_stage_survivor_ranks(
+                raw_stage_ranks, world_size=plan_world_size)
+            if parsed_stage_ranks is not None:
+                stage_ranks = parsed_stage_ranks
         policy = envs_ascend.VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY
-        if intermediate is not None and final is not None:
+        if stage_ranks is not None or (intermediate is not None and final is not None):
             policy = "manual"
         plan = plan_survivor_ranks(
             world_size=plan_world_size,
@@ -336,11 +345,13 @@ class LLMEngine:
             policy=policy,
             intermediate_survivor_ranks=intermediate,
             final_survivor_ranks=final,
+            stage_survivor_ranks=stage_ranks,
         )
         self._shrink_aware_role_plan = plan
         logger.info(
-            "Shrink-aware role plan loaded: donor=%s wave2=%s intermediate=%s final=%s locality=%.4f fallback=%s",
+            "Shrink-aware role plan loaded: donor=%s wave2=%s stages=%s intermediate=%s final=%s locality=%.4f fallback=%s",
             plan.donor_ranks, plan.wave2_ranks,
+            plan.stage_survivor_ranks,
             plan.intermediate_survivor_ranks, plan.final_survivor_ranks,
             plan.package_locality_score, plan.fallback_reason)
         return plan
@@ -348,6 +359,41 @@ class LLMEngine:
     def _staged_shrink_target(self, natural_active_ranks: list[int],
                               has_unfinished: bool,
                               dp_world_size: int) -> tuple[bool, list[int]]:
+        current_floor_raw = os.getenv("VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR")
+        try:
+            current_floor = (int(current_floor_raw)
+                             if current_floor_raw is not None else None)
+        except (TypeError, ValueError):
+            current_floor = None
+        original_dp_world_size = getattr(self, "elastic_original_dp_world_size",
+                                         None)
+        full_world_size = (
+            original_dp_world_size
+            if isinstance(original_dp_world_size, int)
+            and original_dp_world_size > 0
+            else dp_world_size)
+        if current_floor is not None and current_floor >= full_world_size:
+            if not has_unfinished and natural_active_ranks:
+                self.should_execute_dummy_batch = True
+            full_world_ranks = list(range(full_world_size))
+            log_signature = (
+                current_floor,
+                dp_world_size,
+                full_world_size,
+                tuple(full_world_ranks),
+            )
+            if (self.elastic_ep_active_ranks != full_world_ranks and
+                    getattr(self, "_last_full_world_floor_log_signature",
+                            None) != log_signature):
+                self._last_full_world_floor_log_signature = log_signature
+                logger.info(
+                    "Shrink-aware staged disabled for full-world mode1 floor: "
+                    "current_floor=%s dp_world_size=%s full_world_size=%s "
+                    "active_ranks=%s",
+                    current_floor, dp_world_size, full_world_size,
+                    full_world_ranks)
+            return True, full_world_ranks
+
         plan = self._get_shrink_aware_role_plan(dp_world_size)
         if plan is None:
             return False, natural_active_ranks
@@ -363,6 +409,7 @@ class LLMEngine:
             min_window_seconds=envs_ascend.VLLM_ASCEND_SHRINK_AWARE_MIN_WINDOW_SECONDS,
             estimated_window_seconds=None,
             allow_target_size=True,
+            target_policy=envs_ascend.VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY,
         )
         if decision.should_shrink:
             logger.info(
@@ -370,11 +417,6 @@ class LLMEngine:
                 decision.stage_name, current, natural_active_ranks,
                 decision.target_active_ranks)
             return True, decision.target_active_ranks
-        if decision.fallback_reason and decision.fallback_reason != "disabled":
-            logger.info(
-                "Shrink-aware staged trigger skipped: stage=%s current=%s unfinished=%s reason=%s",
-                decision.stage_name, current, natural_active_ranks,
-                decision.fallback_reason)
         if not has_unfinished and natural_active_ranks:
             self.should_execute_dummy_batch = True
         return True, list(current)
@@ -649,6 +691,8 @@ class LLMEngine:
             aggregated_has_unfinished = len(active_global_ranks) > 0
             if not aggregated_has_unfinished:
                 return False
+            if not has_unfinished:
+                self.should_execute_dummy_batch = True
 
             assert self.dp_group is not None
             dp_world_size = torch.distributed.get_world_size(group=self.dp_group)
@@ -792,15 +836,24 @@ class LLMEngine:
                             self.dp_group = get_dp_group().cpu_group
                         else:
                             self.dp_group = None
+                            self.should_execute_dummy_batch = False
                     logger.info(
                         "Elastic parallel shrink rpc done: global_rank=%s active_ranks=%s total_ms=%.2f",
                         current_global_rank, active_global_ranks,
                         (time.perf_counter() - rebuild_start_t) * 1000.0)
-            return has_unfinished
+            return has_unfinished or self.should_execute_dummy_batch
 
         aggregated_has_unfinished = len(active_global_ranks) > 0
-        if not has_unfinished and aggregated_has_unfinished:
+        current_global_rank = torch.distributed.get_rank()
+        current_active_ranks = self.elastic_ep_active_ranks
+        current_rank_is_active = (
+            current_active_ranks is None
+            or current_global_rank in current_active_ranks)
+        if (not has_unfinished and aggregated_has_unfinished
+                and current_rank_is_active):
             self.should_execute_dummy_batch = True
+        elif current_active_ranks is not None and not current_rank_is_active:
+            self.should_execute_dummy_batch = False
         return aggregated_has_unfinished
 
     def restore_elastic_parallel_groups_if_needed(self) -> None:

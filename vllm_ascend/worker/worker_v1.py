@@ -18,6 +18,7 @@
 #
 
 import copy
+import gc
 import math
 import os
 import threading
@@ -58,11 +59,18 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (get_mc2_group,
                                                     init_ascend_model_parallel)
-from vllm_ascend.ops.moe.moe_comm_method import reset_moe_comm_method_cache
+from vllm_ascend.ops.moe.moe_comm_method import (
+    get_moe_comm_method, get_moe_comm_method_topology_cache_stats,
+    prune_moe_comm_method_topology_cache,
+    release_moe_comm_method_runtime_state, reset_moe_comm_method_cache,
+    setup_moe_comm_method)
 from vllm_ascend.platform import NPUPlatform
+from vllm_ascend.shrink_aware.planner import (parse_rank_list,
+                                              parse_stage_survivor_ranks)
 from vllm_ascend.utils import (init_ascend_soc_version,
                                register_ascend_customop, sleep_mode_enabled,
                                try_register_lib)
+from vllm_ascend.worker.npu_input_batch import InputBatch
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -138,6 +146,304 @@ def _mode5_single_control_message_remote() -> bool:
     return os.getenv(
         "VLLM_ASCEND_MODE5_SINGLE_CONTROL_MESSAGE_REMOTE",
         "1").lower() in ("1", "true", "yes", "on")
+
+
+def _mode1_kv_resize_live_tensor_scan_enabled() -> bool:
+    return os.getenv(
+        "VLLM_ASCEND_MODE1_KV_RESIZE_LIVE_TENSOR_SCAN",
+        "0").lower() in ("1", "true", "yes", "on")
+
+
+def _tensor_storage_key_and_nbytes(tensor: torch.Tensor) -> tuple[int, int]:
+    try:
+        storage = tensor.untyped_storage()
+        return int(storage.data_ptr()), int(storage.nbytes())
+    except Exception:
+        try:
+            return int(tensor.data_ptr()), int(tensor.numel() * tensor.element_size())
+        except Exception:
+            return 0, 0
+
+
+def _tensor_tree_storage_nbytes(value: object,
+                                seen: set[int] | None = None) -> int:
+    if seen is None:
+        seen = set()
+    if torch.is_tensor(value):
+        ptr, nbytes = _tensor_storage_key_and_nbytes(value)
+        if ptr and ptr not in seen:
+            seen.add(ptr)
+            return nbytes
+        return 0
+    if isinstance(value, dict):
+        return sum(_tensor_tree_storage_nbytes(item, seen)
+                   for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return sum(_tensor_tree_storage_nbytes(item, seen) for item in value)
+    return 0
+
+
+def _tensor_storage_summary(tensor: object) -> tuple[int, str, tuple[Any, ...]]:
+    if not torch.is_tensor(tensor):
+        return 0, "", ()
+    ptr, nbytes = _tensor_storage_key_and_nbytes(tensor)
+    if not ptr:
+        return 0, "", ()
+    return nbytes, str(tensor.dtype), tuple(tensor.shape)
+
+
+def _mode1_referrer_owner_summary(ref: object,
+                                  ignored_ref_ids: set[int],
+                                  limit: int = 8) -> str:
+    parts: list[str] = []
+    try:
+        referrers = gc.get_referrers(ref)
+    except Exception:
+        return ""
+    for owner in referrers[:limit * 4]:
+        if id(owner) in ignored_ref_ids:
+            continue
+        try:
+            if owner is referrers:
+                continue
+            if getattr(owner, "__dict__", None) is ref:
+                parts.append(f"obj({type(owner).__name__})")
+            elif hasattr(owner, "f_code") and hasattr(owner, "f_lineno"):
+                parts.append(
+                    f"frame({getattr(owner.f_code, 'co_name', '?')}@"
+                    f"{getattr(owner.f_code, 'co_filename', '?')}:"
+                    f"{getattr(owner, 'f_lineno', '?')})")
+            elif isinstance(owner, dict):
+                owner_keys = []
+                try:
+                    for key, value in list(owner.items())[:64]:
+                        if value is ref:
+                            owner_keys.append(str(key))
+                except Exception:
+                    pass
+                parts.append(f"dict(keys={owner_keys[:4]})")
+            elif isinstance(owner, (list, tuple, set)):
+                parts.append(f"{type(owner).__name__}(len={len(owner)})")
+            else:
+                parts.append(type(owner).__name__)
+        except Exception:
+            parts.append(type(owner).__name__)
+        if len(parts) >= limit:
+            break
+    return ",".join(parts)
+
+
+def _append_large_npu_tensor_paths(owner: object,
+                                   prefix: str,
+                                   out: list[tuple[int, str, str, tuple[Any,
+                                                                        ...]]],
+                                   *,
+                                   min_bytes: int,
+                                   seen_objects: set[int],
+                                   depth: int = 0,
+                                   max_depth: int = 3) -> None:
+    if owner is None or depth > max_depth:
+        return
+    owner_id = id(owner)
+    if owner_id in seen_objects:
+        return
+    seen_objects.add(owner_id)
+    if torch.is_tensor(owner):
+        try:
+            if owner.device.type != "npu":
+                return
+            nbytes, dtype, shape = _tensor_storage_summary(owner)
+            if nbytes >= min_bytes:
+                out.append((nbytes, prefix, dtype, shape))
+        except Exception:
+            return
+        return
+    if isinstance(owner, dict):
+        for key, value in list(owner.items()):
+            _append_large_npu_tensor_paths(value,
+                                           f"{prefix}.{key}",
+                                           out,
+                                           min_bytes=min_bytes,
+                                           seen_objects=seen_objects,
+                                           depth=depth + 1,
+                                           max_depth=max_depth)
+        return
+    if isinstance(owner, (list, tuple, set)):
+        for idx, value in enumerate(list(owner)):
+            _append_large_npu_tensor_paths(value,
+                                           f"{prefix}[{idx}]",
+                                           out,
+                                           min_bytes=min_bytes,
+                                           seen_objects=seen_objects,
+                                           depth=depth + 1,
+                                           max_depth=max_depth)
+        return
+    obj_dict = getattr(owner, "__dict__", None)
+    if not isinstance(obj_dict, dict):
+        return
+    for attr, value in list(obj_dict.items()):
+        if attr in ("_modules", "_parameters", "_buffers"):
+            continue
+        _append_large_npu_tensor_paths(value,
+                                       f"{prefix}.{attr}",
+                                       out,
+                                       min_bytes=min_bytes,
+                                       seen_objects=seen_objects,
+                                       depth=depth + 1,
+                                       max_depth=max_depth)
+
+
+def _release_mode1_double_buffer_owner(owner: object) -> int:
+    if owner is None:
+        return 0
+    released = 0
+    owners: list[object] = [owner]
+    for attr in ("slots", "_mode3_cpu_npu_double_buffer_slots",
+                 "_mode4_remote_npu_double_buffer_slots"):
+        value = getattr(owner, attr, None)
+        if value is not None:
+            owners.append(value)
+    for candidate in owners:
+        if isinstance(candidate, dict):
+            iterable = list(candidate.values())
+        elif isinstance(candidate, (list, tuple, set)):
+            iterable = list(candidate)
+        else:
+            iterable = [candidate]
+        for item in iterable:
+            if item is None:
+                continue
+            for attr in ("w13", "w2", "cpu_stage_w13", "cpu_stage_w2",
+                         "expert_map", "dispatch_log2phy"):
+                if hasattr(item, attr):
+                    try:
+                        if getattr(item, attr) is not None:
+                            released += 1
+                        setattr(item, attr, None)
+                    except Exception:
+                        pass
+            for attr in ("block_layer_states", "prefetch_timing",
+                         "last_bind_timing",
+                         "last_prefetch_timing_by_target_layer",
+                         "_dispatch_remap_cache", "_slot_expert_map_cache"):
+                value = getattr(item, attr, None)
+                if isinstance(value, dict):
+                    try:
+                        value.clear()
+                    except Exception:
+                        pass
+    return released
+
+
+def _refresh_mode1_eplb_adaptor_references(model_runner: object) -> int:
+    refreshed = 0
+    adaptors: list[object] = []
+    adaptor = getattr(model_runner, "eplb_adaptor", None)
+    if adaptor is not None:
+        adaptors.append(adaptor)
+    for owner_attr in ("eplb_loader", "eplb_updator"):
+        owner = getattr(model_runner, owner_attr, None)
+        adaptor = getattr(owner, "eplb_adaptor", None)
+        if adaptor is not None:
+            adaptors.append(adaptor)
+        adaptor = getattr(owner, "adaptor", None)
+        if adaptor is not None:
+            adaptors.append(adaptor)
+
+    seen: set[int] = set()
+    for adaptor in adaptors:
+        if id(adaptor) in seen:
+            continue
+        seen.add(id(adaptor))
+        refresh_fn = getattr(adaptor, "refresh_parameter_references", None)
+        if callable(refresh_fn):
+            refresh_fn()
+            refreshed += 1
+            continue
+        param_dict = getattr(adaptor, "param_dict", None)
+        if isinstance(param_dict, dict):
+            param_dict.clear()
+            refreshed += 1
+        expert_param = getattr(adaptor, "expert_param_per_layer", None)
+        if isinstance(expert_param, dict):
+            expert_param.clear()
+    return refreshed
+
+
+def _is_mode1_stale_fullname_expert_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    if not key.startswith("model.layers."):
+        return False
+    return (key.endswith(".mlp.experts.w13_weight")
+            or key.endswith(".mlp.experts.w2_weight"))
+
+
+def _clear_stale_mode1_fullname_parameter_dicts(model: nn.Module) -> tuple[int, int, int]:
+    """Drop stale full-name parameter caches that retain pre-compaction MoE weights.
+
+    Some loaders/adaptors keep a dict keyed by full parameter names, e.g.
+    ``model.layers.0.mlp.experts.w13_weight``.  After mode=1 compacts the
+    physical expert slots for a floor=world-size step, those dicts can retain
+    the old 32-slot Parameters even though the live module now owns 8-slot
+    Parameters.  They are not part of ``module._parameters`` (those use local
+    names), so removing only stale full-name entries is safe and releases the
+    old storages before rebuilding the larger KV cache.
+    """
+    try:
+        current_params = dict(model.named_parameters())
+    except Exception:
+        current_params = {}
+
+    cleared_dicts = 0
+    cleared_entries = 0
+    cleared_bytes = 0
+    seen_dicts: set[int] = set()
+    for obj in gc.get_objects():
+        if not isinstance(obj, dict):
+            continue
+        obj_id = id(obj)
+        if obj_id in seen_dicts:
+            continue
+        seen_dicts.add(obj_id)
+        try:
+            candidate_items = [
+                (key, value) for key, value in list(obj.items())
+                if _is_mode1_stale_fullname_expert_key(key)
+            ]
+        except Exception:
+            continue
+        if not candidate_items:
+            continue
+
+        removed_this_dict = 0
+        for key, value in candidate_items:
+            if value is current_params.get(key):
+                continue
+            if not torch.is_tensor(value):
+                continue
+            try:
+                if value.device.type != "npu":
+                    continue
+            except Exception:
+                continue
+            try:
+                shape = tuple(value.shape)
+            except Exception:
+                shape = ()
+            if not shape or int(shape[0]) <= 8:
+                continue
+            _ptr, nbytes = _tensor_storage_key_and_nbytes(value)
+            try:
+                obj.pop(key, None)
+            except Exception:
+                continue
+            cleared_entries += 1
+            removed_this_dict += 1
+            cleared_bytes += int(nbytes)
+        if removed_this_dict:
+            cleared_dicts += 1
+    return cleared_dicts, cleared_entries, cleared_bytes
 
 
 def _mode4_get_flat_payload(cache: dict[tuple[object, ...], torch.Tensor],
@@ -812,6 +1118,39 @@ def _module_has_mode1_native_parity_ready(module: nn.Module) -> bool:
     return bool(getattr(module, "lossless_mode1_native_parity_ready", False))
 
 
+def _set_module_active_expert_mask(
+        module: nn.Module, new_active_expert_mask: Optional[torch.Tensor]
+) -> None:
+    setter = getattr(module, "set_active_expert_mask", None)
+    if callable(setter):
+        setter(new_active_expert_mask)
+        return
+    if new_active_expert_mask is None:
+        setattr(module, "active_expert_mask", None)
+        setattr(module, "elastic_runtime_log2phy", None)
+        return
+    expert_map = getattr(module, "expert_map", None)
+    target_device = getattr(expert_map, "device", new_active_expert_mask.device)
+    setattr(module, "active_expert_mask",
+            new_active_expert_mask.to(device=target_device, dtype=torch.bool))
+
+
+def _set_module_elastic_runtime_log2phy(
+        module: nn.Module, new_log2phy: Optional[torch.Tensor]) -> None:
+    setter = getattr(module, "set_elastic_runtime_log2phy", None)
+    if callable(setter):
+        setter(new_log2phy)
+        return
+    if new_log2phy is None:
+        setattr(module, "elastic_runtime_log2phy", None)
+        return
+    log2phy = getattr(module, "log2phy", None)
+    target_device = getattr(log2phy, "device", new_log2phy.device)
+    target_dtype = getattr(log2phy, "dtype", new_log2phy.dtype)
+    setattr(module, "elastic_runtime_log2phy",
+            new_log2phy.to(device=target_device, dtype=target_dtype))
+
+
 def _module_mode1_lightweight_parity_path(module: nn.Module) -> str:
     if _is_custom_ascend_fused_moe_module(module):
         return "old_custom_fused_moe"
@@ -830,6 +1169,42 @@ def _module_lightweight_no_headroom_path(module: nn.Module) -> str:
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _register_custom_models_if_requested() -> None:
+    if not _env_flag("VLLM_ASCEND_REGISTER_CUSTOM_MODELS", "0"):
+        return
+    if _env_flag("VLLM_ASCEND_USE_NATIVE_QWEN3_MOE", "0"):
+        logger.warning(
+            "VLLM_ASCEND_REGISTER_CUSTOM_MODELS=1 was requested, but "
+            "VLLM_ASCEND_USE_NATIVE_QWEN3_MOE is also enabled; Qwen3 MoE "
+            "will stay on the native model path.")
+        return
+
+    import vllm_ascend
+    vllm_ascend.register_model()
+
+    try:
+        from vllm.model_executor.model_loader import utils as loader_utils
+        loader_utils._MODEL_ARCH_BY_HASH.clear()
+    except Exception:
+        logger.debug("Unable to clear model architecture cache.",
+                     exc_info=True)
+    try:
+        from vllm.model_executor.models import registry as model_registry
+        model_registry._try_load_model_cls.cache_clear()
+        model_registry._try_inspect_model_cls.cache_clear()
+    except Exception:
+        logger.debug("Unable to clear model registry caches.", exc_info=True)
+
+    try:
+        from vllm import ModelRegistry
+        qwen3_model = ModelRegistry.models.get("Qwen3MoeForCausalLM")
+        logger.info("Registered custom Ascend models; Qwen3MoeForCausalLM=%s",
+                    qwen3_model)
+    except Exception:
+        logger.debug("Unable to log Qwen3 model registry entry.",
+                     exc_info=True)
 
 
 def _mode4_keep_weights_out_of_sleep_pool() -> bool:
@@ -853,6 +1228,7 @@ class NPUWorker(WorkerBase):
         # register patch for vllm
         from vllm_ascend.utils import adapt_patch
         adapt_patch()
+        _register_custom_models_if_requested()
         # Register ops when worker init.
         from vllm_ascend import ops
         ops.register_dummy_fusion_op()
@@ -925,6 +1301,7 @@ class NPUWorker(WorkerBase):
         self._elastic_current_active_ranks: list[int] | None = None
         self._post_shrink_moe_dispatch_warmed_active_signatures: set[tuple[
             int, ...]] = set()
+        self._mode1_planned_floor_groups_precreated = False
         original_parallel_config = self.vllm_config.parallel_config
         self._elastic_original_dp_size = int(
             original_parallel_config.data_parallel_size)
@@ -1006,6 +1383,9 @@ class NPUWorker(WorkerBase):
         # of the model.
         _, total_npu_memory = NPUPlatform.mem_get_info()
         self.model_runner.profile_run()
+        NPUPlatform.synchronize()
+        NPUPlatform.empty_cache()
+        self._precreate_mode1_planned_floor_groups_before_kv_cache()
         NPUPlatform.synchronize()
 
         # Calculate the number of blocks that can be allocated with the
@@ -1927,6 +2307,792 @@ class NPUWorker(WorkerBase):
                 self._warm_up_post_kv_ep_collectives()
                 self._post_kv_ep_collectives_warmed_up = True
 
+    def clear_kv_cache_for_resize(self) -> None:
+        """Release worker-side KV tensor references before step-level resize."""
+        cleared_layers = 0
+        rebuilt_input_batch = False
+        cleared_connector_refs = False
+        try:
+            from vllm.attention import AttentionType
+        except Exception:
+            AttentionType = None
+
+        model = None
+        module_map = {}
+        try:
+            model = self.model_runner.get_model()
+            if hasattr(model, "named_modules"):
+                module_map = dict(model.named_modules())
+        except Exception:
+            logger.exception("Failed to build module map while clearing KV cache")
+
+        ctx = getattr(self.vllm_config.compilation_config,
+                      "static_forward_context", None)
+        if ctx is not None:
+            pipeline_parallel_size = max(
+                int(self.vllm_config.parallel_config.pipeline_parallel_size), 1)
+            layer_names = []
+            for layer_name, ctx_entry in ctx.items():
+                attn_type = getattr(ctx_entry, "attn_type", None)
+                if (AttentionType is None or attn_type in (
+                        AttentionType.DECODER, AttentionType.ENCODER_DECODER)):
+                    layer_names.append(layer_name)
+            for layer_name in layer_names:
+                kv_cache = [
+                    torch.tensor([]) for _ in range(pipeline_parallel_size)
+                ]
+                try:
+                    ctx[layer_name].kv_cache = kv_cache
+                    module = module_map.get(layer_name)
+                    if module is not None and hasattr(module, "kv_cache"):
+                        module.kv_cache = kv_cache
+                    cleared_layers += 1
+                except Exception:
+                    logger.exception(
+                        "Failed to clear KV cache reference for layer %s",
+                        layer_name)
+
+        try:
+            self.model_runner.kv_caches = []
+        except Exception:
+            logger.exception("Failed to clear model_runner.kv_caches")
+
+        try:
+            runner = self.model_runner
+            old_input_batch = getattr(runner, "input_batch", None)
+            logitsprocs = getattr(old_input_batch, "logitsprocs", None)
+            block_sizes = [
+                group.kv_cache_spec.block_size
+                for group in runner.kv_cache_config.kv_cache_groups
+            ]
+            runner.input_batch = InputBatch(
+                max_num_reqs=runner.max_num_reqs,
+                max_model_len=runner.model_config.max_model_len,
+                max_num_batched_tokens=runner.max_num_tokens,
+                device=runner.device,
+                pin_memory=runner.pin_memory,
+                vocab_size=runner.model_config.get_vocab_size(),
+                block_sizes=block_sizes,
+                logitsprocs=logitsprocs,
+                is_spec_decode=bool(runner.vllm_config.speculative_config),
+                is_pooling_model=runner.is_pooling_model,
+                num_speculative_tokens=(
+                    runner.vllm_config.speculative_config.num_speculative_tokens
+                    if runner.vllm_config.speculative_config else 0),
+            )
+            rebuilt_input_batch = True
+        except Exception:
+            logger.exception("Failed to rebuild empty input_batch for KV resize")
+
+        try:
+            from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                                      has_kv_transfer_group)
+            if has_kv_transfer_group():
+                kv_group = get_kv_transfer_group()
+                connector_worker = getattr(kv_group, "connector_worker", None)
+                targets = [kv_group]
+                if connector_worker is not None:
+                    targets.append(connector_worker)
+                for target in targets:
+                    for attr in ("gpu_kv_caches", "gpu_kv_caches_load_iter",
+                                 "cpu_kv_caches", "kv_caches"):
+                        if hasattr(target, attr):
+                            try:
+                                setattr(target, attr, None)
+                                cleared_connector_refs = True
+                            except Exception:
+                                logger.debug(
+                                    "Failed to clear KV connector attr %s on %s",
+                                    attr,
+                                    type(target).__name__,
+                                    exc_info=True,
+                                )
+        except Exception:
+            logger.exception("Failed to clear KV transfer connector references")
+
+        if model is not None:
+            try:
+                first_attn = model.model.layers[0].self_attn
+                if hasattr(first_attn, "attn"):
+                    for i in range(model.model.start_layer,
+                                   model.model.end_layer):
+                        attn_impl = model.model.layers[i].self_attn.attn.impl
+                        if hasattr(attn_impl, "key_cache"):
+                            attn_impl.key_cache = None
+                            attn_impl.value_cache = None
+                if hasattr(first_attn, "mla_attn"):
+                    for i in range(model.model.start_layer,
+                                   model.model.end_layer):
+                        mla_attn = model.model.layers[i].self_attn.mla_attn
+                        if mla_attn is None or not hasattr(mla_attn, "impl"):
+                            continue
+                        mla_impl = mla_attn.impl
+                        if hasattr(mla_impl, "key_cache"):
+                            mla_impl.key_cache = None
+                            mla_impl.value_cache = None
+            except Exception:
+                logger.exception("Failed to clear attention implementation KV refs")
+
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception("Failed to empty/sync NPU cache during KV resize")
+        logger.info(
+            "Mode1 adaptive KV cache references cleared: rank=%s layers=%s "
+            "rebuilt_input_batch=%s cleared_connector_refs=%s",
+            self.rank,
+            cleared_layers,
+            rebuilt_input_batch,
+            cleared_connector_refs,
+        )
+
+    def clear_mode1_stale_fullname_parameter_dicts_for_kv_resize(self) -> None:
+        """Release stale full-name MoE Parameter caches before new KV alloc."""
+        cleared_stale_param_dicts = 0
+        cleared_stale_param_entries = 0
+        cleared_stale_param_bytes = 0
+        try:
+            model = self.model_runner.get_model()
+            (cleared_stale_param_dicts, cleared_stale_param_entries,
+             cleared_stale_param_bytes) = (
+                 _clear_stale_mode1_fullname_parameter_dicts(model))
+        except Exception:
+            logger.exception(
+                "Failed to clear stale mode1 full-name parameter dicts during "
+                "KV resize: rank=%s",
+                self.rank,
+            )
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception(
+                "Failed to empty/sync NPU cache after stale mode1 parameter "
+                "dict cleanup")
+        logger.info(
+            "Mode1 adaptive KV resize stale full-name parameter caches cleared: "
+            "rank=%s cleared_stale_param_dicts=%s "
+            "cleared_stale_param_entries=%s cleared_stale_param_bytes=%s",
+            self.rank,
+            cleared_stale_param_dicts,
+            cleared_stale_param_entries,
+            cleared_stale_param_bytes,
+        )
+
+    def mode1_resize_live_tensor_scan(self, tag: str = "") -> None:
+        """Log live NPU tensor storages during adaptive KV resize debugging."""
+        if not _mode1_kv_resize_live_tensor_scan_enabled():
+            return
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            pass
+        gc.collect()
+        storages: dict[int, dict[str, object]] = {}
+        tensor_count = 0
+        for obj in gc.get_objects():
+            try:
+                if not torch.is_tensor(obj):
+                    continue
+                if getattr(obj, "device", None) is None or obj.device.type != "npu":
+                    continue
+                ptr, nbytes = _tensor_storage_key_and_nbytes(obj)
+                if not ptr or nbytes <= 0:
+                    continue
+                tensor_count += 1
+                item = storages.setdefault(
+                    ptr, {
+                        "nbytes": nbytes,
+                        "count": 0,
+                        "dtype": str(obj.dtype),
+                        "shape": tuple(obj.shape),
+                        "sample": obj,
+                    },
+                )
+                item["count"] = int(item["count"]) + 1
+                if nbytes > int(item["nbytes"]):
+                    item["nbytes"] = nbytes
+                    item["dtype"] = str(obj.dtype)
+                    item["shape"] = tuple(obj.shape)
+                    item["sample"] = obj
+            except Exception:
+                continue
+
+        top_all = sorted(
+            storages.values(), key=lambda item: int(item["nbytes"]), reverse=True)
+        top_int8 = [
+            item for item in top_all if str(item.get("dtype")) == "torch.int8"
+        ]
+
+        def _fmt(items: list[dict[str, object]], limit: int) -> str:
+            parts = []
+            for item in items[:limit]:
+                parts.append(
+                    f"{int(item['nbytes'])}:{item['dtype']}:{item['shape']}:refs={item['count']}"
+                )
+            return ";".join(parts)
+
+        def _referrer_summary(tensor: object,
+                              ignored_ref_ids: set[int],
+                              limit: int = 16) -> str:
+            if not torch.is_tensor(tensor):
+                return ""
+            summaries = []
+            try:
+                referrers = gc.get_referrers(tensor)
+            except Exception:
+                return ""
+            for ref in referrers:
+                if id(ref) in ignored_ref_ids:
+                    continue
+                try:
+                    ref_type = type(ref).__name__
+                    if isinstance(ref, dict):
+                        keys = []
+                        for key, value in list(ref.items())[:128]:
+                            if value is tensor:
+                                keys.append(str(key))
+                        owners = []
+                        try:
+                            for owner in gc.get_referrers(ref)[:8]:
+                                if id(owner) in ignored_ref_ids:
+                                    continue
+                                if getattr(owner, "__dict__", None) is ref:
+                                    owners.append(type(owner).__name__)
+                        except Exception:
+                            pass
+                        if keys == ["sample"] and not owners:
+                            continue
+                        dict_refs = _mode1_referrer_owner_summary(
+                            ref, ignored_ref_ids, limit=6)
+                        summaries.append(
+                            f"dict(keys={keys[:6]},owners={owners[:4]},"
+                            f"refs={dict_refs})")
+                    elif isinstance(ref, (list, tuple, set)):
+                        if isinstance(ref, list) and len(ref) > 1024:
+                            continue
+                        summaries.append(f"{ref_type}(len={len(ref)})")
+                    elif hasattr(ref, "f_code") and hasattr(ref, "f_lineno"):
+                        summaries.append(
+                            f"frame({getattr(ref.f_code, 'co_name', '?')}@"
+                            f"{getattr(ref.f_code, 'co_filename', '?')}:"
+                            f"{getattr(ref, 'f_lineno', '?')})")
+                    else:
+                        summaries.append(ref_type)
+                except Exception:
+                    summaries.append(type(ref).__name__)
+                if len(summaries) >= limit:
+                    break
+            return "|".join(summaries)
+
+        stale_referrers = []
+        ignored_ref_ids = {id(storages), id(top_all), id(top_int8)}
+        for item in top_all:
+            ignored_ref_ids.add(id(item))
+            shape = item.get("shape")
+            dtype = str(item.get("dtype"))
+            if dtype != "torch.bfloat16" or not isinstance(shape, tuple):
+                continue
+            if (shape == (32, 1536, 2048)
+                    or shape == (32, 2048, 768)
+                    or (len(shape) == 1 and int(shape[0]) == 143654912)):
+                sample = item.get("sample")
+                stale_referrers.append(
+                    f"{int(item['nbytes'])}:{dtype}:{shape}:"
+                    f"{_referrer_summary(sample, ignored_ref_ids)}")
+                if len(stale_referrers) >= 8:
+                    break
+
+        known: dict[str, int] = {}
+        try:
+            known["model_runner.kv_caches"] = _tensor_tree_storage_nbytes(
+                getattr(self.model_runner, "kv_caches", None))
+        except Exception:
+            pass
+        try:
+            known["model_runner.input_batch"] = _tensor_tree_storage_nbytes(
+                getattr(self.model_runner, "input_batch", None))
+        except Exception:
+            pass
+        try:
+            ctx = getattr(self.vllm_config.compilation_config,
+                          "static_forward_context", None)
+            known["static_forward_context"] = _tensor_tree_storage_nbytes(ctx)
+        except Exception:
+            pass
+        try:
+            model = self.model_runner.get_model()
+            impl_refs = []
+            first_attn = model.model.layers[0].self_attn
+            if hasattr(first_attn, "attn"):
+                for i in range(model.model.start_layer, model.model.end_layer):
+                    attn_impl = model.model.layers[i].self_attn.attn.impl
+                    impl_refs.append(getattr(attn_impl, "key_cache", None))
+                    impl_refs.append(getattr(attn_impl, "value_cache", None))
+            known["attention_impl_kv"] = _tensor_tree_storage_nbytes(impl_refs)
+        except Exception:
+            pass
+        owner_hits: list[tuple[int, str, str, tuple[Any, ...]]] = []
+        try:
+            model = self.model_runner.get_model()
+            model_level_attrs = (
+                "_mode3_cpu_npu_double_buffer_slots",
+                "_mode4_remote_npu_double_buffer_slots",
+                "_mode3_double_buffer_manager",
+            )
+            for attr in model_level_attrs:
+                value = getattr(model, attr, None)
+                known[f"model.{attr}"] = _tensor_tree_storage_nbytes(value)
+                _append_large_npu_tensor_paths(value,
+                                               f"model.{attr}",
+                                               owner_hits,
+                                               min_bytes=64 * 1024 * 1024,
+                                               seen_objects=set(),
+                                               max_depth=4)
+            try:
+                from vllm.forward_context import get_forward_context
+                forward_context = get_forward_context()
+                for attr in ("moe_double_buffer_manager", "moe_comm_method",
+                             "moe_prefetch_stream"):
+                    value = getattr(forward_context, attr, None)
+                    known[f"forward_context.{attr}"] = (
+                        _tensor_tree_storage_nbytes(value))
+                    _append_large_npu_tensor_paths(
+                        value,
+                        f"forward_context.{attr}",
+                        owner_hits,
+                        min_bytes=64 * 1024 * 1024,
+                        seen_objects=set(),
+                        max_depth=4)
+            except Exception:
+                pass
+            moe_seen = set()
+            named_param_seen: set[int] = set()
+            for module in model.modules():
+                if not _is_ascend_fused_moe_module(module):
+                    continue
+                layer_idx = getattr(module, "layer_idx", "?")
+                for name, param in getattr(module, "named_parameters",
+                                           lambda recurse=False: [])(
+                                               recurse=False):
+                    ptr, nbytes = _tensor_storage_key_and_nbytes(param)
+                    if ptr and ptr not in named_param_seen:
+                        named_param_seen.add(ptr)
+                        if nbytes >= 64 * 1024 * 1024:
+                            owner_hits.append(
+                                (nbytes, f"moe[{layer_idx}]._parameters.{name}",
+                                 str(param.dtype), tuple(param.shape)))
+                for name, buffer in getattr(module, "named_buffers",
+                                            lambda recurse=False: [])(
+                                                recurse=False):
+                    ptr, nbytes = _tensor_storage_key_and_nbytes(buffer)
+                    if ptr and ptr not in named_param_seen:
+                        named_param_seen.add(ptr)
+                        if nbytes >= 64 * 1024 * 1024:
+                            owner_hits.append(
+                                (nbytes, f"moe[{layer_idx}]._buffers.{name}",
+                                 str(buffer.dtype), tuple(buffer.shape)))
+                for attr in ("w13_weight", "w2_weight", "runtime_w13_weight",
+                             "runtime_w2_weight", "runtime_w13_buffer",
+                             "runtime_w2_buffer",
+                             "lossless_saved_primary_prefix_w13",
+                             "lossless_saved_primary_prefix_w2",
+                             "lossless_cpu_shadow_w13_buffer",
+                             "lossless_cpu_shadow_w2_buffer",
+                             "_mode3_double_buffer_manager", "quant_method"):
+                    value = getattr(module, attr, None)
+                    _append_large_npu_tensor_paths(
+                        value,
+                        f"moe[{layer_idx}].{attr}",
+                        owner_hits,
+                        min_bytes=64 * 1024 * 1024,
+                        seen_objects=moe_seen,
+                        max_depth=3)
+        except Exception:
+            logger.exception(
+                "Failed to collect mode1 adaptive KV owner tensor scan: "
+                "rank=%s tag=%s",
+                self.rank,
+                tag,
+            )
+        try:
+            from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                                      has_kv_transfer_group)
+            if has_kv_transfer_group():
+                known["kv_transfer_group"] = _tensor_tree_storage_nbytes(
+                    get_kv_transfer_group())
+        except Exception:
+            pass
+
+        logger.info(
+            "Mode1 adaptive KV live tensor scan: rank=%s tag=%s "
+            "tensor_count=%s storage_count=%s total_storage_bytes=%s "
+            "top_int8=%s top_all=%s known_bytes=%s owner_hits=%s "
+            "stale_referrers=%s",
+            self.rank,
+            tag,
+            tensor_count,
+            len(storages),
+            sum(int(item["nbytes"]) for item in storages.values()),
+            _fmt(top_int8, 12),
+            _fmt(top_all, 12),
+            known,
+            ";".join(
+                f"{nbytes}:{path}:{dtype}:{shape}"
+                for nbytes, path, dtype, shape in sorted(
+                    owner_hits, key=lambda item: item[0], reverse=True)[:24]),
+            ";".join(stale_referrers),
+        )
+
+    def prepare_mode1_step_floor_for_kv_resize(self, target_floor: int) -> bool:
+        """Adjust mode=1 resident MoE slots before per-step KV resizing.
+
+        A full-world step needs the largest KV cache budget and should not keep
+        the floor-N runtime state resident.  When target_floor reaches the
+        world size the step is semantically no-shrink, so restore the primary
+        full-world layout and clear per-shrink masks instead of keeping the
+        low-floor parity runtime active.
+        """
+        try:
+            target_floor = int(target_floor)
+        except (TypeError, ValueError):
+            return False
+        world_size = int(torch.distributed.get_world_size()
+                         if torch.distributed.is_available()
+                         and torch.distributed.is_initialized() else 1)
+        prune_stats = self._prune_mode1_planned_floor_groups_for_current_step(
+            target_floor, "kv_resize_prepare")
+        if target_floor < world_size:
+            precreate_stats = (
+                self._precreate_mode1_planned_floor_groups_before_kv_cache(
+                    prefill_expert_slots=False))
+            return bool(
+                prune_stats.get("changed", 0.0) > 0.0
+                or precreate_stats.get("stage_groups", 0.0) > 0.0)
+
+        model = None
+        try:
+            model = self.model_runner.get_model()
+        except Exception:
+            logger.exception("Failed to fetch model for mode1 floor preparation")
+            return False
+        if model is None:
+            return False
+
+        released_model_slot_caches = 0
+        try:
+            from vllm.forward_context import get_forward_context
+            try:
+                forward_context = get_forward_context()
+            except AssertionError:
+                forward_context = None
+            if hasattr(forward_context, "moe_double_buffer_manager"):
+                released_model_slot_caches += _release_mode1_double_buffer_owner(
+                    getattr(forward_context, "moe_double_buffer_manager", None))
+                setattr(forward_context, "moe_double_buffer_manager", None)
+                released_model_slot_caches += 1
+        except Exception:
+            logger.exception(
+                "Failed to release forward-context mode1 double-buffer cache: "
+                "rank=%s",
+                self.rank,
+            )
+        if hasattr(model, "_mode3_double_buffer_manager"):
+            try:
+                released_model_slot_caches += _release_mode1_double_buffer_owner(
+                    getattr(model, "_mode3_double_buffer_manager", None))
+                setattr(model, "_mode3_double_buffer_manager", None)
+                released_model_slot_caches += 1
+            except Exception:
+                logger.exception(
+                    "Failed to release model-level mode1 manager cache: "
+                    "rank=%s",
+                    self.rank,
+                )
+        for slot_attr in ("_mode3_cpu_npu_double_buffer_slots",
+                          "_mode4_remote_npu_double_buffer_slots"):
+            if hasattr(model, slot_attr):
+                try:
+                    released_model_slot_caches += _release_mode1_double_buffer_owner(
+                        getattr(model, slot_attr, None))
+                    setattr(model, slot_attr, None)
+                    released_model_slot_caches += 1
+                except Exception:
+                    logger.exception(
+                        "Failed to release model-level mode1 slot cache: "
+                        "rank=%s attr=%s",
+                        self.rank,
+                        slot_attr,
+                    )
+
+        restored_layers = 0
+        compacted_layers = 0
+        refreshed_eplb_adaptors = 0
+        cleared_stale_param_dicts = 0
+        cleared_stale_param_entries = 0
+        cleared_stale_param_bytes = 0
+        moe_weight_bytes = 0
+        moe_runtime_bytes = 0
+        moe_loaded_capacity_hist: dict[int, int] = {}
+        moe_weight_shape_hist: dict[str, int] = {}
+        for module in model.modules():
+            if not _is_ascend_fused_moe_module(module):
+                continue
+            if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+                continue
+            if not _module_uses_lossless_elastic(module):
+                continue
+            restore_fn = getattr(module,
+                                 "restore_lossless_full_world_primary_layout",
+                                 None)
+            if callable(restore_fn):
+                restore_fn()
+            elif hasattr(module, "reset_expert_map_and_log2phy"):
+                module.reset_expert_map_and_log2phy()
+            release_transient_fn = getattr(
+                module, "release_mode1_full_world_transient_state", None)
+            if callable(release_transient_fn):
+                release_transient_fn()
+            if hasattr(module, "_mode3_double_buffer_manager"):
+                try:
+                    released_model_slot_caches += _release_mode1_double_buffer_owner(
+                        getattr(module, "_mode3_double_buffer_manager", None))
+                    setattr(module, "_mode3_double_buffer_manager", None)
+                except Exception:
+                    logger.exception(
+                        "Failed to release module mode1 manager cache: "
+                        "rank=%s layer=%s",
+                        self.rank,
+                        getattr(module, "layer_idx", "?"),
+                    )
+            compact_fn = getattr(module,
+                                 "shrink_lossless_loaded_weights_to_primary",
+                                 None)
+            if callable(compact_fn) and compact_fn():
+                compacted_layers += 1
+            _set_module_active_expert_mask(module, None)
+            _set_module_elastic_runtime_log2phy(module, None)
+            original_num_experts = getattr(module,
+                                           "elastic_original_num_experts",
+                                           None)
+            if original_num_experts is not None:
+                module.num_experts = int(original_num_experts)
+                module.moe_config.num_experts = int(original_num_experts)
+            quant_method = getattr(module, "quant_method", None)
+            if (quant_method is not None and hasattr(
+                    quant_method,
+                    "invalidate_lossless_runtime_state_for_reload")):
+                quant_method.invalidate_lossless_runtime_state_for_reload(
+                    layer=module, reason="mode1_full_world_step_floor")
+            else:
+                module.runtime_w13_weight = None
+                module.runtime_w2_weight = None
+                module.runtime_w13_buffer = None
+                module.runtime_w2_buffer = None
+                module.runtime_weight_capacity = 0
+                module.lossless_runtime_activated = False
+            restored_layers += 1
+            try:
+                w13 = getattr(module, "w13_weight", None)
+                w2 = getattr(module, "w2_weight", None)
+                for tensor in (w13, w2):
+                    if isinstance(tensor, torch.Tensor):
+                        try:
+                            moe_weight_bytes += int(
+                                tensor.untyped_storage().nbytes())
+                        except Exception:
+                            moe_weight_bytes += (int(tensor.numel()) *
+                                                 int(tensor.element_size()))
+                runtime_w13 = getattr(module, "runtime_w13_buffer", None)
+                runtime_w2 = getattr(module, "runtime_w2_buffer", None)
+                for tensor in (runtime_w13, runtime_w2):
+                    if isinstance(tensor, torch.Tensor):
+                        try:
+                            moe_runtime_bytes += int(
+                                tensor.untyped_storage().nbytes())
+                        except Exception:
+                            moe_runtime_bytes += (int(tensor.numel()) *
+                                                  int(tensor.element_size()))
+                capacity = int(getattr(module, "loaded_weight_capacity", -1))
+                moe_loaded_capacity_hist[capacity] = (
+                    moe_loaded_capacity_hist.get(capacity, 0) + 1)
+                shape_key = (
+                    f"{tuple(getattr(w13, 'shape', ()))}/"
+                    f"{tuple(getattr(w2, 'shape', ()))}")
+                moe_weight_shape_hist[shape_key] = (
+                    moe_weight_shape_hist.get(shape_key, 0) + 1)
+            except Exception:
+                logger.exception(
+                    "Failed to collect mode1 MoE compact memory stats: rank=%s",
+                    self.rank,
+                )
+
+        try:
+            refreshed_eplb_adaptors = (
+                _refresh_mode1_eplb_adaptor_references(self.model_runner))
+        except Exception:
+            logger.exception(
+                "Failed to refresh mode1 EPLB cached parameter references: "
+                "rank=%s",
+                self.rank,
+            )
+
+        try:
+            (cleared_stale_param_dicts, cleared_stale_param_entries,
+             cleared_stale_param_bytes) = (
+                 _clear_stale_mode1_fullname_parameter_dicts(model))
+        except Exception:
+            logger.exception(
+                "Failed to clear stale mode1 full-name parameter dicts: rank=%s",
+                self.rank,
+            )
+
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception("Failed to empty/sync NPU cache after floor prep")
+        if restored_layers > 0:
+            logger.info(
+                "Mode1 step floor preparation restored full-world layout: "
+                "rank=%s target_floor=%s world_size=%s layers=%s "
+                "compacted_layers=%s "
+                "released_model_slot_caches=%s refreshed_eplb_adaptors=%s "
+                "cleared_stale_param_dicts=%s cleared_stale_param_entries=%s "
+                "cleared_stale_param_bytes=%s "
+                "moe_weight_bytes=%s "
+                "moe_runtime_bytes=%s loaded_capacity_hist=%s "
+                "weight_shape_hist=%s group_refresh=deferred",
+                self.rank,
+                target_floor,
+                world_size,
+                restored_layers,
+                compacted_layers,
+                released_model_slot_caches,
+                refreshed_eplb_adaptors,
+                cleared_stale_param_dicts,
+                cleared_stale_param_entries,
+                cleared_stale_param_bytes,
+                moe_weight_bytes,
+                moe_runtime_bytes,
+                moe_loaded_capacity_hist,
+                moe_weight_shape_hist,
+            )
+        return restored_layers > 0
+
+    def refresh_mode1_step_floor_groups_for_kv_resize(
+            self, target_floor: int) -> bool:
+        """Refresh MoE communication groups after old KV cache is released."""
+        try:
+            target_floor = int(target_floor)
+        except (TypeError, ValueError):
+            return False
+        world_size = int(torch.distributed.get_world_size()
+                         if torch.distributed.is_available()
+                         and torch.distributed.is_initialized() else 1)
+        if target_floor < world_size:
+            return False
+
+        model = None
+        try:
+            model = self.model_runner.get_model()
+        except Exception:
+            logger.exception("Failed to fetch model for mode1 group refresh")
+            return False
+        if model is None:
+            return False
+
+        refreshed_layers = 0
+        for module in model.modules():
+            if not _is_ascend_fused_moe_module(module):
+                continue
+            if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+                continue
+            if not _module_uses_lossless_elastic(module):
+                continue
+            module.refresh_elastic_groups()
+            refreshed_layers += 1
+
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception("Failed to empty/sync NPU cache after group refresh")
+        if refreshed_layers > 0:
+            logger.info(
+                "Mode1 step floor MoE groups refreshed after old KV release: "
+                "rank=%s target_floor=%s world_size=%s layers=%s",
+                self.rank,
+                target_floor,
+                world_size,
+                refreshed_layers,
+            )
+        return refreshed_layers > 0
+
+    def mode1_resize_world_barrier(self, tag: str) -> None:
+        """Synchronize all rollout workers between step-level resize phases."""
+        if not (torch.distributed.is_available()
+                and torch.distributed.is_initialized()):
+            return
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception("Failed to sync NPU before mode1 resize barrier")
+        start = time.time()
+        torch.distributed.barrier()
+        elapsed_ms = (time.time() - start) * 1000.0
+        logger.info(
+            "Mode1 adaptive KV resize world barrier done: rank=%s tag=%s "
+            "elapsed_ms=%.2f",
+            self.rank,
+            tag,
+            elapsed_ms,
+        )
+
+    def get_mode1_resize_available_kv_memory(
+            self, headroom_bytes: int = 0) -> int:
+        """Return currently free NPU memory usable for a resized KV cache."""
+        try:
+            headroom_bytes = max(int(headroom_bytes), 0)
+        except (TypeError, ValueError):
+            headroom_bytes = 0
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+            free_bytes, total_bytes = torch.npu.mem_get_info()
+            stats = torch_npu.npu.memory_stats()
+            torch_current = int(stats.get("allocated_bytes.all.current", 0))
+            torch_reserved = int(stats.get("reserved_bytes.all.current", 0))
+            total_allocated = int(total_bytes - free_bytes)
+            non_torch = max(total_allocated - torch_current, 0)
+            available = max(int(free_bytes) - headroom_bytes, 0)
+            logger.info(
+                "Mode1 adaptive KV resize memory: rank=%s free_bytes=%s "
+                "total_bytes=%s torch_current=%s torch_reserved=%s "
+                "non_torch=%s total_allocated=%s headroom_bytes=%s "
+                "available_for_kv=%s",
+                self.rank,
+                free_bytes,
+                total_bytes,
+                torch_current,
+                torch_reserved,
+                non_torch,
+                total_allocated,
+                headroom_bytes,
+                available,
+            )
+            return available
+        except Exception:
+            logger.exception(
+                "Failed to query current free NPU memory for mode1 KV resize")
+            return 0
+
     def _warm_up_post_kv_ep_collectives(self) -> None:
         """Warm up EP HCCL collectives after KV cache allocation.
 
@@ -1992,6 +3158,12 @@ class NPUWorker(WorkerBase):
         return self.model_runner.pin_lora(lora_id)
 
     def execute_dummy_batch(self) -> None:
+        if getattr(self, "elastic_parallel_detached", False):
+            logger.info(
+                "Elastic dummy batch skipped on detached rank: rank=%s",
+                self.rank,
+            )
+            return
         with self._maybe_elastic_op_profile("dummy"):
             self.model_runner._dummy_run(1)
 
@@ -2239,12 +3411,14 @@ class NPUWorker(WorkerBase):
                         # if a later shrink lands on the same active-rank
                         # signature, we must warm it again because the EP/MC2
                         # groups have been rebuilt from the restored 16-rank
-                        # world in between.
-                        self._post_shrink_moe_dispatch_warmed_active_signatures.clear()
+                        # world in between. Fixed-topology reuse keeps those
+                        # shrink groups alive, so their warm state remains valid.
+                        if not self._mode1_fixed_topology_group_reuse_enabled():
+                            self._post_shrink_moe_dispatch_warmed_active_signatures.clear()
                         current_dp_group = get_dp_group()
                         current_ep_group = get_ep_group()
-                        module.set_active_expert_mask(None)
-                        module.set_elastic_runtime_log2phy(None)
+                        _set_module_active_expert_mask(module, None)
+                        _set_module_elastic_runtime_log2phy(module, None)
                         module.ep_group = current_ep_group
                         module.moe_parallel_config.dp_size = current_dp_group.world_size
                         module.moe_parallel_config.dp_rank = current_dp_group.rank_in_group
@@ -2320,8 +3494,8 @@ class NPUWorker(WorkerBase):
                         mode4_remote_sources[expert_id] = (
                             int(remote_source_rank), int(source_slot))
                 if participate_only:
-                    module.set_active_expert_mask(None)
-                    module.set_elastic_runtime_log2phy(None)
+                    _set_module_active_expert_mask(module, None)
+                    _set_module_elastic_runtime_log2phy(module, None)
                     module.moe_config.num_experts = module.elastic_original_num_experts
                     continue
                 logical_num_experts = int(module.elastic_original_num_experts)
@@ -2334,9 +3508,9 @@ class NPUWorker(WorkerBase):
                 # warmup. Mode=3 still manages active experts through its own
                 # double-buffer metadata and therefore keeps this mask unset.
                 if getattr(module, "elastic_execution_mode", 0) == 3:
-                    module.set_active_expert_mask(None)
+                    _set_module_active_expert_mask(module, None)
                 else:
-                    module.set_active_expert_mask(None)
+                    _set_module_active_expert_mask(module, None)
                 assignments = payload["assignments"]
                 my_rank_idx = active_ranks.index(current_rank)
                 ordered_assignments = payload["ordered_assignments"]
@@ -2562,13 +3736,13 @@ class NPUWorker(WorkerBase):
                         active_expert_mask = (new_log2phy_cpu >= 0).to(
                             device=module.expert_map.device,
                             dtype=torch.bool)
-                        module.set_active_expert_mask(active_expert_mask)
+                        _set_module_active_expert_mask(module, active_expert_mask)
                 if module.log2phy is not None and new_log2phy_cpu is not None:
-                    module.set_elastic_runtime_log2phy(
+                    _set_module_elastic_runtime_log2phy(module,
                         new_log2phy_cpu.to(device=module.log2phy.device,
                                            dtype=module.log2phy.dtype))
                 else:
-                    module.set_elastic_runtime_log2phy(None)
+                    _set_module_elastic_runtime_log2phy(module, None)
                 hybrid_t4 = time.perf_counter() if use_hybrid_cpu_swap else None
                 # Rebuild the token dispatcher with the post-shrink local expert
                 # count before decode resumes on the new 8-rank EP group.
@@ -2685,13 +3859,13 @@ class NPUWorker(WorkerBase):
                 continue
 
             if not is_active_rank:
-                module.set_active_expert_mask(None)
-                module.set_elastic_runtime_log2phy(None)
+                _set_module_active_expert_mask(module, None)
+                _set_module_elastic_runtime_log2phy(module, None)
                 module.moe_config.num_experts = module.elastic_original_num_experts
                 continue
             if module.expert_map is None:
-                module.set_active_expert_mask(None)
-                module.set_elastic_runtime_log2phy(None)
+                _set_module_active_expert_mask(module, None)
+                _set_module_elastic_runtime_log2phy(module, None)
                 module.moe_config.num_experts = module.elastic_original_num_experts
                 module.refresh_elastic_groups()
                 continue
@@ -2731,7 +3905,7 @@ class NPUWorker(WorkerBase):
                                                       dtype=torch.bool)
                 for rank_expert_map in gathered_expert_map:
                     active_expert_mask |= (rank_expert_map != -1)
-                module.set_active_expert_mask(active_expert_mask.to(
+                _set_module_active_expert_mask(module, active_expert_mask.to(
                     device=module.expert_map.device))
 
                 if module.log2phy is not None:
@@ -2770,11 +3944,11 @@ class NPUWorker(WorkerBase):
                         if old_phy_id is None:
                             continue
                         new_log2phy_cpu[expert_id] = old_phy_to_dense[old_phy_id]
-                    module.set_elastic_runtime_log2phy(
+                    _set_module_elastic_runtime_log2phy(module,
                         new_log2phy_cpu.to(device=module.log2phy.device,
                                            dtype=module.log2phy.dtype))
                 else:
-                    module.set_elastic_runtime_log2phy(None)
+                    _set_module_elastic_runtime_log2phy(module, None)
                     module.set_runtime_num_experts(sum(local_expert_counts))
 
                 module.refresh_elastic_groups()
@@ -3499,6 +4673,7 @@ class NPUWorker(WorkerBase):
                 inactive_runtime_pairs_by_rank: dict[int, list[tuple[int, int]]] = {}
                 active_free_count_by_rank: dict[int, int] = {}
                 inactive_export_count_by_rank: dict[int, int] = {}
+                paired_prefilled_hits = 0
 
                 for active_rank in active_ranks:
                     active_runtime_slots = {
@@ -3612,6 +4787,14 @@ class NPUWorker(WorkerBase):
                             int(expert_id), int(local_slot))
                     for free_slot, (expert_id, inactive_local_slot) in zip(
                             free_loaded_slots, inactive_runtime_pairs):
+                        prefilled_loaded_slot = int(
+                            gathered_loaded_maps_by_rank[active_rank][int(
+                                expert_id)].item())
+                        if int(prefilled_loaded_slot) == int(free_slot):
+                            ordered_rank_assignments[free_slot] = (
+                                int(expert_id), int(prefilled_loaded_slot))
+                            paired_prefilled_hits += 1
+                            continue
                         remote_source_rank, source_slot = _resolve_mode4_npu_source(
                             inactive_rank, int(expert_id),
                             int(inactive_local_slot))
@@ -3671,12 +4854,13 @@ class NPUWorker(WorkerBase):
                     "target_per_rank": target_per_rank,
                     "mode5_remote_experts": sorted(mode5_remote_experts),
                     "mode5_cpu_import_experts": sorted(mode5_cpu_import_experts),
+                    "paired_prefilled_loaded_hits": paired_prefilled_hits,
                 }
                 payload_store_ms += (
                     time.perf_counter() - module_store_start_t) * 1000.0
                 if module.layer_idx == 0 and current_rank == active_ranks[0]:
                     logger.info(
-                        "Elastic paired redundant shrink plan: rank=%s active_ranks=%s inactive_ranks=%s target_per_rank=%s pairings=%s paired_imports=%s",
+                        "Elastic paired redundant shrink plan: rank=%s active_ranks=%s inactive_ranks=%s target_per_rank=%s pairings=%s paired_imports=%s prefilled_hits=%s",
                         current_rank,
                         active_ranks,
                         inactive_ranks,
@@ -3685,6 +4869,7 @@ class NPUWorker(WorkerBase):
                                for inactive_rank, active_rank in
                                pairing_by_inactive.items()),
                         len(cpu_import_source_rank),
+                        paired_prefilled_hits,
                     )
                 continue
 
@@ -6786,6 +7971,195 @@ class NPUWorker(WorkerBase):
                 preload_filter_cpu_payload_ms + preload_stream_import_ms +
                 preload_store_ms)
 
+    def _commit_preloaded_direct_slots_to_loaded_maps(
+            self, active_ranks: list[int], reason: str) -> dict[str, float]:
+        stats = {
+            "layers": 0.0,
+            "direct_slots": 0.0,
+            "map_updates": 0.0,
+        }
+        if not active_ranks or self.rank not in set(int(r) for r in active_ranks):
+            return stats
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return stats
+        direct_by_layer = getattr(self, "_lossless_preloaded_direct_import_slots",
+                                  {})
+        if not direct_by_layer:
+            return stats
+        for module in model.modules():
+            if not _is_ascend_fused_moe_module(module):
+                continue
+            if getattr(module, "elastic_moe_mode", "lossy") != "lossless":
+                continue
+            layer_slots = direct_by_layer.get(getattr(module, "layer_idx", -1), {})
+            if not layer_slots:
+                continue
+            mark_fn = getattr(module, "mark_lossless_loaded_slots_resident",
+                              None)
+            if not callable(mark_fn):
+                continue
+            updates = mark_fn({
+                int(expert_id): int(slot)
+                for expert_id, slot in layer_slots.items()
+            }, reason=reason)
+            stats["layers"] += 1.0
+            stats["direct_slots"] += float(len(layer_slots))
+            stats["map_updates"] += float(updates)
+        return stats
+
+    def _prefill_mode1_planned_expert_slots_for_active_ranks(
+            self, active_ranks: list[int], world_group,
+            reason: str) -> dict[str, float]:
+        stats = {
+            "enabled": 0.0,
+            "active_size": float(len(active_ranks)),
+            "payload_ms": 0.0,
+            "preload_ms": 0.0,
+            "commit_layers": 0.0,
+            "commit_slots": 0.0,
+            "commit_updates": 0.0,
+            "total_ms": 0.0,
+        }
+        if not self._mode1_prefill_planned_expert_slots_enabled():
+            return stats
+        if not active_ranks:
+            return stats
+        world_size = int(torch.distributed.get_world_size()
+                         if torch.distributed.is_initialized() else 1)
+        if len(active_ranks) >= world_size:
+            return stats
+        previous_active = self._get_previous_active_ranks_for_shrink(world_size)
+        if len(previous_active) != 2 * len(active_ranks):
+            return stats
+        if not set(int(rank) for rank in active_ranks).issubset(
+                set(int(rank) for rank in previous_active)):
+            return stats
+
+        old_payload = getattr(self, "_lossless_shrink_payload", {})
+        old_cpu_imports = getattr(self, "_lossless_preloaded_cpu_import_weights",
+                                  {})
+        old_direct_slots = getattr(self, "_lossless_preloaded_direct_import_slots",
+                                   {})
+        old_current_active = getattr(self, "_elastic_current_active_ranks", None)
+        start_t = time.perf_counter()
+        try:
+            stats["enabled"] = 1.0
+            payload_start_t = time.perf_counter()
+            self._prepare_lossless_shrink_payload(list(active_ranks), world_group)
+            stats["payload_ms"] = (
+                time.perf_counter() - payload_start_t) * 1000.0
+            preload_start_t = time.perf_counter()
+            self._preload_lossless_shrink_import_weights(list(active_ranks),
+                                                         world_group)
+            stats["preload_ms"] = (
+                time.perf_counter() - preload_start_t) * 1000.0
+            commit_stats = self._commit_preloaded_direct_slots_to_loaded_maps(
+                list(active_ranks), reason=reason)
+            stats["commit_layers"] = float(commit_stats.get("layers", 0.0))
+            stats["commit_slots"] = float(commit_stats.get("direct_slots", 0.0))
+            stats["commit_updates"] = float(commit_stats.get("map_updates", 0.0))
+            if torch.npu.is_available():
+                torch.npu.synchronize()
+            stats["total_ms"] = (time.perf_counter() - start_t) * 1000.0
+            if (self.rank == int(active_ranks[0])
+                    or self.rank == int(previous_active[0])):
+                logger.info(
+                    "Mode1 planned expert slot prefill complete: "
+                    "rank=%s active_ranks=%s previous_active=%s reason=%s "
+                    "payload_ms=%.2f preload_ms=%.2f commit_layers=%.0f "
+                    "commit_slots=%.0f commit_updates=%.0f total_ms=%.2f",
+                    self.rank,
+                    list(active_ranks),
+                    list(previous_active),
+                    reason,
+                    stats["payload_ms"],
+                    stats["preload_ms"],
+                    stats["commit_layers"],
+                    stats["commit_slots"],
+                    stats["commit_updates"],
+                    stats["total_ms"],
+                )
+        finally:
+            self._lossless_shrink_payload = old_payload
+            self._lossless_preloaded_cpu_import_weights = old_cpu_imports
+            self._lossless_preloaded_direct_import_slots = old_direct_slots
+            self._elastic_current_active_ranks = old_current_active
+        return stats
+
+    def prefill_mode1_planned_expert_slots_for_kv_resize(
+            self, target_floor: int) -> bool:
+        """Prefill real expert weights into existing mode=1 redundant slots.
+
+        This is only a loaded-slot residency optimization for planned topology:
+        it does not allocate more expert rows.  The goal is to make the next
+        planned shrink see the needed experts in loaded_expert_map and avoid
+        scheduling another direct-NPU import at the shrink point.
+        """
+        if not self._mode1_prefill_planned_expert_slots_enabled():
+            return False
+        try:
+            target_floor = int(target_floor)
+        except (TypeError, ValueError):
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+        world_size = int(torch.distributed.get_world_size())
+        if target_floor <= 0 or target_floor >= world_size:
+            return False
+        planned_signature = self._mode1_planned_floor_group_signature()
+        if not planned_signature:
+            return False
+
+        # At a step boundary the runtime has been restored to full world.  The
+        # immediate next shrink is therefore the largest planned subgroup, e.g.
+        # 16 -> 8 for a floor4 plan.  Prefilling that first hop is safe without
+        # temporarily installing smaller source groups.
+        first_stage = next(
+            (tuple(int(rank) for rank in ranks)
+             for ranks in planned_signature if len(ranks) < world_size),
+            (),
+        )
+        if not first_stage:
+            return False
+        if target_floor > len(first_stage):
+            return False
+
+        world_group = get_world_group()
+        stats = self._prefill_mode1_planned_expert_slots_for_active_ranks(
+            list(first_stage),
+            world_group,
+            reason=f"kv_resize_target_floor={target_floor}",
+        )
+        changed = bool(
+            stats.get("commit_updates", 0.0) > 0.0
+            or stats.get("commit_slots", 0.0) > 0.0)
+        logger.info(
+            "Mode1 planned expert slot prefill for KV resize: rank=%s "
+            "target_floor=%s first_stage=%s changed=%s payload_ms=%.2f "
+            "preload_ms=%.2f commit_layers=%.0f commit_slots=%.0f "
+            "commit_updates=%.0f total_ms=%.2f",
+            self.rank,
+            target_floor,
+            list(first_stage),
+            int(changed),
+            float(stats.get("payload_ms", 0.0)),
+            float(stats.get("preload_ms", 0.0)),
+            float(stats.get("commit_layers", 0.0)),
+            float(stats.get("commit_slots", 0.0)),
+            float(stats.get("commit_updates", 0.0)),
+            float(stats.get("total_ms", 0.0)),
+        )
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception(
+                "Failed to empty/sync NPU cache after planned expert prefill")
+        return changed
+
     def _destroy_group_if_present(self, state_module, attr_name: str) -> None:
         group = getattr(state_module, attr_name, None)
         if group is not None:
@@ -6881,8 +8255,116 @@ class NPUWorker(WorkerBase):
                 exc,
             )
 
-    def _cleanup_after_elastic_mc2_group_destroy(self,
-                                                 reason: str) -> dict[str, float]:
+    def mode1_log_comm_cache_state(self, tag: str) -> None:
+        """Log planned/natural communicator cache state and NPU memory."""
+        if not torch.npu.is_available():
+            return
+
+        def _fmt_rank_tuple(ranks: tuple[int, ...]) -> str:
+            return "[" + ",".join(str(int(rank)) for rank in ranks) + "]"
+
+        def _fmt_cached_groups() -> str:
+            cached = getattr(self, "_elastic_cached_parallel_groups", {}) or {}
+            parts = []
+            for attr_name, groups_by_ranks in sorted(cached.items()):
+                ranks_list = sorted(
+                    tuple(int(rank) for rank in ranks)
+                    for ranks in groups_by_ranks.keys())
+                if ranks_list:
+                    parts.append(
+                        f"{attr_name}:"
+                        f"{','.join(_fmt_rank_tuple(r) for r in ranks_list)}")
+            return ";".join(parts) if parts else "-"
+
+        def _fmt_registry() -> str:
+            registry = getattr(self, "_elastic_parallel_group_registry", {}) or {}
+            parts = []
+            for kind, groups_by_ranks in sorted(registry.items()):
+                rank_parts = []
+                for ranks, groups_by_id in sorted(
+                        groups_by_ranks.items(),
+                        key=lambda item: (len(item[0]), item[0])):
+                    rank_tuple = tuple(int(rank) for rank in ranks)
+                    rank_parts.append(
+                        f"{_fmt_rank_tuple(rank_tuple)}x{len(groups_by_id)}")
+                if rank_parts:
+                    parts.append(f"{kind}:{','.join(rank_parts)}")
+            return ";".join(parts) if parts else "-"
+
+        def _fmt_seen() -> str:
+            seen = getattr(
+                self, "_elastic_seen_parallel_group_signatures", set()) or set()
+            counts: dict[str, list[tuple[int, ...]]] = {}
+            for kind, ranks in seen:
+                counts.setdefault(str(kind), []).append(
+                    tuple(int(rank) for rank in ranks))
+            parts = []
+            for kind, ranks_list in sorted(counts.items()):
+                parts.append(
+                    f"{kind}:"
+                    f"{','.join(_fmt_rank_tuple(r) for r in sorted(ranks_list))}")
+            return ";".join(parts) if parts else "-"
+
+        try:
+            topology_stats = get_moe_comm_method_topology_cache_stats()
+            topology_desc = ";".join(
+                ",".join(item.get("groups", []))
+                + f"x{int(item.get('methods', 0))}"
+                + ("*" if int(item.get("active", 0)) else "")
+                for item in topology_stats.get("topologies", []))
+            if not topology_desc:
+                topology_desc = "-"
+        except Exception:
+            logger.exception(
+                "Failed to collect mode1 MoE topology cache state: rank=%s "
+                "tag=%s",
+                self.rank,
+                tag,
+            )
+            topology_stats = {}
+            topology_desc = "error"
+
+        try:
+            free_bytes, total_bytes = torch.npu.mem_get_info()
+            stats = torch_npu.npu.memory_stats()
+            torch_current = int(stats.get("allocated_bytes.all.current", 0))
+            torch_reserved = int(stats.get("reserved_bytes.all.current", 0))
+            total_allocated = int(total_bytes - free_bytes)
+            non_torch = max(total_allocated - torch_current, 0)
+        except Exception:
+            logger.exception(
+                "Failed to collect mode1 comm cache memory state: rank=%s "
+                "tag=%s",
+                self.rank,
+                tag,
+            )
+            free_bytes = total_bytes = torch_current = torch_reserved = 0
+            total_allocated = non_torch = 0
+
+        logger.info(
+            "Mode1 comm cache state: tag=%s rank=%s cached_groups=%s "
+            "registry_groups=%s seen_signatures=%s topology_count=%s "
+            "topology_methods=%s topology_groups=%s free_bytes=%s "
+            "total_bytes=%s torch_current=%s torch_reserved=%s "
+            "non_torch=%s total_allocated=%s",
+            tag,
+            self.rank,
+            _fmt_cached_groups(),
+            _fmt_registry(),
+            _fmt_seen(),
+            topology_stats.get("topology_count", 0),
+            topology_stats.get("method_count", 0),
+            topology_desc,
+            free_bytes,
+            total_bytes,
+            torch_current,
+            torch_reserved,
+            non_torch,
+            total_allocated,
+        )
+
+    def _cleanup_after_elastic_group_release(
+            self, reason: str, force: bool = False) -> dict[str, float]:
         stats = {
             "gc_ms": 0.0,
             "empty_cache_ms": 0.0,
@@ -6891,18 +8373,19 @@ class NPUWorker(WorkerBase):
             "total_ms": 0.0,
         }
         cleanup_start_t = time.perf_counter()
-        if _env_flag("VLLM_ASCEND_MODE1_PARITY_GC_AFTER_MC2_GROUP_DESTROY",
-                     "0"):
+        if force or _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_GC_AFTER_MC2_GROUP_DESTROY",
+                "0"):
             import gc
             gc_start_t = time.perf_counter()
             gc.collect()
             stats["gc_ms"] = (time.perf_counter() - gc_start_t) * 1000.0
-        if (torch.npu.is_available()
-                and _env_flag(
+        if (torch.npu.is_available() and
+                (force or _env_flag(
                     "VLLM_ASCEND_MODE1_PARITY_SYNC_AFTER_MC2_GROUP_DESTROY",
                     "0" if (self._is_mode1_low_floor_elastic_runtime()
                             or self._has_mode1_lightweight_parity_module())
-                    else "1")):
+                    else "1"))):
             empty_cache_start_t = time.perf_counter()
             torch.npu.empty_cache()
             stats["empty_cache_ms"] = (
@@ -6913,13 +8396,34 @@ class NPUWorker(WorkerBase):
                                 sync_start_t) * 1000.0
         memory_log_start_t = time.perf_counter()
         self._log_custom_mode1_worker_memory(
-            "after_mc2_group_destroy_cleanup",
-            f"reason={reason}",
+            "after_elastic_group_release_cleanup",
+            f"reason={reason} force={int(force)}",
         )
         stats["memory_log_ms"] = (
             time.perf_counter() - memory_log_start_t) * 1000.0
         stats["total_ms"] = (time.perf_counter() - cleanup_start_t) * 1000.0
         return stats
+
+    def _cleanup_after_elastic_mc2_group_destroy(self,
+                                                 reason: str) -> dict[str, float]:
+        return self._cleanup_after_elastic_group_release(reason, force=False)
+
+    def _should_force_cleanup_after_mode1_floor_group_release(
+            self, group_kind: str, group_ranks: tuple[int, ...]) -> bool:
+        if group_kind not in ("dp", "ep", "mc2"):
+            return False
+        if not group_ranks:
+            return False
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return False
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FORCE_CLEANUP_AFTER_FLOOR_GROUP_RELEASE",
+                "1"):
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+        world_size = int(torch.distributed.get_world_size())
+        return len(group_ranks) < world_size
 
     def _detach_destroyed_group_references(self, group) -> None:
         """Break wrapper references after ProcessGroup destruction.
@@ -6965,6 +8469,7 @@ class NPUWorker(WorkerBase):
         retire_start_t = time.perf_counter()
         npu_sync_ms = 0.0
         device_pg_destroy_ms = 0.0
+        cpu_pg_destroy_ms = 0.0
         dropped_device_pg_refs = 0.0
         deferred_device_pg_refs = 0.0
         deferred_cpu_pg_refs = 0.0
@@ -7070,12 +8575,33 @@ class NPUWorker(WorkerBase):
                 continue
             seen_cpu_pg_ids.add(cpu_pg_id)
             unique_cpu_pgs.append(cpu_pg)
+        destroy_cpu_pg = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE", "1")
+        if destroy_cpu_pg:
+            cpu_destroy_start_t = time.perf_counter()
+            for cpu_pg in unique_cpu_pgs:
+                try:
+                    torch.distributed.destroy_process_group(cpu_pg)
+                except Exception:
+                    logger.exception(
+                        "Elastic retired group CPU ProcessGroup destroy failed: "
+                        "rank=%s group_ranks=%s",
+                        self.rank,
+                        tuple(int(rank)
+                              for rank in getattr(group, "ranks", [])),
+                    )
+            cpu_pg_destroy_ms = (
+                time.perf_counter() - cpu_destroy_start_t) * 1000.0
+            deferred_cpu_pg_refs = 0.0
+            unique_cpu_pgs = []
         return {
             "retire_wrapper_ms": (
                 time.perf_counter() - retire_start_t) * 1000.0,
             "npu_sync_ms": npu_sync_ms,
             "device_pg_destroy_ms": device_pg_destroy_ms,
+            "cpu_pg_destroy_ms": cpu_pg_destroy_ms,
             "destroy_device_pg": 1.0 if destroy_device_pg else 0.0,
+            "destroy_cpu_pg": 1.0 if destroy_cpu_pg else 0.0,
             "dropped_pg_refs": dropped_device_pg_refs,
             "deferred_device_pg_refs": deferred_device_pg_refs,
             "deferred_cpu_pg_refs": deferred_cpu_pg_refs,
@@ -7109,20 +8635,22 @@ class NPUWorker(WorkerBase):
     def _quarantine_deferred_elastic_group(
             self, group, group_kind: str,
             group_ranks: tuple[int, ...], reason: str) -> bool:
-        """Remove a stale group from live/cache paths without HCCL destroy.
+        """Remove a stale group from live/cache paths without wrapper destroy.
 
         On this CANN/HCCL stack, destroying low-floor elastic communicators in
         the shrink RPC hot path can block for roughly 350s. The group is already
-        no longer reachable from vLLM parallel state after stashing; keep one
-        private reference so Python GC will not run teardown at an arbitrary
-        point in the same shrink call, and let process teardown or an explicit
-        diagnostic cleanup handle the low-level destroy later.
+        no longer reachable from vLLM parallel state after stashing. Retire the
+        wrapper and explicitly destroy raw ProcessGroups when enabled, but only
+        keep deferred PG references when there is something left to defer. This
+        keeps arbitrary-rank shrink groups from accumulating empty wrapper
+        shells and stale HCCL workspace pressure across steps.
         """
         deferred_ids = self._get_deferred_elastic_group_ids()
+        retired_ids = self._get_retired_elastic_group_ids()
         group_id = id(group)
-        if group_id in deferred_ids:
+        if group_id in deferred_ids or group_id in retired_ids:
             logger.info(
-                "Elastic parallel group destroy already deferred: rank=%s "
+                "Elastic parallel group destroy already retired/deferred: rank=%s "
                 "group_kind=%s group_ranks=%s reason=%s",
                 self.rank,
                 group_kind,
@@ -7130,16 +8658,43 @@ class NPUWorker(WorkerBase):
                 reason,
             )
             return False
+        deferred_ids.add(group_id)
+        self._mark_retired_elastic_group(group)
+        retire_stats = self._retire_group_wrapper_defer_pg_destroy(group)
+        deferred_device_pgs = list(retire_stats.get("device_pgs", []) or [])
+        deferred_cpu_pgs = list(retire_stats.get("cpu_pgs", []) or [])
+        self._remove_elastic_parallel_group_registry_entry(
+            group_kind, group_ranks, group)
+        if not deferred_device_pgs and not deferred_cpu_pgs:
+            deferred_ids.discard(group_id)
+            logger.info(
+                "Elastic parallel group retired immediately: rank=%s "
+                "group_kind=%s group_ranks=%s reason=%s "
+                "retire_wrapper_ms=%.2f npu_sync_ms=%.2f "
+                "device_pg_destroy_ms=%.2f cpu_pg_destroy_ms=%.2f "
+                "destroy_device_pg=%.0f destroy_cpu_pg=%.0f "
+                "dropped_pg_refs=%.0f",
+                self.rank,
+                group_kind,
+                group_ranks,
+                reason,
+                float(retire_stats.get("retire_wrapper_ms", 0.0)),
+                float(retire_stats.get("npu_sync_ms", 0.0)),
+                float(retire_stats.get("device_pg_destroy_ms", 0.0)),
+                float(retire_stats.get("cpu_pg_destroy_ms", 0.0)),
+                float(retire_stats.get("destroy_device_pg", 0.0)),
+                float(retire_stats.get("destroy_cpu_pg", 0.0)),
+                float(retire_stats.get("dropped_pg_refs", 0.0)),
+            )
+            return True
+
         deferred = getattr(self, "_elastic_deferred_destroy_groups", None)
         if deferred is None:
             deferred = []
             self._elastic_deferred_destroy_groups = deferred
-        deferred_ids.add(group_id)
-        self._mark_retired_elastic_group(group)
-        retire_stats = self._retire_group_wrapper_defer_pg_destroy(group)
         deferred.append({
-            "device_pgs": retire_stats.get("device_pgs", []),
-            "cpu_pgs": retire_stats.get("cpu_pgs", []),
+            "device_pgs": deferred_device_pgs,
+            "cpu_pgs": deferred_cpu_pgs,
             "group_id": group_id,
             "group_kind": group_kind,
             "group_ranks": group_ranks,
@@ -7149,7 +8704,8 @@ class NPUWorker(WorkerBase):
             "Elastic parallel group destroy deferred: rank=%s "
             "group_kind=%s group_ranks=%s reason=%s deferred_count=%s "
             "retire_wrapper_ms=%.2f npu_sync_ms=%.2f "
-            "device_pg_destroy_ms=%.2f destroy_device_pg=%.0f "
+            "device_pg_destroy_ms=%.2f cpu_pg_destroy_ms=%.2f "
+            "destroy_device_pg=%.0f destroy_cpu_pg=%.0f "
             "dropped_pg_refs=%.0f deferred_device_pg_refs=%.0f "
             "deferred_cpu_pg_refs=%.0f",
             self.rank,
@@ -7160,17 +8716,148 @@ class NPUWorker(WorkerBase):
             float(retire_stats.get("retire_wrapper_ms", 0.0)),
             float(retire_stats.get("npu_sync_ms", 0.0)),
             float(retire_stats.get("device_pg_destroy_ms", 0.0)),
+            float(retire_stats.get("cpu_pg_destroy_ms", 0.0)),
             float(retire_stats.get("destroy_device_pg", 0.0)),
+            float(retire_stats.get("destroy_cpu_pg", 0.0)),
             float(retire_stats.get("dropped_pg_refs", 0.0)),
             float(retire_stats.get("deferred_device_pg_refs", 0.0)),
             float(retire_stats.get("deferred_cpu_pg_refs", 0.0)),
         )
         return True
 
+    def _release_elastic_parallel_group_reference(
+            self, group, group_kind: str, group_ranks: tuple[int, ...],
+            keep_group_ranks: tuple[int, ...], reason: str,
+            destroyed_group_ids: set[int],
+            memory_log_tag: str | None = None,
+            force_destroy: bool = False) -> dict[str, float]:
+        stats = {
+            "destroy_ms": 0.0,
+            "cleanup_ms": 0.0,
+            "cleanup_gc_ms": 0.0,
+            "cleanup_empty_cache_ms": 0.0,
+            "cleanup_sync_ms": 0.0,
+            "cleanup_memory_log_ms": 0.0,
+            "deferred_groups": 0.0,
+            "released_groups": 0.0,
+        }
+        if group is None:
+            return stats
+        group_id = id(group)
+        if group_id in destroyed_group_ids:
+            return stats
+        if memory_log_tag and group_kind == "mc2":
+            self._log_custom_mode1_worker_memory(
+                memory_log_tag,
+                f"stale_ranks={group_ranks} keep_ranks={keep_group_ranks}",
+            )
+        force_cleanup_after_release = (
+            self._should_force_cleanup_after_mode1_floor_group_release(
+                group_kind, group_ranks))
+        if self._is_retired_elastic_group(group):
+            destroyed_group_ids.add(group_id)
+            self._remove_elastic_parallel_group_registry_entry(
+                group_kind, group_ranks, group)
+            stats["released_groups"] = 1.0
+            return stats
+        if (not force_destroy and self._should_defer_mode1_group_destroy(
+                group_kind,
+                group_ranks,
+                keep_group_ranks,
+                reason,
+        )):
+            if self._quarantine_deferred_elastic_group(
+                    group,
+                    group_kind,
+                    group_ranks,
+                    reason,
+            ):
+                stats["deferred_groups"] = 1.0
+            destroyed_group_ids.add(group_id)
+            stats["released_groups"] = 1.0
+            if force_cleanup_after_release:
+                cleanup_stats = self._cleanup_after_elastic_group_release(
+                    reason, force=True)
+                stats["cleanup_ms"] += float(
+                    cleanup_stats.get("total_ms", 0.0))
+                stats["cleanup_gc_ms"] += float(
+                    cleanup_stats.get("gc_ms", 0.0))
+                stats["cleanup_empty_cache_ms"] += float(
+                    cleanup_stats.get("empty_cache_ms", 0.0))
+                stats["cleanup_sync_ms"] += float(
+                    cleanup_stats.get("sync_ms", 0.0))
+                stats["cleanup_memory_log_ms"] += float(
+                    cleanup_stats.get("memory_log_ms", 0.0))
+            return stats
+
+        if self._is_mode1_low_floor_elastic_runtime():
+            logger.warning(
+                "Elastic mode1 low-floor group direct destroy fallback: "
+                "rank=%s group_kind=%s group_ranks=%s keep_ranks=%s "
+                "reason=%s defer_env=%s defer_sizes=%s",
+                self.rank,
+                group_kind,
+                group_ranks,
+                keep_group_ranks,
+                reason,
+                os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY",
+                          "1"),
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES",
+                    "1,2,4,8"),
+            )
+        destroy_start_t = time.perf_counter()
+        group.destroy()
+        self._detach_destroyed_group_references(group)
+        self._mark_retired_elastic_group(group)
+        self._remove_elastic_parallel_group_registry_entry(
+            group_kind, group_ranks, group)
+        stats["destroy_ms"] = (
+            time.perf_counter() - destroy_start_t) * 1000.0
+        destroyed_group_ids.add(group_id)
+        stats["released_groups"] = 1.0
+        if group_kind == "mc2" and (
+                self._has_mode1_lightweight_parity_module()
+                or self._has_mode4_remote_npu_lightweight_module()):
+            cleanup_stats = self._cleanup_after_elastic_group_release(
+                reason, force=force_cleanup_after_release)
+            stats["cleanup_ms"] += float(cleanup_stats.get("total_ms", 0.0))
+            stats["cleanup_gc_ms"] += float(cleanup_stats.get("gc_ms", 0.0))
+            stats["cleanup_empty_cache_ms"] += float(
+                cleanup_stats.get("empty_cache_ms", 0.0))
+            stats["cleanup_sync_ms"] += float(
+                cleanup_stats.get("sync_ms", 0.0))
+            stats["cleanup_memory_log_ms"] += float(
+                cleanup_stats.get("memory_log_ms", 0.0))
+        elif force_cleanup_after_release:
+            cleanup_stats = self._cleanup_after_elastic_group_release(
+                reason, force=True)
+            stats["cleanup_ms"] += float(cleanup_stats.get("total_ms", 0.0))
+            stats["cleanup_gc_ms"] += float(cleanup_stats.get("gc_ms", 0.0))
+            stats["cleanup_empty_cache_ms"] += float(
+                cleanup_stats.get("empty_cache_ms", 0.0))
+            stats["cleanup_sync_ms"] += float(
+                cleanup_stats.get("sync_ms", 0.0))
+            stats["cleanup_memory_log_ms"] += float(
+                cleanup_stats.get("memory_log_ms", 0.0))
+        return stats
+
     def _should_defer_mode1_group_destroy(
             self, group_kind: str, group_ranks: tuple[int, ...],
             keep_group_ranks: tuple[int, ...], reason: str) -> bool:
         if not self._is_mode1_low_floor_elastic_runtime():
+            return False
+        if (reason == "mode1_full_restore" and not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE",
+                "0")):
+            return False
+        if (reason == "mode1_pre_rebuild" and not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD",
+                "0")):
+            return False
+        if (reason == "stash_group" and not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH",
+                "0")):
             return False
         if not _env_flag("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"):
             return False
@@ -7213,6 +8900,81 @@ class NPUWorker(WorkerBase):
             self._elastic_cached_parallel_groups = cached_groups
         return cached_groups
 
+    def _get_elastic_parallel_group_registry(
+            self) -> dict[str, dict[tuple[int, ...], dict[int, object]]]:
+        registry = getattr(self, "_elastic_parallel_group_registry", None)
+        if registry is None:
+            registry = {}
+            self._elastic_parallel_group_registry = registry
+        return registry
+
+    def _register_elastic_parallel_group(
+            self, attr_name: str, group_ranks: tuple[int, ...],
+            group: object | None) -> None:
+        if group is None or not group_ranks:
+            return
+        group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
+        if group_kind not in ("dp", "ep", "mc2"):
+            return
+        groups_by_ranks = self._get_elastic_parallel_group_registry(
+        ).setdefault(group_kind, {}).setdefault(group_ranks, {})
+        groups_by_ranks[id(group)] = group
+
+    def _remove_elastic_parallel_group_registry_entry(
+            self, group_kind: str, group_ranks: tuple[int, ...],
+            group: object | None = None) -> bool:
+        registry = getattr(self, "_elastic_parallel_group_registry", None)
+        if not registry:
+            return False
+        groups_by_kind = registry.get(group_kind)
+        if not groups_by_kind:
+            return False
+        groups_by_id = groups_by_kind.get(group_ranks)
+        if not groups_by_id:
+            return False
+        removed = False
+        if group is None:
+            removed = bool(groups_by_id)
+            groups_by_id.clear()
+        else:
+            removed = groups_by_id.pop(id(group), None) is not None
+        if not groups_by_id:
+            groups_by_kind.pop(group_ranks, None)
+        if not groups_by_kind:
+            registry.pop(group_kind, None)
+        return removed
+
+    def _iter_stale_elastic_parallel_group_registry_entries(
+            self, keep_group_ranks: tuple[int, ...],
+            old_floor_only: bool) -> list[tuple[str, tuple[int, ...], object]]:
+        registry = getattr(self, "_elastic_parallel_group_registry", None)
+        if not registry:
+            return []
+        entries: list[tuple[str, tuple[int, ...], object]] = []
+        for group_kind, groups_by_ranks in registry.items():
+            if group_kind not in ("dp", "ep", "mc2"):
+                continue
+            for ranks, groups_by_id in groups_by_ranks.items():
+                ranks_tuple = tuple(int(rank) for rank in ranks)
+                should_drop = (
+                    self._should_drop_old_floor_group_cache_after_mode1_shrink(
+                        group_kind, ranks_tuple, keep_group_ranks)
+                    if old_floor_only else
+                    ranks_tuple != keep_group_ranks
+                    and not (
+                        self._should_keep_stale_group_cache_for_custom_mode1_parity(
+                            group_kind, ranks_tuple, keep_group_ranks)
+                        or self._should_keep_stale_group_cache_for_mode3(
+                            group_kind, ranks_tuple, keep_group_ranks)
+                        or self._should_keep_stale_group_cache_for_mode5(
+                            group_kind, ranks_tuple, keep_group_ranks)
+                    ))
+                if not should_drop:
+                    continue
+                for group in list(groups_by_id.values()):
+                    entries.append((group_kind, ranks_tuple, group))
+        return entries
+
     def _get_seen_elastic_parallel_group_signatures(
             self) -> set[tuple[str, tuple[int, ...]]]:
         seen_signatures = getattr(
@@ -7254,6 +9016,853 @@ class NPUWorker(WorkerBase):
             return "mc2"
         return normalized_name
 
+    def _mode1_fixed_topology_group_reuse_enabled(self) -> bool:
+        if int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) != 1:
+            return False
+        if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
+            return False
+        target_policy = os.getenv(
+            "VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY",
+            "natural").lower().strip()
+        if target_policy not in ("planned", "fixed", "plan"):
+            return False
+        if self._is_mode1_low_floor_elastic_runtime():
+            return True
+        # Only explicit planned-floor caching should keep floor-8/4 groups
+        # resident while the current step runs full-world. Precreate alone is
+        # a KV sizing aid, not a cross-step residency request.
+        return self._mode1_planned_floor_group_cache_enabled()
+
+    def _mode1_precreate_planned_floor_groups_enabled(self) -> bool:
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_PRECREATE_PLANNED_FLOOR_GROUPS",
+                "0"):
+            return False
+        if int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) != 1:
+            return False
+        if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
+            return False
+        target_policy = os.getenv(
+            "VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY",
+            "natural").lower().strip()
+        return target_policy in ("planned", "fixed", "plan")
+
+    def _mode1_planned_floor_group_cache_enabled(self) -> bool:
+        return _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_CACHE_PLANNED_FLOOR_GROUPS", "0")
+
+    def _mode1_precreate_comm_cache_enabled(self) -> bool:
+        return _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_PRECREATE_COMM_CACHE", "0")
+
+    def _mode1_prefill_planned_expert_slots_enabled(self) -> bool:
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_PREFILL_PLANNED_EXPERT_SLOTS",
+                "0"):
+            return False
+        if int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) != 1:
+            return False
+        if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
+            return False
+        if envs_ascend.VLLM_ASCEND_ELASTIC_MOE_MODE != "lossless":
+            return False
+        target_policy = os.getenv(
+            "VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY",
+            "natural").lower().strip()
+        return target_policy in ("planned", "fixed", "plan")
+
+    def _mode1_fixed_topology_reusable_group_ranks(
+            self) -> set[tuple[int, ...]]:
+        if not torch.distributed.is_initialized():
+            return set()
+        world_size = int(torch.distributed.get_world_size())
+        fixed_ranks: set[tuple[int, ...]] = {tuple(range(world_size))}
+        if not self._mode1_planned_floor_group_cache_enabled():
+            # Planned shrink targets are still honored by the trigger policy,
+            # but floor-8/floor-4 communicator residency is too expensive for
+            # the adaptive KV-cache path. By default only keep the full-world
+            # group, matching the earlier shortswap memory behavior while
+            # preserving fixed target selection.
+            return fixed_ranks
+        raw_stage_ranks = os.getenv(
+            "VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS", "")
+        try:
+            stage_ranks = parse_stage_survivor_ranks(
+                raw_stage_ranks, world_size=world_size)
+        except Exception:
+            logger.exception(
+                "Failed to parse planned shrink-aware stage ranks for group cache reuse: rank=%s raw=%r",
+                self.rank,
+                raw_stage_ranks,
+            )
+            stage_ranks = None
+        if stage_ranks:
+            fixed_ranks.update(tuple(int(rank) for rank in ranks)
+                               for ranks in stage_ranks)
+            return fixed_ranks
+
+        intermediate = parse_rank_list(os.getenv(
+            "VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS", ""))
+        final = parse_rank_list(os.getenv(
+            "VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS", ""))
+        for ranks in (intermediate, final):
+            if ranks:
+                fixed_ranks.add(tuple(sorted(int(rank) for rank in ranks)))
+        return fixed_ranks
+
+    def _mode1_planned_floor_group_signature(self) -> tuple[tuple[int, ...], ...]:
+        if not torch.distributed.is_initialized():
+            return ()
+        world_size = int(torch.distributed.get_world_size())
+        full_world_ranks = tuple(range(world_size))
+        planned = [
+            tuple(int(rank) for rank in ranks)
+            for ranks in self._mode1_fixed_topology_reusable_group_ranks()
+            if ranks and ranks != full_world_ranks and len(ranks) < world_size
+        ]
+        return tuple(sorted(set(planned), key=lambda ranks:
+                            (-len(ranks), ranks)))
+
+    def _release_mode1_moe_comm_runtime_state(
+            self, reason: str) -> dict[str, int]:
+        start_t = time.perf_counter()
+        stats = release_moe_comm_method_runtime_state()
+        stats["total_ms"] = int((time.perf_counter() - start_t) * 1000.0)
+        if (stats.get("method_attrs", 0) or stats.get("dispatcher_attrs", 0)
+                or stats.get("prepare_attrs", 0)):
+            logger.info(
+                "Mode1 MoE comm runtime transient release: rank=%s reason=%s "
+                "methods=%s topologies=%s method_attrs=%s "
+                "dispatcher_attrs=%s prepare_attrs=%s tensors=%s "
+                "tensor_bytes=%s total_ms=%s",
+                self.rank,
+                reason,
+                stats.get("methods", 0),
+                stats.get("topologies", 0),
+                stats.get("method_attrs", 0),
+                stats.get("dispatcher_attrs", 0),
+                stats.get("prepare_attrs", 0),
+                stats.get("tensors", 0),
+                stats.get("tensor_bytes", 0),
+                stats.get("total_ms", 0),
+            )
+        return stats
+
+    def _prune_mode1_planned_floor_groups_for_current_step(
+            self, target_floor: int, reason: str) -> dict[str, float]:
+        stats: dict[str, float] = {
+            "changed": 0.0,
+            "drop_ms": 0.0,
+            "dropped_groups": 0.0,
+            "dropped_signatures": 0.0,
+            "deferred_groups": 0.0,
+            "topology_dropped": 0.0,
+            "topology_methods_dropped": 0.0,
+            "runtime_tensor_bytes": 0.0,
+        }
+        if not (
+                self._mode1_planned_floor_group_cache_enabled()
+                or self._mode1_precreate_planned_floor_groups_enabled()):
+            return stats
+        if not torch.distributed.is_initialized():
+            return stats
+        world_size = int(torch.distributed.get_world_size())
+        keep_group_ranks = tuple(range(world_size))
+        desired_groups = self._mode1_fixed_topology_reusable_group_ranks()
+        desired_signature = self._mode1_planned_floor_group_signature()
+        old_signature = getattr(
+            self, "_mode1_planned_floor_groups_precreated_signature", None)
+
+        force_destroy = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_FORCE_DESTROY_PLANNED_PRUNE", "1")
+        drop_stats = self._drop_stale_cached_elastic_parallel_groups(
+            keep_group_ranks,
+            reason=f"planned_floor_prune:{reason}",
+            force_destroy=force_destroy,
+        )
+        topology_stats = prune_moe_comm_method_topology_cache(desired_groups)
+        runtime_stats = self._release_mode1_moe_comm_runtime_state(
+            f"planned_floor_prune:{reason}:target_floor={target_floor}")
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception(
+                "Failed to empty/sync NPU cache after planned floor group prune")
+
+        stats["drop_ms"] = float(drop_stats.get("total_ms", 0.0))
+        stats["dropped_groups"] = float(drop_stats.get("dropped_groups", 0.0))
+        stats["dropped_signatures"] = float(
+            drop_stats.get("dropped_signatures", 0.0))
+        stats["deferred_groups"] = float(
+            drop_stats.get("deferred_groups", 0.0))
+        stats["topology_dropped"] = float(
+            topology_stats.get("dropped_topologies", 0))
+        stats["topology_methods_dropped"] = float(
+            topology_stats.get("dropped_methods", 0))
+        stats["runtime_tensor_bytes"] = float(
+            runtime_stats.get("tensor_bytes", 0))
+        changed = (
+            stats["dropped_groups"] > 0.0
+            or stats["dropped_signatures"] > 0.0
+            or stats["topology_dropped"] > 0.0
+            or stats["runtime_tensor_bytes"] > 0.0
+            or old_signature != desired_signature)
+        stats["changed"] = 1.0 if changed else 0.0
+        if changed:
+            self._mode1_planned_floor_groups_precreated = False
+            self._mode1_planned_floor_groups_precreated_signature = (
+                desired_signature)
+            logger.info(
+                "Mode1 planned floor groups pruned for current step: "
+                "rank=%s target_floor=%s reason=%s desired_groups=%s "
+                "old_signature=%s new_signature=%s dropped_groups=%.0f "
+                "deferred_groups=%.0f dropped_signatures=%.0f "
+                "topology_dropped=%.0f topology_methods_dropped=%.0f "
+                "runtime_tensor_bytes=%.0f force_destroy=%s drop_ms=%.2f",
+                self.rank,
+                target_floor,
+                reason,
+                [list(ranks) for ranks in sorted(desired_groups,
+                                                 key=lambda ranks:
+                                                 (-len(ranks), ranks))],
+                [list(ranks) for ranks in old_signature]
+                if old_signature else [],
+                [list(ranks) for ranks in desired_signature],
+                stats["dropped_groups"],
+                stats["deferred_groups"],
+                stats["dropped_signatures"],
+                stats["topology_dropped"],
+                stats["topology_methods_dropped"],
+                stats["runtime_tensor_bytes"],
+                force_destroy,
+                stats["drop_ms"],
+            )
+        return stats
+
+    def _precreate_mode1_planned_floor_groups_before_kv_cache(
+            self, prefill_expert_slots: bool = True) -> dict[str, float]:
+        stats: dict[str, float] = {
+            "stage_groups": 0.0,
+            "rebuild_ms": 0.0,
+            "comm_cache_ms": 0.0,
+            "comm_cache_layers": 0.0,
+            "dispatch_warmup_ms": 0.0,
+            "dispatch_warmup_groups": 0.0,
+            "refresh_ms": 0.0,
+            "expert_prefill_ms": 0.0,
+            "expert_prefill_slots": 0.0,
+            "expert_prefill_updates": 0.0,
+            "barrier_ms": 0.0,
+            "total_ms": 0.0,
+        }
+        if not self._mode1_precreate_planned_floor_groups_enabled():
+            return stats
+        if not torch.distributed.is_initialized():
+            return stats
+
+        import vllm.distributed.parallel_state as vllm_ps
+        import vllm_ascend.distributed.parallel_state as ascend_ps
+
+        world_group = get_world_group()
+        world_size = int(torch.distributed.get_world_size())
+        current_rank = int(torch.distributed.get_rank())
+        full_world_ranks = tuple(range(world_size))
+        planned_ranks = [
+            ranks for ranks in self._mode1_fixed_topology_reusable_group_ranks()
+            if ranks and ranks != full_world_ranks and len(ranks) < world_size
+        ]
+        planned_ranks = sorted(set(planned_ranks), key=lambda ranks:
+                               (-len(ranks), ranks))
+        planned_signature = tuple(planned_ranks)
+        old_signature = getattr(
+            self, "_mode1_planned_floor_groups_precreated_signature", None)
+        if (getattr(self, "_mode1_planned_floor_groups_precreated", False)
+                and old_signature == planned_signature):
+            return stats
+        if (getattr(self, "_mode1_planned_floor_groups_precreated", False)
+                and old_signature != planned_signature):
+            self._prune_mode1_planned_floor_groups_for_current_step(
+                len(planned_ranks[-1]) if planned_ranks else world_size,
+                "planned_floor_precreate_signature_change",
+            )
+        if not planned_ranks:
+            self._mode1_planned_floor_groups_precreated = True
+            self._mode1_planned_floor_groups_precreated_signature = (
+                planned_signature)
+            return stats
+
+        start_t = time.perf_counter()
+        backend = torch.distributed.get_backend(world_group.device_group)
+        try:
+            barrier_start_t = time.perf_counter()
+            torch.distributed.barrier(group=world_group.cpu_group)
+            stats["barrier_ms"] += (
+                time.perf_counter() - barrier_start_t) * 1000.0
+
+            rebuild_start_t = time.perf_counter()
+            with set_current_vllm_config(self.vllm_config):
+                for ranks in planned_ranks:
+                    elastic_group_ranks = [list(ranks)]
+                    if current_rank in ranks:
+                        self._rebuild_group(vllm_ps, "_DP",
+                                            elastic_group_ranks, world_group,
+                                            backend, "dp")
+                        self._rebuild_group(vllm_ps, "_EP",
+                                            elastic_group_ranks, world_group,
+                                            backend, "ep")
+                        self._rebuild_group(ascend_ps, "_MC2",
+                                            elastic_group_ranks, world_group,
+                                            backend, "mc2")
+                        if self._mode1_precreate_comm_cache_enabled():
+                            cache_start_t = time.perf_counter()
+                            stats["comm_cache_layers"] += (
+                                self._materialize_mode1_moe_comm_cache_for_current_groups(
+                                    list(ranks)))
+                            stats["comm_cache_ms"] += (
+                                time.perf_counter() -
+                                cache_start_t) * 1000.0
+                        warmup_start_t = time.perf_counter()
+                        if self._warmup_mode1_precreated_moe_comm_cache(
+                                list(ranks)):
+                            stats["dispatch_warmup_groups"] += 1.0
+                            stats["dispatch_warmup_ms"] += (
+                                time.perf_counter() -
+                                warmup_start_t) * 1000.0
+                    else:
+                        self._advance_group_creation_sequence_for_non_member(
+                            elastic_group_ranks, backend, "dp")
+                        self._advance_group_creation_sequence_for_non_member(
+                            elastic_group_ranks, backend, "ep")
+                        self._advance_group_creation_sequence_for_non_member(
+                            elastic_group_ranks, backend, "mc2")
+                    stats["stage_groups"] += 1.0
+
+                self._rebuild_group(
+                    vllm_ps, "_DP",
+                    self._build_original_dp_group_ranks(world_size),
+                    world_group, backend, "dp")
+                self._rebuild_group(
+                    vllm_ps, "_EP",
+                    self._build_original_ep_group_ranks(world_size),
+                    world_group, backend, "ep")
+                self._rebuild_group(
+                    ascend_ps, "_MC2",
+                    self._build_original_mc2_group_ranks(world_size),
+                    world_group, backend, "mc2")
+            stats["rebuild_ms"] = (
+                time.perf_counter() - rebuild_start_t) * 1000.0
+
+            refresh_start_t = time.perf_counter()
+            self._reset_elastic_moe_comm_setup_cache(
+                f"before_precreated_planned_floor_restore world_size={world_size}"
+            )
+            with set_current_vllm_config(self.vllm_config):
+                self._refresh_elastic_parallel_state(list(range(world_size)),
+                                                     world_group)
+            stale_drop_stats = self._drop_stale_cached_elastic_parallel_groups(
+                tuple(range(world_size)))
+            if (stale_drop_stats.get("dropped_groups", 0.0) > 0.0
+                    or stale_drop_stats.get("dropped_signatures", 0.0) > 0.0):
+                logger.info(
+                    "Mode1 planned floor precreate stale group release summary: "
+                    "rank=%s dropped_groups=%.0f deferred_groups=%.0f "
+                    "dropped_signatures=%.0f cleanup_ms=%.2f total_ms=%.2f",
+                    self.rank,
+                    stale_drop_stats.get("dropped_groups", 0.0),
+                    stale_drop_stats.get("deferred_groups", 0.0),
+                    stale_drop_stats.get("dropped_signatures", 0.0),
+                    stale_drop_stats.get("cleanup_ms", 0.0),
+                    stale_drop_stats.get("total_ms", 0.0),
+                )
+            stats["refresh_ms"] = (
+                time.perf_counter() - refresh_start_t) * 1000.0
+            self.elastic_parallel_detached = False
+            self._elastic_current_active_ranks = list(range(world_size))
+
+            if (prefill_expert_slots
+                    and self._mode1_prefill_planned_expert_slots_enabled()):
+                first_stage_ranks = list(planned_ranks[0])
+                prefill_stats = (
+                    self._prefill_mode1_planned_expert_slots_for_active_ranks(
+                        first_stage_ranks,
+                        world_group,
+                        reason="precreate_planned_floor_groups_before_kv",
+                    ))
+                stats["expert_prefill_ms"] = float(
+                    prefill_stats.get("total_ms", 0.0))
+                stats["expert_prefill_slots"] = float(
+                    prefill_stats.get("commit_slots", 0.0))
+                stats["expert_prefill_updates"] = float(
+                    prefill_stats.get("commit_updates", 0.0))
+
+            if torch.npu.is_available():
+                torch.npu.synchronize()
+            self._release_mode1_moe_comm_runtime_state(
+                "after_precreate_planned_floor_groups_before_kv")
+            gc.collect()
+            if torch.npu.is_available():
+                torch.npu.empty_cache()
+                torch.npu.synchronize()
+            barrier_start_t = time.perf_counter()
+            torch.distributed.barrier(group=world_group.cpu_group)
+            stats["barrier_ms"] += (
+                time.perf_counter() - barrier_start_t) * 1000.0
+            stats["total_ms"] = (time.perf_counter() - start_t) * 1000.0
+            self._mode1_planned_floor_groups_precreated = True
+            self._mode1_planned_floor_groups_precreated_signature = (
+                planned_signature)
+            logger.info(
+                "Mode1 planned floor groups precreated before KV sizing: "
+                "rank=%s planned_ranks=%s stage_groups=%.0f rebuild_ms=%.2f "
+                "comm_cache_layers=%.0f comm_cache_ms=%.2f "
+                "dispatch_warmup_groups=%.0f dispatch_warmup_ms=%.2f "
+                "refresh_ms=%.2f expert_prefill_ms=%.2f "
+                "expert_prefill_slots=%.0f expert_prefill_updates=%.0f "
+                "barrier_ms=%.2f total_ms=%.2f",
+                self.rank,
+                [list(ranks) for ranks in planned_ranks],
+                stats["stage_groups"],
+                stats["rebuild_ms"],
+                stats["comm_cache_layers"],
+                stats["comm_cache_ms"],
+                stats["dispatch_warmup_groups"],
+                stats["dispatch_warmup_ms"],
+                stats["refresh_ms"],
+                stats.get("expert_prefill_ms", 0.0),
+                stats.get("expert_prefill_slots", 0.0),
+                stats.get("expert_prefill_updates", 0.0),
+                stats["barrier_ms"],
+                stats["total_ms"],
+            )
+        except Exception:
+            logger.exception(
+                "Mode1 planned floor group precreation before KV sizing failed: "
+                "rank=%s planned_ranks=%s",
+                self.rank,
+                [list(ranks) for ranks in planned_ranks],
+            )
+            raise
+        return stats
+
+    def _materialize_mode1_moe_comm_cache_for_current_groups(
+            self, active_ranks: list[int]) -> int:
+        """Warm topology-keyed MoE comm cache for the currently installed groups."""
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return 0
+
+        current_rank = int(torch.distributed.get_rank())
+        if current_rank not in active_ranks:
+            return 0
+        dp_group = get_dp_group()
+        ep_group = get_ep_group()
+        mc2_group = get_mc2_group()
+        refreshed_layers = 0
+        for module in model.modules():
+            if not _is_ascend_fused_moe_module(module):
+                continue
+            if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+                continue
+
+            moe_parallel_config = getattr(module, "moe_parallel_config", None)
+            moe_config = getattr(module, "moe_config", None)
+            if moe_parallel_config is None or moe_config is None:
+                continue
+
+            old_values = {
+                "num_experts": getattr(moe_config, "num_experts", None),
+                "num_local_experts": getattr(moe_config, "num_local_experts",
+                                             None),
+                "dp_size": getattr(moe_parallel_config, "dp_size", None),
+                "dp_rank": getattr(moe_parallel_config, "dp_rank", None),
+                "ep_size": getattr(moe_parallel_config, "ep_size", None),
+                "ep_rank": getattr(moe_parallel_config, "ep_rank", None),
+                "module_ep_group": getattr(module, "ep_group", None),
+                "moe_parallel_config": getattr(moe_config,
+                                               "moe_parallel_config", None),
+                "dp_group": getattr(moe_config, "dp_group", None),
+                "ep_group": getattr(moe_config, "ep_group", None),
+                "mc2_group": getattr(moe_config, "mc2_group", None),
+                "model_type": getattr(moe_config, "model_type", None),
+            }
+            try:
+                logical_num_experts = int(
+                    getattr(module, "elastic_original_num_experts",
+                            getattr(moe_config, "num_experts", 0)) or 0)
+                target_local_experts = max(
+                    1,
+                    (logical_num_experts + len(active_ranks) - 1) //
+                    len(active_ranks))
+                moe_config.num_experts = logical_num_experts
+                moe_config.num_local_experts = target_local_experts
+                moe_parallel_config.dp_size = dp_group.world_size
+                moe_parallel_config.dp_rank = dp_group.rank_in_group
+                moe_parallel_config.ep_size = ep_group.world_size
+                moe_parallel_config.ep_rank = ep_group.rank_in_group
+                module.ep_group = ep_group
+                moe_config.moe_parallel_config = moe_parallel_config
+                moe_config.model_type = getattr(module, "model_type",
+                                                getattr(moe_config,
+                                                        "model_type", ""))
+                moe_config.dp_group = dp_group
+                moe_config.ep_group = ep_group
+                moe_config.mc2_group = mc2_group
+                setup_moe_comm_method(moe_config)
+                refreshed_layers += 1
+            finally:
+                moe_config.num_experts = old_values["num_experts"]
+                moe_config.num_local_experts = old_values[
+                    "num_local_experts"]
+                moe_parallel_config.dp_size = old_values["dp_size"]
+                moe_parallel_config.dp_rank = old_values["dp_rank"]
+                moe_parallel_config.ep_size = old_values["ep_size"]
+                moe_parallel_config.ep_rank = old_values["ep_rank"]
+                module.ep_group = old_values["module_ep_group"]
+                moe_config.moe_parallel_config = old_values[
+                    "moe_parallel_config"]
+                moe_config.dp_group = old_values["dp_group"]
+                moe_config.ep_group = old_values["ep_group"]
+                moe_config.mc2_group = old_values["mc2_group"]
+                if old_values["model_type"] is None:
+                    try:
+                        delattr(moe_config, "model_type")
+                    except AttributeError:
+                        pass
+                else:
+                    moe_config.model_type = old_values["model_type"]
+        return refreshed_layers
+
+    def _warmup_mode1_precreated_moe_comm_cache(
+            self, active_ranks: list[int]) -> bool:
+        """Optionally materialize MC2 dispatcher workspace before KV sizing.
+
+        The planned precreate path primarily needs the DP/EP/MC2 group handles
+        to stay resident and reusable across steps. Dispatcher/workspace warmup
+        is heavier and should be enabled only when the KV budget also reserves
+        enough headroom for that steady-state footprint.
+        """
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_PRECREATE_DISPATCH_WARMUP", "0"):
+            return False
+        current_rank = int(torch.distributed.get_rank())
+        if current_rank not in active_ranks:
+            return False
+
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return False
+
+        target_module = None
+        for module in model.modules():
+            if not _is_ascend_fused_moe_module(module):
+                continue
+            if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+                continue
+            if getattr(module, "moe_config", None) is None:
+                continue
+            if getattr(module, "moe_parallel_config", None) is None:
+                continue
+            target_module = module
+            break
+        if target_module is None:
+            return False
+
+        try:
+            from vllm.config import CUDAGraphMode
+            from vllm.forward_context import BatchDescriptor, get_forward_context
+            from vllm_ascend.ascend_forward_context import (
+                MoECommType, set_ascend_forward_context)
+        except Exception:
+            logger.exception(
+                "Mode1 planned floor precreate dispatch warmup import failed: rank=%s",
+                self.rank)
+            raise
+
+        dp_group = get_dp_group()
+        ep_group = get_ep_group()
+        mc2_group = get_mc2_group()
+        moe_config = target_module.moe_config
+        moe_parallel_config = target_module.moe_parallel_config
+        old_values = {
+            "num_experts": getattr(moe_config, "num_experts", None),
+            "num_local_experts": getattr(moe_config, "num_local_experts",
+                                         None),
+            "dp_size": getattr(moe_parallel_config, "dp_size", None),
+            "dp_rank": getattr(moe_parallel_config, "dp_rank", None),
+            "ep_size": getattr(moe_parallel_config, "ep_size", None),
+            "ep_rank": getattr(moe_parallel_config, "ep_rank", None),
+            "module_ep_group": getattr(target_module, "ep_group", None),
+            "moe_parallel_config": getattr(moe_config,
+                                           "moe_parallel_config", None),
+            "dp_group": getattr(moe_config, "dp_group", None),
+            "ep_group": getattr(moe_config, "ep_group", None),
+            "mc2_group": getattr(moe_config, "mc2_group", None),
+            "model_type": getattr(moe_config, "model_type", None),
+        }
+
+        hidden_states = None
+        topk_ids = None
+        topk_weights = None
+        row_idx = None
+        expert_map = None
+        try:
+            logical_num_experts = int(
+                getattr(target_module, "elastic_original_num_experts",
+                        getattr(moe_config, "num_experts", 0)) or 0)
+            target_local_experts = max(
+                1,
+                (logical_num_experts + len(active_ranks) - 1) //
+                len(active_ranks))
+            moe_config.num_experts = logical_num_experts
+            moe_config.num_local_experts = target_local_experts
+            moe_parallel_config.dp_size = dp_group.world_size
+            moe_parallel_config.dp_rank = dp_group.rank_in_group
+            moe_parallel_config.ep_size = ep_group.world_size
+            moe_parallel_config.ep_rank = ep_group.rank_in_group
+            target_module.ep_group = ep_group
+            moe_config.moe_parallel_config = moe_parallel_config
+            moe_config.model_type = getattr(target_module, "model_type",
+                                            getattr(moe_config, "model_type",
+                                                    ""))
+            moe_config.dp_group = dp_group
+            moe_config.ep_group = ep_group
+            moe_config.mc2_group = mc2_group
+            setup_moe_comm_method(moe_config)
+
+            moe_comm_method = get_moe_comm_method(MoECommType.MC2)
+            token_dispatcher = getattr(moe_comm_method, "token_dispatcher",
+                                       None)
+            if token_dispatcher is None:
+                return False
+
+            num_tokens = max(
+                1,
+                int(
+                    os.getenv(
+                        "VLLM_ASCEND_MODE1_PARITY_PRECREATE_DISPATCH_WARMUP_TOKENS",
+                        "32")))
+            hidden_size = int(
+                getattr(moe_config, "hidden_dim",
+                        getattr(target_module, "hidden_size", 0)) or 0)
+            top_k = int(
+                getattr(target_module, "top_k",
+                        getattr(moe_config, "experts_per_token", 0)) or 0)
+            if hidden_size <= 0 or top_k <= 0 or logical_num_experts <= 0:
+                logger.info(
+                    "Mode1 planned floor precreate dispatch warmup skipped: "
+                    "rank=%s active_ranks=%s reason=invalid_shape "
+                    "hidden_size=%s top_k=%s num_experts=%s",
+                    self.rank,
+                    active_ranks,
+                    hidden_size,
+                    top_k,
+                    logical_num_experts,
+                )
+                return False
+
+            device = getattr(model_runner, "device", torch.device("npu"))
+            dtype = getattr(model_runner, "dtype", self.model_config.dtype)
+            hidden_states = torch.zeros((num_tokens, hidden_size),
+                                        dtype=dtype,
+                                        device=device)
+            topk_ids = (torch.arange(num_tokens * top_k,
+                                     dtype=torch.int32,
+                                     device=device) %
+                        logical_num_experts).reshape(num_tokens,
+                                                     top_k).contiguous()
+            topk_weights = torch.full((num_tokens, top_k),
+                                      1.0 / float(top_k),
+                                      dtype=torch.float32,
+                                      device=device)
+            row_idx = torch.arange(0,
+                                   num_tokens * top_k,
+                                   dtype=torch.int32,
+                                   device=device).view(top_k, -1).permute(
+                                       1, 0).contiguous()
+            expert_map = torch.arange(logical_num_experts,
+                                      dtype=torch.int32,
+                                      device=device)
+            # set_forward_context() still uses the global DP rank from the
+            # vLLM parallel config, even while this warmup temporarily points
+            # MoE communication at a planned floor group. Keep this vector in
+            # global-DP coordinates so ranks like 8..15 do not index past a
+            # floor8/floor4-sized tensor.
+            global_dp_size = max(
+                int(getattr(self.parallel_config, "data_parallel_size", 0)
+                    or 0),
+                current_rank + 1,
+                max((int(rank) for rank in active_ranks), default=0) + 1,
+            )
+            num_tokens_across_dp = torch.zeros((global_dp_size, ),
+                                               dtype=torch.int64)
+            for rank in active_ranks:
+                if 0 <= int(rank) < global_dp_size:
+                    num_tokens_across_dp[int(rank)] = num_tokens
+
+            logger.info(
+                "Mode1 planned floor precreate dispatch warmup start: "
+                "rank=%s active_ranks=%s tokens=%s hidden_size=%s top_k=%s "
+                "num_experts=%s ep_size=%s",
+                self.rank,
+                active_ranks,
+                num_tokens,
+                hidden_size,
+                top_k,
+                logical_num_experts,
+                ep_group.world_size,
+            )
+            with set_ascend_forward_context(
+                    None,
+                    self.vllm_config,
+                    num_tokens=num_tokens,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    with_prefill=False,
+                    reserved_mc2_mask=getattr(model_runner,
+                                              "reserved_mc2_mask", None),
+                    moe_comm_type=MoECommType.MC2,
+                    num_actual_tokens=num_tokens,
+                    aclgraph_runtime_mode=CUDAGraphMode.NONE,
+                    batch_descriptor=BatchDescriptor(num_tokens=num_tokens,
+                                                     uniform_decode=False),
+                    prefetch_stream=getattr(model_runner, "prefetch_stream",
+                                            None),
+                    moe_prefetch_stream=getattr(model_runner,
+                                                "moe_prefetch_stream", None),
+                    model_instance=model):
+                forward_context = get_forward_context()
+                forward_context.elastic_debug_info = {
+                    "layer_idx": int(getattr(target_module, "layer_idx", -1)),
+                    "phase": "precreate_planned_floor_dispatch_warmup",
+                }
+                old_num_experts = int(
+                    getattr(token_dispatcher, "num_experts", 0))
+                old_top_k = int(getattr(token_dispatcher, "top_k", 0))
+                old_expert_token_nums_type = int(
+                    getattr(token_dispatcher, "expert_token_nums_type", 0))
+                token_dispatcher.num_experts = logical_num_experts
+                token_dispatcher.top_k = top_k
+                if hasattr(token_dispatcher, "expert_token_nums_type"):
+                    token_dispatcher.expert_token_nums_type = 1
+                try:
+                    dispatch_results = token_dispatcher.token_dispatch(
+                        hidden_states=hidden_states,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        row_idx=row_idx,
+                        expert_map=expert_map,
+                        log2phy=None,
+                        global_redundant_expert_num=0,
+                        shared_experts=None,
+                        quantized_x_for_share=None,
+                        dynamic_scale_for_share=None,
+                        mc2_mask=getattr(forward_context, "mc2_mask", None),
+                        apply_router_weight_on_input=False,
+                        with_quant=False)
+                    combined = token_dispatcher.token_combine(
+                        dispatch_results["hidden_states"])
+                    del combined, dispatch_results
+                finally:
+                    token_dispatcher.num_experts = old_num_experts
+                    token_dispatcher.top_k = old_top_k
+                    if hasattr(token_dispatcher, "expert_token_nums_type"):
+                        token_dispatcher.expert_token_nums_type = (
+                            old_expert_token_nums_type)
+                    for attr in (
+                            "output",
+                            "assist_info_for_combine",
+                            "ep_recv_counts",
+                            "topk_ids",
+                            "topk_weights",
+                            "mc2_mask",
+                            "expert_map",
+                            "shared_experts",
+                            "shared_act",
+                    ):
+                        if hasattr(token_dispatcher, attr):
+                            setattr(token_dispatcher, attr, None)
+
+            logger.info(
+                "Mode1 planned floor precreate dispatch warmup complete: "
+                "rank=%s active_ranks=%s tokens=%s ep_size=%s",
+                self.rank,
+                active_ranks,
+                num_tokens,
+                ep_group.world_size,
+            )
+            return True
+        finally:
+            if hidden_states is not None:
+                del hidden_states
+            if topk_ids is not None:
+                del topk_ids
+            if topk_weights is not None:
+                del topk_weights
+            if row_idx is not None:
+                del row_idx
+            if expert_map is not None:
+                del expert_map
+            moe_config.num_experts = old_values["num_experts"]
+            moe_config.num_local_experts = old_values["num_local_experts"]
+            moe_parallel_config.dp_size = old_values["dp_size"]
+            moe_parallel_config.dp_rank = old_values["dp_rank"]
+            moe_parallel_config.ep_size = old_values["ep_size"]
+            moe_parallel_config.ep_rank = old_values["ep_rank"]
+            target_module.ep_group = old_values["module_ep_group"]
+            moe_config.moe_parallel_config = old_values["moe_parallel_config"]
+            moe_config.dp_group = old_values["dp_group"]
+            moe_config.ep_group = old_values["ep_group"]
+            moe_config.mc2_group = old_values["mc2_group"]
+            if old_values["model_type"] is None:
+                try:
+                    delattr(moe_config, "model_type")
+                except AttributeError:
+                    pass
+            else:
+                moe_config.model_type = old_values["model_type"]
+            self._release_mode1_moe_comm_runtime_state(
+                "after_precreate_planned_floor_dispatch_warmup:"
+                f"active_ranks={tuple(active_ranks)}")
+            gc.collect()
+            if torch.npu.is_available():
+                torch.npu.empty_cache()
+                torch.npu.synchronize()
+
+    def _is_mode1_fixed_topology_reusable_group(
+            self, group_kind: str, group_ranks: tuple[int, ...]) -> bool:
+        if not self._mode1_fixed_topology_group_reuse_enabled():
+            return False
+        if group_kind not in ("dp", "ep", "mc2"):
+            return False
+        if not group_ranks:
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+        return group_ranks in self._mode1_fixed_topology_reusable_group_ranks()
+
+    def _should_keep_mode1_fixed_topology_stale_group(
+            self, group_kind: str, stale_group_ranks: tuple[int, ...],
+            keep_group_ranks: tuple[int, ...]) -> bool:
+        if not self._is_mode1_fixed_topology_reusable_group(
+                group_kind, stale_group_ranks):
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+        world_size = int(torch.distributed.get_world_size())
+        full_world_ranks = tuple(range(world_size))
+        if stale_group_ranks == full_world_ranks:
+            return True
+        if keep_group_ranks == full_world_ranks:
+            # Fixed-topology targeting should not imply cross-step residency
+            # for planned floor-8/floor-4 communicators. Keep them across a
+            # full-world restore only when the experiment explicitly enables
+            # planned floor-group cache residency.
+            return self._mode1_planned_floor_group_cache_enabled()
+        return True
+
     def _should_cache_elastic_parallel_group(self, attr_name: str) -> bool:
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
         if group_kind != "mc2":
@@ -7275,6 +9884,29 @@ class NPUWorker(WorkerBase):
         return os.getenv(
             "VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE",
             "0").lower() not in ("1", "true", "yes", "on")
+
+    def _should_cache_elastic_parallel_group_ranks(
+            self, attr_name: str, group_ranks: tuple[int, ...]) -> bool:
+        if not self._should_cache_elastic_parallel_group(attr_name):
+            return False
+        group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
+        if group_kind not in ("dp", "ep", "mc2"):
+            return True
+        if not group_ranks:
+            return False
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return True
+        if self._mode1_fixed_topology_group_reuse_enabled():
+            return self._is_mode1_fixed_topology_reusable_group(
+                group_kind, group_ranks)
+        if _env_flag("VLLM_ASCEND_MODE1_PARITY_CACHE_FLOOR_GROUPS", "0"):
+            return True
+        if not torch.distributed.is_initialized():
+            return True
+        world_size = int(torch.distributed.get_world_size())
+        full_world_ranks = tuple(range(world_size))
+        return group_ranks == full_world_ranks
+
 
     def _should_keep_stale_mc2_cache_for_custom_mode1_parity(
             self, stale_group_ranks: tuple[int, ...],
@@ -7339,6 +9971,9 @@ class NPUWorker(WorkerBase):
             return False
         if not stale_group_ranks:
             return False
+        if self._should_keep_mode1_fixed_topology_stale_group(
+                group_kind, stale_group_ranks, keep_group_ranks):
+            return True
         if self._should_keep_mode1_floor4_group_cache(
                 group_kind, stale_group_ranks, keep_group_ranks):
             return True
@@ -7385,6 +10020,9 @@ class NPUWorker(WorkerBase):
         full_world_ranks = tuple(range(world_size))
         if cached_group_ranks == full_world_ranks:
             return False
+        if self._should_keep_mode1_fixed_topology_stale_group(
+                group_kind, cached_group_ranks, keep_group_ranks):
+            return False
         if self._should_keep_mode1_floor4_group_cache(
                 group_kind, cached_group_ranks, keep_group_ranks):
             return False
@@ -7410,6 +10048,7 @@ class NPUWorker(WorkerBase):
         row_log_ms = 0.0
         signature_sweep_ms = 0.0
         release_ref_ms = 0.0
+        registry_dropped_groups = 0
         verbose_drop_log = _env_flag(
             "VLLM_ASCEND_MODE1_PARITY_OLD_FLOOR_DROP_VERBOSE", "0")
 
@@ -7428,6 +10067,7 @@ class NPUWorker(WorkerBase):
                 group = groups_by_ranks.pop(ranks, None)
                 if group is not None:
                     group_id = id(group)
+                    released_group = group
                     if group_id not in destroyed_group_ids:
                         if group_kind == "mc2" and verbose_drop_log:
                             memory_log_start_t = time.perf_counter()
@@ -7438,6 +10078,9 @@ class NPUWorker(WorkerBase):
                             memory_log_ms += (
                                 time.perf_counter() -
                                 memory_log_start_t) * 1000.0
+                        force_cleanup_after_release = (
+                            self._should_force_cleanup_after_mode1_floor_group_release(
+                                group_kind, ranks))
                         if self._should_defer_mode1_group_destroy(
                                 group_kind,
                                 ranks,
@@ -7452,6 +10095,20 @@ class NPUWorker(WorkerBase):
                             ):
                                 deferred_groups += 1
                             destroyed_group_ids.add(group_id)
+                            if force_cleanup_after_release:
+                                cleanup_stats = self._cleanup_after_elastic_group_release(
+                                    "mode1_old_floor_after_shrink",
+                                    force=True)
+                                cleanup_ms += float(
+                                    cleanup_stats.get("total_ms", 0.0))
+                                cleanup_gc_ms += float(
+                                    cleanup_stats.get("gc_ms", 0.0))
+                                cleanup_empty_cache_ms += float(
+                                    cleanup_stats.get("empty_cache_ms", 0.0))
+                                cleanup_sync_ms += float(
+                                    cleanup_stats.get("sync_ms", 0.0))
+                                cleanup_memory_log_ms += float(
+                                    cleanup_stats.get("memory_log_ms", 0.0))
                         else:
                             if self._is_mode1_low_floor_elastic_runtime():
                                 logger.warning(
@@ -7474,8 +10131,23 @@ class NPUWorker(WorkerBase):
                                 destroy_start_t) * 1000.0
                             destroyed_group_ids.add(group_id)
                             if group_kind == "mc2":
-                                cleanup_stats = self._cleanup_after_elastic_mc2_group_destroy(
-                                    "mode1_old_floor_after_shrink")
+                                cleanup_stats = self._cleanup_after_elastic_group_release(
+                                    "mode1_old_floor_after_shrink",
+                                    force=force_cleanup_after_release)
+                                cleanup_ms += float(
+                                    cleanup_stats.get("total_ms", 0.0))
+                                cleanup_gc_ms += float(
+                                    cleanup_stats.get("gc_ms", 0.0))
+                                cleanup_empty_cache_ms += float(
+                                    cleanup_stats.get("empty_cache_ms", 0.0))
+                                cleanup_sync_ms += float(
+                                    cleanup_stats.get("sync_ms", 0.0))
+                                cleanup_memory_log_ms += float(
+                                    cleanup_stats.get("memory_log_ms", 0.0))
+                            elif force_cleanup_after_release:
+                                cleanup_stats = self._cleanup_after_elastic_group_release(
+                                    "mode1_old_floor_after_shrink",
+                                    force=True)
                                 cleanup_ms += float(
                                     cleanup_stats.get("total_ms", 0.0))
                                 cleanup_gc_ms += float(
@@ -7487,10 +10159,13 @@ class NPUWorker(WorkerBase):
                                 cleanup_memory_log_ms += float(
                                     cleanup_stats.get("memory_log_ms", 0.0))
                         release_ref_start_t = time.perf_counter()
+                        released_group = group
                         group = None
                         release_ref_ms += (
                             time.perf_counter() -
                             release_ref_start_t) * 1000.0
+                    self._remove_elastic_parallel_group_registry_entry(
+                        group_kind, ranks, released_group)
                     dropped_groups += 1
                 if (group_kind, ranks) in seen_signatures:
                     seen_signatures.discard((group_kind, ranks))
@@ -7515,6 +10190,32 @@ class NPUWorker(WorkerBase):
             dropped_signatures += 1
         signature_sweep_ms = (
             time.perf_counter() - signature_sweep_start_t) * 1000.0
+
+        for group_kind, ranks, group in (
+                self._iter_stale_elastic_parallel_group_registry_entries(
+                    keep_group_ranks, old_floor_only=True)):
+            stats = self._release_elastic_parallel_group_reference(
+                group,
+                group_kind,
+                ranks,
+                keep_group_ranks,
+                "old_floor_after_shrink",
+                destroyed_group_ids,
+                "before_old_floor_registry_mc2_drop_after_shrink",
+            )
+            if stats.get("released_groups", 0.0) > 0.0:
+                registry_dropped_groups += 1
+                dropped_groups += 1
+            deferred_groups += int(stats.get("deferred_groups", 0.0))
+            destroy_ms += float(stats.get("destroy_ms", 0.0))
+            cleanup_ms += float(stats.get("cleanup_ms", 0.0))
+            cleanup_gc_ms += float(stats.get("cleanup_gc_ms", 0.0))
+            cleanup_empty_cache_ms += float(
+                stats.get("cleanup_empty_cache_ms", 0.0))
+            cleanup_sync_ms += float(stats.get("cleanup_sync_ms", 0.0))
+            cleanup_memory_log_ms += float(
+                stats.get("cleanup_memory_log_ms", 0.0))
+            seen_signatures.discard((group_kind, ranks))
 
         summary_log_ms = 0.0
         if ((dropped_groups > 0 or dropped_signatures > 0)
@@ -7543,6 +10244,7 @@ class NPUWorker(WorkerBase):
             "signature_sweep_ms": signature_sweep_ms,
             "release_ref_ms": release_ref_ms,
             "dropped_groups": float(dropped_groups),
+            "registry_dropped_groups": float(registry_dropped_groups),
             "deferred_groups": float(deferred_groups),
             "dropped_signatures": float(dropped_signatures),
         }
@@ -7873,18 +10575,53 @@ class NPUWorker(WorkerBase):
             return True
         return False
 
+    def _mode1_current_floor_override(self) -> Optional[int]:
+        raw_floor = os.getenv("VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR")
+        if raw_floor is None:
+            return None
+        try:
+            return int(raw_floor)
+        except (TypeError, ValueError):
+            return None
+
+    def _mode1_current_floor_is_full_world(
+            self, world_size: Optional[int] = None) -> bool:
+        floor = self._mode1_current_floor_override()
+        if floor is None:
+            return False
+        if world_size is None:
+            for env_name in ("WORLD_SIZE", "RAY_LOCAL_WORLD_SIZE"):
+                raw_world_size = os.getenv(env_name)
+                if raw_world_size is None:
+                    continue
+                try:
+                    world_size = int(raw_world_size)
+                    break
+                except (TypeError, ValueError):
+                    world_size = None
+            if world_size is None:
+                if not (torch.distributed.is_available()
+                        and torch.distributed.is_initialized()):
+                    return False
+                world_size = int(torch.distributed.get_world_size())
+        return int(world_size) > 0 and floor >= int(world_size)
+
     def _is_mode1_low_floor_elastic_runtime(
             self, max_floor: Optional[int] = 8) -> bool:
         if int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) != 1:
             return False
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return False
-        floor = envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE
+        floor = self._mode1_current_floor_override()
         if floor is None:
-            return False
-        try:
-            floor = int(floor)
-        except (TypeError, ValueError):
+            floor = envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE
+            if floor is None:
+                return False
+            try:
+                floor = int(floor)
+            except (TypeError, ValueError):
+                return False
+        if self._mode1_current_floor_is_full_world():
             return False
         if floor <= 0:
             return False
@@ -7934,6 +10671,12 @@ class NPUWorker(WorkerBase):
             )
             raise
         if torch.npu.is_available():
+            torch.npu.synchronize()
+        self._release_mode1_moe_comm_runtime_state(
+            f"after_post_restore_mc2_dispatcher_warmup:world_size={world_size}")
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
             torch.npu.synchronize()
         self._log_custom_mode1_worker_memory(
             "after_post_restore_mc2_dispatcher_warmup",
@@ -8048,6 +10791,9 @@ class NPUWorker(WorkerBase):
         full_world_ranks = tuple(range(world_size))
         if target_ranks != full_world_ranks:
             return False
+        if self._should_keep_mode1_fixed_topology_stale_group(
+                group_kind, group_ranks, target_ranks):
+            return False
         # Keep only the previously stashed full-world EP cache across shrink.
         # During restore, the currently live shrink-stage DP/EP/MC2 groups are
         # not useful after the full-world rebuild target is known. Re-stashing
@@ -8098,6 +10844,9 @@ class NPUWorker(WorkerBase):
         world_size = int(torch.distributed.get_world_size())
         if group_ranks == tuple(range(world_size)):
             return False
+        if self._should_keep_mode1_fixed_topology_stale_group(
+                group_kind, group_ranks, target_ranks):
+            return False
         if self._should_keep_mode1_floor4_group_cache(
                 group_kind, group_ranks, target_ranks):
             return False
@@ -8121,10 +10870,11 @@ class NPUWorker(WorkerBase):
         if group is None:
             return
 
-        should_cache_group = self._should_cache_elastic_parallel_group(
-            attr_name)
         group_ranks = tuple(int(rank) for rank in getattr(group, "ranks", []))
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
+        self._register_elastic_parallel_group(attr_name, group_ranks, group)
+        should_cache_group = self._should_cache_elastic_parallel_group_ranks(
+            attr_name, group_ranks)
         destroy_for_single_live_mc2 = (
             self._should_destroy_stashed_mc2_for_single_live_group(
                 attr_name, group_ranks))
@@ -8159,7 +10909,7 @@ class NPUWorker(WorkerBase):
                 int(rank) for rank in getattr(
                     self, "_elastic_rebuild_target_ranks", ()) or ())
             logger.info(
-                "Elastic mode1 full-restore defers stale live floor group destroy: "
+                "Elastic mode1 full-restore releases stale live floor group: "
                 "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
                 self.rank,
                 attr_name,
@@ -8169,7 +10919,7 @@ class NPUWorker(WorkerBase):
             )
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
-                    "before_mode1_full_restore_mc2_defer",
+                    "before_mode1_full_restore_mc2_release",
                     f"old_ranks={group_ranks} target_ranks={target_ranks}",
                 )
             should_cache_group = False
@@ -8214,8 +10964,13 @@ class NPUWorker(WorkerBase):
             else:
                 destroy_reason = "stash_group"
             cleanup_ms = 0.0
+            force_cleanup_after_release = (
+                self._should_force_cleanup_after_mode1_floor_group_release(
+                    group_kind, group_ranks))
             if already_retired_group:
                 destroy_ms = 0.0
+                self._remove_elastic_parallel_group_registry_entry(
+                    group_kind, group_ranks, group)
             elif self._should_defer_stashed_group_destroy_for_mode1(
                     group_kind,
                     group_ranks,
@@ -8228,6 +10983,10 @@ class NPUWorker(WorkerBase):
                     destroy_reason,
                 )
                 destroy_ms = 0.0
+                if force_cleanup_after_release:
+                    cleanup_stats = self._cleanup_after_elastic_group_release(
+                        destroy_reason, force=True)
+                    cleanup_ms = float(cleanup_stats.get("total_ms", 0.0))
             else:
                 if self._is_mode1_low_floor_elastic_runtime():
                     logger.warning(
@@ -8244,10 +11003,16 @@ class NPUWorker(WorkerBase):
                 group.destroy()
                 self._detach_destroyed_group_references(group)
                 self._mark_retired_elastic_group(group)
+                self._remove_elastic_parallel_group_registry_entry(
+                    group_kind, group_ranks, group)
                 destroy_ms = (time.perf_counter() - destroy_start_t) * 1000.0
                 if group_kind == "mc2":
-                    cleanup_stats = self._cleanup_after_elastic_mc2_group_destroy(
-                        destroy_reason)
+                    cleanup_stats = self._cleanup_after_elastic_group_release(
+                        destroy_reason, force=force_cleanup_after_release)
+                    cleanup_ms = float(cleanup_stats.get("total_ms", 0.0))
+                elif force_cleanup_after_release:
+                    cleanup_stats = self._cleanup_after_elastic_group_release(
+                        destroy_reason, force=True)
                     cleanup_ms = float(cleanup_stats.get("total_ms", 0.0))
             if destroy_for_mode1_pre_rebuild or destroy_for_mode1_full_restore or destroy_ms >= 1000.0:
                 logger.info(
@@ -8274,12 +11039,23 @@ class NPUWorker(WorkerBase):
         return ()
 
     def _drop_stale_cached_elastic_parallel_groups(
-            self, keep_group_ranks: tuple[int, ...]) -> None:
+            self,
+            keep_group_ranks: tuple[int, ...],
+            reason: str = "drop_stale_cache",
+            force_destroy: bool = False) -> dict[str, float]:
+        drop_start_t = time.perf_counter()
         cached_groups = self._get_cached_elastic_parallel_groups()
         seen_signatures = self._get_seen_elastic_parallel_group_signatures()
         dropped_groups = 0
         dropped_signatures = 0
         destroyed_group_ids: set[int] = set()
+        deferred_groups = 0
+        cleanup_ms = 0.0
+        cleanup_gc_ms = 0.0
+        cleanup_empty_cache_ms = 0.0
+        cleanup_sync_ms = 0.0
+        cleanup_memory_log_ms = 0.0
+        registry_dropped_groups = 0
 
         for attr_name, groups_by_ranks in cached_groups.items():
             group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
@@ -8345,41 +11121,90 @@ class NPUWorker(WorkerBase):
                                     "before_stale_mc2_cache_drop",
                                     f"stale_ranks={ranks} keep_ranks={keep_group_ranks}",
                                 )
-                            if self._should_defer_mode1_group_destroy(
+                            ranks_tuple = tuple(int(rank) for rank in ranks)
+                            force_cleanup_after_release = (
+                                self._should_force_cleanup_after_mode1_floor_group_release(
+                                    group_kind, ranks_tuple))
+                            if (not force_destroy
+                                    and self._should_defer_mode1_group_destroy(
                                     group_kind,
-                                    tuple(int(rank) for rank in ranks),
+                                    ranks_tuple,
                                     keep_group_ranks,
-                                    "drop_stale_cache",
-                            ):
-                                self._quarantine_deferred_elastic_group(
+                                    reason,
+                            )):
+                                if self._quarantine_deferred_elastic_group(
                                     group,
                                     group_kind,
-                                    tuple(int(rank) for rank in ranks),
-                                    "drop_stale_cache",
-                                )
+                                    ranks_tuple,
+                                    reason,
+                                ):
+                                    deferred_groups += 1
                                 destroyed_group_ids.add(group_id)
+                                if force_cleanup_after_release:
+                                    cleanup_stats = self._cleanup_after_elastic_group_release(
+                                        reason, force=True)
+                                    cleanup_ms += float(
+                                        cleanup_stats.get("total_ms", 0.0))
+                                    cleanup_gc_ms += float(
+                                        cleanup_stats.get("gc_ms", 0.0))
+                                    cleanup_empty_cache_ms += float(
+                                        cleanup_stats.get("empty_cache_ms", 0.0))
+                                    cleanup_sync_ms += float(
+                                        cleanup_stats.get("sync_ms", 0.0))
+                                    cleanup_memory_log_ms += float(
+                                        cleanup_stats.get("memory_log_ms", 0.0))
                             else:
                                 if self._is_mode1_low_floor_elastic_runtime():
                                     logger.warning(
                                         "Elastic mode1 low-floor stale cache direct destroy fallback: "
                                         "rank=%s group_kind=%s group_ranks=%s keep_ranks=%s "
-                                        "reason=drop_stale_cache defer_env=%s defer_sizes=%s",
+                                        "reason=%s force_destroy=%s defer_env=%s defer_sizes=%s",
                                         self.rank,
                                         group_kind,
                                         tuple(int(rank) for rank in ranks),
                                         keep_group_ranks,
+                                        reason,
+                                        force_destroy,
                                         os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"),
                                         os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES", "1,2,4,8"),
                                     )
                                 group.destroy()
                                 self._detach_destroyed_group_references(group)
                                 self._mark_retired_elastic_group(group)
+                                self._remove_elastic_parallel_group_registry_entry(
+                                    group_kind,
+                                    tuple(int(rank) for rank in ranks),
+                                    group)
                                 destroyed_group_ids.add(group_id)
                                 if group_kind == "mc2" and (
                                         self._has_mode1_lightweight_parity_module()
                                         or self._has_mode4_remote_npu_lightweight_module()):
-                                    self._cleanup_after_elastic_mc2_group_destroy(
-                                        "drop_stale_cache")
+                                    cleanup_stats = self._cleanup_after_elastic_group_release(
+                                        reason,
+                                        force=force_cleanup_after_release)
+                                    cleanup_ms += float(
+                                        cleanup_stats.get("total_ms", 0.0))
+                                    cleanup_gc_ms += float(
+                                        cleanup_stats.get("gc_ms", 0.0))
+                                    cleanup_empty_cache_ms += float(
+                                        cleanup_stats.get("empty_cache_ms", 0.0))
+                                    cleanup_sync_ms += float(
+                                        cleanup_stats.get("sync_ms", 0.0))
+                                    cleanup_memory_log_ms += float(
+                                        cleanup_stats.get("memory_log_ms", 0.0))
+                                elif force_cleanup_after_release:
+                                    cleanup_stats = self._cleanup_after_elastic_group_release(
+                                        reason, force=True)
+                                    cleanup_ms += float(
+                                        cleanup_stats.get("total_ms", 0.0))
+                                    cleanup_gc_ms += float(
+                                        cleanup_stats.get("gc_ms", 0.0))
+                                    cleanup_empty_cache_ms += float(
+                                        cleanup_stats.get("empty_cache_ms", 0.0))
+                                    cleanup_sync_ms += float(
+                                        cleanup_stats.get("sync_ms", 0.0))
+                                    cleanup_memory_log_ms += float(
+                                        cleanup_stats.get("memory_log_ms", 0.0))
                     dropped_groups += 1
                 if (group_kind, ranks) in seen_signatures:
                     seen_signatures.discard((group_kind, ranks))
@@ -8388,6 +11213,36 @@ class NPUWorker(WorkerBase):
                     logger.info(
                         "Elastic parallel stale MC2 cache dropped across restore: rank=%s keep_ranks=%s stale_ranks=%s",
                         self.rank, keep_group_ranks, ranks)
+
+        for group_kind, ranks, group in (
+                self._iter_stale_elastic_parallel_group_registry_entries(
+                    keep_group_ranks, old_floor_only=False)):
+            stats = self._release_elastic_parallel_group_reference(
+                group,
+                group_kind,
+                ranks,
+                keep_group_ranks,
+                reason,
+                destroyed_group_ids,
+                "before_stale_registry_mc2_drop",
+                force_destroy=force_destroy,
+            )
+            if stats.get("released_groups", 0.0) > 0.0:
+                registry_dropped_groups += 1
+                dropped_groups += 1
+            deferred_groups += int(stats.get("deferred_groups", 0.0))
+            cleanup_ms += float(stats.get("cleanup_ms", 0.0))
+            cleanup_gc_ms += float(stats.get("cleanup_gc_ms", 0.0))
+            cleanup_empty_cache_ms += float(
+                stats.get("cleanup_empty_cache_ms", 0.0))
+            cleanup_sync_ms += float(stats.get("cleanup_sync_ms", 0.0))
+            cleanup_memory_log_ms += float(
+                stats.get("cleanup_memory_log_ms", 0.0))
+            seen_signatures.discard((group_kind, ranks))
+            if group_kind == "mc2":
+                logger.info(
+                    "Elastic parallel stale MC2 registry dropped: rank=%s keep_ranks=%s stale_ranks=%s",
+                    self.rank, keep_group_ranks, ranks)
 
         stale_signatures = [
             signature for signature in seen_signatures
@@ -8414,9 +11269,22 @@ class NPUWorker(WorkerBase):
 
         if dropped_groups > 0 or dropped_signatures > 0:
             logger.info(
-                "Elastic parallel stale group cache dropped: rank=%s keep_ranks=%s dropped_groups=%s dropped_signatures=%s",
-                self.rank, keep_group_ranks, dropped_groups,
-                dropped_signatures)
+                "Elastic parallel stale group cache dropped: rank=%s keep_ranks=%s reason=%s force_destroy=%s dropped_groups=%s dropped_signatures=%s deferred_groups=%s cleanup_ms=%.2f",
+                self.rank, keep_group_ranks, reason, force_destroy,
+                dropped_groups, dropped_signatures, deferred_groups,
+                cleanup_ms)
+        return {
+            "total_ms": (time.perf_counter() - drop_start_t) * 1000.0,
+            "cleanup_ms": cleanup_ms,
+            "cleanup_gc_ms": cleanup_gc_ms,
+            "cleanup_empty_cache_ms": cleanup_empty_cache_ms,
+            "cleanup_sync_ms": cleanup_sync_ms,
+            "cleanup_memory_log_ms": cleanup_memory_log_ms,
+            "dropped_groups": float(dropped_groups),
+            "registry_dropped_groups": float(registry_dropped_groups),
+            "deferred_groups": float(deferred_groups),
+            "dropped_signatures": float(dropped_signatures),
+        }
 
     def _advance_group_creation_sequence_for_non_member(
             self, group_ranks: list[list[int]], backend: str,
@@ -8595,8 +11463,8 @@ class NPUWorker(WorkerBase):
                 continue
             if hasattr(module, "clear_lossless_hybrid_state"):
                 module.clear_lossless_hybrid_state()
-            module.set_active_expert_mask(None)
-            module.set_elastic_runtime_log2phy(None)
+            _set_module_active_expert_mask(module, None)
+            _set_module_elastic_runtime_log2phy(module, None)
             module.moe_config.num_experts = module.elastic_original_num_experts
             module.ep_group = None
             module.moe_config.dp_group = None
@@ -8609,6 +11477,71 @@ class NPUWorker(WorkerBase):
 
         self.elastic_parallel_detached = True
         self._elastic_current_active_ranks = None
+
+    def _release_live_mode1_old_floor_groups_before_rebuild(
+            self, active_ranks: list[int]) -> dict[str, float]:
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return {"released_groups": 0.0, "total_ms": 0.0}
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_RELEASE_LIVE_OLD_FLOOR_ON_REBUILD",
+                "1"):
+            return {"released_groups": 0.0, "total_ms": 0.0}
+        if not torch.distributed.is_initialized():
+            return {"released_groups": 0.0, "total_ms": 0.0}
+
+        import vllm.distributed.parallel_state as vllm_ps
+        import vllm_ascend.distributed.parallel_state as ascend_ps
+
+        world_size = int(torch.distributed.get_world_size())
+        target_ranks = tuple(int(rank) for rank in active_ranks)
+        previous_target_ranks = getattr(self, "_elastic_rebuild_target_ranks",
+                                        None)
+        self._elastic_rebuild_target_ranks = target_ranks
+        release_start_t = time.perf_counter()
+        released_groups = 0
+        released_kinds: list[str] = []
+        try:
+            for state_module, attr_name in (
+                    (vllm_ps, "_DP"),
+                    (vllm_ps, "_EP"),
+                    (ascend_ps, "_MC2"),
+            ):
+                group = getattr(state_module, attr_name, None)
+                if group is None:
+                    continue
+                group_ranks = tuple(
+                    int(rank) for rank in getattr(group, "ranks", []))
+                if (not group_ranks or group_ranks == target_ranks
+                        or len(group_ranks) >= world_size):
+                    continue
+                group_kind = self._normalize_elastic_parallel_group_kind(
+                    attr_name)
+                logger.info(
+                    "Elastic mode1 pre-rebuild releases live old floor group: "
+                    "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
+                    self.rank,
+                    attr_name,
+                    group_kind,
+                    group_ranks,
+                    target_ranks,
+                )
+                self._stash_group_if_present(state_module, attr_name)
+                released_groups += 1
+                released_kinds.append(group_kind)
+        finally:
+            self._elastic_rebuild_target_ranks = previous_target_ranks
+        total_ms = (time.perf_counter() - release_start_t) * 1000.0
+        if released_groups:
+            logger.info(
+                "Elastic mode1 pre-rebuild live old floor release done: "
+                "rank=%s target_ranks=%s released_groups=%s released_kinds=%s total_ms=%.2f",
+                self.rank,
+                target_ranks,
+                released_groups,
+                released_kinds,
+                total_ms,
+            )
+        return {"released_groups": float(released_groups), "total_ms": total_ms}
 
     def _rebuild_group(self, state_module, attr_name: str,
                        group_ranks: list[list[int]], world_group,
@@ -8626,13 +11559,15 @@ class NPUWorker(WorkerBase):
                 )
             self._stash_group_if_present(state_module, attr_name)
 
-            should_cache_group = self._should_cache_elastic_parallel_group(
-                attr_name)
+            should_cache_group = self._should_cache_elastic_parallel_group_ranks(
+                attr_name, local_group_ranks)
             if should_cache_group:
                 cached_groups = self._get_cached_elastic_parallel_groups()
                 cached_group = cached_groups.get(attr_name,
                                                  {}).get(local_group_ranks)
                 if cached_group is not None:
+                    self._register_elastic_parallel_group(
+                        attr_name, local_group_ranks, cached_group)
                     setattr(state_module, attr_name, cached_group)
                     logger.info(
                         "Elastic parallel group cache hit: rank=%s attr=%s group_name=%s ranks=%s",
@@ -8653,6 +11588,10 @@ class NPUWorker(WorkerBase):
                 state_module, attr_name,
                 init_model_parallel_group(group_ranks, world_group.local_rank,
                                           backend, group_name=group_name))
+            created_group = getattr(state_module, attr_name)
+            self._register_elastic_parallel_group(attr_name,
+                                                  local_group_ranks,
+                                                  created_group)
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "after_rebuild_mc2_create",
@@ -8773,9 +11712,11 @@ class NPUWorker(WorkerBase):
         if not self.parallel_config.enable_expert_parallel:
             return
         active_signature = tuple(active_ranks or [])
+        mode1_low_floor_runtime = self._is_mode1_low_floor_elastic_runtime()
         repeat_warmup = bool(int(
-            os.getenv("VLLM_ASCEND_REPEAT_POST_SHRINK_MOE_DISPATCH_WARMUP",
-                      "0")))
+            os.getenv(
+                "VLLM_ASCEND_REPEAT_POST_SHRINK_MOE_DISPATCH_WARMUP",
+                "1" if mode1_low_floor_runtime else "0")))
         if (active_signature
                 and active_signature in
                 self._post_shrink_moe_dispatch_warmed_active_signatures
@@ -8832,18 +11773,28 @@ class NPUWorker(WorkerBase):
         if warmup_tokens <= 0:
             return
         force_mode1_parity_warmup = os.getenv(
-            "VLLM_ASCEND_MODE1_PARITY_POST_SHRINK_WARMUP", "0").lower() in (
+            "VLLM_ASCEND_MODE1_PARITY_POST_SHRINK_WARMUP",
+            "1" if mode1_low_floor_runtime else "0").lower() in (
                 "1", "true", "yes", "on")
-        if self._is_mode1_low_floor_elastic_runtime(
-        ) and not force_mode1_parity_warmup:
-            if active_signature:
-                self._post_shrink_moe_dispatch_warmed_active_signatures.add(
-                    active_signature)
+        mode1_parity_warmup_kind = os.getenv(
+            "VLLM_ASCEND_MODE1_PARITY_POST_SHRINK_WARMUP_KIND",
+            "mc2_dispatcher_only").strip().lower()
+        use_mode1_dispatcher_only_warmup = mode1_parity_warmup_kind in (
+            "dispatcher", "dispatcher_only", "mc2",
+            "mc2_dispatcher", "mc2_dispatcher_only")
+        mode1_parity_warmup_helper = (
+            "warmup_mode1_parity_mc2_dispatcher_only"
+            if use_mode1_dispatcher_only_warmup else
+            "warmup_mode1_parity_moe_dispatch_only")
+        if mode1_low_floor_runtime and force_mode1_parity_warmup and not hasattr(
+                model_runner, mode1_parity_warmup_helper):
             logger.info(
                 "Elastic post-shrink MoE dispatch warmup skipped: rank=%s "
-                "active_ranks=%s reason=mode1_low_floor_runtime_no_synthetic_warmup",
+                "active_ranks=%s reason=mode1_parity_no_helper kind=%s helper=%s",
                 self.rank,
                 list(active_signature),
+                mode1_parity_warmup_kind,
+                mode1_parity_warmup_helper,
             )
             return
 
@@ -8863,13 +11814,97 @@ class NPUWorker(WorkerBase):
                         )
                         return
                     logger.info(
-                        "Elastic post-shrink MoE dispatch warmup forced for mode1 parity: rank=%s active_ranks=%s tokens=%s path=%s",
+                        "Elastic post-shrink MoE dispatch warmup forced for mode1 parity: rank=%s active_ranks=%s tokens=%s kind=%s path=%s",
                         self.rank,
                         list(active_signature),
                         warmup_tokens,
+                        mode1_parity_warmup_kind,
                         _module_mode1_lightweight_parity_path(module),
                     )
                     break
+
+        if mode1_low_floor_runtime and force_mode1_parity_warmup:
+            self._log_custom_mode1_worker_memory(
+                "before_post_shrink_mode1_parity_moe_warmup",
+                f"active_ranks={list(active_signature)} "
+                f"tokens={warmup_tokens}",
+            )
+            if _env_flag("VLLM_ASCEND_MODE1_PARITY_PRE_MOE_WARMUP_EMPTY_CACHE",
+                         "0"):
+                self._log_custom_mode1_worker_memory(
+                    "before_post_shrink_mode1_parity_pre_moe_warmup_cache_release",
+                    f"active_ranks={list(active_signature)} "
+                    f"tokens={warmup_tokens}",
+                )
+                import gc
+                gc.collect()
+                if torch.npu.is_available():
+                    torch.npu.empty_cache()
+                    torch.npu.synchronize()
+                self._log_custom_mode1_worker_memory(
+                    "after_post_shrink_mode1_parity_pre_moe_warmup_cache_release",
+                    f"active_ranks={list(active_signature)} "
+                    f"tokens={warmup_tokens}",
+                )
+            warmup_start_t = time.perf_counter()
+            try:
+                if use_mode1_dispatcher_only_warmup:
+                    model_runner.warmup_mode1_parity_mc2_dispatcher_only(
+                        warmup_tokens)
+                else:
+                    model_runner.warmup_mode1_parity_moe_dispatch_only(
+                        warmup_tokens)
+            except Exception:
+                logger.exception(
+                    "Elastic post-shrink MoE dispatch warmup failed: rank=%s "
+                    "active_ranks=%s reason=mode1_parity_%s "
+                    "tokens=%s",
+                    self.rank,
+                    list(active_signature),
+                    mode1_parity_warmup_kind,
+                    warmup_tokens,
+                )
+                raise
+            if torch.npu.is_available():
+                torch.npu.synchronize()
+            self._log_custom_mode1_worker_memory(
+                "after_post_shrink_mode1_parity_moe_warmup",
+                f"active_ranks={list(active_signature)} "
+                f"tokens={warmup_tokens}",
+            )
+            if _env_flag("VLLM_ASCEND_MODE1_PARITY_RELEASE_WARMUP_CACHE",
+                         "1"):
+                self._log_custom_mode1_worker_memory(
+                    "before_post_shrink_mode1_parity_moe_warmup_cache_release",
+                    f"active_ranks={list(active_signature)} "
+                    f"tokens={warmup_tokens}",
+                )
+                self._release_mode1_moe_comm_runtime_state(
+                    "after_post_shrink_mode1_parity_moe_warmup:"
+                    f"active_ranks={tuple(active_signature)}")
+                gc.collect()
+                if torch.npu.is_available():
+                    torch.npu.empty_cache()
+                    torch.npu.synchronize()
+                self._log_custom_mode1_worker_memory(
+                    "after_post_shrink_mode1_parity_moe_warmup_cache_release",
+                    f"active_ranks={list(active_signature)} "
+                    f"tokens={warmup_tokens}",
+                )
+            if active_signature:
+                self._post_shrink_moe_dispatch_warmed_active_signatures.add(
+                    active_signature)
+            logger.info(
+                "Elastic post-shrink MoE dispatch warmup done: rank=%s "
+                "active_ranks=%s reason=mode1_parity_%s tokens=%s "
+                "total_ms=%.2f",
+                self.rank,
+                list(active_signature),
+                mode1_parity_warmup_kind,
+                warmup_tokens,
+                (time.perf_counter() - warmup_start_t) * 1000.0,
+            )
+            return
 
         if self._has_mode3_hybrid_lossless_module():
             if not _env_flag("VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP",
@@ -9069,6 +12104,7 @@ class NPUWorker(WorkerBase):
         next_block_prime_ms = 0.0
         remote_cache_barrier2_ms = 0.0
         release_staging_ms = 0.0
+        post_preload_source_barrier_ms = 0.0
         release_staging_clear_ms = 0.0
         release_staging_gc_ms = 0.0
         release_staging_empty_cache_ms = 0.0
@@ -9197,11 +12233,33 @@ class NPUWorker(WorkerBase):
         self._prepare_lossless_shrink_payload(active_ranks, world_group)
         prepare_payload_ms = (
             time.perf_counter() - prepare_payload_start_t) * 1000.0
+        is_active_rank = current_rank in active_ranks
+        mode1_low_floor_runtime = self._is_mode1_low_floor_elastic_runtime()
         preload_import_start_t = time.perf_counter()
         self._preload_lossless_shrink_import_weights(active_ranks, world_group)
         preload_import_ms = (
             time.perf_counter() - preload_import_start_t) * 1000.0
-        is_active_rank = current_rank in active_ranks
+        if (mode1_low_floor_runtime and _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_BARRIER_AFTER_PRELOAD_BEFORE_RELEASE",
+                "1")):
+            post_preload_source_barrier_start_t = time.perf_counter()
+            self._mode1_source_cpu_p2p_barrier(
+                _source_ranks_for_barrier,
+                world_group,
+                38088 + len(active_ranks) * 10,
+            )
+            post_preload_source_barrier_ms = (
+                time.perf_counter() -
+                post_preload_source_barrier_start_t) * 1000.0
+            logger.info(
+                "Elastic mode1 post-preload source barrier done: rank=%s "
+                "active_ranks=%s source_ranks=%s is_active=%s total_ms=%.2f",
+                self.rank,
+                active_ranks,
+                _source_ranks_for_barrier,
+                int(is_active_rank),
+                post_preload_source_barrier_ms,
+            )
         if not is_active_rank and not self.elastic_parallel_detached:
             detach_start_t = time.perf_counter()
             self._detach_from_elastic_parallel_groups()
@@ -9219,16 +12277,67 @@ class NPUWorker(WorkerBase):
             seq_stats = self._advance_group_creation_sequence_for_non_member(
                 elastic_group_ranks, backend, "mc2")
             _accumulate_non_member_sequence_stats("mc2", seq_stats)
-
         old_floor_group_dropped_before_rebuild = False
-        mode1_low_floor_runtime = self._is_mode1_low_floor_elastic_runtime()
+        if (mode1_low_floor_runtime and _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DROP_OLD_FLOOR_BEFORE_REBUILD",
+                "1")):
+            keep_group_ranks = tuple(int(rank) for rank in active_ranks)
+            old_floor_pre_memory_log_start_t = time.perf_counter()
+            self._log_custom_mode1_worker_memory(
+                "before_old_floor_group_cache_drop_before_rebuild",
+                f"keep_ranks={keep_group_ranks}",
+            )
+            old_floor_pre_memory_log_ms += (
+                time.perf_counter() -
+                old_floor_pre_memory_log_start_t) * 1000.0
+            drop_old_floor_group_cache_start_t = time.perf_counter()
+            live_release_stats = (
+                self._release_live_mode1_old_floor_groups_before_rebuild(
+                    active_ranks))
+            drop_old_floor_stats = (
+                self._drop_old_floor_cached_elastic_parallel_groups_after_mode1_shrink(
+                    keep_group_ranks)
+            )
+            drop_old_floor_stats["dropped_groups"] = (
+                float(drop_old_floor_stats.get("dropped_groups", 0.0)) +
+                float(live_release_stats.get("released_groups", 0.0)))
+            drop_old_floor_stats["destroy_ms"] = (
+                float(drop_old_floor_stats.get("destroy_ms", 0.0)) +
+                float(live_release_stats.get("total_ms", 0.0)))
+            drop_old_floor_group_call_wall = (
+                time.perf_counter() -
+                drop_old_floor_group_cache_start_t) * 1000.0
+            _accumulate_old_floor_drop_stats(
+                drop_old_floor_stats, drop_old_floor_group_call_wall)
+            old_floor_group_dropped_before_rebuild = True
+
+            post_old_floor_group_drop_barrier_start_t = time.perf_counter()
+            self._mode1_source_cpu_p2p_barrier(
+                _source_ranks_for_barrier,
+                world_group,
+                38092 + len(active_ranks) * 10,
+            )
+            post_old_floor_group_drop_barrier_ms += (
+                time.perf_counter() -
+                post_old_floor_group_drop_barrier_start_t) * 1000.0
+
+            old_floor_post_memory_log_start_t = time.perf_counter()
+            self._log_custom_mode1_worker_memory(
+                "after_old_floor_group_cache_drop_before_rebuild",
+                f"keep_ranks={keep_group_ranks}",
+            )
+            old_floor_post_memory_log_ms += (
+                time.perf_counter() -
+                old_floor_post_memory_log_start_t) * 1000.0
+
         # Stash the currently live DP/EP/MC2 group first, then sweep stale
         # cache entries before per-layer refresh. Dropping the cache before
         # active ranks rebuild can retire the same object while it is still the
         # live parallel-state group, which previously led to ghost cached
         # wrappers and later HCCL workspace pressure.
         drop_old_floor_before_rebuild_default = "0"
-        if (mode1_low_floor_runtime and _env_flag(
+        if (not old_floor_group_dropped_before_rebuild
+                and mode1_low_floor_runtime and _env_flag(
                 "VLLM_ASCEND_MODE1_PARITY_DROP_OLD_FLOOR_BEFORE_REBUILD",
                 drop_old_floor_before_rebuild_default)):
             keep_group_ranks = tuple(int(rank) for rank in active_ranks)
@@ -9562,19 +12671,19 @@ class NPUWorker(WorkerBase):
         total_ms = (time.perf_counter() - start_t) * 1000.0
         hidden_tail_ms = total_ms - (
             prefetch_drain_ms + prepare_payload_ms + preload_import_ms +
-            detach_ms + rebuild_ms + pre_refresh_source_barrier_ms +
-            non_member_sequence_ms + refresh_ms + remote_cache_phase_ms +
-            release_staging_ms + drop_stale_group_cache_ms +
-            old_floor_group_drop_barrier_ms +
+            post_preload_source_barrier_ms + detach_ms + rebuild_ms +
+            pre_refresh_source_barrier_ms + non_member_sequence_ms +
+            refresh_ms + remote_cache_phase_ms + release_staging_ms +
+            drop_stale_group_cache_ms + old_floor_group_drop_barrier_ms +
             drop_old_floor_group_call_wall_ms + old_floor_pre_memory_log_ms +
             old_floor_post_memory_log_ms +
             post_old_floor_group_drop_barrier_ms +
             release_mode5_cache_state_ms + warmup_ms)
         logger.info(
-            "Elastic parallel shrink phase breakdown: rank=%s active_ranks=%s is_active=%s prefetch_drain_ms=%.2f prepare_payload_ms=%.2f preload_import_ms=%.2f detach_ms=%.2f rebuild_ms=%.2f rebuild_dp_ms=%.2f rebuild_ep_ms=%.2f rebuild_mc2_ms=%.2f non_member_sequence_ms=%.2f non_member_sequence_dp_ms=%.2f non_member_sequence_ep_ms=%.2f non_member_sequence_mc2_ms=%.2f non_member_sequence_device_new_group_ms=%.2f non_member_sequence_cpu_new_group_ms=%.2f non_member_sequence_destroy_ms=%.2f non_member_sequence_signature_ms=%.2f non_member_sequence_log_ms=%.2f non_member_sequence_groups=%.0f pre_refresh_source_barrier_ms=%.2f refresh_ms=%.2f remote_cache_phase_ms=%.2f remote_cache_start_ms=%.2f remote_cache_barrier1_ms=%.2f remote_payload_warmup_ms=%.2f next_block_prime_ms=%.2f remote_cache_barrier2_ms=%.2f release_staging_ms=%.2f release_staging_clear_ms=%.2f release_staging_gc_ms=%.2f release_staging_empty_cache_ms=%.2f release_staging_sync_ms=%.2f drop_stale_group_cache_ms=%.2f old_floor_group_drop_barrier_ms=%.2f drop_old_floor_group_call_wall_ms=%.2f drop_old_floor_group_cache_ms=%.2f old_floor_pre_memory_log_ms=%.2f old_floor_post_memory_log_ms=%.2f drop_old_floor_group_destroy_ms=%.2f drop_old_floor_group_cleanup_ms=%.2f drop_old_floor_group_cleanup_gc_ms=%.2f drop_old_floor_group_cleanup_empty_cache_ms=%.2f drop_old_floor_group_cleanup_sync_ms=%.2f drop_old_floor_group_cleanup_memory_log_ms=%.2f drop_old_floor_group_memory_log_ms=%.2f drop_old_floor_group_row_log_ms=%.2f drop_old_floor_group_summary_log_ms=%.2f drop_old_floor_group_signature_sweep_ms=%.2f drop_old_floor_group_release_ref_ms=%.2f drop_old_floor_group_dropped_groups=%.0f drop_old_floor_group_deferred_groups=%.0f drop_old_floor_group_dropped_signatures=%.0f post_old_floor_group_drop_barrier_ms=%.2f release_mode5_cache_state_ms=%.2f warmup_ms=%.2f hidden_tail_ms=%.2f total_ms=%.2f",
+            "Elastic parallel shrink phase breakdown: rank=%s active_ranks=%s is_active=%s prefetch_drain_ms=%.2f prepare_payload_ms=%.2f preload_import_ms=%.2f post_preload_source_barrier_ms=%.2f detach_ms=%.2f rebuild_ms=%.2f rebuild_dp_ms=%.2f rebuild_ep_ms=%.2f rebuild_mc2_ms=%.2f non_member_sequence_ms=%.2f non_member_sequence_dp_ms=%.2f non_member_sequence_ep_ms=%.2f non_member_sequence_mc2_ms=%.2f non_member_sequence_device_new_group_ms=%.2f non_member_sequence_cpu_new_group_ms=%.2f non_member_sequence_destroy_ms=%.2f non_member_sequence_signature_ms=%.2f non_member_sequence_log_ms=%.2f non_member_sequence_groups=%.0f pre_refresh_source_barrier_ms=%.2f refresh_ms=%.2f remote_cache_phase_ms=%.2f remote_cache_start_ms=%.2f remote_cache_barrier1_ms=%.2f remote_payload_warmup_ms=%.2f next_block_prime_ms=%.2f remote_cache_barrier2_ms=%.2f release_staging_ms=%.2f release_staging_clear_ms=%.2f release_staging_gc_ms=%.2f release_staging_empty_cache_ms=%.2f release_staging_sync_ms=%.2f drop_stale_group_cache_ms=%.2f old_floor_group_drop_barrier_ms=%.2f drop_old_floor_group_call_wall_ms=%.2f drop_old_floor_group_cache_ms=%.2f old_floor_pre_memory_log_ms=%.2f old_floor_post_memory_log_ms=%.2f drop_old_floor_group_destroy_ms=%.2f drop_old_floor_group_cleanup_ms=%.2f drop_old_floor_group_cleanup_gc_ms=%.2f drop_old_floor_group_cleanup_empty_cache_ms=%.2f drop_old_floor_group_cleanup_sync_ms=%.2f drop_old_floor_group_cleanup_memory_log_ms=%.2f drop_old_floor_group_memory_log_ms=%.2f drop_old_floor_group_row_log_ms=%.2f drop_old_floor_group_summary_log_ms=%.2f drop_old_floor_group_signature_sweep_ms=%.2f drop_old_floor_group_release_ref_ms=%.2f drop_old_floor_group_dropped_groups=%.0f drop_old_floor_group_deferred_groups=%.0f drop_old_floor_group_dropped_signatures=%.0f post_old_floor_group_drop_barrier_ms=%.2f release_mode5_cache_state_ms=%.2f warmup_ms=%.2f hidden_tail_ms=%.2f total_ms=%.2f",
             self.rank, active_ranks, int(is_active_rank), prefetch_drain_ms,
-            prepare_payload_ms, preload_import_ms, detach_ms, rebuild_ms,
-            rebuild_dp_ms, rebuild_ep_ms, rebuild_mc2_ms,
+            prepare_payload_ms, preload_import_ms, post_preload_source_barrier_ms,
+            detach_ms, rebuild_ms, rebuild_dp_ms, rebuild_ep_ms, rebuild_mc2_ms,
             non_member_sequence_ms, non_member_sequence_dp_ms,
             non_member_sequence_ep_ms, non_member_sequence_mc2_ms,
             non_member_sequence_device_new_group_ms,
@@ -9664,8 +12773,21 @@ class NPUWorker(WorkerBase):
         refresh_ms = (time.perf_counter() - refresh_start_t) * 1000.0
         self.elastic_parallel_detached = False
         self._elastic_current_active_ranks = list(range(world_size))
-        self._drop_stale_cached_elastic_parallel_groups(
+        stale_drop_stats = self._drop_stale_cached_elastic_parallel_groups(
             tuple(range(world_size)))
+        if (stale_drop_stats.get("dropped_groups", 0.0) > 0.0
+                or stale_drop_stats.get("dropped_signatures", 0.0) > 0.0):
+            logger.info(
+                "Elastic full-world restore stale floor group release summary: "
+                "rank=%s dropped_groups=%.0f deferred_groups=%.0f "
+                "dropped_signatures=%.0f cleanup_ms=%.2f total_ms=%.2f",
+                self.rank,
+                stale_drop_stats.get("dropped_groups", 0.0),
+                stale_drop_stats.get("deferred_groups", 0.0),
+                stale_drop_stats.get("dropped_signatures", 0.0),
+                stale_drop_stats.get("cleanup_ms", 0.0),
+                stale_drop_stats.get("total_ms", 0.0),
+            )
         self._warmup_post_restore_mc2_dispatch_for_custom_mode1_parity(
             world_size)
         self._warmup_post_restore_alltoall_dispatch_for_custom_mode1_parity(

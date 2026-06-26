@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 import os.path
+import re
 from typing import Callable, Optional
 
 import torch
@@ -33,11 +34,25 @@ from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import (determine_default_expert_map,
                                               determine_default_log2phy_map)
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
+from vllm_ascend.ops.fused_moe import AscendFusedMoE as CustomAscendFusedMoE
 from vllm_ascend.ops.moe.experts_selector import select_experts
 from vllm_ascend.ops.moe.moe_comm_method import setup_moe_comm_method
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_310p, npu_stream_switch
 
 original_unquantized_fused_moe_init_func = UnquantizedFusedMoEMethod.__init__
+
+
+def _infer_layer_idx_from_prefix(prefix: str) -> int:
+    match = re.search(r"(?:^|\.)(?:layers|h)\.(\d+)(?:\.|$)", prefix)
+    if match is None:
+        match = re.search(r"(?:^|\.)(\d+)\.(?:mlp|experts|block|layer)(?:\.|$)",
+                          prefix)
+    if match is None:
+        return -1
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return -1
 
 
 def unquantized_fused_moe_init_func(self, *args, **kwargs):
@@ -132,69 +147,70 @@ def process_weights_after_loading(self, layer):
             layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
 
 
-class AscendFusedMoE(FusedMoE):
+class AscendFusedMoE(CustomAscendFusedMoE):
     moe_counter = -1
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        AscendFusedMoE.moe_counter += 1
-        self.moe_instance_id = AscendFusedMoE.moe_counter
-        self.moe_config.tp_group = get_tp_group()
-        self.moe_config.dp_group = get_dp_group()
-        self.moe_config.ep_group = get_ep_group()
-        self.moe_config.mc2_group = get_mc2_group()
-        ascend_config = get_ascend_config()
-        self.dynamic_eplb = ascend_config.dynamic_eplb
-        self.expert_map_path = ascend_config.expert_map_path
-        self.global_redundant_expert_num = ascend_config.init_redundancy_expert
-        # static eplb initializing with expert_map_path
-        if self.expert_map_path and os.path.exists(
-                self.expert_map_path) and os.access(self.expert_map_path,
-                                                    os.R_OK):
-            self.expert_load_balancer = ExpertLoadBalancer(
-                self.expert_map_path, self.global_num_experts)
-            self.local_num_experts, self.expert_map = (
-                self.expert_load_balancer.get_rank_placement_map(
-                    self.moe_instance_id, self.ep_rank))
-            self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
-                self.moe_instance_id, self.ep_rank).npu()
-            self.global_redundant_expert_num = (
-                self.expert_load_balancer.get_global_redundant_expert_num())
-        else:
-            # init moe. vLLM has returned either (local_num_experts,
-            # expert_map) or (local_num_experts, expert_map, log2phy)
-            # across versions/forks; keep this common OOT path compatible
-            # with both forms.
-            expert_mapping = determine_expert_map(
-                self.ep_size, self.ep_rank, self.global_num_experts)
-            if len(expert_mapping) == 3:
-                self.local_num_experts, self.expert_map, self.log2phy = (
-                    expert_mapping)
-            elif len(expert_mapping) == 2:
-                self.local_num_experts, self.expert_map = expert_mapping
-                self.log2phy = determine_default_log2phy_map(
-                    self.global_num_experts, self.ep_size, self.ep_rank, 0)
-            else:
-                raise ValueError(
-                    f"Unexpected determine_expert_map return arity="
-                    f"{len(expert_mapping)}")
-            # dynamic eplb initializing with not expert_map_path
-            if self.dynamic_eplb:
-                self.global_redundant_expert_num = ascend_config.init_redundancy_expert
-                self.local_num_experts, self.expert_map = determine_default_expert_map(
-                    self.global_num_experts, self.ep_size, self.ep_rank,
-                    self.global_redundant_expert_num)
-                self.log2phy = determine_default_log2phy_map(
-                    self.global_num_experts, self.ep_size, self.ep_rank,
-                    self.global_redundant_expert_num)
-        local_num_experts = (torch.sum(
-            self.expert_map != -1) if self.expert_map is not None else
-                             self.global_num_experts)
-        if self.dynamic_eplb:
-            self.moe_load = torch.zeros(local_num_experts, dtype=torch.int64)
-
-        setup_moe_comm_method(self.moe_config)
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config=None,
+        tp_size: Optional[int] = None,
+        ep_size: Optional[int] = None,
+        dp_size: Optional[int] = None,
+        prefix: str = "",
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        enable_eplb: bool = False,
+        num_redundant_experts: int = 0,
+        has_bias: bool = False,
+        is_sequence_parallel: bool = False,
+        zero_expert_num: Optional[int] = 0,
+        zero_expert_type: Optional[str] = None,
+        layer_idx: int = -1,
+    ):
+        del routed_scaling_factor, num_redundant_experts, has_bias
+        if layer_idx is None or int(layer_idx) < 0:
+            layer_idx = _infer_layer_idx_from_prefix(prefix)
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            params_dtype=params_dtype,
+            reduce_results=reduce_results,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            quant_config=quant_config,
+            tp_size=tp_size,
+            ep_size=ep_size,
+            dp_size=dp_size,
+            prefix=prefix,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,
+        )
+        self.enable_eplb = enable_eplb
+        self.is_sequence_parallel = is_sequence_parallel
+        self.zero_expert_num = zero_expert_num
+        self.zero_expert_type = zero_expert_type
 
     def update_expert_map(self, new_expert_map):
         self.expert_map = new_expert_map
@@ -203,7 +219,7 @@ class AscendFusedMoE(FusedMoE):
         return self.expert_map
 
     def get_log2phy_map(self):
-        return self.logical_to_physical_map
+        return self.log2phy
 
     def clear_moe_load(self):
         if self.moe_load is not None:
@@ -220,50 +236,35 @@ class AscendFusedMoE(FusedMoE):
         return torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(
             final_hidden_states)
 
+    def forward(self,
+                hidden_states: torch.Tensor,
+                router_logits: torch.Tensor,
+                is_prefill: Optional[bool] = None,
+                enable_force_load_balance: bool = False,
+                top_k: Optional[int] = None,
+                shared_experts: Optional[torch.nn.Module] = None,
+                gate=None,
+                replace_allreduce: bool = False,
+                is_dummy: bool = False):
+        if is_prefill is None:
+            try:
+                is_prefill = bool(get_forward_context().with_prefill)
+            except Exception:
+                is_prefill = False
+        return super().forward(hidden_states=hidden_states,
+                               router_logits=router_logits,
+                               is_prefill=is_prefill,
+                               enable_force_load_balance=enable_force_load_balance,
+                               top_k=top_k,
+                               shared_experts=shared_experts,
+                               gate=gate,
+                               replace_allreduce=replace_allreduce,
+                               is_dummy=is_dummy)
+
     def forward_impl(self, hidden_states: torch.Tensor,
                      router_logits: torch.Tensor):
-        assert self.quant_method is not None
-
-        forward_context = get_forward_context()
-        hidden_states, router_logits = forward_context.moe_comm_method.prepare(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            replace_allreduce=forward_context.sp_enabled)
-
-        # Matrix multiply.
-        final_hidden_states = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            enable_eplb=self.enable_eplb,
-            expert_load_view=self.expert_load_view,
-            logical_to_physical_map=self.logical_to_physical_map,
-            logical_replica_count=self.logical_replica_count,
-        )
-        if isinstance(final_hidden_states, tuple):
-            final_hidden_states, group_list_type, expert_tokens = final_hidden_states
-
-        if self.dynamic_eplb:
-            self.moe_load += expert_tokens if group_list_type else \
-                torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
-
-        final_hidden_states = forward_context.moe_comm_method.finalize(
-            hidden_states=final_hidden_states,
-            reduce_results=self.reduce_results)
-
-        return final_hidden_states
+        return self.forward(hidden_states=hidden_states,
+                            router_logits=router_logits)
 
     def transpose_weight(self, loaded_weight, expert_data, shard_dim):
         # Ensure training and inference weight shapes match during RL weight updates

@@ -484,6 +484,50 @@ def _allocate_formatted_buffer_like(weight: torch.Tensor,
     return buffer
 
 
+def _release_npu_parameter_storage(param: Optional[torch.nn.Parameter],
+                                   *,
+                                   reason: str = "") -> bool:
+    """Detach stale Parameter storage so old NPU buffers cannot pin HBM."""
+    if param is None:
+        return False
+    data = getattr(param, "data", None)
+    if data is None or not isinstance(data, torch.Tensor):
+        return False
+    if data.device.type != "npu":
+        return False
+    try:
+        param.data = torch.empty((0, ), device=data.device, dtype=data.dtype)
+        return True
+    except Exception:
+        logger.exception("Failed to release stale NPU parameter storage: %s",
+                         reason)
+        return False
+
+
+def _replace_parameter(module: torch.nn.Module, name: str,
+                       tensor: torch.Tensor) -> torch.nn.Parameter:
+    """Replace a Parameter through nn.Module bookkeeping.
+
+    Direct attribute assignment usually works, but using register_parameter
+    makes the intent explicit and guarantees the module's _parameters table no
+    longer owns the old Parameter object.
+    """
+    if name in module._parameters:
+        del module._parameters[name]
+    param = torch.nn.Parameter(tensor, requires_grad=False)
+    module.register_parameter(name, param)
+    return param
+
+
+def _tensor_storage_nbytes(tensor: Optional[torch.Tensor]) -> int:
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return 0
+    try:
+        return int(tensor.untyped_storage().nbytes())
+    except Exception:
+        return int(tensor.numel()) * int(tensor.element_size())
+
+
 def _npu_zero_offset_alias_for_p2p(base: torch.Tensor,
                                    slot_view: torch.Tensor) -> torch.Tensor:
     if slot_view.device.type != "npu":
@@ -4320,6 +4364,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if getattr(layer, "elastic_moe_mode", "lossy") == "lossless":
             pass  # debug log removed
             layer.activate_lossless_primary_experts()
+            stash_primary = getattr(
+                layer, "_stash_lossless_primary_prefix_for_mode1_full_world",
+                None)
+            if callable(stash_primary):
+                stash_primary()
             pass  # debug log removed
 
     def invalidate_lossless_runtime_state_for_reload(
@@ -5597,6 +5646,78 @@ class AscendFusedMoE(FusedMoE):
                 [int(slot) for slot in map_tensor.detach().cpu().tolist()])
         setattr(self, f"{attr_name}_tensor_id", id(map_tensor))
 
+    def mark_lossless_loaded_slots_resident(
+            self,
+            expert_slot_map: dict[int, int],
+            reason: str = "") -> int:
+        """Mark already-allocated loaded slots as containing real experts.
+
+        Mode=1 preallocates redundant loaded slots up front. Planned topology can
+        fill those rows before the shrink point, so later shrink planning should
+        see them through loaded_expert_map instead of scheduling another import.
+        This method never grows the expert weight tensors; it only updates rows
+        that already exist inside loaded_weight_capacity.
+        """
+        if self.elastic_moe_mode != "lossless":
+            return 0
+        if self.loaded_expert_map is None:
+            return 0
+        if not expert_slot_map:
+            return 0
+        logical_num_experts = int(
+            getattr(self, "elastic_original_num_experts", self.num_experts))
+        loaded_capacity = int(getattr(self, "loaded_weight_capacity", 0))
+        row_capacity = min(loaded_capacity, int(self.w13_weight.shape[0]),
+                           int(self.w2_weight.shape[0]))
+        if logical_num_experts <= 0 or row_capacity <= 0:
+            return 0
+
+        loaded_map_cpu = [
+            int(slot) for slot in self.loaded_expert_map.detach().cpu().tolist()
+        ]
+        updates = 0
+        for expert_id, local_slot in sorted(expert_slot_map.items()):
+            expert_id = int(expert_id)
+            local_slot = int(local_slot)
+            if not (0 <= expert_id < logical_num_experts):
+                continue
+            if not (0 <= local_slot < row_capacity):
+                continue
+            for other_expert, other_slot in enumerate(loaded_map_cpu):
+                if other_expert != expert_id and int(other_slot) == local_slot:
+                    loaded_map_cpu[other_expert] = -1
+            if loaded_map_cpu[expert_id] != local_slot:
+                updates += 1
+            loaded_map_cpu[expert_id] = local_slot
+
+        if updates <= 0:
+            return 0
+        with torch.no_grad():
+            new_loaded_map = torch.tensor(loaded_map_cpu,
+                                          device=self.loaded_expert_map.device,
+                                          dtype=torch.int32)
+            self.loaded_expert_map.copy_(new_loaded_map)
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        self.clear_lossless_npu_export_slot_cache()
+        self.loaded_local_num_experts = sum(
+            1 for slot in loaded_map_cpu if int(slot) >= 0)
+        self.lossless_loaded_offloaded = False
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = (
+                self._should_enable_mode1_parity_for_current_layout())
+        if self.layer_idx == 0:
+            logger.info(
+                "Mode1 planned loaded-slot residency map updated: "
+                "layer=%s updates=%s mapped=%s loaded_capacity=%s reason=%s",
+                self.layer_idx,
+                updates,
+                self.loaded_local_num_experts,
+                loaded_capacity,
+                reason,
+            )
+        return updates
+
     @staticmethod
     def _is_power_of_two(value: int) -> bool:
         return value > 0 and (value & (value - 1)) == 0
@@ -5857,6 +5978,80 @@ class AscendFusedMoE(FusedMoE):
         self._mode3_gate_reject_logged = False
         self._mode3_refresh_skip_logged = False
 
+    def release_mode1_full_world_transient_state(self) -> None:
+        """Drop mode=1 shrink/runtime-only references for full-world steps."""
+        self.clear_lossless_hybrid_state()
+        self.runtime_w13_weight = None
+        self.runtime_w2_weight = None
+        self.runtime_w13_buffer = None
+        self.runtime_w2_buffer = None
+        self.runtime_weight_capacity = 0
+        self.lossless_runtime_activated = False
+        self.lossless_saved_primary_prefix_w13 = None
+        self.lossless_saved_primary_prefix_w2 = None
+        self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+        clear_export_cache = getattr(self, "clear_lossless_npu_export_slot_cache",
+                                     None)
+        if callable(clear_export_cache):
+            clear_export_cache()
+        self.lossless_runtime_dispatch_log2phy = None
+        self.lossless_runtime_dispatch_signature = None
+        self.lossless_runtime_dispatch_num_experts = 0
+        if hasattr(self, "_mode3_double_buffer_manager"):
+            self._mode3_double_buffer_manager = None
+
+    def _finalize_mode1_full_world_compact_metadata(self) -> None:
+        """Keep compacted full-world weights and MoE routing metadata aligned."""
+        self.elastic_runtime_log2phy = None
+        self.lossless_runtime_dispatch_log2phy = None
+        self.lossless_runtime_dispatch_signature = None
+        self.lossless_runtime_dispatch_num_experts = 0
+        clear_export_cache = getattr(self, "clear_lossless_npu_export_slot_cache",
+                                     None)
+        if callable(clear_export_cache):
+            clear_export_cache()
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        if self.layer_idx == 0:
+            try:
+                expert_slots = []
+                loaded_slots = []
+                if self.expert_map is not None:
+                    expert_slots = [
+                        int(slot) for slot in self.expert_map.detach().cpu().tolist()
+                        if int(slot) >= 0
+                    ]
+                if self.loaded_expert_map is not None:
+                    loaded_slots = [
+                        int(slot)
+                        for slot in self.loaded_expert_map.detach().cpu().tolist()
+                        if int(slot) >= 0
+                    ]
+                logger.info(
+                    "Mode1 full-world compact metadata aligned: layer=%s "
+                    "active_local=%s local_num=%s moe_config_local=%s "
+                    "loaded_local=%s loaded_capacity=%s weight_rows=%s "
+                    "expert_map_count=%s expert_map_max=%s "
+                    "loaded_map_count=%s loaded_map_max=%s",
+                    self.layer_idx,
+                    int(getattr(self, "active_local_num_experts", -1)),
+                    int(getattr(self, "local_num_experts", -1)),
+                    int(getattr(getattr(self, "moe_config", None),
+                                "num_local_experts", -1)),
+                    int(getattr(self, "loaded_local_num_experts", -1)),
+                    int(getattr(self, "loaded_weight_capacity", -1)),
+                    int(getattr(self.w13_weight, "shape", (0, ))[0]),
+                    len(expert_slots),
+                    max(expert_slots) if expert_slots else -1,
+                    len(loaded_slots),
+                    max(loaded_slots) if loaded_slots else -1,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to log mode1 full-world compact metadata alignment")
+
     def _can_reuse_loaded_prefix_for_hybrid(
             self, resident_capacity: int, runtime_device: torch.device,
             runtime_w13_dtype: torch.dtype,
@@ -5926,6 +6121,33 @@ class AscendFusedMoE(FusedMoE):
             )
             self.lossless_primary_prefix_stash_logged = True
 
+    def _stash_lossless_primary_prefix_for_mode1_full_world(self) -> None:
+        if int(getattr(self, "elastic_execution_mode", 0)) != 1:
+            return
+        if self.lossless_loaded_offloaded:
+            return
+        if int(getattr(self, "loaded_weight_capacity", 0)) <= 0:
+            return
+        row_count = min(self._get_lossless_primary_prefix_row_count(),
+                        int(self.w13_weight.shape[0]),
+                        int(self.w2_weight.shape[0]))
+        if row_count <= 0:
+            return
+        self.lossless_saved_primary_prefix_w13 = self.w13_weight[
+            :row_count].detach().cpu().clone()
+        self.lossless_saved_primary_prefix_w2 = self.w2_weight[
+            :row_count].detach().cpu().clone()
+        if (self.layer_idx == 0
+                and not self.lossless_primary_prefix_stash_logged):
+            logger.info(
+                "Mode1 primary prefix stashed for full-world compaction: "
+                "layer=%s rows=%s loaded_capacity=%s",
+                self.layer_idx,
+                row_count,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+            )
+            self.lossless_primary_prefix_stash_logged = True
+
     def _clear_lossless_cpu_shadow_state(self,
                                          drop_buffers: bool = False) -> None:
         self.lossless_cpu_w13_weight = None
@@ -5941,10 +6163,18 @@ class AscendFusedMoE(FusedMoE):
             self.lossless_cpu_shadow_w2_buffer = None
             self.lossless_cpu_shadow_capacity = 0
 
-    def _restore_stashed_lossless_primary_prefix(self) -> None:
+    def _restore_stashed_lossless_primary_prefix(self, *, force: bool = False) -> None:
         if int(getattr(self, "elastic_execution_mode", 0)) in (4, 5):
             self.lossless_saved_primary_prefix_w13 = None
             self.lossless_saved_primary_prefix_w2 = None
+            return
+        # Mode=1 fixed-slot parity normally restores the full-world logical
+        # layout without copying a CPU-stashed prefix back into formatted NPU
+        # weights. The CPU shadow is only a last-mile safeguard for the
+        # explicit floor=16 physical compaction path. Restoring it on every
+        # between-step full-world reset can perturb the loaded expert tensors
+        # and causes pathological all-16k generations.
+        if int(getattr(self, "elastic_execution_mode", 0)) == 1 and not force:
             return
         saved_w13 = getattr(self, "lossless_saved_primary_prefix_w13", None)
         saved_w2 = getattr(self, "lossless_saved_primary_prefix_w2", None)
@@ -7207,7 +7437,7 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_local_experts = self.active_local_num_experts
         self.elastic_runtime_log2phy = None
         self.lossless_cpu_import_expert_ids = []
-        self._restore_stashed_lossless_primary_prefix()
+        self._restore_stashed_lossless_primary_prefix(force=True)
         self.set_lossless_runtime_prefix_views()
         if self.elastic_execution_mode == 1:
             self.lossless_mode1_native_parity_ready = (
@@ -7219,6 +7449,146 @@ class AscendFusedMoE(FusedMoE):
                 self.active_local_num_experts,
                 int(getattr(self, "loaded_weight_capacity", 0)),
             )
+
+    def shrink_lossless_loaded_weights_to_primary(self) -> bool:
+        """Physically drop redundant loaded expert slots for full-world steps.
+
+        restore_lossless_full_world_primary_layout() switches the logical
+        active layout back to the primary 16-rank view, but the canonical loaded
+        tensors may still keep the floor-N redundant tail allocated.  A step
+        that intentionally runs with floor=16 needs that HBM back for KV cache,
+        so compact the primary prefix into a new smaller Parameter.
+        """
+        if self.elastic_moe_mode != "lossless":
+            return False
+        primary_rows = int(self._get_lossless_primary_prefix_row_count())
+        if primary_rows <= 0:
+            return False
+        old_w13 = self.w13_weight
+        old_w2 = self.w2_weight
+        old_rows = min(int(old_w13.shape[0]), int(old_w2.shape[0]))
+        old_capacity = int(getattr(self, "loaded_weight_capacity", old_rows))
+        if old_rows <= primary_rows and old_capacity <= primary_rows:
+            return False
+        self._restore_stashed_lossless_primary_prefix()
+
+        new_w13 = _allocate_formatted_buffer_like(old_w13, primary_rows)
+        new_w2 = _allocate_formatted_buffer_like(old_w2, primary_rows)
+        new_w13.copy_(old_w13[:primary_rows], non_blocking=False)
+        new_w2.copy_(old_w2[:primary_rows], non_blocking=False)
+
+        old_w13_bytes = int(old_w13.numel()) * int(old_w13.element_size())
+        old_w2_bytes = int(old_w2.numel()) * int(old_w2.element_size())
+        old_w13_storage_bytes = _tensor_storage_nbytes(old_w13)
+        old_w2_storage_bytes = _tensor_storage_nbytes(old_w2)
+        self.runtime_w13_weight = None
+        self.runtime_w2_weight = None
+        self.runtime_w13_buffer = None
+        self.runtime_w2_buffer = None
+        self.w13_weight = _replace_parameter(self, "w13_weight", new_w13)
+        self.w2_weight = _replace_parameter(self, "w2_weight", new_w2)
+        new_w13_bytes = int(self.w13_weight.numel()) * int(
+            self.w13_weight.element_size())
+        new_w2_bytes = int(self.w2_weight.numel()) * int(
+            self.w2_weight.element_size())
+        new_w13_storage_bytes = _tensor_storage_nbytes(self.w13_weight)
+        new_w2_storage_bytes = _tensor_storage_nbytes(self.w2_weight)
+        self.loaded_weight_capacity = primary_rows
+        self.loaded_local_num_experts = primary_rows
+        self.active_local_num_experts = primary_rows
+        self.local_num_experts = primary_rows
+        self.moe_config.num_local_experts = primary_rows
+        self.global_redundant_expert_num = 0
+        self.moe_config.num_global_redundant_experts = 0
+
+        logical_num_experts = int(
+            getattr(self, "elastic_original_num_experts", self.num_experts))
+        loaded_map = torch.full((logical_num_experts, ),
+                                -1,
+                                dtype=torch.int32,
+                                device=self.w13_weight.device)
+        primary_map = getattr(self, "elastic_original_expert_map", None)
+        primary_log2phy = getattr(self, "primary_log2phy", None)
+        if primary_map is None:
+            primary_mapping = determine_expert_map(
+                self.ep_size,
+                self.ep_rank,
+                logical_num_experts,
+                layer_idx=self.layer_idx,
+            )
+            primary_map = primary_mapping[1]
+            if len(primary_mapping) == 3:
+                primary_log2phy = primary_mapping[2]
+        primary_map_cpu = primary_map.detach().cpu().tolist()
+        for expert_id, local_slot in enumerate(primary_map_cpu):
+            local_slot = int(local_slot)
+            if 0 <= local_slot < primary_rows:
+                loaded_map[int(expert_id)] = local_slot
+        self.loaded_expert_map = loaded_map
+        self.expert_map = loaded_map.clone()
+        if primary_log2phy is None:
+            primary_log2phy = self.log2phy
+        if primary_log2phy is None:
+            primary_log2phy = determine_default_log2phy_map(
+                logical_num_experts, self.ep_size, self.ep_rank, 0)
+        self.log2phy = primary_log2phy.to(
+            device=self.w13_weight.device,
+            dtype=(self.log2phy.dtype if self.log2phy is not None
+                   else torch.int32),
+        )
+        self.primary_log2phy = self.log2phy.clone()
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+
+        self.runtime_weight_capacity = 0
+        self.lossless_runtime_activated = False
+        self.lossless_loaded_offloaded = False
+        self.lossless_cpu_import_expert_ids = []
+        self.clear_lossless_hybrid_state()
+        self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+        self.set_lossless_runtime_prefix_views()
+        self._finalize_mode1_full_world_compact_metadata()
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = (
+                self._should_enable_mode1_parity_for_current_layout())
+
+        released_old_storage = 0
+        if _release_npu_parameter_storage(
+                old_w13, reason="mode1_full_world_compact_w13"):
+            released_old_storage += 1
+        if _release_npu_parameter_storage(
+                old_w2, reason="mode1_full_world_compact_w2"):
+            released_old_storage += 1
+        del old_w13
+        del old_w2
+        if os.getenv(
+                "VLLM_ASCEND_MODE1_FULL_WORLD_COMPACT_EMPTY_CACHE_PER_LAYER",
+                "0").lower() in ("1", "true", "yes", "on"):
+            gc.collect()
+            if hasattr(torch, "npu") and torch.npu.is_available():
+                torch.npu.empty_cache()
+                torch.npu.synchronize()
+        if self.layer_idx == 0:
+            logger.info(
+                "Mode1 full-world step physically compacted MoE loaded slots: "
+                "layer=%s primary_rows=%s old_rows=%s old_capacity=%s "
+                "new_capacity=%s old_weight_bytes=%s new_weight_bytes=%s "
+                "old_storage_bytes=%s new_storage_bytes=%s "
+                "released_old_storage=%s",
+                self.layer_idx,
+                primary_rows,
+                old_rows,
+                old_capacity,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+                old_w13_bytes + old_w2_bytes,
+                new_w13_bytes + new_w2_bytes,
+                old_w13_storage_bytes + old_w2_storage_bytes,
+                new_w13_storage_bytes + new_w2_storage_bytes,
+                released_old_storage,
+            )
+        return True
 
     def prepare_lossless_zero_redundancy_runtime_slots(self) -> bool:
         if (self.elastic_moe_mode != "lossless"

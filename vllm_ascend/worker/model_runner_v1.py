@@ -201,7 +201,7 @@ def _dummy_waste_rank() -> int:
     return -1
 
 
-def _module_is_custom_mode1_floor8(module: Any) -> bool:
+def _module_is_custom_mode1_low_floor(module: Any, max_floor: int = 8) -> bool:
     get_floor = getattr(module, "_get_configured_elastic_min_compute_group_size",
                         None)
     configured_floor = None
@@ -215,7 +215,11 @@ def _module_is_custom_mode1_floor8(module: Any) -> bool:
             getattr(envs_ascend,
                     "VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", 0) or 0)
     return (getattr(module, "elastic_execution_mode", 0) == 1
-            and int(configured_floor or 0) == 8)
+            and 0 < int(configured_floor or 0) <= int(max_floor))
+
+
+def _module_is_custom_mode1_floor8(module: Any) -> bool:
+    return _module_is_custom_mode1_low_floor(module, max_floor=8)
 
 
 def _module_has_mode1_native_parity_ready(module: Any) -> bool:
@@ -953,7 +957,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     elastic_mode == 3
                     and _env_flag("VLLM_ASCEND_MODE3_CPU_DP_METADATA_SYNC", "1")) or (
                         elastic_mode == 1 and _env_flag(
-                            "VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC", "1"))
+                            "VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC", "0"))
         sync_device = "cpu" if use_cpu_dp_metadata_sync else "npu"
         sync_group = (get_dp_group().cpu_group
                       if use_cpu_dp_metadata_sync else
@@ -1026,6 +1030,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return
         if not self.parallel_config.enable_expert_parallel:
+            return
+        if not _env_flag("VLLM_ASCEND_ELASTIC_FORWARD_FINGERPRINT_LOG", "0"):
             return
 
         if num_tokens_across_dp is None:

@@ -296,12 +296,17 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY":
     lambda: os.getenv("VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY",
                       "topology_aware").lower().strip(),
+    "VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY":
+    lambda: os.getenv("VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY",
+                      "natural").lower().strip(),
     "VLLM_ASCEND_SHRINK_AWARE_PACKAGE_TOPOLOGY":
     lambda: os.getenv("VLLM_ASCEND_SHRINK_AWARE_PACKAGE_TOPOLOGY", ""),
     "VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS":
     lambda: os.getenv("VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS", ""),
     "VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS":
     lambda: os.getenv("VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS", ""),
+    "VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS":
+    lambda: os.getenv("VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS", ""),
     "VLLM_ASCEND_SHRINK_AWARE_LENGTH_SOURCE":
     lambda: os.getenv("VLLM_ASCEND_SHRINK_AWARE_LENGTH_SOURCE",
                       "existing_regroup").lower().strip(),

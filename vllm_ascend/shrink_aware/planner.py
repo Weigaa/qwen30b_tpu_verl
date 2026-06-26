@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+from collections.abc import Iterable as IterableABC, Mapping
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence
 
@@ -12,6 +13,7 @@ class RankRolePlan:
     wave2_ranks: list[int]
     intermediate_survivor_ranks: list[int]
     final_survivor_ranks: list[int]
+    stage_survivor_ranks: list[list[int]]
     package_topology: list[list[int]]
     intermediate_survivor_packages: list[list[int]]
     final_survivor_packages: list[list[int]]
@@ -34,16 +36,46 @@ def parse_rank_topology(value: object,
     parsed = _parse_jsonish(value)
     if parsed is None:
         return None
-    if not isinstance(parsed, list):
+    if not _is_sequence_like(parsed):
         raise ValueError("package_topology must be a list of rank lists")
     topology: list[list[int]] = []
     for package in parsed:
-        if not isinstance(package, (list, tuple)):
+        if not _is_sequence_like(package):
             raise ValueError("package_topology must be a list of rank lists")
         ranks = [int(rank) for rank in package]
         topology.append(ranks)
     _validate_topology(topology, world_size)
     return topology
+
+
+def parse_stage_survivor_ranks(
+        value: object,
+        world_size: Optional[int] = None) -> Optional[list[list[int]]]:
+    if value is None or value == "":
+        return None
+    parsed = _parse_jsonish(value)
+    if parsed is None:
+        return None
+    if not _is_sequence_like(parsed):
+        raise ValueError("stage_survivor_ranks must be a list of rank lists")
+    stage_sets: list[list[int]] = []
+    for stage in parsed:
+        if not _is_sequence_like(stage):
+            raise ValueError("stage_survivor_ranks must be a list of rank lists")
+        ranks = [int(rank) for rank in stage]
+        if not ranks:
+            raise ValueError("stage_survivor_ranks cannot contain empty stages")
+        if len(set(ranks)) != len(ranks):
+            raise ValueError(
+                f"stage_survivor_ranks contains duplicate ranks within a stage: {ranks}")
+        for rank in ranks:
+            if world_size is not None and (rank < 0 or rank >= world_size):
+                raise ValueError(
+                    f"stage_survivor_ranks rank {rank} is out of range "
+                    f"for world_size={world_size}")
+        stage_sets.append(sorted(ranks))
+    _validate_nested_stages(stage_sets)
+    return stage_sets
 
 
 def parse_rank_list(value: object) -> Optional[list[int]]:
@@ -54,9 +86,16 @@ def parse_rank_list(value: object) -> Optional[list[int]]:
         return None
     if isinstance(parsed, str):
         parsed = [item for item in parsed.split(",") if item.strip()]
-    if not isinstance(parsed, (list, tuple)):
+    if not _is_sequence_like(parsed):
         raise ValueError(f"rank list must be a list or comma string, got {value!r}")
     return [int(rank) for rank in parsed]
+
+
+def _is_sequence_like(value: object) -> bool:
+    return (
+        isinstance(value, IterableABC)
+        and not isinstance(value, (str, bytes, bytearray, Mapping))
+    )
 
 
 def plan_survivor_ranks(
@@ -66,17 +105,19 @@ def plan_survivor_ranks(
     policy: str = "topology_aware",
     intermediate_survivor_ranks: Optional[Sequence[int]] = None,
     final_survivor_ranks: Optional[Sequence[int]] = None,
+    stage_survivor_ranks: Optional[Sequence[Sequence[int]]] = None,
 ) -> RankRolePlan:
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, got {world_size}")
     stages = [int(stage) for stage in shrink_stages]
-    if len(stages) != 2:
-        raise ValueError(f"shrink_stages must contain exactly two stages, got {stages}")
-    intermediate_size, final_size = stages
-    if not (world_size >= intermediate_size >= final_size > 0):
+    if len(stages) < 1:
+        raise ValueError(f"shrink_stages must contain at least one stage, got {stages}")
+    if not all(left >= right > 0 for left, right in zip([world_size] + stages, stages)):
         raise ValueError(
-            "shrink_stages must satisfy world_size >= intermediate >= final > 0, "
+            "shrink_stages must satisfy world_size >= stage1 >= ... >= final > 0, "
             f"got world_size={world_size}, stages={stages}")
+    intermediate_size = stages[0]
+    final_size = stages[-1]
 
     normalized_topology = [list(map(int, pkg)) for pkg in (
         package_topology if package_topology is not None
@@ -85,7 +126,22 @@ def plan_survivor_ranks(
 
     policy = (policy or "topology_aware").lower().strip()
     fallback_reason: Optional[str] = None
-    if policy == "manual":
+    manual_stage_sets: Optional[list[list[int]]] = None
+    if stage_survivor_ranks is not None:
+        raw_stage_sets = [list(map(int, ranks)) for ranks in stage_survivor_ranks]
+        if len(raw_stage_sets) != len(stages):
+            raise ValueError(
+                "stage_survivor_ranks must have the same length as shrink_stages, "
+                f"got {len(raw_stage_sets)} and {len(stages)}")
+        manual_stage_sets = [
+            _validate_rank_set(ranks, world_size, size, f"stage_survivor_ranks[{idx}]")
+            for idx, (ranks, size) in enumerate(zip(raw_stage_sets, stages))
+        ]
+        _validate_nested_stages(manual_stage_sets)
+        intermediate = manual_stage_sets[0]
+        final = manual_stage_sets[-1]
+        fallback_reason = "manual_stage_ranks"
+    elif policy == "manual":
         if intermediate_survivor_ranks is None or final_survivor_ranks is None:
             raise ValueError(
                 "manual survivor selection requires both intermediate and final survivor ranks")
@@ -96,9 +152,11 @@ def plan_survivor_ranks(
             final_survivor_ranks, world_size, final_size,
             "final_survivor_ranks")
         _validate_subset(final, intermediate)
+        manual_stage_sets = _derive_nested_stage_sets(stages, intermediate, final)
     elif policy == "contiguous":
         final = list(range(final_size))
         intermediate = list(range(intermediate_size))
+        manual_stage_sets = [list(range(size)) for size in stages]
     elif policy == "topology_aware":
         if intermediate_survivor_ranks is not None or final_survivor_ranks is not None:
             intermediate = _validate_rank_set(
@@ -108,10 +166,12 @@ def plan_survivor_ranks(
                 final_survivor_ranks or [], world_size, final_size,
                 "final_survivor_ranks")
             _validate_subset(final, intermediate)
+            manual_stage_sets = _derive_nested_stage_sets(stages, intermediate, final)
             fallback_reason = "manual_ranks_override_topology_policy"
         else:
             intermediate, final, fallback_reason = _topology_aware_survivors(
                 world_size, normalized_topology, intermediate_size, final_size)
+            manual_stage_sets = _derive_nested_stage_sets(stages, intermediate, final)
     else:
         raise ValueError(
             "survivor_selection_policy must be topology_aware, contiguous, or manual, "
@@ -120,6 +180,8 @@ def plan_survivor_ranks(
     intermediate = sorted(intermediate)
     final = sorted(final)
     _validate_subset(final, intermediate)
+    stage_sets = [sorted(stage) for stage in (manual_stage_sets or [intermediate, final])]
+    _validate_nested_stages(stage_sets)
 
     all_ranks = set(range(world_size))
     final_set = set(final)
@@ -137,6 +199,7 @@ def plan_survivor_ranks(
         wave2_ranks=wave2,
         intermediate_survivor_ranks=intermediate,
         final_survivor_ranks=final,
+        stage_survivor_ranks=stage_sets,
         package_topology=normalized_topology,
         intermediate_survivor_packages=intermediate_packages,
         final_survivor_packages=final_packages,
@@ -183,6 +246,42 @@ def _validate_subset(final: Sequence[int], intermediate: Sequence[int]) -> None:
         raise ValueError(
             "final_survivor_ranks must be a subset of intermediate_survivor_ranks, "
             f"missing={missing}")
+
+
+def _validate_nested_stages(stage_sets: Sequence[Sequence[int]]) -> None:
+    for prev, current in zip(stage_sets, stage_sets[1:]):
+        _validate_subset(current, prev)
+
+
+def _derive_nested_stage_sets(
+    stages: Sequence[int],
+    intermediate: Sequence[int],
+    final: Sequence[int],
+) -> list[list[int]]:
+    if len(stages) == 1:
+        return [sorted(final)]
+    if len(stages) == 2:
+        return [sorted(intermediate), sorted(final)]
+    final_set = set(int(rank) for rank in final)
+    ordered_intermediate = sorted(
+        (int(rank) for rank in intermediate),
+        key=lambda rank: (rank not in final_set, rank),
+    )
+    stage_sets: list[list[int]] = []
+    for idx, size in enumerate(stages):
+        if idx == 0:
+            stage_sets.append(sorted(intermediate))
+        elif idx == len(stages) - 1:
+            stage_sets.append(sorted(final))
+        else:
+            if size < len(final_set) or size > len(ordered_intermediate):
+                raise ValueError(
+                    "cannot derive nested stage set: "
+                    f"stage_size={size}, intermediate={len(ordered_intermediate)}, "
+                    f"final={len(final_set)}")
+            stage_sets.append(sorted(ordered_intermediate[:size]))
+    _validate_nested_stages(stage_sets)
+    return stage_sets
 
 
 def _validate_topology(topology: Sequence[Sequence[int]],

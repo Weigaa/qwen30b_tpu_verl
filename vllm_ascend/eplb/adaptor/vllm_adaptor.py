@@ -106,6 +106,19 @@ class VllmEplbAdaptor(EplbAdaptor):
                     for name in self.expert_weight_names
                 ])
 
+    def refresh_parameter_references(self) -> None:
+        """Refresh cached parameter views after runtime weight replacement.
+
+        Mode-1 adaptive KV resizing can replace MoE expert Parameters with
+        compact resident tensors.  EPLB keeps a full-name parameter dictionary
+        and per-expert tensor views for D2D transfer; without refreshing them,
+        those dictionaries keep the old 32-slot Parameters alive and prevent
+        their NPU storage from being released.
+        """
+        self.param_dict = dict(self.model.named_parameters())
+        self.expert_param_per_layer.clear()
+        self.init_expert_param_per_layer()
+
     def get_rank_expert_workload(self) -> torch.Tensor:
         self.moe_load = self.model.get_all_moe_loads()
         return self.moe_load
