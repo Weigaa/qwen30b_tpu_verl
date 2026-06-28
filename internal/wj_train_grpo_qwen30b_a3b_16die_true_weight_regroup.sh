@@ -19,10 +19,35 @@ export RAY_DEDUP_LOGS=0
 export ASCEND_GLOBAL_EVENT_ENABLE=0         
 export ASCEND_SLOG_PRINT_TO_STDOUT=0       
 export ASCEND_GLOBAL_LOG_LEVEL=3             
-export HCCL_IF_BASE_PORT=64021
+export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-360}
+export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-64021}
+export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-360}
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-export MASTER_PORT=23300    # vllm port error
+if [[ -z "${GLOO_SOCKET_IFNAME:-}" ]]; then
+    default_gloo_ifname=$(
+        awk '$2 == "00000000" && $1 != "lo" { print $1; exit }' \
+            /proc/net/route 2>/dev/null || true
+    )
+    if [[ -z "${default_gloo_ifname}" ]]; then
+        default_gloo_ifname=$(
+            for iface_path in /sys/class/net/*; do
+                iface=$(basename "${iface_path}")
+                [[ "${iface}" == "lo" ]] && continue
+                [[ -r "${iface_path}/operstate" ]] || continue
+                [[ "$(cat "${iface_path}/operstate")" == "up" ]] || continue
+                echo "${iface}"
+                break
+            done
+        )
+    fi
+    if [[ -n "${default_gloo_ifname}" ]]; then
+        export GLOO_SOCKET_IFNAME="${default_gloo_ifname}"
+    fi
+fi
+echo "[gloo] GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-}"
+
+export MASTER_PORT=${MASTER_PORT:-23300}    # vllm port error
 export D2D_DATA_TRANSFER=1
 
 export VLLM_USE_V1=1
@@ -30,8 +55,13 @@ export PRINT_MEMORY=1
 export USE_ALLTOALL_OVERLAP=1
 export HCCL_OP_EXPANSION_MODE=AIV
 export VLLM_LOGGING_LEVEL=INFO
-export VLLM_ENABLE_MC2=1                     # 910C开启
-export VLLM_DP_SIZE=16                        # world_size // rollout.tp_size
+export VLLM_ASCEND_FORCE_ALLTOALL_MOE=${VLLM_ASCEND_FORCE_ALLTOALL_MOE:-0}  # 1: force AllToAll for EP MoE, 0: allow MC2
+if [[ "${VLLM_ASCEND_FORCE_ALLTOALL_MOE}" == "1" ]]; then
+    export VLLM_ENABLE_MC2=0
+else
+    export VLLM_ENABLE_MC2=1
+fi
+export VLLM_DP_SIZE=${VLLM_DP_SIZE:-16}                        # world_size // rollout.tp_size
 export HCCL_BUFFSIZE=800
 
 export TASK_QUEUE_ENABLE=2
@@ -50,9 +80,9 @@ export VLLM_ENABLE_EPLB=0                   # 0: disable eplb, 1: enable eplb
 export USE_HDP=0                            # 0: disable hdp, 1: enable hdp
 export ROLLOUT_REBALANCE_ENABLE=0          # 0: disable rollout rebalance, 1: enable rollout rebalance
 #关闭看门狗,并控制超时时间
-export HCCL_ASYNC_ERROR_HANDLING=0
-export HCCL_EXEC_TIMEOUT=7200
-export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_ASYNC_ERROR_HANDLING=${HCCL_ASYNC_ERROR_HANDLING:-1}
+export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-360}
+export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-360}
 
 #控制llm.py里的profiler
 export VLLM_ASCEND_LLM_PROFILE_ENABLE=0
