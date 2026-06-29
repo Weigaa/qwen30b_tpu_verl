@@ -505,6 +505,25 @@ class EngineCore:
                 target_floor_int,
             )
             _log_comm_cache_state("after_floor_prepare")
+            if (target_policy not in ("planned", "fixed", "plan")
+                    and self._env_flag(
+                        "VLLM_ASCEND_MODE1_NATURAL_PRUNE_RUNTIME_ON_KV_RESIZE",
+                        "1")):
+                logger.info(
+                    "Mode1 adaptive KV resize phase=natural_runtime_prune_start "
+                    "target_floor=%s",
+                    target_floor_int,
+                )
+                self.collective_rpc(
+                    "prune_mode1_natural_runtime_for_kv_resize",
+                    args=(target_floor_int, ))
+                gc.collect()
+                logger.info(
+                    "Mode1 adaptive KV resize phase=natural_runtime_prune_done "
+                    "target_floor=%s",
+                    target_floor_int,
+                )
+                _log_comm_cache_state("after_natural_runtime_prune")
         self.collective_rpc("mode1_resize_world_barrier",
                             args=("after_floor_prepare", ))
         if self._env_flag("VLLM_ASCEND_MODE1_KV_RESIZE_LIVE_TENSOR_SCAN", "0"):

@@ -456,6 +456,7 @@ def _release_area_matching_for_floor(
     kv_cap: float,
     active_peak_safety_factor: float,
     max_response_len: float,
+    allow_zero_release_censored_tail: bool = False,
 ) -> tuple[list[PairMetric], bool, tuple[float, ...], tuple[tuple[float, int], ...], float, str]:
     metrics = _pair_metrics(
         group,
@@ -530,6 +531,15 @@ def _release_area_matching_for_floor(
         selected_floor=selected_floor,
         tail_time=max(item.load for item in group),
     )
+    if allow_zero_release_censored_tail and max_response_len < DEFAULT_MAX_RESPONSE_LEN:
+        return (
+            pairs,
+            True,
+            fallback_thresholds[0],
+            fallback_thresholds[1],
+            fallback_thresholds[2],
+            "censored_tail_kv_feasible_min_skew",
+        )
     return (
         pairs,
         False,
@@ -586,6 +596,7 @@ def _solve_one_batch(
     min_adaptive_floor: int = 2,
     active_peak_safety_factor: float,
     max_response_len: float,
+    ignore_tail_ties_at_response_cap: bool = False,
 ) -> BatchPlan:
     if len(batch) != 32:
         raise ValueError(f"one e2e batch requires 32 prompts, got {len(batch)}")
@@ -612,6 +623,16 @@ def _solve_one_batch(
         ) in zip(ALL_RANKS, probe_pairs, strict=True)
     }
     theoretical_floor = _theoretical_floor_from_rank_loads(probe_loads)
+    if ignore_tail_ties_at_response_cap and max_response_len < DEFAULT_MAX_RESPONSE_LEN:
+        # A short max-response smoke test censors all longer generations at the
+        # artificial cap. Many unrelated prompts can then have identical
+        # max_len=max_response_len, which is not evidence that all their ranks
+        # would be true tail ranks in an uncapped rollout. Keep the theoretical
+        # value for reporting, but let the KV/release-area oracle choose the
+        # actual floor instead of forcing floor16 from capped ties.
+        theoretical_floor_for_selection = int(min_adaptive_floor)
+    else:
+        theoretical_floor_for_selection = int(theoretical_floor)
     if not adaptive_floor:
         selected_floor = 4
         kv_cap = float(max_rank_peak_tokens)
@@ -628,6 +649,7 @@ def _solve_one_batch(
             kv_cap=kv_cap,
             active_peak_safety_factor=active_peak_safety_factor,
             max_response_len=max_response_len,
+            allow_zero_release_censored_tail=ignore_tail_ties_at_response_cap,
         )
     else:
         selected_floor = 16
@@ -638,7 +660,8 @@ def _solve_one_batch(
         schedule_quotas = ()
         release_area = 0.0
         rank_matching_objective = "probe"
-        start_floor = int(min_adaptive_floor)
+        start_floor = max(int(min_adaptive_floor),
+                          int(theoretical_floor_for_selection))
         for floor in FLOOR_CANDIDATES:
             if floor < start_floor:
                 continue
@@ -656,6 +679,7 @@ def _solve_one_batch(
                 kv_cap=cap,
                 active_peak_safety_factor=active_peak_safety_factor,
                 max_response_len=max_response_len,
+                allow_zero_release_censored_tail=ignore_tail_ties_at_response_cap,
             )
             selected_floor = int(floor)
             kv_cap = cap
@@ -739,6 +763,7 @@ def _solve_group(
     min_adaptive_floor: int = 2,
     active_peak_safety_factor: float,
     max_response_len: float,
+    ignore_tail_ties_at_response_cap: bool = False,
 ) -> BatchPlan:
     return _solve_one_batch(
         group,
@@ -748,6 +773,7 @@ def _solve_group(
         min_adaptive_floor=min_adaptive_floor,
         active_peak_safety_factor=active_peak_safety_factor,
         max_response_len=max_response_len,
+        ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
     )
 
 
@@ -765,6 +791,7 @@ def _solve_group_cached(
     min_adaptive_floor: int = 2,
     active_peak_safety_factor: float,
     max_response_len: float,
+    ignore_tail_ties_at_response_cap: bool = False,
 ) -> BatchPlan:
     key = _group_cache_key(group)
     cached = cache.get(key)
@@ -778,6 +805,7 @@ def _solve_group_cached(
         min_adaptive_floor=min_adaptive_floor,
         active_peak_safety_factor=active_peak_safety_factor,
         max_response_len=max_response_len,
+        ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
     )
     cache[key] = plan
     return plan
@@ -827,6 +855,7 @@ def _best_single_swap_repair(
     active_peak_safety_factor: float,
     max_response_len: float,
     repair_candidate_limit: int,
+    ignore_tail_ties_at_response_cap: bool = False,
 ) -> tuple[int, int, BatchPlan, BatchPlan] | None:
     current_bad = plans[bad_index]
     current_neighbor = plans[neighbor_index]
@@ -900,6 +929,7 @@ def _best_single_swap_repair(
                     min_adaptive_floor=min_adaptive_floor,
                     active_peak_safety_factor=active_peak_safety_factor,
                     max_response_len=max_response_len,
+                    ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
                 )
                 neighbor_plan = _solve_group_cached(
                     candidate_neighbor,
@@ -910,6 +940,7 @@ def _best_single_swap_repair(
                     min_adaptive_floor=min_adaptive_floor,
                     active_peak_safety_factor=active_peak_safety_factor,
                     max_response_len=max_response_len,
+                    ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
                 )
                 if current_neighbor.feasible and not neighbor_plan.feasible:
                     continue
@@ -942,6 +973,7 @@ def _repair_infeasible_groups(
     max_response_len: float,
     max_cross_step_repair_swaps: int,
     repair_candidate_limit: int,
+    ignore_tail_ties_at_response_cap: bool = False,
 ) -> list[BatchPlan]:
     solve_cache: dict[tuple[int, ...], BatchPlan] = {}
     plans = [
@@ -954,6 +986,7 @@ def _repair_infeasible_groups(
             min_adaptive_floor=min_adaptive_floor,
             active_peak_safety_factor=active_peak_safety_factor,
             max_response_len=max_response_len,
+            ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
         )
         for group in groups
     ]
@@ -978,6 +1011,7 @@ def _repair_infeasible_groups(
                     active_peak_safety_factor=active_peak_safety_factor,
                     max_response_len=max_response_len,
                     repair_candidate_limit=repair_candidate_limit,
+                    ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
                 )
                 if repair is None:
                     continue
@@ -1021,6 +1055,7 @@ def _solve_batches(
     max_response_len: float,
     max_cross_step_repair_swaps: int,
     repair_candidate_limit: int,
+    ignore_tail_ties_at_response_cap: bool = False,
 ) -> list[BatchPlan]:
     if batch_size != 32:
         raise ValueError(f"length-sorted e2e plan expects batch_size=32, got {batch_size}")
@@ -1042,6 +1077,7 @@ def _solve_batches(
                 min_adaptive_floor=min_adaptive_floor,
                 active_peak_safety_factor=active_peak_safety_factor,
                 max_response_len=max_response_len,
+                ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
             ) for group in groups
         ]
     return _repair_infeasible_groups(
@@ -1054,6 +1090,7 @@ def _solve_batches(
         max_response_len=max_response_len,
         max_cross_step_repair_swaps=max_cross_step_repair_swaps,
         repair_candidate_limit=repair_candidate_limit,
+        ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
     )
 
 
@@ -1070,6 +1107,12 @@ def _write_outputs(
     max_response_len: float,
     baseline_dirs: list[Path],
     length_ema_decay: float,
+    tail_guard_ratio: float,
+    tail_guard_ratio_quantile: float,
+    tail_guard_ratio_window: int,
+    tail_guard_sample_count: int,
+    tail_guard_min_cap: int,
+    tail_guard_round_to: int,
 ) -> None:
     ordered_source_indices: list[int] = []
     plan_payload: list[dict[str, Any]] = []
@@ -1077,6 +1120,16 @@ def _write_outputs(
     row_loads: dict[str, float] = {}
     next_row = 0
     for step_idx, plan in enumerate(plans, start=1):
+        predicted_step_exit = max(plan.rank_loads[rank] for rank in ALL_RANKS)
+        raw_tail_guard_cap = float(tail_guard_ratio) * float(predicted_step_exit)
+        tail_guard_cap = min(
+            int(max_response_len),
+            max(
+                int(tail_guard_min_cap),
+                _ceil_to_multiple(raw_tail_guard_cap, int(tail_guard_round_to)),
+            ),
+        )
+        tail_guard_enabled = int(tail_guard_cap) < int(max_response_len)
         load_by_source = {
             int(item.source_idx): float(item.load)
             for item in plan.prompts
@@ -1101,6 +1154,20 @@ def _write_outputs(
             ],
             "release_area": float(plan.release_area),
             "rank_matching_solver": str(plan.rank_matching_objective),
+            "tail_guard_response_cap": int(tail_guard_cap),
+            "tail_guard_enabled": bool(tail_guard_enabled),
+            "tail_guard_ratio": float(tail_guard_ratio),
+            "tail_guard_ratio_quantile": float(tail_guard_ratio_quantile),
+            "tail_guard_ratio_window": int(tail_guard_ratio_window),
+            "tail_guard_ratio_sample_count": int(tail_guard_sample_count),
+            "tail_guard_predicted_step_exit": float(predicted_step_exit),
+            "tail_guard_raw_cap": float(raw_tail_guard_cap),
+            "tail_guard_min_cap": int(tail_guard_min_cap),
+            "tail_guard_round_to": int(tail_guard_round_to),
+            "tail_guard_formula": (
+                "min(max_response_len, max(min_cap, "
+                "ceil_to_multiple(ratio_q * predicted_step_exit, round_to)))"
+            ),
             "shrink_stages": [int(stage) for stage in plan.shrink_stages],
             "stage_survivor_ranks": [
                 [int(rank) for rank in ranks]
@@ -1168,6 +1235,16 @@ def _write_outputs(
         ]
         load_gaps = [plan.rank_load_gaps[rank] for rank in ALL_RANKS]
         sums = [plan.rank_token_sums[rank] for rank in ALL_RANKS]
+        predicted_step_exit = max(loads)
+        raw_tail_guard_cap = float(tail_guard_ratio) * float(predicted_step_exit)
+        tail_guard_cap = min(
+            int(max_response_len),
+            max(
+                int(tail_guard_min_cap),
+                _ceil_to_multiple(raw_tail_guard_cap, int(tail_guard_round_to)),
+            ),
+        )
+        tail_guard_enabled = int(tail_guard_cap) < int(max_response_len)
         summary.append({
             "step": step_idx,
             "feasible": plan.feasible,
@@ -1205,6 +1282,21 @@ def _write_outputs(
             ],
             "release_area": float(plan.release_area),
             "rank_matching_solver": str(plan.rank_matching_objective),
+            "tail_guard_response_cap": int(tail_guard_cap),
+            "tail_guard_enabled": bool(tail_guard_enabled),
+            "tail_guard_ratio": float(tail_guard_ratio),
+            "tail_guard_ratio_quantile": float(tail_guard_ratio_quantile),
+            "tail_guard_ratio_window": int(tail_guard_ratio_window),
+            "tail_guard_ratio_sample_count": int(tail_guard_sample_count),
+            "tail_guard_raw_cap": float(raw_tail_guard_cap),
+            "tail_guard_min_cap": int(tail_guard_min_cap),
+            "tail_guard_round_to": int(tail_guard_round_to),
+            "tail_guard_prompt_tail_stat": "max_response_over_rollout_n",
+            "tail_guard_ratio_definition": (
+                "Q_q(max(1, actual_prompt_max_tail / "
+                "predicted_prompt_max_tail)) over a sliding window of "
+                "recent adjacent historical epochs"
+            ),
             "active_peak_safety_factor": float(active_peak_safety_factor),
             "max_response_len": float(max_response_len),
             "length_prediction_mode": (
@@ -1256,6 +1348,80 @@ def _parse_floor_kv_caps(value: str | None,
     return caps
 
 
+def _ceil_to_multiple(value: float, multiple: int) -> int:
+    if multiple <= 1:
+        return int(np.ceil(value))
+    return int(np.ceil(value / float(multiple)) * multiple)
+
+
+def _tail_guard_underestimate_ratio(
+    baseline_dirs: list[Path],
+    *,
+    steps: int,
+    responses_per_prompt: int,
+    ema_decay: float,
+    quantile: float,
+    default_ratio: float,
+    window: int,
+) -> tuple[float, int]:
+    """Calibrate prompt-level max-tail underestimation from history.
+
+    For history dirs d0, d1, ..., dk, predict dj from the EMA of d0..d(j-1)
+    and compare prompt-level max response lengths.  The returned ratio is the
+    high quantile of max(1, actual_max / predicted_max) over the most recent
+    `window` adjacent epoch transitions.
+    """
+    if len(baseline_dirs) < 2:
+        return float(default_ratio), 0
+
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError(
+            f"--tail-guard-ratio-quantile must be in [0, 1], got {quantile}")
+    if window <= 0:
+        raise ValueError(f"--tail-guard-ratio-window must be positive, got {window}")
+
+    ema_by_input: dict[str, tuple[float, ...]] = {}
+    transition_ratios: list[list[float]] = []
+    eps = 1.0
+    for idx, baseline_dir in enumerate(baseline_dirs):
+        current = _read_baseline_stats(
+            baseline_dir, steps, responses_per_prompt)
+        if idx > 0:
+            current_ratios: list[float] = []
+            for prompt_input, actual in current.items():
+                predicted = ema_by_input.get(prompt_input)
+                if predicted is None:
+                    continue
+                predicted_tail = max(float(item) for item in predicted)
+                actual_tail = float(actual.max_len)
+                current_ratios.append(max(
+                    1.0, actual_tail / max(predicted_tail, eps)))
+            if current_ratios:
+                transition_ratios.append(current_ratios)
+
+        for prompt_input, stat in current.items():
+            previous = ema_by_input.get(prompt_input)
+            if previous is None:
+                ema_by_input[prompt_input] = stat.lengths
+            else:
+                if len(previous) != len(stat.lengths):
+                    continue
+                ema_by_input[prompt_input] = tuple(
+                    ema_decay * old + (1.0 - ema_decay) * new
+                    for old, new in zip(previous, stat.lengths, strict=True)
+                )
+
+    recent_transitions = transition_ratios[-int(window):]
+    ratios = [
+        ratio
+        for transition in recent_transitions
+        for ratio in transition
+    ]
+    if not ratios:
+        return float(default_ratio), 0
+    return float(np.quantile(np.asarray(ratios, dtype=np.float64), quantile)), len(ratios)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-dir", action="append", required=True)
@@ -1287,12 +1453,40 @@ def main() -> None:
             "2:147456,4:280576,8:377344,16:377344."))
     parser.add_argument("--active-peak-safety-factor", type=float, default=1.16)
     parser.add_argument("--max-response-len", type=float, default=DEFAULT_MAX_RESPONSE_LEN)
+    parser.add_argument(
+        "--ignore-tail-ties-at-response-cap",
+        action="store_true",
+        help=(
+            "For short max-response smoke tests, do not treat many "
+            "max_len==max_response_len ties as proof that shrink is impossible. "
+            "The original theoretical floor is still reported."))
     parser.add_argument("--max-cross-step-repair-swaps", type=int, default=8)
     parser.add_argument("--repair-candidate-limit", type=int, default=8)
+    parser.add_argument("--tail-guard-ratio-quantile", type=float, default=0.95)
+    parser.add_argument("--tail-guard-ratio-window", type=int, default=3)
+    parser.add_argument("--tail-guard-default-ratio", type=float, default=1.20)
+    parser.add_argument("--tail-guard-min-cap", type=int, default=4096)
+    parser.add_argument("--tail-guard-round-to", type=int, default=512)
     parser.add_argument("--allow-infeasible", action="store_true")
     args = parser.parse_args()
 
     baseline_dirs = [Path(item) for item in args.baseline_dir]
+    tail_guard_ratio, tail_guard_sample_count = _tail_guard_underestimate_ratio(
+        baseline_dirs,
+        steps=args.steps,
+        responses_per_prompt=args.responses_per_prompt,
+        ema_decay=args.length_ema_decay,
+        quantile=args.tail_guard_ratio_quantile,
+        default_ratio=args.tail_guard_default_ratio,
+        window=args.tail_guard_ratio_window,
+    )
+    print(
+        "[mode1 length-sorted e2e plan] tail guard "
+        f"ratio_q={args.tail_guard_ratio_quantile} "
+        f"window={args.tail_guard_ratio_window} "
+        f"ratio={tail_guard_ratio:.6f} samples={tail_guard_sample_count} "
+        f"min_cap={args.tail_guard_min_cap} round_to={args.tail_guard_round_to}"
+    )
     stats_by_input = _read_ema_baseline_stats(
         baseline_dirs,
         args.steps,
@@ -1320,6 +1514,7 @@ def main() -> None:
         max_response_len=args.max_response_len,
         max_cross_step_repair_swaps=args.max_cross_step_repair_swaps,
         repair_candidate_limit=args.repair_candidate_limit,
+        ignore_tail_ties_at_response_cap=args.ignore_tail_ties_at_response_cap,
     )
     infeasible_steps = [
         idx for idx, plan in enumerate(plans, start=1) if not plan.feasible
@@ -1357,6 +1552,12 @@ def main() -> None:
         max_response_len=args.max_response_len,
         baseline_dirs=baseline_dirs,
         length_ema_decay=args.length_ema_decay,
+        tail_guard_ratio=tail_guard_ratio,
+        tail_guard_ratio_quantile=args.tail_guard_ratio_quantile,
+        tail_guard_ratio_window=args.tail_guard_ratio_window,
+        tail_guard_sample_count=tail_guard_sample_count,
+        tail_guard_min_cap=args.tail_guard_min_cap,
+        tail_guard_round_to=args.tail_guard_round_to,
     )
 
 

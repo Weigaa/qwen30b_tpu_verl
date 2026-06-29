@@ -9241,6 +9241,104 @@ class NPUWorker(WorkerBase):
             )
         return stats
 
+    def prune_mode1_natural_runtime_for_kv_resize(
+            self, target_floor: int) -> dict[str, float]:
+        """Release non-resident natural-mode shrink runtime before KV sizing.
+
+        Natural policy does not intentionally keep floor8/floor4 communicators
+        across steps.  After a real shrink, however, MoE comm methods may still
+        hold dispatcher/runtime workspace references until the next topology is
+        materialized.  Drop those transient references before planning the next
+        step's KV cache so floor8 can use the true natural-mode budget instead
+        of inheriting floor4 warmup residue.
+        """
+        stats: dict[str, float] = {
+            "changed": 0.0,
+            "dropped_groups": 0.0,
+            "deferred_groups": 0.0,
+            "dropped_signatures": 0.0,
+            "topology_dropped": 0.0,
+            "topology_methods_dropped": 0.0,
+            "runtime_tensor_bytes": 0.0,
+            "runtime_tensors": 0.0,
+            "total_ms": 0.0,
+        }
+        start_t = time.perf_counter()
+        try:
+            target_floor = int(target_floor)
+        except (TypeError, ValueError):
+            return stats
+        target_policy = os.getenv("VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY",
+                                  "natural").strip().lower()
+        if target_policy in ("planned", "fixed", "plan"):
+            return stats
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return stats
+        if not torch.distributed.is_initialized():
+            return stats
+
+        world_size = int(torch.distributed.get_world_size())
+        full_world_ranks = tuple(range(world_size))
+        force_destroy = _env_flag(
+            "VLLM_ASCEND_MODE1_NATURAL_FORCE_DESTROY_FLOOR_GROUPS_ON_KV_RESIZE",
+            "1")
+        drop_stats = self._drop_stale_cached_elastic_parallel_groups(
+            full_world_ranks,
+            reason=f"natural_kv_resize_prepare:target_floor={target_floor}",
+            force_destroy=force_destroy,
+        )
+        runtime_stats = self._release_mode1_moe_comm_runtime_state(
+            f"natural_kv_resize_prepare:target_floor={target_floor}")
+        topology_stats = prune_moe_comm_method_topology_cache(
+            {full_world_ranks})
+        gc.collect()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception(
+                "Failed to empty/sync NPU cache after natural KV prune")
+
+        stats["dropped_groups"] = float(drop_stats.get("dropped_groups", 0.0))
+        stats["deferred_groups"] = float(drop_stats.get("deferred_groups", 0.0))
+        stats["dropped_signatures"] = float(
+            drop_stats.get("dropped_signatures", 0.0))
+        stats["topology_dropped"] = float(
+            topology_stats.get("dropped_topologies", 0))
+        stats["topology_methods_dropped"] = float(
+            topology_stats.get("dropped_methods", 0))
+        stats["runtime_tensor_bytes"] = float(
+            runtime_stats.get("tensor_bytes", 0))
+        stats["runtime_tensors"] = float(runtime_stats.get("tensors", 0))
+        stats["total_ms"] = (time.perf_counter() - start_t) * 1000.0
+        changed = (
+            stats["dropped_groups"] > 0.0
+            or stats["dropped_signatures"] > 0.0
+            or stats["topology_dropped"] > 0.0
+            or stats["runtime_tensor_bytes"] > 0.0)
+        stats["changed"] = 1.0 if changed else 0.0
+        logger.info(
+            "Mode1 natural KV resize runtime prune summary: rank=%s "
+            "target_floor=%s changed=%.0f dropped_groups=%.0f "
+            "deferred_groups=%.0f dropped_signatures=%.0f "
+            "topology_dropped=%.0f topology_methods_dropped=%.0f "
+            "runtime_tensors=%.0f runtime_tensor_bytes=%.0f "
+            "force_destroy=%s total_ms=%.2f",
+            self.rank,
+            target_floor,
+            stats["changed"],
+            stats["dropped_groups"],
+            stats["deferred_groups"],
+            stats["dropped_signatures"],
+            stats["topology_dropped"],
+            stats["topology_methods_dropped"],
+            stats["runtime_tensors"],
+            stats["runtime_tensor_bytes"],
+            force_destroy,
+            stats["total_ms"],
+        )
+        return stats
+
     def _precreate_mode1_planned_floor_groups_before_kv_cache(
             self, prefill_expert_slots: bool = True) -> dict[str, float]:
         stats: dict[str, float] = {

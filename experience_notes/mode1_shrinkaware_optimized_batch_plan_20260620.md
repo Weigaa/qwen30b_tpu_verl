@@ -909,7 +909,7 @@ adaptive plan, step 5 is allowed to recover the full-world layout and a larger
 KV cache, so the old short-swap repair is no longer required unless floor16 is
 also infeasible.
 
-### Rank Pairing Solver
+### Rank Assignment Solver
 
 For each fixed 32-prompt step, the solver builds a graph with one vertex per
 prompt. An edge \((i,j)\) means the two prompts can share one rank. The edge is
@@ -927,27 +927,14 @@ A(\{\min(\mu l, L_{\max}) : l \in R_i \cup R_j\}),
 \quad \mu=1.16,\quad L_{\max}=16384.
 $$
 
-Among the remaining feasible edges, the solver runs exact minimum-weight
-perfect matching with:
-
-$$
-w(i,j) = |m_i - m_j|.
-$$
-
-So for a fixed step and fixed candidate floor, the selected matching is globally
-optimal for:
-
-$$
-\min_M \sum_{(i,j)\in M} |m_i - m_j|
-\quad
-\text{s.t.}
-\quad
-A_\mu(\{i,j\}) \le C_f.
-$$
-
-This makes the two prompts assigned to the same rank finish as closely as
-possible, which reduces rank-internal idle time and avoids making a long prompt
-share a rank with a very short prompt when a safer feasible pairing exists.
+The earlier implementation then minimized only the rank-internal length gap.
+The current implementation instead treats shrink timing as the first-class
+objective. For a candidate floor, it enumerates feasible shrink schedules and
+calls a quota-aware exact matching oracle. The primary objective is to maximize
+released rank-time area subject to KV feasibility and schedule quotas; length
+gap, pair max length, adjusted peak, and token sum are only tie-breakers inside
+a fixed release-area schedule. This aligns the offline assignment objective with
+the system-level benefit of making ranks reusable earlier.
 
 ### Natural Runtime Policy
 
@@ -1280,6 +1267,106 @@ planner-residency headroom from
 `run_mode1_local_length_sorted_e2e_adaptive_floor4.sh`, so the offline planner
 sees the reduced effective KV caps before selecting floors or attempting repair.
 
+### Step-Level Tail Outlier Guard
+
+The adaptive length-sorted plan optimizes batch construction from historical
+response lengths, but a synchronous rollout step can still be dominated by a
+rare pathological generation. In epoch2 of the planner run, step1 was planned
+as a short step with predicted exit around `3768`, while five realized responses
+hit `16384`; the step therefore behaved like a long-tail step even though most
+responses were short.
+
+The guard is not a fixed `max4096` smoke-test threshold. It is a calibrated
+per-step upper bound derived from historical prediction error. For every prompt
+we first reduce its `rollout.n=16` responses to a prompt-level tail statistic:
+
+$$
+\hat{M}_i=\max_j \hat{L}_{i,j}, \qquad
+M_i=\max_j L_{i,j}.
+$$
+
+Using the maximum is deliberate: step latency is sensitive to the slowest
+response for a prompt, and using the mean would hide exactly the tail behavior
+that can dominate wall-clock time.
+
+The per-prompt length predictor itself already uses EMA. The tail guard
+therefore does not add another EMA on the error ratio. Instead, for each
+adjacent historical transition, the planner predicts epoch \(k\) from the EMA of
+epochs before \(k\), then measures the prompt-level underestimation ratio:
+
+$$
+r_i^+ =
+\max\left(1, \frac{M_i}{\hat{M}_i+\epsilon}\right).
+$$
+
+The global calibration factor is the empirical high quantile over a recent
+sliding window of adjacent transitions:
+
+$$
+\rho_q = Q_q(\{r_i^+ \mid k \in [T-K,T)\}), \qquad q=0.95.
+$$
+
+The current default is `K=3`. This keeps the uncertainty calibration close to
+the current policy while avoiding the instability of using only the most recent
+epoch transition. With only two available historical epochs, it naturally
+degenerates to the single transition `epoch0 -> epoch1`.
+
+For a new step \(B_t\), the predicted step tail is the maximum prompt-level
+predicted tail inside the step:
+
+$$
+S_t = \max_{i\in B_t}\hat{M}_i.
+$$
+
+The runtime response cap for that step is then:
+
+$$
+C_t =
+\min\left(
+  L_{\max},
+  \max\left(
+    C_{\min},
+    \left\lceil \frac{\rho_q S_t}{A} \right\rceil A
+  \right)
+\right),
+$$
+
+where the current defaults are:
+
+```text
+q = 0.95
+K = 3
+C_min = 4096
+A = 512
+L_max = 16384
+```
+
+Thus every step receives a tail guard, but long-tail steps naturally recover the
+full 16k budget because \(\rho_q S_t \ge L_{\max}\). The cap is written into
+`length_sorted_rank_plan.json` as `tail_guard_response_cap`, and runtime only
+applies that planned value. This keeps the rule tied to the offline oracle
+instead of using a hard-coded runtime threshold.
+
+For the observed epoch2 planner example, only one adjacent transition was
+available inside the sliding window, so calibrating from epoch0 -> epoch1 gave:
+
+```text
+rho_0.95 = 1.257025
+```
+
+The resulting per-step caps were:
+
+| step | selected floor | predicted step exit | tail guard cap |
+| ---: | ---: | ---: | ---: |
+| 1 | 4 | 3767.7 | 5120 |
+| 2 | 4 | 5767.5 | 7680 |
+| 3 | 8 | 8131.9 | 10240 |
+| 4 | 8 | 11569.8 | 14848 |
+| 5 | 16 | 16384.0 | 16384 |
+
+This makes the guard scale-invariant: short steps are protected from rare
+outlier generations, while naturally long steps remain uncapped.
+
 ### Resume And Checkpointing
 
 The dynamic driver isolates epoch processes. By default, the existing experiment
@@ -1295,3 +1382,302 @@ from epoch0 rollout lengths, and then saves its own checkpoint for epoch2.
 
 Set `DYNAMIC_ENABLE_CKPT_CHAIN=0` only when validating rollout scheduling in
 isolation and intentionally starting each child run from the same initial model.
+
+## Paper-Style Method Summary
+
+This section summarizes the current method in a form closer to a systems-paper
+methodology section. The goal is to make the algorithmic assumptions explicit
+and separate policy choices from implementation details.
+
+### Problem Statement
+
+We consider RL rollout generation for a MoE LLM on \(R=16\) devices. Each
+rollout step contains \(B=32\) prompts and each prompt produces
+`rollout.n=16` sampled responses. The system can shrink the active execution
+group during generation, for example `16 -> 8 -> 4`, so ranks that have
+finished their assigned work can release memory and communication resources.
+
+The scheduling problem has three coupled constraints:
+
+1. response lengths are stochastic and change across training epochs;
+2. the selected floor determines both potential rank-time savings and the
+   available KV capacity;
+3. planner mode can keep planned floor8/floor4 communication groups resident
+   across steps, which improves reuse but consumes non-trivial device memory.
+
+The objective is therefore not simply to minimize within-rank length skew. The
+objective is to maximize useful rank-time release while preserving KV
+feasibility and avoiding rare tail responses that dominate a synchronous rollout
+step.
+
+### Historical Length Predictor
+
+For prompt \(i\) in epoch \(e\), let
+\(L_{i,e,j}\) be the length of response sample \(j\). The scheduler uses a
+prompt-level tail statistic:
+
+$$
+M_{i,e}=\max_j L_{i,e,j}.
+$$
+
+Using the maximum rather than the mean matches the latency-sensitive quantity:
+a rank cannot be released until the longest live response on that rank
+finishes. Across epochs, the predictor uses an exponential moving average:
+
+$$
+\hat{M}_{i,e+1}
+=
+\alpha \hat{M}_{i,e} + (1-\alpha)M_{i,e},
+\qquad \alpha=0.7.
+$$
+
+Epoch0 is a normal `mode=0` no-shrink training epoch. It is not discarded; it
+both updates the model and provides the first measured length distribution for
+epoch1 planning. Later epochs rebuild the plan from the most recent rollout
+history before launching generation.
+
+### Batch Construction
+
+Given predicted prompt tails \(\hat{M}_{i,e}\), prompts are sorted by predicted
+tail length and split into contiguous 32-prompt batches:
+
+$$
+B_t =
+\text{sort}_{\hat{M}}(P)[32(t-1):32t].
+$$
+
+This preserves an epoch-level length-sorted shape: early steps contain shorter
+prompts and late steps contain longer prompts. The method deliberately avoids a
+global reshuffle that would hide tail-heavy prompts inside many otherwise short
+steps.
+
+### KV Feasibility Model
+
+For a rank pair \(S=\{i,j\}\), the planner estimates active KV pressure by:
+
+$$
+A(S)=
+\max_{\tau\ge0}
+\tau \sum_{p\in S}\sum_j \mathbf{1}[L_{p,j}\ge\tau].
+$$
+
+To account for prediction drift, every response length is inflated by a safety
+factor and clipped at the physical response limit:
+
+$$
+A_\mu(S)=
+A(\{\min(\mu L,L_{\max}) : L\in S\}),
+\qquad
+\mu=1.16,\quad L_{\max}=16384.
+$$
+
+A candidate rank pair is KV-feasible at floor \(f\) only if
+
+$$
+A_\mu(S)\le C_f,
+$$
+
+where \(C_f\) is the effective KV cap after subtracting any memory reserved for
+resident communication groups.
+
+### Release-Area Rank Assignment
+
+For each fixed 32-prompt batch and candidate floor, the planner constructs all
+\(\binom{32}{2}=496\) possible rank-pair edges. Each edge stores:
+
+- pair completion proxy \(M_e=\max(\hat{M}_i,\hat{M}_j)\);
+- adjusted KV peak \(A_\mu(e)\);
+- token-sum and length-gap tie-breakers.
+
+Let \(T=\max_e M_e\) be the predicted batch tail. A shrink schedule is
+represented as quota constraints over pair completion times. For floor4, a
+schedule with thresholds \(a\le b\) requires:
+
+$$
+\#\{e\in\mathcal{M}:M_e\le a\}\ge8,
+\qquad
+\#\{e\in\mathcal{M}:M_e\le b\}\ge12.
+$$
+
+Its released rank-time area is:
+
+$$
+\mathcal{A}_{4}(a,b)=8(T-a)+4(T-b).
+$$
+
+Analogously, floor8 uses \(\mathcal{A}_8(a)=8(T-a)\), and floor2 uses
+\(\mathcal{A}_2(a,b,c)=8(T-a)+4(T-b)+2(T-c)\).
+
+The matching oracle solves an exact 0/1 assignment problem:
+
+$$
+\max_{\mathcal{M}} \mathcal{A}_f
+$$
+
+subject to:
+
+- every prompt appears in exactly one selected edge;
+- every selected edge is KV-feasible under \(C_f\);
+- all schedule quota constraints are satisfied.
+
+Candidate schedules are enumerated from larger release area to smaller release
+area. The first feasible exact matching is therefore release-area optimal for
+the fixed batch and floor. Within one schedule, the solver breaks ties by
+smaller rank-internal length gap, lower pair max length, lower adjusted KV
+peak, and lower token sum. This hierarchy is important: length gap is useful,
+but only after the shrink schedule has already maximized the system-level
+rank-time release.
+
+### Floor Selection
+
+The planner tries floors from the minimum allowed floor upward. In the current
+adaptive floor4 configuration:
+
+```text
+candidate floors = 4, 8, 16
+```
+
+The selected floor is the deepest floor that has both:
+
+1. a KV-feasible exact matching; and
+2. positive useful release area.
+
+The second condition prevents a misleading case where a floor8 matching is
+technically KV-feasible but can only shrink at \(T\). Such a schedule releases
+zero rank-time and is treated as no useful shrink.
+
+Runtime transitions are restricted to halving steps. Thus a floor4 step uses
+`16 -> 8 -> 4`, while a floor8 step uses `16 -> 8`. Direct non-halving
+transitions are avoided because they can fall back to slow object-broadcast
+parameter movement instead of the optimized direct-NPU path.
+
+### Natural And Planner Policies
+
+The offline plan specifies prompts, rank assignments, floors, and planned
+survivor topology. Runtime can consume this plan in two ways.
+
+Natural policy lets the actually unfinished ranks determine the survivor set at
+each shrink point. This is the most faithful system behavior under stochastic
+generation drift. It avoids dummy work when a planned survivor happens to
+finish early, and it does not keep planned floor subgroups resident across
+steps.
+
+Planner policy fixes the survivor topology to the planned groups. This gives a
+deterministic communication topology and enables cross-step reuse of planned
+floor8/floor4 communication groups. The cost is extra resident HCCL/MC2/TBE
+workspace memory and possible dummy run if runtime completion order differs
+from the planned order.
+
+Planner residency is treated as an explicit resource contract. The effective
+caps used by the offline planner are:
+
+| floor | raw cap | planned-residency headroom | effective cap |
+| ---: | ---: | ---: | ---: |
+| 4 | 280576 | 147456 | 133120 |
+| 8 | 377344 | 114688 | 262656 |
+| 16 | 380800 | 0 | 380800 |
+
+This makes the planner solve the same memory problem that the runtime will
+face. Natural mode can use larger caps because it does not retain planned
+floor-group residency, although real post-shrink runtime workspaces still lower
+some observed capacities compared with cold profiles.
+
+### Prediction-Error Tail Guard
+
+Length-aware batching reduces average imbalance, but a single underpredicted
+pathological response can still dominate a step. The tail guard is a
+statistical cap on per-step generation length. It is not a hard-coded smoke
+test threshold; it is derived from recent prediction error.
+
+For an adjacent historical transition, define the one-sided prompt-tail
+underestimation ratio:
+
+$$
+r_i^+ =
+\max\left(1,\frac{M_{i,e}}{\hat{M}_{i,e}+\epsilon}\right).
+$$
+
+The uncertainty multiplier is a high empirical quantile over the most recent
+\(K\) transitions:
+
+$$
+\rho_q = Q_q(\{r_i^+\}),\qquad q=0.95,\quad K=3.
+$$
+
+The ratio is one-sided because overestimation is conservative for latency,
+whereas underestimation causes short steps to accidentally become long steps.
+The method uses a sliding window rather than another EMA because the length
+predictor already uses EMA; the guard is intended to calibrate residual
+uncertainty, not to smooth the same signal twice.
+
+For step \(t\), let
+
+$$
+S_t=\max_{i\in B_t}\hat{M}_{i,e}
+$$
+
+be the predicted step tail. The cap is:
+
+$$
+C_t =
+\min\left(
+  L_{\max},
+  \max\left(C_{\min},
+    \left\lceil \frac{\rho_q S_t}{A} \right\rceil A
+  \right)
+\right),
+$$
+
+with current defaults:
+
+```text
+q = 0.95
+K = 3
+C_min = 4096
+A = 512
+L_max = 16384
+```
+
+Short predicted steps therefore receive a bounded generation length, while
+long-tail steps naturally recover the full 16k response budget. The cap is
+stored in the offline rank plan as `tail_guard_response_cap` and is injected
+into runtime as `response_max_tokens_cap` after the shrink-aware plan has been
+applied. This ordering is required because the cap is plan-dependent.
+
+### Algorithm Sketch
+
+For each epoch \(e\):
+
+1. collect rollout lengths from epoch \(e-1\);
+2. update EMA prompt-tail predictions \(\hat{M}_{i,e}\);
+3. compute the residual underestimation multiplier \(\rho_q\);
+4. sort prompts by \(\hat{M}_{i,e}\) and form 32-prompt batches;
+5. for each batch, solve release-area rank assignment under floor-specific KV
+   caps;
+6. write per-step floor, survivor topology, rank assignment, and
+   `tail_guard_response_cap`;
+7. run the epoch in natural or planner mode;
+8. save rollout lengths and a checkpoint for the next epoch.
+
+This closed loop makes the scheduler adaptive to model-policy drift while
+keeping the optimization offline and deterministic for each launched epoch.
+
+### Evaluation Protocol
+
+A comparison suitable for a systems venue should report more than total wall
+time. At minimum, each run should include:
+
+- per-step generated token count and `rollout_output_time_s`;
+- throughput in generated tokens per second;
+- selected floor and actual shrink stages;
+- tail guard cap and clipped-response ratio;
+- KV cache capacity used by the step;
+- resize / precreate / stale-group-release overhead;
+- for planner mode, resident communication-group state and dummy-run time;
+- end-to-end epoch time including rollout, reward/logprob, update, and
+  checkpoint overhead.
+
+Because generation is stochastic, natural/planner comparisons should be made
+over repeated runs or normalized by generated-token count and observed response
+length distribution. Single-run improvements should be interpreted together
+with the realized length histogram, especially when rare 16k responses appear.

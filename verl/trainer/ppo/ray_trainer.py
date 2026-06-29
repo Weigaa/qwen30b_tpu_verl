@@ -23,6 +23,7 @@ import logging
 import os
 import uuid
 import time
+import gc
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from copy import deepcopy
@@ -390,6 +391,24 @@ class RayPPOTrainer:
         )
         self.rollout_early_stop_factor = float(os.getenv("VLLM_ROLLOUT_EARLY_STOP_FACTOR", "2.0"))
         self.rollout_early_stop_min_tokens = int(os.getenv("VLLM_ROLLOUT_EARLY_STOP_MIN_TOKENS", "10000"))
+        self.rollout_shrink_aware_short_step_cap_enable = os.getenv(
+            "VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_CAP_ENABLE", "0").lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        self.rollout_shrink_aware_short_step_exit_threshold = float(os.getenv(
+            "VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_EXIT_THRESHOLD", "4096"))
+        self.rollout_shrink_aware_short_step_cap_tokens = int(os.getenv(
+            "VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_CAP_TOKENS", "4096"))
+        floor_values = os.getenv(
+            "VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_CAP_FLOORS", "4")
+        self.rollout_shrink_aware_short_step_cap_floors = {
+            int(item.strip())
+            for item in floor_values.split(",")
+            if item.strip()
+        }
 
     def _restore_rollout_elastic_parallel_groups_if_needed(self) -> None:
         if self.async_rollout_mode:
@@ -618,6 +637,9 @@ class RayPPOTrainer:
         return gen_batch
 
     def _maybe_compute_rollout_response_cap(self, batch: DataProto) -> Optional[int]:
+        shrink_cap = self._maybe_compute_shrink_aware_short_step_response_cap(batch)
+        if shrink_cap is not None:
+            return shrink_cap
         if not self.rollout_early_stop_enable:
             return None
         if not isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
@@ -650,6 +672,64 @@ class RayPPOTrainer:
         cap = max(1, min(raw_cap, hard_cap))
         if cap >= hard_cap:
             return None
+        return cap
+
+    def _maybe_compute_shrink_aware_short_step_response_cap(
+            self, batch: DataProto) -> Optional[int]:
+        if not self.rollout_shrink_aware_short_step_cap_enable:
+            return None
+        kv_plan = batch.meta_info.get("shrink_aware_kv_plan")
+        if not isinstance(kv_plan, dict):
+            return None
+        try:
+            selected_floor = int(kv_plan.get("selected_floor", 16))
+        except (TypeError, ValueError):
+            return None
+        hard_cap = int(self.config.actor_rollout_ref.rollout.response_length)
+        plan_cap = kv_plan.get("tail_guard_response_cap")
+        if plan_cap is not None:
+            try:
+                cap = int(float(plan_cap))
+            except (TypeError, ValueError):
+                return None
+            cap = max(1, min(cap, hard_cap))
+            if cap >= hard_cap:
+                return None
+            logger.info(
+                "Shrink-aware tail-guard response cap: selected_floor=%s "
+                "plan_cap=%s ratio=%s ratio_q=%s predicted_step_exit=%s",
+                selected_floor,
+                cap,
+                kv_plan.get("tail_guard_ratio"),
+                kv_plan.get("tail_guard_ratio_quantile"),
+                kv_plan.get("tail_guard_predicted_step_exit"),
+            )
+            return cap
+
+        if selected_floor not in self.rollout_shrink_aware_short_step_cap_floors:
+            return None
+
+        predicted_load = batch.meta_info.get("shrink_aware_predicted_load")
+        if predicted_load is None:
+            return None
+        try:
+            predicted_step_exit = float(np.max(np.asarray(predicted_load, dtype=np.float64)))
+        except (TypeError, ValueError):
+            return None
+        if predicted_step_exit > self.rollout_shrink_aware_short_step_exit_threshold:
+            return None
+
+        cap = max(1, min(int(self.rollout_shrink_aware_short_step_cap_tokens), hard_cap))
+        if cap >= hard_cap:
+            return None
+        logger.info(
+            "Shrink-aware short-step response cap: selected_floor=%s "
+            "predicted_step_exit=%.3f threshold=%.3f cap=%s",
+            selected_floor,
+            predicted_step_exit,
+            self.rollout_shrink_aware_short_step_exit_threshold,
+            cap,
+        )
         return cap
 
     def _validate(self):
@@ -1237,7 +1317,6 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
-                response_cap = self._maybe_compute_rollout_response_cap(batch)
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
@@ -1267,6 +1346,7 @@ class RayPPOTrainer:
                             shrink_aware_result.assignment_plan.
                             per_rank_predicted_load.items()):
                         metrics[f"rollout/shrink_aware_rank_{rank}_predicted_load"] = load
+                response_cap = self._maybe_compute_rollout_response_cap(gen_batch)
                 if response_cap is not None:
                     gen_batch.meta_info["response_max_tokens_cap"] = int(response_cap)
                     metrics["rollout/response_max_tokens_cap"] = int(response_cap)
@@ -1558,9 +1638,17 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 tracker.log(data=metrics, step=self.global_steps)
+                if os.environ.get("VERL_LOG_POST_STEP_BOUNDARY", "1") == "1":
+                    logger.info(
+                        "post-step boundary: tracker_logged step=%s is_last_step=%s",
+                        self.global_steps,
+                        is_last_step,
+                    )
 
                 progress_bar.update(1)
                 self.global_steps += 1
+                if os.environ.get("VERL_POST_STEP_DRIVER_GC", "1") == "1":
+                    gc.collect()
 
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")
@@ -1583,7 +1671,20 @@ class RayPPOTrainer:
                 # in favor of a general-purpose data buffer pool
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
+                    if os.environ.get("VERL_LOG_POST_STEP_BOUNDARY", "1") == "1":
+                        logger.info(
+                            "post-step boundary: before train_dataset.on_batch_end "
+                            "next_global_step=%s dataset=%s",
+                            self.global_steps,
+                            type(self.train_dataset).__name__,
+                        )
                     self.train_dataset.on_batch_end(batch=batch)
+                    if os.environ.get("VERL_LOG_POST_STEP_BOUNDARY", "1") == "1":
+                        logger.info(
+                            "post-step boundary: after train_dataset.on_batch_end "
+                            "next_global_step=%s",
+                            self.global_steps,
+                        )
             end_epoch_time = time.time()
             epoch_duration = end_epoch_time - beginning_epoch_time
             print(f"Epoch {epoch} completed in {epoch_duration:.2f} seconds.")

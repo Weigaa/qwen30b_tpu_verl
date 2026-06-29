@@ -21,6 +21,15 @@ Key environment variables:
   DYNAMIC_LENGTH_EMA_DECAY=0.7  EMA decay for historical rollout lengths.
   DYNAMIC_ENABLE_THRESHOLD_CONTROL=0
                                  Keep short threshold/max-response overrides.
+  DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS=
+                                 Optional runtime-only tail validation caps.
+                                 This does not change offline length planning.
+  DYNAMIC_SHORT_STEP_CAP_ENABLE=0
+                                 Optional runtime guard for predicted-short
+                                 shrink steps. When enabled, only selected
+                                 floors in DYNAMIC_SHORT_STEP_CAP_FLOORS are
+                                 capped if predicted step exit is below
+                                 DYNAMIC_SHORT_STEP_EXIT_THRESHOLD.
   DYNAMIC_TRAIN_STEPS=           Optional child-run training steps; keeps
                                  DYNAMIC_PLAN_STEPS unchanged for planning.
   TRAIN_FILE_ORIG=...           Original train parquet prompt pool.
@@ -66,15 +75,52 @@ DYNAMIC_ENABLE_CKPT_CHAIN="${DYNAMIC_ENABLE_CKPT_CHAIN:-1}"
 DYNAMIC_INITIAL_RESUME_CKPT="${DYNAMIC_INITIAL_RESUME_CKPT:-}"
 DYNAMIC_LENGTH_EMA_DECAY="${DYNAMIC_LENGTH_EMA_DECAY:-0.7}"
 DYNAMIC_ENABLE_THRESHOLD_CONTROL="${DYNAMIC_ENABLE_THRESHOLD_CONTROL:-0}"
+DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP="${DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP:-auto}"
+DYNAMIC_NATURAL_FLOOR8_RUNTIME_CAP="${DYNAMIC_NATURAL_FLOOR8_RUNTIME_CAP:-315648}"
+DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS="${DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS:-}"
+DYNAMIC_SHORT_STEP_CAP_ENABLE="${DYNAMIC_SHORT_STEP_CAP_ENABLE:-0}"
+DYNAMIC_SHORT_STEP_EXIT_THRESHOLD="${DYNAMIC_SHORT_STEP_EXIT_THRESHOLD:-4096}"
+DYNAMIC_SHORT_STEP_CAP_TOKENS="${DYNAMIC_SHORT_STEP_CAP_TOKENS:-4096}"
+DYNAMIC_SHORT_STEP_CAP_FLOORS="${DYNAMIC_SHORT_STEP_CAP_FLOORS:-4}"
+DYNAMIC_TAIL_GUARD_RATIO_QUANTILE="${DYNAMIC_TAIL_GUARD_RATIO_QUANTILE:-0.95}"
+DYNAMIC_TAIL_GUARD_RATIO_WINDOW="${DYNAMIC_TAIL_GUARD_RATIO_WINDOW:-3}"
+DYNAMIC_TAIL_GUARD_DEFAULT_RATIO="${DYNAMIC_TAIL_GUARD_DEFAULT_RATIO:-1.20}"
+DYNAMIC_TAIL_GUARD_MIN_CAP="${DYNAMIC_TAIL_GUARD_MIN_CAP:-4096}"
+DYNAMIC_TAIL_GUARD_ROUND_TO="${DYNAMIC_TAIL_GUARD_ROUND_TO:-512}"
+
+if [[ "$DYNAMIC_SHRINK_POLICY" == "natural" && -z "${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR8+x}" ]]; then
+    # Natural policy does not keep planned floor groups resident, but after
+    # real floor4 shrink/warmup the NPU runtime workspace still lowers the
+    # observed floor8 KV capacity.  Use the measured per-rank minimum from the
+    # full natural run instead of the optimistic cold-profile cap.
+    export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR8="$DYNAMIC_NATURAL_FLOOR8_RUNTIME_CAP"
+fi
 
 if [[ "$DYNAMIC_ENABLE_THRESHOLD_CONTROL" != "1" ]]; then
     # The dynamic planner must see and validate the true rollout-length
     # distribution.  Threshold smoke wrappers intentionally override this.
-    unset VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS
+    if [[ -n "$DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS" ]]; then
+        export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS="$DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS"
+    else
+        unset VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS
+    fi
     export MAX_PROMPT_LENGTH="${DYNAMIC_FULL_MAX_PROMPT_LENGTH:-1024}"
     export MAX_RESPONSE_LENGTH="${DYNAMIC_FULL_MAX_RESPONSE_LENGTH:-16384}"
     export MAX_RESPONSE_LEN="${DYNAMIC_FULL_MAX_RESPONSE_LEN:-$MAX_RESPONSE_LENGTH}"
     export ROLLOUT_MAX_NUM_BATCHED_TOKENS="${DYNAMIC_FULL_MAX_NUM_BATCHED_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
+else
+    export MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
+    export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-${MAX_RESPONSE_LEN:-4096}}"
+    export MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-$MAX_RESPONSE_LENGTH}"
+    export ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
+fi
+
+if [[ "$DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP" == "auto" ]]; then
+    if (( MAX_RESPONSE_LEN < 16384 )); then
+        DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP=1
+    else
+        DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP=0
+    fi
 fi
 
 TRAIN_FILE_ORIG="${TRAIN_FILE_ORIG:-/data/deepscaler/train.parquet}"
@@ -95,6 +141,24 @@ validate_rollout_dir() {
         echo "$label has only $count rollout jsonl files, expected at least $DYNAMIC_PLAN_STEPS: $dir" >&2
         exit 3
     fi
+}
+
+validate_rollout_history() {
+    local history="$1"
+    local label="$2"
+    local normalized="${history//,/:}"
+    local old_ifs="$IFS"
+    local dir
+
+    IFS=':'
+    for dir in $normalized; do
+        if [[ -z "$dir" ]]; then
+            continue
+        fi
+        validate_rollout_dir "$dir" "$label"
+    done
+    IFS="$old_ifs"
+    printf '%s' "$normalized"
 }
 
 find_latest_checkpoint() {
@@ -194,10 +258,20 @@ run_mode1_epoch() {
     TRAINER_TOTAL_EPOCHS=1 \
     DATASET_FRACTION_FOR_ORACLE="$DYNAMIC_DATASET_FRACTION" \
     LENGTH_EMA_DECAY="$DYNAMIC_LENGTH_EMA_DECAY" \
+    IGNORE_TAIL_TIES_AT_RESPONSE_CAP="$DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP" \
+    TAIL_GUARD_RATIO_QUANTILE="$DYNAMIC_TAIL_GUARD_RATIO_QUANTILE" \
+    TAIL_GUARD_RATIO_WINDOW="$DYNAMIC_TAIL_GUARD_RATIO_WINDOW" \
+    TAIL_GUARD_DEFAULT_RATIO="$DYNAMIC_TAIL_GUARD_DEFAULT_RATIO" \
+    TAIL_GUARD_MIN_CAP="$DYNAMIC_TAIL_GUARD_MIN_CAP" \
+    TAIL_GUARD_ROUND_TO="$DYNAMIC_TAIL_GUARD_ROUND_TO" \
     PLAN_STEPS="$DYNAMIC_PLAN_STEPS" \
     SAVE_CKPT_ENABLE="$save_ckpt_enable" \
     TRAINER_SAVE_FREQ="$trainer_save_freq" \
     VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY="$DYNAMIC_SHRINK_POLICY" \
+    VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_CAP_ENABLE="$DYNAMIC_SHORT_STEP_CAP_ENABLE" \
+    VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_EXIT_THRESHOLD="$DYNAMIC_SHORT_STEP_EXIT_THRESHOLD" \
+    VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_CAP_TOKENS="$DYNAMIC_SHORT_STEP_CAP_TOKENS" \
+    VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_CAP_FLOORS="$DYNAMIC_SHORT_STEP_CAP_FLOORS" \
     VERL_RESET_TRAINER_PROGRESS_AFTER_RESUME="${DYNAMIC_RESET_PROGRESS_AFTER_RESUME:-1}" \
     "$REPO_ROOT/run_mode1_local_length_sorted_e2e_adaptive_floor4.sh" \
         "trainer.total_training_steps=$train_steps" "${child_args[@]}"
@@ -222,6 +296,10 @@ echo "[dynamic length-aware] dataset_fraction=$DYNAMIC_DATASET_FRACTION plan_ste
 echo "[dynamic length-aware] train_steps=${DYNAMIC_TRAIN_STEPS:-<plan_steps>}"
 echo "[dynamic length-aware] checkpoint_chain=$DYNAMIC_ENABLE_CKPT_CHAIN length_ema_decay=$DYNAMIC_LENGTH_EMA_DECAY threshold_control=$DYNAMIC_ENABLE_THRESHOLD_CONTROL"
 echo "[dynamic length-aware] max_prompt=$MAX_PROMPT_LENGTH max_response=$MAX_RESPONSE_LENGTH max_batched_tokens=$ROLLOUT_MAX_NUM_BATCHED_TOKENS tail_validate=${VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS:-<unset>}"
+echo "[dynamic length-aware] ignore_tail_ties_at_response_cap=$DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP"
+echo "[dynamic length-aware] floor8_cap=${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR8:-<local-default>}"
+echo "[dynamic length-aware] short_step_cap_enable=$DYNAMIC_SHORT_STEP_CAP_ENABLE threshold=$DYNAMIC_SHORT_STEP_EXIT_THRESHOLD cap=$DYNAMIC_SHORT_STEP_CAP_TOKENS floors=$DYNAMIC_SHORT_STEP_CAP_FLOORS"
+echo "[dynamic length-aware] tail_guard_ratio_q=$DYNAMIC_TAIL_GUARD_RATIO_QUANTILE window=$DYNAMIC_TAIL_GUARD_RATIO_WINDOW default_ratio=$DYNAMIC_TAIL_GUARD_DEFAULT_RATIO min_cap=$DYNAMIC_TAIL_GUARD_MIN_CAP round_to=$DYNAMIC_TAIL_GUARD_ROUND_TO"
 
 previous_rollout_dir=""
 baseline_history=""
@@ -230,9 +308,8 @@ if [[ "$DYNAMIC_SKIP_MODE0_PROBE" == "1" ]]; then
         echo "DYNAMIC_SKIP_MODE0_PROBE=1 requires DYNAMIC_INITIAL_BASELINE_DIR" >&2
         exit 2
     fi
-    previous_rollout_dir="$DYNAMIC_INITIAL_BASELINE_DIR"
-    validate_rollout_dir "$previous_rollout_dir" "initial baseline"
-    baseline_history="$previous_rollout_dir"
+    baseline_history=$(validate_rollout_history "$DYNAMIC_INITIAL_BASELINE_DIR" "initial baseline")
+    previous_rollout_dir="${baseline_history##*:}"
 else
     run_mode0_probe "$@"
     previous_rollout_dir="$NEXT_ROLLOUT_DIR"

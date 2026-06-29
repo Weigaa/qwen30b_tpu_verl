@@ -138,6 +138,15 @@ def maybe_apply_shrink_aware_schedule(
                 "kv_cap",
                 "max_adjusted_rank_peak_tokens",
                 "max_rank_peak_tokens",
+                "tail_guard_response_cap",
+                "tail_guard_enabled",
+                "tail_guard_ratio",
+                "tail_guard_ratio_quantile",
+                "tail_guard_ratio_sample_count",
+                "tail_guard_predicted_step_exit",
+                "tail_guard_raw_cap",
+                "tail_guard_min_cap",
+                "tail_guard_round_to",
         ):
             if key in plan_entry:
                 kv_plan[key] = plan_entry[key]
@@ -165,6 +174,11 @@ def maybe_apply_shrink_aware_schedule(
             runtime["theoretical_floor"] = int(kv_plan["theoretical_floor"])
         if "kv_cap" in kv_plan:
             runtime["kv_cap"] = int(float(kv_plan["kv_cap"]))
+        if "tail_guard_response_cap" in kv_plan:
+            runtime["tail_guard_response_cap"] = int(float(
+                kv_plan["tail_guard_response_cap"]))
+        if "tail_guard_enabled" in kv_plan:
+            runtime["tail_guard_enabled"] = bool(kv_plan["tail_guard_enabled"])
 
     if _cfg_bool(shrink_cfg, "enable_shrink_aware_logging", False):
         logger.info(

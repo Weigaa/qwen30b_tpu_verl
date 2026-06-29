@@ -223,6 +223,7 @@ MIN_ADAPTIVE_FLOOR="${MIN_ADAPTIVE_FLOOR:-4}"
 ACTIVE_PEAK_SAFETY_FACTOR="${ACTIVE_PEAK_SAFETY_FACTOR:-1.16}"
 LENGTH_EMA_DECAY="${LENGTH_EMA_DECAY:-0.7}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-16384}"
+IGNORE_TAIL_TIES_AT_RESPONSE_CAP="${IGNORE_TAIL_TIES_AT_RESPONSE_CAP:-0}"
 MAX_CROSS_STEP_REPAIR_SWAPS="${MAX_CROSS_STEP_REPAIR_SWAPS:-8}"
 REPAIR_CANDIDATE_LIMIT="${REPAIR_CANDIDATE_LIMIT:-8}"
 
@@ -239,9 +240,14 @@ for baseline_dir_item in "${BASELINE_DIR_ARRAY[@]}"; do
         baseline_args+=(--baseline-dir "$baseline_dir_item")
     fi
 done
+planner_extra_args=()
+if [[ "$IGNORE_TAIL_TIES_AT_RESPONSE_CAP" == "1" ]]; then
+    planner_extra_args+=(--ignore-tail-ties-at-response-cap)
+fi
 
 python3 "$PATCH_TREE/tools/build_mode1_length_sorted_e2e_plan.py" \
     "${baseline_args[@]}" \
+    "${planner_extra_args[@]}" \
     --length-ema-decay "$LENGTH_EMA_DECAY" \
     --train-file "$TRAIN_FILE_ORIG" \
     --output-train "$OPT_TRAIN_FILE" \
@@ -258,6 +264,11 @@ python3 "$PATCH_TREE/tools/build_mode1_length_sorted_e2e_plan.py" \
     --floor-kv-caps "$FLOOR_KV_CAPS" \
     --active-peak-safety-factor "$ACTIVE_PEAK_SAFETY_FACTOR" \
     --max-response-len "$MAX_RESPONSE_LEN" \
+    --tail-guard-ratio-quantile "${TAIL_GUARD_RATIO_QUANTILE:-0.95}" \
+    --tail-guard-ratio-window "${TAIL_GUARD_RATIO_WINDOW:-3}" \
+    --tail-guard-default-ratio "${TAIL_GUARD_DEFAULT_RATIO:-1.20}" \
+    --tail-guard-min-cap "${TAIL_GUARD_MIN_CAP:-4096}" \
+    --tail-guard-round-to "${TAIL_GUARD_ROUND_TO:-512}" \
     --max-cross-step-repair-swaps "$MAX_CROSS_STEP_REPAIR_SWAPS" \
     --repair-candidate-limit "$REPAIR_CANDIDATE_LIMIT"
 
@@ -299,6 +310,8 @@ printf '[mode1 length-sorted e2e adaptive] mode=1 global_floor=4 util=%s kv_caps
     "$TRAINER_TOTAL_EPOCHS"
 printf '[mode1 length-sorted e2e adaptive] max_rank_peak_tokens=%s min_adaptive_floor=%s active_peak_safety_factor=%s max_response_len=%s shrink_not_required=true\n' \
     "$MAX_RANK_PEAK_TOKENS" "$MIN_ADAPTIVE_FLOOR" "$ACTIVE_PEAK_SAFETY_FACTOR" "$MAX_RESPONSE_LEN"
+printf '[mode1 length-sorted e2e adaptive] ignore_tail_ties_at_response_cap=%s\n' \
+    "$IGNORE_TAIL_TIES_AT_RESPONSE_CAP"
 printf '[mode1 length-sorted e2e adaptive] length_ema_decay=%s history_dirs=%s\n' \
     "$LENGTH_EMA_DECAY" "${#BASELINE_DIR_ARRAY[@]}"
 printf '[mode1 length-sorted e2e adaptive] plan_steps=%s dataset_fraction_for_oracle=%s\n' \
