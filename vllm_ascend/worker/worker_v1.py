@@ -22,6 +22,7 @@ import math
 import os
 import threading
 import time
+import weakref
 from datetime import timedelta
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -7046,8 +7047,165 @@ class NPUWorker(WorkerBase):
                 except Exception:
                     pass
 
+    def _quiesce_floor4_mc2_device_pg_before_destroy(
+            self, device_pg, cpu_pg, group_ranks: tuple[int, ...],
+            reason: str) -> dict[str, float]:
+        """Drain a retiring floor=4 MC2 HCCL PG before destroying it.
+
+        The problematic case on this stack is repeated 4-rank MC2/HCCL
+        communicator teardown followed by creation of another overlapping
+        4-rank group. A plain torch.npu.synchronize() only drains the current
+        stream; it does not prove that all ranks reached the same HCCL control
+        point for this subgroup. This opt-in path performs a tiny collective on
+        the retiring device PG and brackets it with CPU-group barriers so the
+        subsequent HCCL destroy sees a quiesced subgroup.
+        """
+        stats = {
+            "floor4_quiesce_total_ms": 0.0,
+            "floor4_quiesce_pre_cpu_barrier_ms": 0.0,
+            "floor4_quiesce_pre_sync_ms": 0.0,
+            "floor4_quiesce_device_op_ms": 0.0,
+            "floor4_quiesce_post_sync_ms": 0.0,
+            "floor4_quiesce_post_cpu_barrier_ms": 0.0,
+            "floor4_quiesce_sleep_ms": 0.0,
+            "floor4_quiesce_enabled": 0.0,
+            "floor4_quiesce_failed": 0.0,
+        }
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_BEFORE_DESTROY",
+                "0"):
+            return stats
+        stats["floor4_quiesce_enabled"] = 1.0
+        if not torch.distributed.is_initialized():
+            return stats
+        current_rank = int(torch.distributed.get_rank())
+        if current_rank not in group_ranks:
+            return stats
+        if device_pg is None:
+            return stats
+
+        quiesce_start_t = time.perf_counter()
+        try:
+            if (cpu_pg is not None and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_CPU_BARRIER",
+                    "1")):
+                barrier_start_t = time.perf_counter()
+                torch.distributed.barrier(group=cpu_pg)
+                stats["floor4_quiesce_pre_cpu_barrier_ms"] = (
+                    time.perf_counter() - barrier_start_t) * 1000.0
+
+            if torch.npu.is_available() and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_PRE_SYNC",
+                    "1"):
+                sync_start_t = time.perf_counter()
+                torch.npu.synchronize()
+                stats["floor4_quiesce_pre_sync_ms"] = (
+                    time.perf_counter() - sync_start_t) * 1000.0
+
+            op = os.getenv(
+                "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_OP",
+                "all_reduce",
+            ).strip().lower()
+            if op not in ("", "0", "none", "off", "false"):
+                device_op_start_t = time.perf_counter()
+                if op == "all_to_all":
+                    local_index = group_ranks.index(current_rank)
+                    world_size = len(group_ranks)
+                    inp = torch.full((world_size, ),
+                                     local_index,
+                                     dtype=torch.int32,
+                                     device="npu")
+                    out = torch.empty_like(inp)
+                    torch.distributed.all_to_all_single(out,
+                                                        inp,
+                                                        group=device_pg)
+                    del out
+                    del inp
+                else:
+                    tensor = torch.ones(1, dtype=torch.int32, device="npu")
+                    torch.distributed.all_reduce(tensor, group=device_pg)
+                    del tensor
+                stats["floor4_quiesce_device_op_ms"] = (
+                    time.perf_counter() - device_op_start_t) * 1000.0
+
+            if torch.npu.is_available() and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_POST_SYNC",
+                    "1"):
+                sync_start_t = time.perf_counter()
+                torch.npu.synchronize()
+                stats["floor4_quiesce_post_sync_ms"] = (
+                    time.perf_counter() - sync_start_t) * 1000.0
+
+            if (cpu_pg is not None and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_CPU_BARRIER",
+                    "1")):
+                barrier_start_t = time.perf_counter()
+                torch.distributed.barrier(group=cpu_pg)
+                stats["floor4_quiesce_post_cpu_barrier_ms"] = (
+                    time.perf_counter() - barrier_start_t) * 1000.0
+
+            try:
+                sleep_ms = float(
+                    os.getenv(
+                        "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_SLEEP_MS",
+                        "0"))
+            except ValueError:
+                sleep_ms = 0.0
+            if sleep_ms > 0:
+                sleep_start_t = time.perf_counter()
+                time.sleep(sleep_ms / 1000.0)
+                stats["floor4_quiesce_sleep_ms"] = (
+                    time.perf_counter() - sleep_start_t) * 1000.0
+        except Exception:
+            stats["floor4_quiesce_failed"] = 1.0
+            logger.exception(
+                "Elastic floor4 MC2 PG quiesce failed before destroy: "
+                "rank=%s group_ranks=%s reason=%s",
+                self.rank,
+                group_ranks,
+                reason,
+            )
+            if _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_STRICT",
+                    "0"):
+                raise
+        finally:
+            stats["floor4_quiesce_total_ms"] = (
+                time.perf_counter() - quiesce_start_t) * 1000.0
+
+        if (stats["floor4_quiesce_enabled"]
+                and (self._elastic_group_lifecycle_log_enabled()
+                     or stats["floor4_quiesce_total_ms"] >=
+                     self._elastic_slow_timing_log_threshold_ms())):
+            logger.info(
+                "Elastic floor4 MC2 PG quiesce before destroy: rank=%s "
+                "group_ranks=%s reason=%s op=%s total_ms=%.2f "
+                "pre_cpu_barrier_ms=%.2f pre_sync_ms=%.2f "
+                "device_op_ms=%.2f post_sync_ms=%.2f "
+                "post_cpu_barrier_ms=%.2f sleep_ms=%.2f failed=%.0f",
+                self.rank,
+                group_ranks,
+                reason,
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUIESCE_OP",
+                    "all_reduce",
+                ),
+                stats["floor4_quiesce_total_ms"],
+                stats["floor4_quiesce_pre_cpu_barrier_ms"],
+                stats["floor4_quiesce_pre_sync_ms"],
+                stats["floor4_quiesce_device_op_ms"],
+                stats["floor4_quiesce_post_sync_ms"],
+                stats["floor4_quiesce_post_cpu_barrier_ms"],
+                stats["floor4_quiesce_sleep_ms"],
+                stats["floor4_quiesce_failed"],
+            )
+        return stats
+
     def _retire_group_wrapper_defer_pg_destroy(
-            self, group) -> dict[str, float]:
+            self,
+            group,
+            group_kind: str | None = None,
+            group_ranks: tuple[int, ...] | None = None) -> dict[str, float]:
         """Retire a GroupCoordinator wrapper without hot-path PG destroy.
 
         Low-floor mode=1 GroupCoordinator.destroy() can block for hundreds of
@@ -7070,8 +7228,16 @@ class NPUWorker(WorkerBase):
         dropped_device_pg_refs = 0.0
         deferred_device_pg_refs = 0.0
         deferred_cpu_pg_refs = 0.0
+        floor4_quiesce_stats: dict[str, float] = {}
         device_pgs: list[object] = []
         cpu_pgs: list[object] = []
+        destroyed_device_pgs: list[object] = []
+        normalized_group_kind = (group_kind or "").lower()
+        if group_ranks is None:
+            group_ranks = tuple(
+                int(rank) for rank in getattr(group, "ranks", []))
+        else:
+            group_ranks = tuple(int(rank) for rank in group_ranks)
         if _env_flag("VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE",
                      "1"):
             sync_start_t = time.perf_counter()
@@ -7082,7 +7248,7 @@ class NPUWorker(WorkerBase):
                     "Elastic retired group NPU sync failed: rank=%s "
                     "group_ranks=%s",
                     self.rank,
-                    tuple(int(rank) for rank in getattr(group, "ranks", [])),
+                    group_ranks,
                 )
             npu_sync_ms = (time.perf_counter() - sync_start_t) * 1000.0
 
@@ -7136,6 +7302,14 @@ class NPUWorker(WorkerBase):
                 continue
             seen_pg_ids.add(device_pg_id)
             unique_device_pgs.append(device_pg)
+        seen_cpu_pg_ids: set[int] = set()
+        unique_cpu_pgs = []
+        for cpu_pg in cpu_pgs:
+            cpu_pg_id = id(cpu_pg)
+            if cpu_pg_id in seen_cpu_pg_ids:
+                continue
+            seen_cpu_pg_ids.add(cpu_pg_id)
+            unique_cpu_pgs.append(cpu_pg)
         if (int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) == 3
                 and self._has_mode3_cross_layer_lightweight_module()):
             destroy_device_pg = _env_flag(
@@ -7143,22 +7317,51 @@ class NPUWorker(WorkerBase):
         else:
             destroy_device_pg = _env_flag(
                 "VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE", "1")
+        if (destroy_device_pg and normalized_group_kind == "mc2"
+                and len(group_ranks) == 4
+                and self._is_mode1_low_floor_elastic_runtime()
+                and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_FLOOR4_MC2_DEVICE_PG_DESTROY",
+                    "0")):
+            destroy_device_pg = False
         if destroy_device_pg:
             destroy_start_t = time.perf_counter()
             for device_pg in unique_device_pgs:
                 try:
+                    if (normalized_group_kind == "mc2"
+                            and len(group_ranks) == 4
+                            and self._is_mode1_low_floor_elastic_runtime()):
+                        cpu_pg = unique_cpu_pgs[0] if unique_cpu_pgs else None
+                        floor4_quiesce_stats = (
+                            self.
+                            _quiesce_floor4_mc2_device_pg_before_destroy(
+                                device_pg,
+                                cpu_pg,
+                                group_ranks,
+                                "retire_device_pg",
+                            ))
                     torch.distributed.destroy_process_group(device_pg)
                 except Exception:
                     logger.exception(
                         "Elastic retired group device ProcessGroup destroy failed: "
                         "rank=%s group_ranks=%s",
                         self.rank,
-                        tuple(int(rank)
-                              for rank in getattr(group, "ranks", [])),
+                        group_ranks,
                     )
             device_pg_destroy_ms = (
                 time.perf_counter() - destroy_start_t) * 1000.0
             deferred_device_pgs = []
+            if (normalized_group_kind == "mc2" and len(group_ranks) == 4
+                    and self._is_mode1_low_floor_elastic_runtime()
+                    and _env_flag(
+                        "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_KEEP_DESTROYED_PG_REF",
+                        "1")):
+                # Keep the Python ProcessGroup wrapper alive after explicit
+                # destroy_process_group().  The 80s+ retire_call_ms with only
+                # ~17ms measured inside this function points at local PG object
+                # release/destructor work happening as the function returns,
+                # not at the explicit destroy call itself.
+                destroyed_device_pgs = unique_device_pgs
         else:
             deferred_device_pg_refs = float(len(unique_device_pgs))
             deferred_device_pgs = unique_device_pgs
@@ -7169,15 +7372,7 @@ class NPUWorker(WorkerBase):
                     setattr(group, attr_name, None)
                 except Exception:
                     pass
-        seen_cpu_pg_ids: set[int] = set()
-        unique_cpu_pgs = []
-        for cpu_pg in cpu_pgs:
-            cpu_pg_id = id(cpu_pg)
-            if cpu_pg_id in seen_cpu_pg_ids:
-                continue
-            seen_cpu_pg_ids.add(cpu_pg_id)
-            unique_cpu_pgs.append(cpu_pg)
-        return {
+        stats = {
             "retire_wrapper_ms": (
                 time.perf_counter() - retire_start_t) * 1000.0,
             "npu_sync_ms": npu_sync_ms,
@@ -7187,31 +7382,200 @@ class NPUWorker(WorkerBase):
             "deferred_device_pg_refs": deferred_device_pg_refs,
             "deferred_cpu_pg_refs": deferred_cpu_pg_refs,
             "device_pgs": deferred_device_pgs,
+            "destroyed_device_pgs": destroyed_device_pgs,
             "cpu_pgs": unique_cpu_pgs,
         }
+        stats.update(floor4_quiesce_stats)
+        return stats
 
-    def _get_deferred_elastic_group_ids(self) -> set[int]:
-        deferred_ids = getattr(self, "_elastic_deferred_destroy_group_ids",
-                               None)
-        if deferred_ids is None:
-            deferred_ids = set()
-            self._elastic_deferred_destroy_group_ids = deferred_ids
-        return deferred_ids
+    def _get_deferred_elastic_group_refs(self) -> dict[int, weakref.ReferenceType]:
+        deferred_refs = getattr(self, "_elastic_deferred_destroy_group_ids",
+                                None)
+        if deferred_refs is None or isinstance(deferred_refs, set):
+            deferred_refs = {}
+            self._elastic_deferred_destroy_group_ids = deferred_refs
+        return deferred_refs
 
-    def _get_retired_elastic_group_ids(self) -> set[int]:
-        retired_ids = getattr(self, "_elastic_retired_group_ids", None)
-        if retired_ids is None:
-            retired_ids = set()
-            self._elastic_retired_group_ids = retired_ids
-        return retired_ids
+    def _get_retired_elastic_group_refs(self) -> dict[int, weakref.ReferenceType]:
+        retired_refs = getattr(self, "_elastic_retired_group_ids", None)
+        if retired_refs is None or isinstance(retired_refs, set):
+            retired_refs = {}
+            self._elastic_retired_group_ids = retired_refs
+        return retired_refs
 
     def _mark_retired_elastic_group(self, group) -> None:
-        self._get_retired_elastic_group_ids().add(id(group))
+        self._get_retired_elastic_group_refs()[id(group)] = weakref.ref(group)
 
     def _is_retired_elastic_group(self, group) -> bool:
         group_id = id(group)
-        return (group_id in self._get_retired_elastic_group_ids()
-                or group_id in self._get_deferred_elastic_group_ids())
+        for refs in (self._get_retired_elastic_group_refs(),
+                     self._get_deferred_elastic_group_refs()):
+            group_ref = refs.get(group_id)
+            if group_ref is None:
+                continue
+            referenced_group = group_ref()
+            if referenced_group is group:
+                return True
+            if referenced_group is None:
+                refs.pop(group_id, None)
+        return False
+
+    def _floor4_mc2_destroyed_pg_ref_limit(self) -> int:
+        raw_value = os.getenv(
+            "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_DESTROYED_PG_REF_LIMIT",
+            "-1",
+        )
+        try:
+            return int(raw_value)
+        except ValueError:
+            return 1
+
+    def _floor4_mc2_destroyed_pg_ref_trim_lock(self) -> threading.Lock:
+        trim_lock = getattr(self, "_elastic_floor4_mc2_pg_ref_trim_lock", None)
+        if trim_lock is None:
+            trim_lock = threading.Lock()
+            self._elastic_floor4_mc2_pg_ref_trim_lock = trim_lock
+        return trim_lock
+
+    def _trim_floor4_mc2_destroyed_pg_refs(
+            self, reason: str) -> dict[str, float]:
+        """Bound delayed destroyed-PG refs kept to avoid hot-path destructor stalls.
+
+        Keeping the Python ProcessGroup wrapper alive after explicit HCCL destroy
+        avoids the observed 80s+ return-path teardown. Keeping every historical
+        wrapper, however, can retain non-torch/HCCL state across rollouts. Keep
+        only the newest N floor=4 MC2 destroyed PG refs per worker when the
+        diagnostic limit is explicitly enabled.  By default this trim is off: on
+        the affected CANN/HCCL stack, releasing the old Python PG wrapper itself
+        can block for ~80s and poison the next DispatchV2 run.
+        """
+        limit = self._floor4_mc2_destroyed_pg_ref_limit()
+        if limit < 0:
+            return {
+                "destroyed_pg_ref_limit": float(limit),
+                "destroyed_pg_ref_trim_ms": 0.0,
+                "destroyed_pg_refs_trimmed": 0.0,
+                "destroyed_pg_refs_remaining": -1.0,
+            }
+        trim_start_t = time.perf_counter()
+        with self._floor4_mc2_destroyed_pg_ref_trim_lock():
+            deferred = getattr(self, "_elastic_deferred_destroy_groups", None)
+            if not deferred:
+                return {
+                    "destroyed_pg_ref_limit": float(limit),
+                    "destroyed_pg_ref_trim_ms": 0.0,
+                    "destroyed_pg_refs_trimmed": 0.0,
+                    "destroyed_pg_refs_remaining": 0.0,
+                }
+
+            budget = limit
+            trimmed = 0
+            remaining = 0
+            for entry in reversed(deferred):
+                if not isinstance(entry, dict):
+                    continue
+                if (str(entry.get("group_kind", "")).lower() != "mc2"
+                        or len(tuple(entry.get("group_ranks", ()) or ())) != 4):
+                    continue
+                refs = entry.get("destroyed_device_pgs", []) or []
+                if not refs:
+                    continue
+                if budget <= 0:
+                    trimmed += len(refs)
+                    entry["destroyed_device_pgs"] = []
+                    del refs
+                    continue
+                if len(refs) <= budget:
+                    remaining += len(refs)
+                    budget -= len(refs)
+                    del refs
+                    continue
+                keep_refs = refs[-budget:]
+                trimmed += len(refs) - len(keep_refs)
+                remaining += len(keep_refs)
+                entry["destroyed_device_pgs"] = keep_refs
+                budget = 0
+                del refs
+        trim_ms = (time.perf_counter() - trim_start_t) * 1000.0
+        if trimmed or _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUARANTINE_TRACE",
+                "1"):
+            logger.warning(
+                "Elastic floor4 MC2 destroyed PG ref trim: rank=%s reason=%s "
+                "max_refs=%s trimmed=%s remaining=%s trim_ms=%.2f "
+                "deferred_count=%s",
+                self.rank,
+                reason,
+                limit,
+                trimmed,
+                remaining,
+                trim_ms,
+                len(deferred),
+            )
+        return {
+            "destroyed_pg_ref_limit": float(limit),
+            "destroyed_pg_ref_trim_ms": trim_ms,
+            "destroyed_pg_refs_trimmed": float(trimmed),
+            "destroyed_pg_refs_remaining": float(remaining),
+        }
+
+    def _schedule_floor4_mc2_destroyed_pg_ref_trim(self, reason: str) -> None:
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_ASYNC_TRIM_DESTROYED_PG_REF",
+                "0"):
+            return
+        if getattr(self, "_elastic_floor4_mc2_async_trim_pending", False):
+            return
+        try:
+            delay_ms = float(
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_ASYNC_TRIM_DELAY_MS",
+                    "0",
+                ))
+        except ValueError:
+            delay_ms = 0.0
+        self._elastic_floor4_mc2_async_trim_pending = True
+
+        def _trim_worker() -> None:
+            try:
+                if delay_ms > 0:
+                    time.sleep(delay_ms / 1000.0)
+                logger.warning(
+                    "Elastic floor4 MC2 async destroyed PG ref trim start: "
+                    "rank=%s reason=%s delay_ms=%.2f",
+                    self.rank,
+                    reason,
+                    delay_ms,
+                )
+                stats = self._trim_floor4_mc2_destroyed_pg_refs(
+                    f"async_{reason}")
+                logger.warning(
+                    "Elastic floor4 MC2 async destroyed PG ref trim end: "
+                    "rank=%s reason=%s trim_ms=%.2f trimmed=%.0f "
+                    "remaining=%.0f limit=%.0f",
+                    self.rank,
+                    reason,
+                    float(stats.get("destroyed_pg_ref_trim_ms", 0.0)),
+                    float(stats.get("destroyed_pg_refs_trimmed", 0.0)),
+                    float(stats.get("destroyed_pg_refs_remaining", 0.0)),
+                    float(stats.get("destroyed_pg_ref_limit", -1.0)),
+                )
+            except Exception:
+                logger.exception(
+                    "Elastic floor4 MC2 async destroyed PG ref trim failed: "
+                    "rank=%s reason=%s",
+                    self.rank,
+                    reason,
+                )
+            finally:
+                self._elastic_floor4_mc2_async_trim_pending = False
+
+        trim_thread = threading.Thread(
+            target=_trim_worker,
+            name=f"floor4-mc2-pg-ref-trim-r{self.rank}",
+            daemon=True,
+        )
+        trim_thread.start()
 
     def _quarantine_deferred_elastic_group(
             self, group, group_kind: str,
@@ -7225,54 +7589,186 @@ class NPUWorker(WorkerBase):
         point in the same shrink call, and let process teardown or an explicit
         diagnostic cleanup handle the low-level destroy later.
         """
-        deferred_ids = self._get_deferred_elastic_group_ids()
+        deferred_refs = self._get_deferred_elastic_group_refs()
         group_id = id(group)
-        if group_id in deferred_ids:
-            logger.info(
-                "Elastic parallel group destroy already deferred: rank=%s "
-                "group_kind=%s group_ranks=%s reason=%s",
-                self.rank,
-                group_kind,
-                group_ranks,
-                reason,
-            )
+        deferred_group_ref = deferred_refs.get(group_id)
+        if deferred_group_ref is not None and deferred_group_ref() is group:
+            if self._elastic_group_lifecycle_log_enabled():
+                logger.info(
+                    "Elastic parallel group destroy already deferred: rank=%s "
+                    "group_kind=%s group_ranks=%s reason=%s",
+                    self.rank,
+                    group_kind,
+                    group_ranks,
+                    reason,
+                )
             return False
+        if deferred_group_ref is not None and deferred_group_ref() is None:
+            deferred_refs.pop(group_id, None)
         deferred = getattr(self, "_elastic_deferred_destroy_groups", None)
         if deferred is None:
             deferred = []
             self._elastic_deferred_destroy_groups = deferred
-        deferred_ids.add(group_id)
+        is_floor4_mc2 = (
+            (group_kind or "").lower() == "mc2" and len(group_ranks) == 4
+            and self._is_mode1_low_floor_elastic_runtime())
+        quarantine_total_start_t = time.perf_counter()
+        mark_ms = 0.0
+        retire_call_ms = 0.0
+        append_ms = 0.0
+        trim_ms = 0.0
+        destroyed_pg_refs_trimmed = 0.0
+        destroyed_pg_refs_remaining = 0.0
+        log_ms = 0.0
+        mark_start_t = time.perf_counter()
+        deferred_refs[group_id] = weakref.ref(group)
         self._mark_retired_elastic_group(group)
-        retire_stats = self._retire_group_wrapper_defer_pg_destroy(group)
+        mark_ms = (time.perf_counter() - mark_start_t) * 1000.0
+        if (is_floor4_mc2
+                and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUARANTINE_TRACE",
+                    "1")):
+            logger.warning(
+                "Elastic floor4 MC2 quarantine enter: rank=%s group_ranks=%s "
+                "reason=%s deferred_count_before=%s",
+                self.rank,
+                group_ranks,
+                reason,
+                len(deferred),
+            )
+        retire_call_start_t = time.perf_counter()
+        retire_stats = self._retire_group_wrapper_defer_pg_destroy(
+            group, group_kind, group_ranks)
+        retire_call_ms = (time.perf_counter() -
+                          retire_call_start_t) * 1000.0
+        append_start_t = time.perf_counter()
+        # If the device PG was actually destroyed, do not keep stale CPU PG
+        # references in the deferred pool for floor=4 MC2.  The wrapper itself
+        # is quarantined; retaining CPU PGs here has no correctness benefit and
+        # can keep control-plane state alive across the next overlapping group.
+        deferred_cpu_pgs = retire_stats.get("cpu_pgs", [])
+        if (is_floor4_mc2 and float(
+                retire_stats.get("destroy_device_pg", 0.0)) == 1.0
+                and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_DROP_DEFERRED_CPU_PG",
+                    "1")):
+            deferred_cpu_pgs = []
+        deferred_group_ref = group
+        if (is_floor4_mc2 and float(
+                retire_stats.get("destroy_device_pg", 0.0)) == 1.0
+                and not deferred_cpu_pgs
+                and not retire_stats.get("device_pgs", [])
+                and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_DROP_DEFERRED_GROUP_REF",
+                    "1")):
+            # The wrapper has already been removed from live/cache paths and
+            # its CPU/device PG references were detached. Keeping the whole
+            # wrapper in the deferred list can preserve stale control-plane
+            # state across the next overlapping 4-rank MC2 group. Keep only the
+            # retired id and metadata so stale cache checks still work.
+            deferred_group_ref = None
         deferred.append({
-            "group": group,
+            "group": deferred_group_ref,
             "device_pgs": retire_stats.get("device_pgs", []),
-            "cpu_pgs": retire_stats.get("cpu_pgs", []),
+            "destroyed_device_pgs": retire_stats.get("destroyed_device_pgs",
+                                                     []),
+            "cpu_pgs": deferred_cpu_pgs,
             "group_id": group_id,
             "group_kind": group_kind,
             "group_ranks": group_ranks,
             "reason": reason,
         })
-        logger.info(
-            "Elastic parallel group destroy deferred: rank=%s "
-            "group_kind=%s group_ranks=%s reason=%s deferred_count=%s "
-            "retire_wrapper_ms=%.2f npu_sync_ms=%.2f "
-            "device_pg_destroy_ms=%.2f destroy_device_pg=%.0f "
-            "dropped_pg_refs=%.0f deferred_device_pg_refs=%.0f "
-            "deferred_cpu_pg_refs=%.0f",
-            self.rank,
-            group_kind,
-            group_ranks,
-            reason,
-            len(deferred),
-            float(retire_stats.get("retire_wrapper_ms", 0.0)),
-            float(retire_stats.get("npu_sync_ms", 0.0)),
-            float(retire_stats.get("device_pg_destroy_ms", 0.0)),
-            float(retire_stats.get("destroy_device_pg", 0.0)),
-            float(retire_stats.get("dropped_pg_refs", 0.0)),
-            float(retire_stats.get("deferred_device_pg_refs", 0.0)),
-            float(retire_stats.get("deferred_cpu_pg_refs", 0.0)),
-        )
+        if is_floor4_mc2:
+            if _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_ASYNC_TRIM_DESTROYED_PG_REF",
+                    "0"):
+                self._schedule_floor4_mc2_destroyed_pg_ref_trim(reason)
+            else:
+                trim_stats = self._trim_floor4_mc2_destroyed_pg_refs(reason)
+                trim_ms = float(trim_stats.get("destroyed_pg_ref_trim_ms", 0.0))
+                destroyed_pg_refs_trimmed = float(
+                    trim_stats.get("destroyed_pg_refs_trimmed", 0.0))
+                destroyed_pg_refs_remaining = float(
+                    trim_stats.get("destroyed_pg_refs_remaining", 0.0))
+        append_ms = (time.perf_counter() - append_start_t) * 1000.0
+        retire_wrapper_ms = float(retire_stats.get("retire_wrapper_ms", 0.0))
+        npu_sync_ms = float(retire_stats.get("npu_sync_ms", 0.0))
+        device_pg_destroy_ms = float(
+            retire_stats.get("device_pg_destroy_ms", 0.0))
+        if (self._elastic_group_lifecycle_log_enabled()
+                or retire_wrapper_ms >= 1000.0
+                or npu_sync_ms >= 1000.0
+                or device_pg_destroy_ms >= 1000.0):
+            log_start_t = time.perf_counter()
+            logger.info(
+                "Elastic parallel group destroy deferred: rank=%s "
+                "group_kind=%s group_ranks=%s reason=%s deferred_count=%s "
+                "retire_wrapper_ms=%.2f npu_sync_ms=%.2f "
+                "device_pg_destroy_ms=%.2f destroy_device_pg=%.0f "
+                "dropped_pg_refs=%.0f deferred_device_pg_refs=%.0f "
+                "deferred_cpu_pg_refs=%.0f destroyed_device_pg_refs=%.0f "
+                "floor4_quiesce_enabled=%.0f floor4_quiesce_failed=%.0f "
+                "floor4_quiesce_total_ms=%.2f "
+                "floor4_quiesce_device_op_ms=%.2f "
+                "floor4_quiesce_pre_cpu_barrier_ms=%.2f "
+                "floor4_quiesce_post_cpu_barrier_ms=%.2f",
+                self.rank,
+                group_kind,
+                group_ranks,
+                reason,
+                len(deferred),
+                retire_wrapper_ms,
+                npu_sync_ms,
+                device_pg_destroy_ms,
+                float(retire_stats.get("destroy_device_pg", 0.0)),
+                float(retire_stats.get("dropped_pg_refs", 0.0)),
+                float(retire_stats.get("deferred_device_pg_refs", 0.0)),
+                float(retire_stats.get("deferred_cpu_pg_refs", 0.0)),
+                float(len(retire_stats.get("destroyed_device_pgs", []))),
+                float(retire_stats.get("floor4_quiesce_enabled", 0.0)),
+                float(retire_stats.get("floor4_quiesce_failed", 0.0)),
+                float(retire_stats.get("floor4_quiesce_total_ms", 0.0)),
+                float(retire_stats.get("floor4_quiesce_device_op_ms", 0.0)),
+                float(retire_stats.get(
+                    "floor4_quiesce_pre_cpu_barrier_ms", 0.0)),
+                float(retire_stats.get(
+                    "floor4_quiesce_post_cpu_barrier_ms", 0.0)),
+            )
+            log_ms = (time.perf_counter() - log_start_t) * 1000.0
+        quarantine_total_ms = (
+            time.perf_counter() - quarantine_total_start_t) * 1000.0
+        if (is_floor4_mc2
+                and (quarantine_total_ms >=
+                     self._elastic_slow_timing_log_threshold_ms()
+                     or _env_flag(
+                         "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_QUARANTINE_TRACE",
+                         "1"))):
+            logger.warning(
+                "Elastic floor4 MC2 quarantine exit: rank=%s group_ranks=%s "
+                "reason=%s total_ms=%.2f mark_ms=%.2f retire_call_ms=%.2f "
+                "retire_wrapper_ms=%.2f append_ms=%.2f log_ms=%.2f "
+                "deferred_count_after=%s cpu_pgs_kept=%s device_pgs_kept=%s "
+                "destroyed_device_pgs_kept=%s group_ref_kept=%s "
+                "destroyed_pg_ref_trim_ms=%.2f destroyed_pg_refs_trimmed=%.0f "
+                "destroyed_pg_refs_remaining=%.0f",
+                self.rank,
+                group_ranks,
+                reason,
+                quarantine_total_ms,
+                mark_ms,
+                retire_call_ms,
+                retire_wrapper_ms,
+                append_ms,
+                log_ms,
+                len(deferred),
+                len(deferred_cpu_pgs),
+                len(retire_stats.get("device_pgs", [])),
+                len(retire_stats.get("destroyed_device_pgs", [])),
+                int(deferred_group_ref is not None),
+                trim_ms,
+                destroyed_pg_refs_trimmed,
+                destroyed_pg_refs_remaining,
+            )
         return True
 
     def _should_defer_mode1_group_destroy(
@@ -7366,6 +7862,25 @@ class NPUWorker(WorkerBase):
             self._elastic_seen_parallel_group_signatures = seen_signatures
         return seen_signatures
 
+    def _elastic_group_lifecycle_log_enabled(self) -> bool:
+        # Low-floor mode=1 hits this path on every shrink/restore. Per-rank
+        # lifecycle logs are useful for bisects, but on this Ray/stdout stack they
+        # can backpressure the hot path and inflate rebuild/rpc timings without a
+        # real communicator rebuild. Keep them opt-in there.
+        default = "0" if self._is_mode1_low_floor_elastic_runtime() else "1"
+        return _env_flag("VLLM_ASCEND_ELASTIC_GROUP_LIFECYCLE_LOG", default)
+
+    def _elastic_group_cache_hit_log_enabled(self) -> bool:
+        default = "0" if self._is_mode1_low_floor_elastic_runtime() else "1"
+        return _env_flag("VLLM_ASCEND_ELASTIC_GROUP_CACHE_HIT_LOG", default)
+
+    def _elastic_slow_timing_log_threshold_ms(self) -> float:
+        try:
+            return float(
+                os.getenv("VLLM_ASCEND_ELASTIC_SLOW_TIMING_LOG_MS", "1000"))
+        except ValueError:
+            return 1000.0
+
     def _remove_cached_elastic_parallel_group_reference(
             self, attr_name: str, group_ranks: tuple[int, ...],
             group=None) -> bool:
@@ -7420,6 +7935,21 @@ class NPUWorker(WorkerBase):
             "VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE",
             "0").lower() not in ("1", "true", "yes", "on")
 
+    def _allow_cache_for_elastic_group_ranks(
+            self, group_kind: str, group_ranks: tuple[int, ...]) -> bool:
+        if not group_ranks:
+            return True
+        if ((group_kind or "").lower() == "mc2" and len(group_ranks) == 4
+                and self._is_mode1_low_floor_elastic_runtime()):
+            # Keep floor4 MC2 out of the elastic cache by default.  The overlap
+            # floor4 tests showed that clearing old cache entries alone is not
+            # enough: newly rebuilt 4-rank MC2 wrappers can be stored again and
+            # then dragged through full-restore stash/cache-hit paths on the
+            # next step.  Still allow explicit opt-in for diagnostics.
+            return _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_CACHE", "0")
+        return True
+
     def _should_keep_stale_mc2_cache_for_custom_mode1_parity(
             self, stale_group_ranks: tuple[int, ...],
             keep_group_ranks: tuple[int, ...]) -> bool:
@@ -7450,12 +7980,17 @@ class NPUWorker(WorkerBase):
     def _should_keep_mode1_floor4_group_cache(
             self, group_kind: str, cached_group_ranks: tuple[int, ...],
             keep_group_ranks: tuple[int, ...]) -> bool:
+        # Default to no stale floor4 cache.  Keeping the fixed tail MC2 group
+        # avoided one HCCL destroy path, but overlapping 4-rank groups can then
+        # drag an old wrapper through full-restore stash/rebuild and produce
+        # 60s+ latency.  Use the env only as an explicit diagnostic opt-in.
+        keep_floor4_default = "0"
         if not _env_flag("VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_CACHE",
-                         "0"):
+                         keep_floor4_default):
             return False
         keep_kinds = os.getenv(
             "VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_KINDS",
-            "dp,ep")
+            "mc2")
         keep_kind_set = {
             kind.strip().lower()
             for kind in keep_kinds.split(",") if kind.strip()
@@ -7468,11 +8003,14 @@ class NPUWorker(WorkerBase):
             return False
         if cached_group_ranks == keep_group_ranks:
             return False
-        # Limit this workaround to floor=2 mode1. Keeping the 8-rank floor
-        # cache was already shown to break or destabilize the following dp=4
-        # stage. Keeping floor4 MC2 by default is also unsafe: it keeps a large
-        # HCCL workspace alive and can OOM the next DP/MC2 workspace allocation.
-        # Use the kind allowlist above only for focused diagnostics.
+        if group_kind == "mc2":
+            # Explicit diagnostic opt-in only.  The default path must not keep a
+            # stale 4-rank MC2 wrapper across steps because overlapping floor4
+            # groups can otherwise revisit an old wrapper during full restore.
+            return self._has_mode1_lightweight_parity_module(exact_floor=4)
+        # Non-MC2 floor4 groups remain opt-in diagnostics. Keeping DP/EP stale
+        # caches can increase process-group count without addressing the observed
+        # floor4 MC2 HCCL destroy latency.
         return self._has_mode1_lightweight_parity_module(max_floor=2)
 
 
@@ -8203,6 +8741,9 @@ class NPUWorker(WorkerBase):
         full_world_ranks = tuple(range(world_size))
         if target_ranks != full_world_ranks:
             return False
+        if self._should_keep_mode1_floor4_group_cache(
+                group_kind, group_ranks, target_ranks):
+            return False
         # Keep only the previously stashed full-world EP cache across shrink.
         # During restore, the currently live shrink-stage DP/EP/MC2 groups are
         # not useful after the full-world rebuild target is known. Re-stashing
@@ -8276,6 +8817,15 @@ class NPUWorker(WorkerBase):
         if group is None:
             return
 
+        stash_start_t = time.perf_counter()
+        cache_store_ms = 0.0
+        cache_remove_ms = 0.0
+        defer_check_ms = 0.0
+        quarantine_ms = 0.0
+        destroy_ms = 0.0
+        cleanup_ms = 0.0
+        destroy_reason = "cache_store"
+
         should_cache_group = self._should_cache_elastic_parallel_group(
             attr_name)
         group_ranks = tuple(int(rank) for rank in getattr(group, "ranks", []))
@@ -8292,18 +8842,22 @@ class NPUWorker(WorkerBase):
         already_retired_group = self._is_retired_elastic_group(group)
         if already_retired_group:
             should_cache_group = False
+        if (should_cache_group and not self._allow_cache_for_elastic_group_ranks(
+                group_kind, group_ranks)):
+            should_cache_group = False
         if destroy_for_single_live_mc2:
             target_ranks = tuple(
                 int(rank) for rank in getattr(
                     self, "_elastic_rebuild_target_ranks", ()) or ())
-            logger.info(
-                "Elastic custom mode1 MC2 single-live-group destroying old group before rebuild: "
-                "rank=%s attr=%s old_ranks=%s target_ranks=%s",
-                self.rank,
-                attr_name,
-                group_ranks,
-                target_ranks,
-            )
+            if self._elastic_group_lifecycle_log_enabled():
+                logger.info(
+                    "Elastic custom mode1 MC2 single-live-group destroying old group before rebuild: "
+                    "rank=%s attr=%s old_ranks=%s target_ranks=%s",
+                    self.rank,
+                    attr_name,
+                    group_ranks,
+                    target_ranks,
+                )
             self._log_custom_mode1_worker_memory(
                 "before_single_live_mc2_destroy",
                 f"old_ranks={group_ranks} target_ranks={target_ranks}",
@@ -8313,15 +8867,16 @@ class NPUWorker(WorkerBase):
             target_ranks = tuple(
                 int(rank) for rank in getattr(
                     self, "_elastic_rebuild_target_ranks", ()) or ())
-            logger.info(
-                "Elastic mode1 full-restore defers stale live floor group destroy: "
-                "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
-                self.rank,
-                attr_name,
-                group_kind,
-                group_ranks,
-                target_ranks,
-            )
+            if self._elastic_group_lifecycle_log_enabled():
+                logger.info(
+                    "Elastic mode1 full-restore defers stale live floor group destroy: "
+                    "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
+                    self.rank,
+                    attr_name,
+                    group_kind,
+                    group_ranks,
+                    target_ranks,
+                )
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "before_mode1_full_restore_mc2_defer",
@@ -8332,15 +8887,16 @@ class NPUWorker(WorkerBase):
             target_ranks = tuple(
                 int(rank) for rank in getattr(
                     self, "_elastic_rebuild_target_ranks", ()) or ())
-            logger.info(
-                "Elastic mode1 pre-rebuild defers stale live floor group destroy: "
-                "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
-                self.rank,
-                attr_name,
-                group_kind,
-                group_ranks,
-                target_ranks,
-            )
+            if self._elastic_group_lifecycle_log_enabled():
+                logger.info(
+                    "Elastic mode1 pre-rebuild defers stale live floor group destroy: "
+                    "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
+                    self.rank,
+                    attr_name,
+                    group_kind,
+                    group_ranks,
+                    target_ranks,
+                )
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "before_mode1_pre_rebuild_mc2_defer",
@@ -8348,16 +8904,22 @@ class NPUWorker(WorkerBase):
                 )
             should_cache_group = False
         if group_ranks and should_cache_group:
+            cache_store_start_t = time.perf_counter()
             cached_groups = self._get_cached_elastic_parallel_groups()
             cached_groups.setdefault(attr_name, {})[group_ranks] = group
             self._get_seen_elastic_parallel_group_signatures().add(
                 (group_kind, group_ranks))
+            cache_store_ms = (
+                time.perf_counter() - cache_store_start_t) * 1000.0
         else:
             if group_ranks:
+                cache_remove_start_t = time.perf_counter()
                 self._remove_cached_elastic_parallel_group_reference(
                     attr_name, group_ranks, group)
                 self._get_seen_elastic_parallel_group_signatures().discard(
                     (group_kind, group_ranks))
+                cache_remove_ms = (
+                    time.perf_counter() - cache_remove_start_t) * 1000.0
             if already_retired_group:
                 destroy_reason = "already_retired"
             elif destroy_for_single_live_mc2:
@@ -8368,50 +8930,63 @@ class NPUWorker(WorkerBase):
                 destroy_reason = "mode1_pre_rebuild"
             else:
                 destroy_reason = "stash_group"
-            cleanup_ms = 0.0
             if already_retired_group:
                 destroy_ms = 0.0
-            elif self._should_defer_stashed_group_destroy_for_mode1(
-                    group_kind,
-                    group_ranks,
-                    destroy_reason,
-            ) or self._should_defer_mode3_group_destroy(
-                    group_kind,
-                    group_ranks,
-                    tuple(
-                        int(rank) for rank in getattr(
-                            self, "_elastic_rebuild_target_ranks", ()) or ()),
-                    destroy_reason,
-            ):
-                self._quarantine_deferred_elastic_group(
-                    group,
-                    group_kind,
-                    group_ranks,
-                    destroy_reason,
-                )
-                destroy_ms = 0.0
             else:
-                if self._is_mode1_low_floor_elastic_runtime():
-                    logger.warning(
-                        "Elastic mode1 low-floor stashed group direct destroy fallback: "
-                        "rank=%s group_kind=%s group_ranks=%s reason=%s defer_env=%s defer_sizes=%s",
-                        self.rank,
+                defer_check_start_t = time.perf_counter()
+                should_defer_destroy = (
+                    self._should_defer_stashed_group_destroy_for_mode1(
                         group_kind,
                         group_ranks,
                         destroy_reason,
-                        os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"),
-                        os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES", "1,2,4,8"),
+                    ) or self._should_defer_mode3_group_destroy(
+                        group_kind,
+                        group_ranks,
+                        tuple(
+                            int(rank) for rank in getattr(
+                                self, "_elastic_rebuild_target_ranks", ())
+                            or ()),
+                        destroy_reason,
+                    ))
+                defer_check_ms = (
+                    time.perf_counter() - defer_check_start_t) * 1000.0
+                if should_defer_destroy:
+                    quarantine_start_t = time.perf_counter()
+                    self._quarantine_deferred_elastic_group(
+                        group,
+                        group_kind,
+                        group_ranks,
+                        destroy_reason,
                     )
-                destroy_start_t = time.perf_counter()
-                group.destroy()
-                self._detach_destroyed_group_references(group)
-                self._mark_retired_elastic_group(group)
-                destroy_ms = (time.perf_counter() - destroy_start_t) * 1000.0
-                if group_kind == "mc2":
-                    cleanup_stats = self._cleanup_after_elastic_mc2_group_destroy(
-                        destroy_reason)
-                    cleanup_ms = float(cleanup_stats.get("total_ms", 0.0))
-            if destroy_for_mode1_pre_rebuild or destroy_for_mode1_full_restore or destroy_ms >= 1000.0:
+                    quarantine_ms = (
+                        time.perf_counter() - quarantine_start_t) * 1000.0
+                    destroy_ms = 0.0
+                else:
+                    if self._is_mode1_low_floor_elastic_runtime():
+                        logger.warning(
+                            "Elastic mode1 low-floor stashed group direct destroy fallback: "
+                            "rank=%s group_kind=%s group_ranks=%s reason=%s defer_env=%s defer_sizes=%s",
+                            self.rank,
+                            group_kind,
+                            group_ranks,
+                            destroy_reason,
+                            os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"),
+                            os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES", "1,2,4,8"),
+                        )
+                    destroy_start_t = time.perf_counter()
+                    group.destroy()
+                    self._detach_destroyed_group_references(group)
+                    self._mark_retired_elastic_group(group)
+                    destroy_ms = (
+                        time.perf_counter() - destroy_start_t) * 1000.0
+                    if group_kind == "mc2":
+                        cleanup_stats = self._cleanup_after_elastic_mc2_group_destroy(
+                            destroy_reason)
+                        cleanup_ms = float(cleanup_stats.get("total_ms", 0.0))
+            if ((self._elastic_group_lifecycle_log_enabled()
+                 and (destroy_for_mode1_pre_rebuild
+                      or destroy_for_mode1_full_restore))
+                    or destroy_ms >= 1000.0):
                 logger.info(
                     "Elastic parallel stashed group released: "
                     "rank=%s attr=%s group_kind=%s old_ranks=%s reason=%s "
@@ -8425,6 +9000,39 @@ class NPUWorker(WorkerBase):
                     cleanup_ms,
                     already_retired_group,
                 )
+        stash_total_ms = (time.perf_counter() - stash_start_t) * 1000.0
+        slow_threshold_ms = self._elastic_slow_timing_log_threshold_ms()
+        if (stash_total_ms >= slow_threshold_ms
+                or cache_store_ms >= slow_threshold_ms
+                or cache_remove_ms >= slow_threshold_ms
+                or defer_check_ms >= slow_threshold_ms
+                or quarantine_ms >= slow_threshold_ms
+                or destroy_ms >= slow_threshold_ms
+                or cleanup_ms >= slow_threshold_ms):
+            logger.warning(
+                "Elastic stash slow timing: rank=%s attr=%s group_kind=%s "
+                "group_ranks=%s target_ranks=%s reason=%s cacheable=%s "
+                "already_retired=%s total_ms=%.2f cache_store_ms=%.2f "
+                "cache_remove_ms=%.2f defer_check_ms=%.2f "
+                "quarantine_ms=%.2f destroy_ms=%.2f cleanup_ms=%.2f",
+                self.rank,
+                attr_name,
+                group_kind,
+                group_ranks,
+                tuple(
+                    int(rank) for rank in getattr(
+                        self, "_elastic_rebuild_target_ranks", ()) or ()),
+                destroy_reason,
+                int(should_cache_group),
+                already_retired_group,
+                stash_total_ms,
+                cache_store_ms,
+                cache_remove_ms,
+                defer_check_ms,
+                quarantine_ms,
+                destroy_ms,
+                cleanup_ms,
+            )
         setattr(state_module, attr_name, None)
 
     def _get_local_group_ranks(self,
@@ -8490,10 +9098,11 @@ class NPUWorker(WorkerBase):
                 )
             ]
             for ranks in kept_stale_group_ranks:
-                logger.info(
-                    "Elastic lightweight path keeps stale %s cache: rank=%s keep_ranks=%s cached_ranks=%s mode3=%s",
-                    group_kind.upper(), self.rank, keep_group_ranks, ranks,
-                    self._has_mode3_cross_layer_lightweight_module())
+                if self._elastic_group_lifecycle_log_enabled():
+                    logger.info(
+                        "Elastic lightweight path keeps stale %s cache: rank=%s keep_ranks=%s cached_ranks=%s mode3=%s",
+                        group_kind.upper(), self.rank, keep_group_ranks, ranks,
+                        self._has_mode3_cross_layer_lightweight_module())
             for ranks in stale_group_ranks:
                 group = groups_by_ranks.pop(ranks, None)
                 if group is not None:
@@ -8551,7 +9160,8 @@ class NPUWorker(WorkerBase):
                 if (group_kind, ranks) in seen_signatures:
                     seen_signatures.discard((group_kind, ranks))
                     dropped_signatures += 1
-                if group_kind == "mc2":
+                if (group_kind == "mc2"
+                        and self._elastic_group_lifecycle_log_enabled()):
                     logger.info(
                         "Elastic parallel stale MC2 cache dropped across restore: rank=%s keep_ranks=%s stale_ranks=%s",
                         self.rank, keep_group_ranks, ranks)
@@ -8780,6 +9390,12 @@ class NPUWorker(WorkerBase):
     def _rebuild_group(self, state_module, attr_name: str,
                        group_ranks: list[list[int]], world_group,
                        backend: str, group_name: str) -> None:
+        rebuild_start_t = time.perf_counter()
+        stash_ms = 0.0
+        cache_lookup_ms = 0.0
+        create_ms = 0.0
+        cache_store_ms = 0.0
+        cache_hit = False
         local_group_ranks = self._get_local_group_ranks(group_ranks)
         previous_target_ranks = getattr(self, "_elastic_rebuild_target_ranks",
                                         None)
@@ -8791,24 +9407,53 @@ class NPUWorker(WorkerBase):
                     "before_rebuild_mc2_stash",
                     f"group_name={group_name} target_ranks={local_group_ranks}",
                 )
+            stash_start_t = time.perf_counter()
             self._stash_group_if_present(state_module, attr_name)
+            stash_ms = (time.perf_counter() - stash_start_t) * 1000.0
 
             should_cache_group = self._should_cache_elastic_parallel_group(
                 attr_name)
+            if (should_cache_group
+                    and not self._allow_cache_for_elastic_group_ranks(
+                        group_kind, local_group_ranks)):
+                should_cache_group = False
             bypass_cache_hit = (
                 group_kind == "mc2"
                 and bool(getattr(self,
                                  "_elastic_force_rebuild_mc2_on_restore",
                                  False)))
             if should_cache_group and not bypass_cache_hit:
+                cache_lookup_start_t = time.perf_counter()
                 cached_groups = self._get_cached_elastic_parallel_groups()
                 cached_group = cached_groups.get(attr_name,
                                                  {}).get(local_group_ranks)
+                cache_lookup_ms = (
+                    time.perf_counter() - cache_lookup_start_t) * 1000.0
                 if cached_group is not None:
-                    setattr(state_module, attr_name, cached_group)
-                    logger.info(
-                        "Elastic parallel group cache hit: rank=%s attr=%s group_name=%s ranks=%s",
-                        self.rank, attr_name, group_name, local_group_ranks)
+                    if self._is_retired_elastic_group(cached_group):
+                        logger.warning(
+                            "Elastic cached group is retired; dropping stale cache entry: "
+                            "rank=%s attr=%s group_kind=%s group_name=%s ranks=%s",
+                            self.rank,
+                            attr_name,
+                            group_kind,
+                            group_name,
+                            local_group_ranks,
+                        )
+                        cached_groups.get(attr_name,
+                                          {}).pop(local_group_ranks, None)
+                        self._get_seen_elastic_parallel_group_signatures(
+                        ).discard((group_kind, local_group_ranks))
+                        cached_group = None
+                    else:
+                        setattr(state_module, attr_name, cached_group)
+                        cache_hit = True
+                if cached_group is not None and cache_hit:
+                    if self._elastic_group_cache_hit_log_enabled():
+                        logger.info(
+                            "Elastic parallel group cache hit: rank=%s attr=%s group_name=%s ranks=%s",
+                            self.rank, attr_name, group_name,
+                            local_group_ranks)
                     if group_kind == "mc2":
                         self._log_custom_mode1_worker_memory(
                             "after_rebuild_mc2_cache_hit",
@@ -8825,10 +9470,12 @@ class NPUWorker(WorkerBase):
                     "before_rebuild_mc2_create",
                     f"group_name={group_name} ranks={local_group_ranks}",
                 )
+            create_start_t = time.perf_counter()
             setattr(
                 state_module, attr_name,
                 init_model_parallel_group(group_ranks, world_group.local_rank,
                                           backend, group_name=group_name))
+            create_ms = (time.perf_counter() - create_start_t) * 1000.0
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "after_rebuild_mc2_create",
@@ -8836,9 +9483,12 @@ class NPUWorker(WorkerBase):
                 )
             if local_group_ranks:
                 if should_cache_group:
+                    cache_store_start_t = time.perf_counter()
                     cached_groups = self._get_cached_elastic_parallel_groups()
                     cached_groups.setdefault(attr_name, {})[
                         local_group_ranks] = getattr(state_module, attr_name)
+                    cache_store_ms = (
+                        time.perf_counter() - cache_store_start_t) * 1000.0
                     if group_kind == "mc2":
                         logger.info(
                             "Elastic parallel MC2 group cached: rank=%s group_name=%s ranks=%s",
@@ -8846,6 +9496,30 @@ class NPUWorker(WorkerBase):
                 self._get_seen_elastic_parallel_group_signatures().add(
                     (group_kind, local_group_ranks))
         finally:
+            total_ms = (time.perf_counter() - rebuild_start_t) * 1000.0
+            slow_threshold_ms = self._elastic_slow_timing_log_threshold_ms()
+            if (total_ms >= slow_threshold_ms
+                    or stash_ms >= slow_threshold_ms
+                    or cache_lookup_ms >= slow_threshold_ms
+                    or create_ms >= slow_threshold_ms
+                    or cache_store_ms >= slow_threshold_ms):
+                logger.warning(
+                    "Elastic rebuild group slow timing: rank=%s attr=%s "
+                    "group_kind=%s group_name=%s target_ranks=%s "
+                    "cache_hit=%s total_ms=%.2f stash_ms=%.2f "
+                    "cache_lookup_ms=%.2f create_ms=%.2f cache_store_ms=%.2f",
+                    self.rank,
+                    attr_name,
+                    group_kind,
+                    group_name,
+                    local_group_ranks,
+                    int(cache_hit),
+                    total_ms,
+                    stash_ms,
+                    cache_lookup_ms,
+                    create_ms,
+                    cache_store_ms,
+                )
             self._elastic_rebuild_target_ranks = previous_target_ranks
 
     def _warmup_post_shrink_dp_collectives(self) -> None:
@@ -9835,8 +10509,10 @@ class NPUWorker(WorkerBase):
             self._stop_mode4_remote_cache_service(world_group)
             torch.distributed.barrier(group=world_group.cpu_group)
 
+        reconcile_start_t = time.perf_counter()
         self._reconcile_group_creation_sequence_before_restore(
             world_group, backend)
+        reconcile_ms = (time.perf_counter() - reconcile_start_t) * 1000.0
 
         force_rebuild_restore_mc2 = (
             int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) == 3
@@ -9845,21 +10521,33 @@ class NPUWorker(WorkerBase):
             self, "_elastic_force_rebuild_mc2_on_restore", False)
 
         rebuild_start_t = time.perf_counter()
+        rebuild_dp_ms = 0.0
+        rebuild_ep_ms = 0.0
+        rebuild_mc2_ms = 0.0
         self._elastic_force_rebuild_mc2_on_restore = force_rebuild_restore_mc2
         try:
             with set_current_vllm_config(self.vllm_config):
+                rebuild_dp_start_t = time.perf_counter()
                 self._rebuild_group(
                     vllm_ps, "_DP",
                     self._build_original_dp_group_ranks(world_size),
                     world_group, backend, "dp")
+                rebuild_dp_ms = (
+                    time.perf_counter() - rebuild_dp_start_t) * 1000.0
+                rebuild_ep_start_t = time.perf_counter()
                 self._rebuild_group(
                     vllm_ps, "_EP",
                     self._build_original_ep_group_ranks(world_size),
                     world_group, backend, "ep")
+                rebuild_ep_ms = (
+                    time.perf_counter() - rebuild_ep_start_t) * 1000.0
+                rebuild_mc2_start_t = time.perf_counter()
                 self._rebuild_group(
                     ascend_ps, "_MC2",
                     self._build_original_mc2_group_ranks(world_size),
                     world_group, backend, "mc2")
+                rebuild_mc2_ms = (
+                    time.perf_counter() - rebuild_mc2_start_t) * 1000.0
         finally:
             self._elastic_force_rebuild_mc2_on_restore = (
                 previous_force_rebuild_mc2)
@@ -9874,17 +10562,26 @@ class NPUWorker(WorkerBase):
         refresh_ms = (time.perf_counter() - refresh_start_t) * 1000.0
         self.elastic_parallel_detached = False
         self._elastic_current_active_ranks = list(range(world_size))
+        drop_stale_start_t = time.perf_counter()
         self._drop_stale_cached_elastic_parallel_groups(
             tuple(range(world_size)))
+        drop_stale_ms = (time.perf_counter() - drop_stale_start_t) * 1000.0
+        warmup_start_t = time.perf_counter()
         self._warmup_post_restore_mc2_dispatch_for_custom_mode1_parity(
             world_size)
         self._warmup_post_restore_alltoall_dispatch_for_custom_mode1_parity(
             world_size)
+        warmup_ms = (time.perf_counter() - warmup_start_t) * 1000.0
 
         logger.info(
-            "Elastic parallel restore done: rank=%s dp_size=%s ep_size=%s rebuild_ms=%.2f refresh_ms=%.2f total_ms=%.2f",
+            "Elastic parallel restore done: rank=%s dp_size=%s ep_size=%s "
+            "reconcile_ms=%.2f rebuild_ms=%.2f rebuild_dp_ms=%.2f "
+            "rebuild_ep_ms=%.2f rebuild_mc2_ms=%.2f refresh_ms=%.2f "
+            "drop_stale_ms=%.2f warmup_ms=%.2f total_ms=%.2f",
             self.rank, get_dp_group().world_size, vllm_ps.get_ep_group().world_size,
-            rebuild_ms, refresh_ms, (time.perf_counter() - start_t) * 1000.0)
+            reconcile_ms, rebuild_ms, rebuild_dp_ms, rebuild_ep_ms,
+            rebuild_mc2_ms, refresh_ms, drop_stale_ms, warmup_ms,
+            (time.perf_counter() - start_t) * 1000.0)
         return True
 
     def set_need_allreduce(self, value: bool):

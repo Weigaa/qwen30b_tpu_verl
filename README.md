@@ -1,5 +1,8 @@
 # Qwen3系列模型 RL训练优化实践样例
 
+> **HCCL floor=4 MC2 通信组问题复现分支说明**：本分支包含 mode=1 elastic rollout 下 4-rank MC2/HCCL communicator destroy/restore 异常长耗时的复现脚本和分析工具。复现步骤见 [README_HCCL_FLOOR4_MC2_REPRO.md](README_HCCL_FLOOR4_MC2_REPRO.md)。
+
+
 ## 概述
 本样例针对Qwen3-235B-A22B和Qwen3-32B模型，基于[veRL开源框架](https://github.com/volcengine/verl)，以及veRL原生支持的MindSpeed和vLLM-Ascend框架，完成了多项强化学习实践。
 

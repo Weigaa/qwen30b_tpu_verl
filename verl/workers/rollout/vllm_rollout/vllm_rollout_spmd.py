@@ -1081,10 +1081,58 @@ class vLLMRollout(BaseRollout):
                     remaining -= take
                     next_bucket = max(next_bucket // 2, 1)
 
+                rotate_buckets = os.getenv(
+                    "VERL_ELASTIC_TAIL_VALIDATE_ROTATE_BUCKETS",
+                    "0").strip().lower() in ("1", "true", "yes", "on")
+                rotate_modes = [
+                    item.strip().lower()
+                    for item in os.getenv(
+                        "VERL_ELASTIC_TAIL_VALIDATE_ROTATE_MODES",
+                        "tail,head").split(",")
+                    if item.strip()
+                ] or ["tail", "head"]
+                rotate_call_idx = int(getattr(
+                    self, "_elastic_tail_validate_call_idx", 0))
+                if rotate_buckets:
+                    setattr(self, "_elastic_tail_validate_call_idx",
+                            rotate_call_idx + 1)
+                rotate_mode = (
+                    rotate_modes[rotate_call_idx % len(rotate_modes)]
+                    if rotate_buckets else "tail")
+                effective_rank = global_rank
+                if rotate_mode in ("head", "reverse", "low"):
+                    effective_rank = world_size - 1 - global_rank
+                elif rotate_mode in ("tail", "normal", "high"):
+                    effective_rank = global_rank
+                elif rotate_mode.startswith(("shift", "offset")):
+                    # Shift the logical bucket assignment while keeping the
+                    # real global ranks unchanged. For world_size=16,
+                    # `tail` gives floor4 [12,13,14,15], while `shift2`
+                    # gives [10,11,12,13], creating controlled overlap.
+                    prefix = "shift" if rotate_mode.startswith("shift") else "offset"
+                    try:
+                        rotate_offset = int(rotate_mode[len(prefix):])
+                        effective_rank = (global_rank + rotate_offset) % world_size
+                    except ValueError:
+                        logger.warning(
+                            "Invalid VERL_ELASTIC_TAIL_VALIDATE_ROTATE_MODES "
+                            "shift/offset entry=%s; falling back to normal tail "
+                            "bucket order.",
+                            rotate_mode)
+                        rotate_mode = "tail"
+                        effective_rank = global_rank
+                else:
+                    logger.warning(
+                        "Unknown VERL_ELASTIC_TAIL_VALIDATE_ROTATE_MODES entry=%s; "
+                        "falling back to normal tail bucket order.",
+                        rotate_mode)
+                    rotate_mode = "tail"
+                    effective_rank = global_rank
+
                 bucket_idx = len(bucket_sizes) - 1
                 cursor = 0
                 for bucket_id, bucket_size in enumerate(bucket_sizes):
-                    if global_rank < cursor + bucket_size:
+                    if effective_rank < cursor + bucket_size:
                         bucket_idx = bucket_id
                         break
                     cursor += bucket_size
@@ -1093,13 +1141,17 @@ class vLLMRollout(BaseRollout):
                 kwargs["max_tokens"] = max(1, min(level_caps[cap_idx], current_max, max_resp_len))
                 logger.info(
                     "Elastic tail validation cap override: rank=%s world_size=%s "
-                    "bucket=%s/%s bucket_sizes=%s max_tokens=%s",
+                    "bucket=%s/%s bucket_sizes=%s max_tokens=%s "
+                    "rotate=%s rotate_call=%s effective_rank=%s",
                     global_rank,
                     world_size,
                     bucket_idx,
                     len(bucket_sizes),
                     bucket_sizes,
                     kwargs["max_tokens"],
+                    rotate_mode if rotate_buckets else "off",
+                    rotate_call_idx if rotate_buckets else -1,
+                    effective_rank,
                 )
 
         lora_requests = None
