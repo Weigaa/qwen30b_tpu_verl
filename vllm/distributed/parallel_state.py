@@ -26,6 +26,7 @@ import contextlib
 import gc
 import os
 import pickle
+import time
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -47,6 +48,58 @@ from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.utils import (direct_register_custom_op, get_distributed_init_method,
                         resolve_obj_by_qualname, supports_custom_op)
+
+
+_ELASTIC_GROUPCOORDINATOR_SEQ_COUNTERS: dict[str, int] = {}
+
+
+def _elastic_groupcoordinator_seq_digest_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_ELASTIC_HCCL_SEQ_DIGEST_LOG",
+                     "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _next_elastic_groupcoordinator_seq(op: str) -> int:
+    seq = _ELASTIC_GROUPCOORDINATOR_SEQ_COUNTERS.get(op, 0) + 1
+    _ELASTIC_GROUPCOORDINATOR_SEQ_COUNTERS[op] = seq
+    return seq
+
+
+def get_elastic_groupcoordinator_seq_counters() -> dict[str, int]:
+    """Return rank-local elastic PG create/destroy counters for diagnostics."""
+    return dict(_ELASTIC_GROUPCOORDINATOR_SEQ_COUNTERS)
+
+
+def _log_elastic_groupcoordinator_seq_digest(
+        event: str,
+        op: str,
+        group_name: str,
+        ranks: list[int],
+        backend: Union[str, Backend],
+        seq: int | None = None,
+        extra: str = "") -> int | None:
+    if not _elastic_groupcoordinator_seq_digest_enabled():
+        return seq
+    try:
+        if seq is None:
+            seq = _next_elastic_groupcoordinator_seq(op)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized(
+        ) else -1
+        init_logger(__name__).info(
+            "Elastic HCCL seq digest: rank=%s op=%s seq=%s event=%s "
+            "group_kind=groupcoordinator group_name=%s backend=%s "
+            "group_ranks=%s target=() active=() reason=GroupCoordinator extra=%s",
+            rank,
+            op,
+            seq,
+            event,
+            group_name,
+            backend,
+            tuple(int(rank) for rank in ranks),
+            extra,
+        )
+        return seq
+    except Exception:
+        return seq
 
 
 @dataclass
@@ -236,12 +289,67 @@ class GroupCoordinator:
                         group_name, self.ranks)
 
         if not reuse_world_group:
+            log_hccl_seq = _elastic_groupcoordinator_seq_digest_enabled()
             for ranks in group_ranks:
+                device_seq = None
+                device_start_t = None
+                if log_hccl_seq:
+                    device_seq = _next_elastic_groupcoordinator_seq("create")
+                    _log_elastic_groupcoordinator_seq_digest(
+                        "groupcoordinator_device_new_group_start",
+                        "create",
+                        group_name,
+                        ranks,
+                        torch_distributed_backend,
+                        seq=device_seq,
+                    )
+                    device_start_t = time.perf_counter()
                 device_group = torch.distributed.new_group(
                     ranks, backend=torch_distributed_backend)
+                if log_hccl_seq:
+                    assert device_start_t is not None
+                    _log_elastic_groupcoordinator_seq_digest(
+                        "groupcoordinator_device_new_group_done",
+                        "create",
+                        group_name,
+                        ranks,
+                        torch_distributed_backend,
+                        seq=device_seq,
+                        extra=(
+                            f"create_ms="
+                            f"{(time.perf_counter() - device_start_t) * 1000.0:.2f}"
+                        ),
+                    )
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
+                cpu_seq = None
+                cpu_start_t = None
+                if log_hccl_seq:
+                    cpu_seq = _next_elastic_groupcoordinator_seq("create")
+                    _log_elastic_groupcoordinator_seq_digest(
+                        "groupcoordinator_cpu_new_group_start",
+                        "create",
+                        group_name,
+                        ranks,
+                        "gloo",
+                        seq=cpu_seq,
+                    )
+                    cpu_start_t = time.perf_counter()
                 cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if log_hccl_seq:
+                    assert cpu_start_t is not None
+                    _log_elastic_groupcoordinator_seq_digest(
+                        "groupcoordinator_cpu_new_group_done",
+                        "create",
+                        group_name,
+                        ranks,
+                        "gloo",
+                        seq=cpu_seq,
+                        extra=(
+                            f"create_ms="
+                            f"{(time.perf_counter() - cpu_start_t) * 1000.0:.2f}"
+                        ),
+                    )
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)
@@ -877,12 +985,64 @@ class GroupCoordinator:
         if self.device_communicator is not None:
             self.device_communicator.destroy()
         if self._owns_process_groups and hasattr(self, "device_group"):
+            destroy_seq = None
+            destroy_start_t = None
+            if _elastic_groupcoordinator_seq_digest_enabled():
+                destroy_seq = _next_elastic_groupcoordinator_seq("destroy")
+                _log_elastic_groupcoordinator_seq_digest(
+                    "groupcoordinator_device_destroy_start",
+                    "destroy",
+                    self.unique_name,
+                    getattr(self, "ranks", []),
+                    "device",
+                    seq=destroy_seq,
+                    extra=f"pg_id={id(self.device_group)}",
+                )
+                destroy_start_t = time.perf_counter()
             torch.distributed.destroy_process_group(self.device_group)
+            if _elastic_groupcoordinator_seq_digest_enabled():
+                assert destroy_start_t is not None
+                _log_elastic_groupcoordinator_seq_digest(
+                    "groupcoordinator_device_destroy_done",
+                    "destroy",
+                    self.unique_name,
+                    getattr(self, "ranks", []),
+                    "device",
+                    seq=destroy_seq,
+                    extra=(f"pg_id={id(self.device_group)} "
+                           f"destroy_ms={(time.perf_counter() - destroy_start_t) * 1000.0:.2f}"),
+                )
             del self.device_group
         elif hasattr(self, "device_group"):
             del self.device_group
         if self._owns_process_groups and hasattr(self, "cpu_group"):
+            destroy_seq = None
+            destroy_start_t = None
+            if _elastic_groupcoordinator_seq_digest_enabled():
+                destroy_seq = _next_elastic_groupcoordinator_seq("destroy")
+                _log_elastic_groupcoordinator_seq_digest(
+                    "groupcoordinator_cpu_destroy_start",
+                    "destroy",
+                    self.unique_name,
+                    getattr(self, "ranks", []),
+                    "gloo",
+                    seq=destroy_seq,
+                    extra=f"pg_id={id(self.cpu_group)}",
+                )
+                destroy_start_t = time.perf_counter()
             torch.distributed.destroy_process_group(self.cpu_group)
+            if _elastic_groupcoordinator_seq_digest_enabled():
+                assert destroy_start_t is not None
+                _log_elastic_groupcoordinator_seq_digest(
+                    "groupcoordinator_cpu_destroy_done",
+                    "destroy",
+                    self.unique_name,
+                    getattr(self, "ranks", []),
+                    "gloo",
+                    seq=destroy_seq,
+                    extra=(f"pg_id={id(self.cpu_group)} "
+                           f"destroy_ms={(time.perf_counter() - destroy_start_t) * 1000.0:.2f}"),
+                )
             del self.cpu_group
         elif hasattr(self, "cpu_group"):
             del self.cpu_group

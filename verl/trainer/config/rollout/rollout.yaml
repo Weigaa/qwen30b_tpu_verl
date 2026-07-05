@@ -116,6 +116,7 @@ shrink_aware:
   shrink_aware_mode: off
   shrink_stages: [8, 4]
   survivor_selection_policy: topology_aware
+  target_policy: natural
   package_topology: null
   intermediate_survivor_ranks: null
   final_survivor_ranks: null

@@ -356,12 +356,24 @@ class RayDAPOTrainer(RayPPOTrainer):
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
+                    skip_actor_update = os.getenv(
+                        "VERL_DIAG_SKIP_ACTOR_UPDATE", "0").lower() in (
+                            "1", "true", "yes", "on")
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
-                        with marked_timer("update_actor", timing_raw, "red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                        if skip_actor_update:
+                            print(
+                                "[VERL_DIAG_SKIP_ACTOR_UPDATE] skip update_actor "
+                                f"at global_step={self.global_steps}",
+                                flush=True,
+                            )
+                            timing_raw["update_actor"] = 0.0
+                            metrics["diag/skip_actor_update"] = 1.0
+                        else:
+                            with marked_timer("update_actor", timing_raw, "red"):
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

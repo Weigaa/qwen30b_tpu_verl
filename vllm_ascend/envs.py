@@ -252,6 +252,11 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # shrink, where MC2 would otherwise introduce another variable.
     "VLLM_ASCEND_FORCE_ALLTOALL_MOE":
     lambda: bool(int(os.getenv("VLLM_ASCEND_FORCE_ALLTOALL_MOE", '0'))),
+    # Force expert-parallel MoE communication onto MC2 when it is available.
+    # This is a diagnostic/mitigation switch for isolating AllToAllV issues in
+    # shrink/restore mode1 runs; normal auto-selection remains the default.
+    "VLLM_ASCEND_FORCE_MC2_MOE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_FORCE_MC2_MOE", '0'))),
     # Minimum EP size required before the runtime is allowed to select MC2.
     # Default to 2 so the elastic floor=2 hybrid path can keep using MC2
     # when the usual token-count / prefill fallbacks still allow it.

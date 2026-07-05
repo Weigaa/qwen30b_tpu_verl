@@ -60,6 +60,7 @@ import time
 
 logger = init_logger(__name__)
 _MODE3_TIMING_COUNTS = defaultdict(int)
+_MOE_DISPATCH_DIGEST_COUNTS = defaultdict(int)
 
 
 def _recover_mode3_invalid_topk(
@@ -178,6 +179,87 @@ def _profile_rank() -> int:
     except Exception:
         pass
     return -1
+
+
+def _moe_dispatch_digest_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_MOE_DISPATCH_SEQ_DIGEST_LOG", "0")
+
+
+def _moe_dispatch_digest_limit() -> int:
+    return _env_int("VLLM_ASCEND_MOE_DISPATCH_SEQ_DIGEST_LIMIT", 32)
+
+
+def _moe_dispatch_digest_sample_every() -> int:
+    return _env_int("VLLM_ASCEND_MOE_DISPATCH_SEQ_DIGEST_SAMPLE_EVERY", 64)
+
+
+def _moe_dispatch_digest_slow_ms() -> float:
+    try:
+        return max(
+            0.0,
+            float(os.getenv("VLLM_ASCEND_MOE_DISPATCH_SEQ_DIGEST_SLOW_MS",
+                            "1000")),
+        )
+    except (TypeError, ValueError):
+        return 1000.0
+
+
+def _log_moe_dispatch_digest(layer: Any,
+                             event: str,
+                             *,
+                             seq: int,
+                             started: bool,
+                             elapsed_ms: float | None = None,
+                             extra: str = "") -> None:
+    if not _moe_dispatch_digest_enabled():
+        return
+    try:
+        layer_idx = int(getattr(layer, "layer_idx", -1))
+        if layer_idx != 0:
+            return
+        rank = _profile_rank()
+        mode = int(getattr(layer, "elastic_execution_mode", 0))
+        active_ranks = tuple(
+            int(rank) for rank in getattr(layer,
+                                          "lossless_hybrid_active_ranks", [])
+            or [])
+        stage = len(active_ranks)
+        key = (rank, layer_idx, stage, event)
+        _MOE_DISPATCH_DIGEST_COUNTS[key] += 1
+        count = _MOE_DISPATCH_DIGEST_COUNTS[key]
+        slow_ms = _moe_dispatch_digest_slow_ms()
+        is_slow = elapsed_ms is not None and elapsed_ms >= slow_ms
+        limit = _moe_dispatch_digest_limit()
+        sample_every = _moe_dispatch_digest_sample_every()
+        sampled = sample_every > 0 and count % sample_every == 0
+        if not is_slow and count > limit and not sampled:
+            return
+        forward_context = get_forward_context()
+        moe_comm_method = getattr(forward_context, "moe_comm_method", None)
+        logger.info(
+            "Elastic MoE dispatch digest: rank=%s seq=%s event=%s "
+            "started=%s mode=%s layer=%s stage=%s active=%s "
+            "selected=%s effective=%s fused_state=%s method=%s "
+            "elapsed_ms=%s extra=%s",
+            rank,
+            seq,
+            event,
+            started,
+            mode,
+            layer_idx,
+            stage,
+            active_ranks,
+            getattr(forward_context, "selected_moe_comm_type", None),
+            getattr(forward_context, "moe_comm_type", None),
+            getattr(forward_context, "fused_moe_state", None),
+            getattr(getattr(moe_comm_method, "__class__", type(None)),
+                    "__name__", "None"),
+            f"{elapsed_ms:.2f}" if elapsed_ms is not None else "NA",
+            extra,
+        )
+    except Exception as exc:
+        logger.warning("Elastic MoE dispatch digest failed: event=%s err=%s",
+                       event, exc)
 
 
 def _parse_layer_filter(value: str) -> Optional[set[int]]:
@@ -8829,6 +8911,20 @@ class AscendFusedMoE(FusedMoE):
         selected_moe_comm_type = getattr(forward_context,
                                          "selected_moe_comm_type",
                                          original_moe_comm_type)
+        if original_moe_comm_method is None and selected_moe_comm_type is not None:
+            setup_moe_comm_method(self.moe_config)
+            original_moe_comm_method = get_moe_comm_method(
+                selected_moe_comm_type)
+            forward_context.moe_comm_method = original_moe_comm_method
+            if self.layer_idx == 0:
+                logger.info(
+                    "Mode1 MoE comm method restored before dispatch: "
+                    "layer=%s selected=%s method=%s",
+                    self.layer_idx,
+                    selected_moe_comm_type,
+                    original_moe_comm_method.__class__.__name__
+                    if original_moe_comm_method is not None else None,
+                )
         original_fused_moe_state = getattr(forward_context, "fused_moe_state",
                                            None)
         original_hybrid_host_metadata = getattr(
@@ -8859,6 +8955,9 @@ class AscendFusedMoE(FusedMoE):
                 self._mode1_host_alltoall_metadata_logged = True
         if forced_hybrid_comm_alignment:
             effective_comm_type = selected_moe_comm_type
+            if (envs_ascend.VLLM_ASCEND_FORCE_MC2_MOE
+                    and effective_comm_type != MoECommType.MC2):
+                effective_comm_type = MoECommType.MC2
             effective_method = (get_moe_comm_method(effective_comm_type)
                                 if effective_comm_type is not None else None)
             if effective_method is None:
@@ -8927,6 +9026,22 @@ class AscendFusedMoE(FusedMoE):
                     except Exception:
                         pass
                 dummy_moe_start = time.perf_counter()
+            dispatch_digest_seq = int(
+                getattr(self, "_elastic_moe_dispatch_digest_seq", 0)) + 1
+            self._elastic_moe_dispatch_digest_seq = dispatch_digest_seq
+            prepare_start_wall = time.perf_counter()
+            _log_moe_dispatch_digest(
+                self,
+                "prepare_start",
+                seq=dispatch_digest_seq,
+                started=True,
+                extra=(
+                    f"hidden_shape={tuple(hidden_states.shape)} "
+                    f"router_shape={tuple(router_logits.shape)} "
+                    f"replace_allreduce={replace_allreduce} "
+                    f"shared_expert_dp={self.enable_shared_expert_dp}"
+                ),
+            )
             hidden_states, router_logits = forward_context.moe_comm_method.prepare(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -8934,6 +9049,17 @@ class AscendFusedMoE(FusedMoE):
                 rm_router_logits=self.rm_router_logits,
                 replace_allreduce=replace_allreduce,
                 gate=gate)
+            _log_moe_dispatch_digest(
+                self,
+                "prepare_done",
+                seq=dispatch_digest_seq,
+                started=False,
+                elapsed_ms=(time.perf_counter() - prepare_start_wall) * 1000.0,
+                extra=(
+                    f"hidden_shape={tuple(hidden_states.shape)} "
+                    f"router_shape={tuple(router_logits.shape)}"
+                ),
+            )
 
             # print("is_dummy in ascendfusedmoe is:", is_dummy)
             # Matrix multiply.

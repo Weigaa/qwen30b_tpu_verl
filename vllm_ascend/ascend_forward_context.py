@@ -38,6 +38,8 @@ def _get_fused_moe_state(ep_size: int, with_prefill: bool,
             return FusedMoEState.NaiveMulticast
         else:
             return FusedMoEState.AllGather
+    if envs_ascend.VLLM_ASCEND_FORCE_MC2_MOE:
+        return FusedMoEState.MC2
     if envs_ascend.VLLM_ASCEND_FORCE_ALLTOALL_MOE:
         return FusedMoEState.All2All
     # the fusion operator torch_npu.npu_grouped_matmul_finalize_routing called by allgather ep

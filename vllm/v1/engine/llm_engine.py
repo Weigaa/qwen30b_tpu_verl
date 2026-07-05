@@ -58,6 +58,12 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
 
 
+def _mode1_seq_checkpoint_log_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_MODE1_SEQ_CHECKPOINT_LOG",
+                     os.getenv("VLLM_ASCEND_ELASTIC_HCCL_SEQ_SUMMARY_LOG",
+                               "0"))
+
+
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     try:
         return max(minimum, int(os.getenv(name, str(default))))
@@ -829,8 +835,37 @@ class LLMEngine:
                                 f"prev_active_ranks={prev_elastic_ep_active_ranks} "
                                 f"dp_world_size={dp_world_size} "
                                 f"local_has_unfinished={has_unfinished}") from exc
+                    if _mode1_seq_checkpoint_log_enabled():
+                        logger.info(
+                            "Elastic engine seq checkpoint: tag=shrink_rpc_before "
+                            "global_rank=%s active_ranks=%s prev_active_ranks=%s "
+                            "dp_world_size=%s local_has_unfinished=%s "
+                            "should_dummy=%s dp_group_present=%s",
+                            current_global_rank,
+                            active_global_ranks,
+                            prev_elastic_ep_active_ranks,
+                            dp_world_size,
+                            has_unfinished,
+                            self.should_execute_dummy_batch,
+                            self.dp_group is not None,
+                        )
                     self.engine_core.collective_rpc(
                         "rebuild_elastic_ep_group", args=(active_global_ranks, ))
+                    if _mode1_seq_checkpoint_log_enabled():
+                        logger.info(
+                            "Elastic engine seq checkpoint: tag=shrink_rpc_after "
+                            "global_rank=%s active_ranks=%s prev_active_ranks=%s "
+                            "dp_world_size=%s local_has_unfinished=%s "
+                            "should_dummy=%s dp_group_present=%s rpc_ms=%.2f",
+                            current_global_rank,
+                            active_global_ranks,
+                            prev_elastic_ep_active_ranks,
+                            dp_world_size,
+                            has_unfinished,
+                            self.should_execute_dummy_batch,
+                            self.dp_group is not None,
+                            (time.perf_counter() - rebuild_start_t) * 1000.0,
+                        )
                     if self.external_launcher_dp:
                         if current_global_rank in active_global_ranks:
                             self.dp_group = get_dp_group().cpu_group
@@ -874,6 +909,20 @@ class LLMEngine:
         if not need_restore:
             return
         restore_start_t = time.perf_counter()
+        if _mode1_seq_checkpoint_log_enabled():
+            logger.info(
+                "Elastic engine seq checkpoint: tag=restore_rpc_before "
+                "global_rank=%s local_need_restore=%s need_restore=%s "
+                "active_ranks=%s runtime_active_ranks=%s dp_group_present=%s "
+                "should_dummy=%s",
+                torch.distributed.get_rank(),
+                local_need_restore,
+                int(need_restore),
+                self.elastic_ep_active_ranks,
+                self.elastic_ep_runtime_active_ranks,
+                self.dp_group is not None,
+                self.should_execute_dummy_batch,
+            )
         self.engine_core.collective_rpc("restore_elastic_parallel_groups")
         if self.external_launcher_dp:
             self.dp_group = get_dp_group().cpu_group
@@ -883,6 +932,21 @@ class LLMEngine:
         self._shrink_aware_role_plan = None
         self._logged_followup_shrink_skip = None
         self._logged_mc2_delay = False
+        if _mode1_seq_checkpoint_log_enabled():
+            logger.info(
+                "Elastic engine seq checkpoint: tag=restore_rpc_after "
+                "global_rank=%s local_need_restore=%s need_restore=%s "
+                "active_ranks=%s runtime_active_ranks=%s dp_group_present=%s "
+                "should_dummy=%s rpc_ms=%.2f",
+                torch.distributed.get_rank(),
+                local_need_restore,
+                int(need_restore),
+                self.elastic_ep_active_ranks,
+                self.elastic_ep_runtime_active_ranks,
+                self.dp_group is not None,
+                self.should_execute_dummy_batch,
+                (time.perf_counter() - restore_start_t) * 1000.0,
+            )
         logger.info(
             "Elastic parallel groups restored: global_rank=%s total_ms=%.2f",
             torch.distributed.get_rank(),

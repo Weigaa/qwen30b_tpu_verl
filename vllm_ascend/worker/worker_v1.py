@@ -3983,22 +3983,48 @@ class NPUWorker(WorkerBase):
     def _get_shrink_source_group_state(self, world_group):
         previous_active_ranks = self._get_previous_active_ranks_for_shrink(
             world_group.world_size)
-        dp_group = get_dp_group()
+
+        def _fallback_source_group(reason: str):
+            full_world_ranks = list(range(world_group.world_size))
+            if list(previous_active_ranks) == full_world_ranks:
+                logger.info(
+                    "Elastic shrink source group falls back to world group: "
+                    "rank=%s previous_active_ranks=%s reason=%s",
+                    self.rank,
+                    previous_active_ranks,
+                    reason,
+                )
+                return (previous_active_ranks, world_group.cpu_group,
+                        world_group.device_group)
+            logger.warning(
+                "Elastic shrink source group unavailable for non-world source ranks: "
+                "rank=%s previous_active_ranks=%s reason=%s",
+                self.rank,
+                previous_active_ranks,
+                reason,
+            )
+            return (previous_active_ranks, None, None)
+
+        try:
+            dp_group = get_dp_group()
+        except Exception:
+            return _fallback_source_group("no_live_dp_group")
         source_cpu_group = getattr(dp_group, "cpu_group", None)
         source_device_group = getattr(dp_group, "device_group", None)
         source_ranks = previous_active_ranks
 
         if source_cpu_group is None or source_device_group is None:
-            return (source_ranks, world_group.cpu_group, world_group.device_group)
+            return _fallback_source_group("missing_source_pg")
 
         try:
             source_group_world_size = torch.distributed.get_world_size(
                 group=source_cpu_group)
         except Exception:
-            return (source_ranks, world_group.cpu_group, world_group.device_group)
+            return _fallback_source_group("source_size_query_failed")
 
         if source_group_world_size != len(source_ranks):
-            return (source_ranks, world_group.cpu_group, world_group.device_group)
+            return _fallback_source_group(
+                f"source_size_mismatch:{source_group_world_size}")
 
         return (source_ranks, source_cpu_group, source_device_group)
 
@@ -4013,6 +4039,34 @@ class NPUWorker(WorkerBase):
         current_rank = torch.distributed.get_rank()
         (source_ranks, source_cpu_group,
          _) = self._get_shrink_source_group_state(world_group)
+        source_ranks = [int(rank) for rank in source_ranks]
+        if not source_ranks:
+            logger.info(
+                "Elastic shrink payload skipped: rank=%s active_ranks=%s "
+                "reason=empty_source_ranks",
+                current_rank, active_ranks)
+            return
+        if current_rank not in source_ranks:
+            if current_rank in set(int(rank) for rank in active_ranks):
+                raise RuntimeError(
+                    "Elastic shrink active rank is not in source ranks; "
+                    f"rank={current_rank} active_ranks={active_ranks} "
+                    f"source_ranks={source_ranks} "
+                    f"detached={getattr(self, 'elastic_parallel_detached', None)}"
+                )
+            logger.info(
+                "Elastic shrink payload skipped on non-source rank: "
+                "rank=%s active_ranks=%s source_ranks=%s detached=%s",
+                current_rank, active_ranks, source_ranks,
+                getattr(self, "elastic_parallel_detached", None))
+            return
+        if source_cpu_group is None:
+            raise RuntimeError(
+                "Elastic shrink payload source CPU group is unavailable; "
+                f"rank={current_rank} active_ranks={active_ranks} "
+                f"source_ranks={source_ranks} "
+                f"detached={getattr(self, 'elastic_parallel_detached', None)}"
+            )
         world_size = world_group.world_size
         previous_active_ranks = self._get_previous_active_ranks_for_shrink(
             world_size)
@@ -6896,6 +6950,28 @@ class NPUWorker(WorkerBase):
         current_rank = torch.distributed.get_rank()
         (source_ranks, source_cpu_group,
          source_device_group) = self._get_shrink_source_group_state(world_group)
+        source_ranks = [int(rank) for rank in source_ranks]
+        if current_rank not in source_ranks:
+            logger.info(
+                "Elastic shrink stream import skipped on non-source rank: "
+                "rank=%s active_ranks=%s source_ranks=%s detached=%s",
+                current_rank, active_ranks, source_ranks,
+                getattr(self, "elastic_parallel_detached", None))
+            return ({}, {}, {"transfer_mode": "non_source_skip"})
+        if source_cpu_group is None:
+            raise RuntimeError(
+                "Elastic shrink stream import source CPU group is unavailable; "
+                f"rank={current_rank} active_ranks={active_ranks} "
+                f"source_ranks={source_ranks} "
+                f"detached={getattr(self, 'elastic_parallel_detached', None)}"
+            )
+        if source_device_group is None:
+            raise RuntimeError(
+                "Elastic shrink stream import source device group is unavailable; "
+                f"rank={current_rank} active_ranks={active_ranks} "
+                f"source_ranks={source_ranks} "
+                f"detached={getattr(self, 'elastic_parallel_detached', None)}"
+            )
         world_size = world_group.world_size
         previous_active_ranks = self._get_previous_active_ranks_for_shrink(
             world_size)
@@ -7779,6 +7855,34 @@ class NPUWorker(WorkerBase):
         if model is None:
             return
 
+        current_rank = torch.distributed.get_rank()
+        (source_ranks, source_cpu_group,
+         source_device_group) = self._get_shrink_source_group_state(world_group)
+        source_ranks = [int(rank) for rank in source_ranks]
+        if current_rank not in source_ranks:
+            if current_rank in set(int(rank) for rank in active_ranks):
+                raise RuntimeError(
+                    "Elastic shrink preload active rank is not in source ranks; "
+                    f"rank={current_rank} active_ranks={active_ranks} "
+                    f"source_ranks={source_ranks} "
+                    f"detached={getattr(self, 'elastic_parallel_detached', None)}"
+                )
+            logger.info(
+                "Elastic shrink preload skipped on non-source rank: "
+                "rank=%s active_ranks=%s source_ranks=%s detached=%s",
+                current_rank, active_ranks, source_ranks,
+                getattr(self, "elastic_parallel_detached", None))
+            return
+        if source_cpu_group is None or source_device_group is None:
+            raise RuntimeError(
+                "Elastic shrink preload source group is unavailable; "
+                f"rank={current_rank} active_ranks={active_ranks} "
+                f"source_ranks={source_ranks} "
+                f"has_cpu_group={source_cpu_group is not None} "
+                f"has_device_group={source_device_group is not None} "
+                f"detached={getattr(self, 'elastic_parallel_detached', None)}"
+            )
+
         lossless_shrink_payload = getattr(self, "_lossless_shrink_payload", {})
         preload_module_count = 0
         preload_filter_cpu_payload_ms = 0.0
@@ -8188,11 +8292,29 @@ class NPUWorker(WorkerBase):
 
         cpu_group = getattr(world_group, "cpu_group", None)
         if cpu_group is None:
+            logger.warning(
+                "Elastic mode1 source p2p barrier skipped: rank=%s "
+                "source_ranks=%s tag=%s reason=missing_world_cpu_group",
+                current_rank,
+                ranks,
+                tag,
+            )
             return
 
         root_rank = ranks[0]
         token = torch.ones(1, dtype=torch.int32, device="cpu")
         ack = torch.empty(1, dtype=torch.int32, device="cpu")
+        barrier_start_t = time.perf_counter()
+        self._log_elastic_hccl_seq_digest(
+            "mode1_source_p2p_barrier_enter",
+            "source_barrier",
+            group_kind="cpu_p2p",
+            group_name="world_cpu",
+            group_ranks=ranks,
+            backend="gloo",
+            reason="mode1_source_p2p_barrier",
+            extra=f"tag={tag} root={root_rank}",
+        )
         if current_rank == root_rank:
             for peer_rank in ranks[1:]:
                 torch.distributed.recv(token,
@@ -8213,6 +8335,17 @@ class NPUWorker(WorkerBase):
                                    src=root_rank,
                                    group=cpu_group,
                                    tag=tag + 1)
+        self._log_elastic_hccl_seq_digest(
+            "mode1_source_p2p_barrier_done",
+            "source_barrier",
+            group_kind="cpu_p2p",
+            group_name="world_cpu",
+            group_ranks=ranks,
+            backend="gloo",
+            reason="mode1_source_p2p_barrier",
+            extra=(f"tag={tag} root={root_rank} "
+                   f"elapsed_ms={(time.perf_counter() - barrier_start_t) * 1000.0:.2f}"),
+        )
 
 
     def _custom_mode1_worker_memory_diag_enabled(self) -> bool:
@@ -8423,6 +8556,10 @@ class NPUWorker(WorkerBase):
         if not torch.distributed.is_initialized():
             return False
         world_size = int(torch.distributed.get_world_size())
+        if (len(group_ranks) == world_size and _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FORCE_CLEANUP_AFTER_FULLWORLD_GROUP_RELEASE",
+                "0")):
+            return True
         return len(group_ranks) < world_size
 
     def _detach_destroyed_group_references(self, group) -> None:
@@ -8461,10 +8598,13 @@ class NPUWorker(WorkerBase):
         communicator wrappers, so wrapper/device-communicator buffers cannot be
         reused but low-level PG destruction is not forced inside the shrink RPC.
 
-        Device PG destruction is enabled by default to release HCCL/HBM
-        workspace. Only CPU/Gloo PG teardown is deferred, because the observed
-        350s stall comes from hot-path GroupCoordinator teardown while retaining
-        stale device PGs can OOM later HCCL collectives.
+        Raw PG destruction is disabled by default in mode=1 low-floor hot
+        paths. Different ranks legitimately visit different shrink levels, and
+        explicit HCCL/Gloo destroy calls here turn that normal difference into
+        divergent low-level communicator state before the next MoE dispatch.
+        Keep PG references quarantined and out of live/cache lookup instead;
+        they can be reclaimed at process teardown or by an explicitly aligned
+        cleanup path.
         """
         retire_start_t = time.perf_counter()
         npu_sync_ms = 0.0
@@ -8540,10 +8680,23 @@ class NPUWorker(WorkerBase):
             seen_pg_ids.add(device_pg_id)
             unique_device_pgs.append(device_pg)
         destroy_device_pg = _env_flag(
-            "VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE", "1")
+            "VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE", "0")
         if destroy_device_pg:
             destroy_start_t = time.perf_counter()
+            log_hccl_seq = self._elastic_hccl_seq_digest_enabled()
             for device_pg in unique_device_pgs:
+                destroy_seq = None
+                if log_hccl_seq:
+                    destroy_seq = self._next_elastic_hccl_seq("destroy")
+                    self._log_elastic_hccl_seq_digest(
+                        "raw_device_pg_destroy_start",
+                        "destroy",
+                        group_ranks=getattr(group, "ranks", []),
+                        backend="hccl",
+                        seq=destroy_seq,
+                        reason="retire_group",
+                        extra=f"pg_id={id(device_pg)}",
+                    )
                 try:
                     torch.distributed.destroy_process_group(device_pg)
                 except Exception:
@@ -8553,6 +8706,16 @@ class NPUWorker(WorkerBase):
                         self.rank,
                         tuple(int(rank)
                               for rank in getattr(group, "ranks", [])),
+                    )
+                if log_hccl_seq:
+                    self._log_elastic_hccl_seq_digest(
+                        "raw_device_pg_destroy_done",
+                        "destroy",
+                        group_ranks=getattr(group, "ranks", []),
+                        backend="hccl",
+                        seq=destroy_seq,
+                        reason="retire_group",
+                        extra=f"pg_id={id(device_pg)}",
                     )
             device_pg_destroy_ms = (
                 time.perf_counter() - destroy_start_t) * 1000.0
@@ -8576,10 +8739,23 @@ class NPUWorker(WorkerBase):
             seen_cpu_pg_ids.add(cpu_pg_id)
             unique_cpu_pgs.append(cpu_pg)
         destroy_cpu_pg = _env_flag(
-            "VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE", "1")
+            "VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE", "0")
         if destroy_cpu_pg:
             cpu_destroy_start_t = time.perf_counter()
+            log_hccl_seq = self._elastic_hccl_seq_digest_enabled()
             for cpu_pg in unique_cpu_pgs:
+                destroy_seq = None
+                if log_hccl_seq:
+                    destroy_seq = self._next_elastic_hccl_seq("destroy")
+                    self._log_elastic_hccl_seq_digest(
+                        "raw_cpu_pg_destroy_start",
+                        "destroy",
+                        group_ranks=getattr(group, "ranks", []),
+                        backend="gloo",
+                        seq=destroy_seq,
+                        reason="retire_group",
+                        extra=f"pg_id={id(cpu_pg)}",
+                    )
                 try:
                     torch.distributed.destroy_process_group(cpu_pg)
                 except Exception:
@@ -8589,6 +8765,16 @@ class NPUWorker(WorkerBase):
                         self.rank,
                         tuple(int(rank)
                               for rank in getattr(group, "ranks", [])),
+                    )
+                if log_hccl_seq:
+                    self._log_elastic_hccl_seq_digest(
+                        "raw_cpu_pg_destroy_done",
+                        "destroy",
+                        group_ranks=getattr(group, "ranks", []),
+                        backend="gloo",
+                        seq=destroy_seq,
+                        reason="retire_group",
+                        extra=f"pg_id={id(cpu_pg)}",
                     )
             cpu_pg_destroy_ms = (
                 time.perf_counter() - cpu_destroy_start_t) * 1000.0
@@ -8663,6 +8849,24 @@ class NPUWorker(WorkerBase):
         retire_stats = self._retire_group_wrapper_defer_pg_destroy(group)
         deferred_device_pgs = list(retire_stats.get("device_pgs", []) or [])
         deferred_cpu_pgs = list(retire_stats.get("cpu_pgs", []) or [])
+        keep_deferred_pg_refs = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_KEEP_DEFERRED_PG_REFS", "0")
+        if not keep_deferred_pg_refs:
+            # The live/cache/registry paths have already been detached, and the
+            # wrapper id is marked retired. Holding raw PG objects here keeps
+            # HCCL/non-torch allocations alive across steps even when the
+            # stable full-world restore is correct. By default this quarantine
+            # records the retirement but releases strong PG references; set the
+            # env above to 1 to restore the old keep-references behavior.
+            retire_stats["released_deferred_device_pg_refs"] = float(
+                len(deferred_device_pgs))
+            retire_stats["released_deferred_cpu_pg_refs"] = float(
+                len(deferred_cpu_pgs))
+            deferred_device_pgs = []
+            deferred_cpu_pgs = []
+        else:
+            retire_stats["released_deferred_device_pg_refs"] = 0.0
+            retire_stats["released_deferred_cpu_pg_refs"] = 0.0
         self._remove_elastic_parallel_group_registry_entry(
             group_kind, group_ranks, group)
         if not deferred_device_pgs and not deferred_cpu_pgs:
@@ -8673,7 +8877,8 @@ class NPUWorker(WorkerBase):
                 "retire_wrapper_ms=%.2f npu_sync_ms=%.2f "
                 "device_pg_destroy_ms=%.2f cpu_pg_destroy_ms=%.2f "
                 "destroy_device_pg=%.0f destroy_cpu_pg=%.0f "
-                "dropped_pg_refs=%.0f",
+                "dropped_pg_refs=%.0f released_deferred_device_pg_refs=%.0f "
+                "released_deferred_cpu_pg_refs=%.0f keep_deferred_pg_refs=%s",
                 self.rank,
                 group_kind,
                 group_ranks,
@@ -8685,6 +8890,10 @@ class NPUWorker(WorkerBase):
                 float(retire_stats.get("destroy_device_pg", 0.0)),
                 float(retire_stats.get("destroy_cpu_pg", 0.0)),
                 float(retire_stats.get("dropped_pg_refs", 0.0)),
+                float(retire_stats.get("released_deferred_device_pg_refs",
+                                       0.0)),
+                float(retire_stats.get("released_deferred_cpu_pg_refs", 0.0)),
+                keep_deferred_pg_refs,
             )
             return True
 
@@ -8707,7 +8916,8 @@ class NPUWorker(WorkerBase):
             "device_pg_destroy_ms=%.2f cpu_pg_destroy_ms=%.2f "
             "destroy_device_pg=%.0f destroy_cpu_pg=%.0f "
             "dropped_pg_refs=%.0f deferred_device_pg_refs=%.0f "
-            "deferred_cpu_pg_refs=%.0f",
+            "deferred_cpu_pg_refs=%.0f released_deferred_device_pg_refs=%.0f "
+            "released_deferred_cpu_pg_refs=%.0f keep_deferred_pg_refs=%s",
             self.rank,
             group_kind,
             group_ranks,
@@ -8722,6 +8932,9 @@ class NPUWorker(WorkerBase):
             float(retire_stats.get("dropped_pg_refs", 0.0)),
             float(retire_stats.get("deferred_device_pg_refs", 0.0)),
             float(retire_stats.get("deferred_cpu_pg_refs", 0.0)),
+            float(retire_stats.get("released_deferred_device_pg_refs", 0.0)),
+            float(retire_stats.get("released_deferred_cpu_pg_refs", 0.0)),
+            keep_deferred_pg_refs,
         )
         return True
 
@@ -8842,34 +9055,7 @@ class NPUWorker(WorkerBase):
                 cleanup_stats.get("memory_log_ms", 0.0))
         return stats
 
-    def _should_defer_mode1_group_destroy(
-            self, group_kind: str, group_ranks: tuple[int, ...],
-            keep_group_ranks: tuple[int, ...], reason: str) -> bool:
-        if not self._is_mode1_low_floor_elastic_runtime():
-            return False
-        if (reason == "mode1_full_restore" and not _env_flag(
-                "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE",
-                "0")):
-            return False
-        if (reason == "mode1_pre_rebuild" and not _env_flag(
-                "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD",
-                "0")):
-            return False
-        if (reason == "stash_group" and not _env_flag(
-                "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH",
-                "0")):
-            return False
-        if not _env_flag("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"):
-            return False
-        if group_kind not in ("dp", "ep", "mc2"):
-            return False
-        if not group_ranks or group_ranks == keep_group_ranks:
-            return False
-        if not torch.distributed.is_initialized():
-            return False
-        world_size = int(torch.distributed.get_world_size())
-        if group_ranks == tuple(range(world_size)):
-            return False
+    def _mode1_defer_destroy_floor_group_sizes(self) -> set[int]:
         raw_sizes = os.getenv(
             "VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES",
             "1,2,4,8",
@@ -8883,7 +9069,85 @@ class NPUWorker(WorkerBase):
                 defer_sizes.add(int(raw_size))
             except ValueError:
                 continue
-        return len(group_ranks) in defer_sizes
+        return defer_sizes
+
+    def _should_defer_mode1_group_destroy(
+            self, group_kind: str, group_ranks: tuple[int, ...],
+            keep_group_ranks: tuple[int, ...], reason: str,
+            allow_same_ranks: bool = False) -> bool:
+        if group_kind not in ("dp", "ep", "mc2"):
+            return False
+        if not group_ranks:
+            return False
+        if group_ranks == keep_group_ranks and not allow_same_ranks:
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+        world_size = int(torch.distributed.get_world_size())
+        if (group_ranks == tuple(range(world_size))
+                and reason != "mode1_fullworld_shrink_drop"):
+            return False
+        if reason == "mode1_fullworld_shrink_drop":
+            return _env_flag("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY",
+                             "1")
+        if reason == "mode1_full_restore":
+            # Full restore is the repeatedly observed slow path: destroying
+            # stale low-floor DP/EP/MC2 wrappers here can enter 100s+ MC2/HCCL
+            # teardown. Treat it as a safety invariant rather than a tunable
+            # runtime option; otherwise one stale env export or full-world
+            # current-floor marker can re-enable the exact post-rollout2 slow
+            # path we are trying to diagnose.
+            if (not _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE",
+                    "1") or not _env_flag(
+                        "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY",
+                        "1")):
+                logger.warning(
+                    "Elastic mode1 full-restore defer forced despite env: "
+                    "rank=%s group_kind=%s group_ranks=%s keep_ranks=%s "
+                    "defer_full_restore_env=%s defer_group_destroy_env=%s",
+                    self.rank,
+                    group_kind,
+                    group_ranks,
+                    keep_group_ranks,
+                    os.getenv(
+                        "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE",
+                        "1"),
+                    os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY",
+                              "1"),
+                )
+            return True
+        if (reason == "mode1_pre_rebuild" and not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD",
+                "1")):
+            return False
+        if (reason == "stash_group" and not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH",
+                "1")):
+            return False
+        if not _env_flag("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"):
+            return False
+        defer_sizes = self._mode1_defer_destroy_floor_group_sizes()
+        if len(group_ranks) not in defer_sizes:
+            return False
+        if self._is_mode1_low_floor_elastic_runtime():
+            return True
+        if reason in ("mode1_pre_rebuild", "stash_group"):
+            logger.info(
+                "Elastic mode1 floor-group defer forced outside low-floor marker: "
+                "rank=%s group_kind=%s group_ranks=%s keep_ranks=%s "
+                "reason=%s defer_sizes=%s",
+                self.rank,
+                group_kind,
+                group_ranks,
+                keep_group_ranks,
+                reason,
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES",
+                    "1,2,4,8"),
+            )
+            return True
+        return False
 
     def _reset_elastic_moe_comm_setup_cache(self, reason: str) -> None:
         reset_moe_comm_method_cache()
@@ -8916,9 +9180,108 @@ class NPUWorker(WorkerBase):
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
         if group_kind not in ("dp", "ep", "mc2"):
             return
+        self._release_duplicate_elastic_parallel_group_signature(
+            attr_name,
+            group_kind,
+            group_ranks,
+            keep_group=group,
+            reason="register_signature_dedup",
+        )
         groups_by_ranks = self._get_elastic_parallel_group_registry(
         ).setdefault(group_kind, {}).setdefault(group_ranks, {})
         groups_by_ranks[id(group)] = group
+
+    def _mode1_single_group_per_signature_enabled(self) -> bool:
+        if not _env_flag("VLLM_ASCEND_MODE1_PARITY_SINGLE_GROUP_PER_SIGNATURE",
+                         "1"):
+            return False
+        try:
+            execution_mode = int(
+                envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
+        except (TypeError, ValueError):
+            return False
+        return (execution_mode == 1
+                and envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK)
+
+    def _release_duplicate_elastic_parallel_group_signature(
+            self,
+            attr_name: str,
+            group_kind: str,
+            group_ranks: tuple[int, ...],
+            keep_group: object | None = None,
+            reason: str = "signature_dedup") -> dict[str, float]:
+        stats = {
+            "released_groups": 0.0,
+            "retired_groups": 0.0,
+            "cleanup_ms": 0.0,
+        }
+        if not self._mode1_single_group_per_signature_enabled():
+            return stats
+        if group_kind not in ("dp", "ep", "mc2") or not group_ranks:
+            return stats
+        registry = getattr(self, "_elastic_parallel_group_registry", None)
+        if not registry:
+            return stats
+        groups_by_id = registry.get(group_kind, {}).get(group_ranks)
+        if not groups_by_id:
+            return stats
+
+        stale_groups = []
+        keep_group_id = id(keep_group) if keep_group is not None else None
+        for group_id, group in list(groups_by_id.items()):
+            if keep_group_id is not None and group_id == keep_group_id:
+                continue
+            stale_groups.append(group)
+        if not stale_groups:
+            return stats
+
+        for stale_group in stale_groups:
+            self._remove_cached_elastic_parallel_group_reference(
+                attr_name, group_ranks, stale_group)
+            if self._is_retired_elastic_group(stale_group):
+                self._remove_elastic_parallel_group_registry_entry(
+                    group_kind, group_ranks, stale_group)
+                stats["released_groups"] += 1.0
+                continue
+            owns_process_groups = bool(
+                getattr(stale_group, "_owns_process_groups", True))
+            if not owns_process_groups:
+                self._detach_destroyed_group_references(stale_group)
+                self._mark_retired_elastic_group(stale_group)
+                self._remove_elastic_parallel_group_registry_entry(
+                    group_kind, group_ranks, stale_group)
+                stats["released_groups"] += 1.0
+                continue
+            if self._quarantine_deferred_elastic_group(
+                    stale_group,
+                    group_kind,
+                    group_ranks,
+                    reason,
+            ):
+                stats["released_groups"] += 1.0
+                stats["retired_groups"] += 1.0
+
+        if (stats["released_groups"] > 0.0 and _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_SIGNATURE_DEDUP_FORCE_CLEANUP",
+                "1")):
+            cleanup_stats = self._cleanup_after_elastic_group_release(
+                reason, force=True)
+            stats["cleanup_ms"] = float(cleanup_stats.get("total_ms", 0.0))
+
+        logger.info(
+            "Elastic parallel duplicate group signature retired: rank=%s "
+            "group_kind=%s group_ranks=%s reason=%s released_groups=%.0f "
+            "retired_groups=%.0f cleanup_ms=%.2f keep_group_id=%s",
+            self.rank,
+            group_kind,
+            group_ranks,
+            reason,
+            stats["released_groups"],
+            stats["retired_groups"],
+            stats["cleanup_ms"],
+            keep_group_id,
+        )
+        return stats
 
     def _remove_elastic_parallel_group_registry_entry(
             self, group_kind: str, group_ranks: tuple[int, ...],
@@ -8983,6 +9346,59 @@ class NPUWorker(WorkerBase):
             seen_signatures = set()
             self._elastic_seen_parallel_group_signatures = seen_signatures
         return seen_signatures
+
+    def _force_mode1_non_member_placeholder_new_group(self) -> bool:
+        """Keep rank-local process-group creation order aligned in mode=1.
+
+        Active ranks may recreate low-floor DP/EP/MC2 groups on every shrink
+        cycle. If detached ranks skip the matching placeholder new_group just
+        because the logical rank signature was seen before, HCCL/Gloo internal
+        communicator order can diverge after the first rollout.
+        """
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return False
+        return _env_flag(
+            "VLLM_ASCEND_MODE1_FORCE_NON_MEMBER_PLACEHOLDER_NEW_GROUP", "1")
+
+    def _allow_elastic_rebuild_cache_hit(
+            self, group_kind: str, group_ranks: tuple[int, ...]) -> bool:
+        """Avoid active/non-member process-group creation order skew.
+
+        With forced non-member placeholders enabled, detached ranks consume a
+        torch.distributed.new_group() for every shrink group signature. If an
+        active rank uses a cached wrapper and skips init_model_parallel_group()
+        for the same signature, HCCL/Gloo group creation order can diverge
+        across ranks after rollout 1. The same risk exists during full-world
+        restore: non-members may already have consumed placeholder new_group
+        calls in the previous shrink phase, while active ranks would otherwise
+        reuse cached full-world wrappers and skip matching creation calls.
+
+        Keep the legacy cache-hit path available behind an env override for
+        targeted diagnostics, but do not gate this guard on the current floor;
+        the point is to keep the whole mode=1 shrink/restore cycle ordered.
+        """
+        if group_kind not in ("dp", "ep", "mc2"):
+            return True
+        if not group_ranks:
+            return True
+        try:
+            execution_mode = int(
+                envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
+        except (TypeError, ValueError):
+            return True
+        if execution_mode != 1:
+            return True
+        if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
+            return True
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_FORCE_NON_MEMBER_PLACEHOLDER_NEW_GROUP",
+                "1"):
+            return True
+        if _env_flag(
+                "VLLM_ASCEND_MODE1_ALLOW_REBUILD_CACHE_HIT_WITH_PLACEHOLDER",
+                "0"):
+            return True
+        return False
 
     def _remove_cached_elastic_parallel_group_reference(
             self, attr_name: str, group_ranks: tuple[int, ...],
@@ -9124,17 +9540,53 @@ class NPUWorker(WorkerBase):
                             (-len(ranks), ranks)))
 
     def _release_mode1_moe_comm_runtime_state(
-            self, reason: str) -> dict[str, int]:
+            self, reason: str,
+            *,
+            trim_npu_cache: bool = False) -> dict[str, int]:
         start_t = time.perf_counter()
+        pre_release_sync_ms = 0.0
+        if (_env_flag("VLLM_ASCEND_MODE1_SYNC_BEFORE_MOE_COMM_RELEASE", "1")
+                and torch.npu.is_available()):
+            sync_start_t = time.perf_counter()
+            torch.npu.synchronize()
+            pre_release_sync_ms = (
+                time.perf_counter() - sync_start_t) * 1000.0
         stats = release_moe_comm_method_runtime_state()
+        gc_ms = 0.0
+        empty_cache_ms = 0.0
+        sync_ms = 0.0
+        if trim_npu_cache and int(stats.get("tensors", 0) or 0) > 0:
+            gc_start_t = time.perf_counter()
+            gc.collect()
+            gc_ms = (time.perf_counter() - gc_start_t) * 1000.0
+            if torch.npu.is_available():
+                empty_cache_start_t = time.perf_counter()
+                torch.npu.empty_cache()
+                empty_cache_ms = (time.perf_counter() -
+                                  empty_cache_start_t) * 1000.0
+                sync_start_t = time.perf_counter()
+                torch.npu.synchronize()
+                sync_ms = (time.perf_counter() - sync_start_t) * 1000.0
+        stats["pre_release_sync_ms"] = int(pre_release_sync_ms)
+        stats["gc_ms"] = int(gc_ms)
+        stats["empty_cache_ms"] = int(empty_cache_ms)
+        stats["sync_ms"] = int(sync_ms)
         stats["total_ms"] = int((time.perf_counter() - start_t) * 1000.0)
+        try:
+            slow_sync_ms = float(
+                os.getenv("VLLM_ASCEND_MODE1_MOE_COMM_RELEASE_SYNC_SLOW_MS",
+                          "1000"))
+        except ValueError:
+            slow_sync_ms = 1000.0
         if (stats.get("method_attrs", 0) or stats.get("dispatcher_attrs", 0)
-                or stats.get("prepare_attrs", 0)):
+                or stats.get("prepare_attrs", 0)
+                or pre_release_sync_ms >= slow_sync_ms):
             logger.info(
                 "Mode1 MoE comm runtime transient release: rank=%s reason=%s "
                 "methods=%s topologies=%s method_attrs=%s "
                 "dispatcher_attrs=%s prepare_attrs=%s tensors=%s "
-                "tensor_bytes=%s total_ms=%s",
+                "tensor_bytes=%s pre_release_sync_ms=%s gc_ms=%s "
+                "empty_cache_ms=%s sync_ms=%s total_ms=%s",
                 self.rank,
                 reason,
                 stats.get("methods", 0),
@@ -9144,6 +9596,10 @@ class NPUWorker(WorkerBase):
                 stats.get("prepare_attrs", 0),
                 stats.get("tensors", 0),
                 stats.get("tensor_bytes", 0),
+                stats.get("pre_release_sync_ms", 0),
+                stats.get("gc_ms", 0),
+                stats.get("empty_cache_ms", 0),
+                stats.get("sync_ms", 0),
                 stats.get("total_ms", 0),
             )
         return stats
@@ -10019,7 +10475,12 @@ class NPUWorker(WorkerBase):
         world_size = int(torch.distributed.get_world_size())
         full_world_ranks = tuple(range(world_size))
         if cached_group_ranks == full_world_ranks:
-            return False
+            return (
+                keep_group_ranks != full_world_ranks
+                and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_DROP_FULLWORLD_GROUP_CACHE_AFTER_SHRINK",
+                    "0")
+            )
         if self._should_keep_mode1_fixed_topology_stale_group(
                 group_kind, cached_group_ranks, keep_group_ranks):
             return False
@@ -10049,8 +10510,14 @@ class NPUWorker(WorkerBase):
         signature_sweep_ms = 0.0
         release_ref_ms = 0.0
         registry_dropped_groups = 0
+        fullworld_cache_dropped_groups = 0
+        fullworld_registry_dropped_groups = 0
         verbose_drop_log = _env_flag(
             "VLLM_ASCEND_MODE1_PARITY_OLD_FLOOR_DROP_VERBOSE", "0")
+        full_world_ranks: tuple[int, ...] = ()
+        if torch.distributed.is_initialized():
+            full_world_ranks = tuple(
+                range(int(torch.distributed.get_world_size())))
 
         for attr_name, groups_by_ranks in cached_groups.items():
             group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
@@ -10167,6 +10634,8 @@ class NPUWorker(WorkerBase):
                     self._remove_elastic_parallel_group_registry_entry(
                         group_kind, ranks, released_group)
                     dropped_groups += 1
+                    if ranks == full_world_ranks:
+                        fullworld_cache_dropped_groups += 1
                 if (group_kind, ranks) in seen_signatures:
                     seen_signatures.discard((group_kind, ranks))
                     dropped_signatures += 1
@@ -10206,6 +10675,8 @@ class NPUWorker(WorkerBase):
             if stats.get("released_groups", 0.0) > 0.0:
                 registry_dropped_groups += 1
                 dropped_groups += 1
+                if ranks == full_world_ranks:
+                    fullworld_registry_dropped_groups += 1
             deferred_groups += int(stats.get("deferred_groups", 0.0))
             destroy_ms += float(stats.get("destroy_ms", 0.0))
             cleanup_ms += float(stats.get("cleanup_ms", 0.0))
@@ -10228,6 +10699,23 @@ class NPUWorker(WorkerBase):
                 dropped_signatures)
             summary_log_ms = (
                 time.perf_counter() - summary_log_start_t) * 1000.0
+        if fullworld_cache_dropped_groups or fullworld_registry_dropped_groups:
+            fullworld_log_start_t = time.perf_counter()
+            logger.info(
+                "Elastic mode1 full-world group cache drop summary: "
+                "rank=%s keep_ranks=%s fullworld_cache_dropped_groups=%s "
+                "fullworld_registry_dropped_groups=%s cleanup_ms=%.2f "
+                "cleanup_empty_cache_ms=%.2f cleanup_sync_ms=%.2f",
+                self.rank,
+                keep_group_ranks,
+                fullworld_cache_dropped_groups,
+                fullworld_registry_dropped_groups,
+                cleanup_ms,
+                cleanup_empty_cache_ms,
+                cleanup_sync_ms,
+            )
+            summary_log_ms += (
+                time.perf_counter() - fullworld_log_start_t) * 1000.0
 
         total_ms = (time.perf_counter() - drop_start_t) * 1000.0
         return {
@@ -10245,6 +10733,10 @@ class NPUWorker(WorkerBase):
             "release_ref_ms": release_ref_ms,
             "dropped_groups": float(dropped_groups),
             "registry_dropped_groups": float(registry_dropped_groups),
+            "fullworld_cache_dropped_groups": float(
+                fullworld_cache_dropped_groups),
+            "fullworld_registry_dropped_groups": float(
+                fullworld_registry_dropped_groups),
             "deferred_groups": float(deferred_groups),
             "dropped_signatures": float(dropped_signatures),
         }
@@ -10634,7 +11126,7 @@ class NPUWorker(WorkerBase):
         if self._has_mode4_remote_npu_lightweight_module():
             return
         if not _env_flag(
-                "VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_MC2_WARMUP", "1"):
+                "VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_MC2_WARMUP", "0"):
             return
         if not self._has_custom_mode1_native_parity_module():
             return
@@ -10771,6 +11263,524 @@ class NPUWorker(WorkerBase):
             return False
         return True
 
+    def _elastic_group_seq_digest_enabled(self) -> bool:
+        return _env_flag("VLLM_ASCEND_GROUP_SEQ_DIGEST_LOG", "0")
+
+    def _format_elastic_group_seq_ranks(self, group_ranks):
+        if group_ranks is None:
+            return ()
+        try:
+            if isinstance(group_ranks, torch.Tensor):
+                return tuple(int(rank) for rank in group_ranks.tolist())
+        except Exception:
+            return repr(group_ranks)
+        if isinstance(group_ranks, (list, tuple)):
+            if group_ranks and isinstance(group_ranks[0], (list, tuple)):
+                return tuple(
+                    tuple(int(rank) for rank in ranks)
+                    for ranks in group_ranks)
+            return tuple(int(rank) for rank in group_ranks)
+        return repr(group_ranks)
+
+    def _log_elastic_group_seq_digest(
+            self,
+            event: str,
+            group_kind: str = "",
+            attr_name: str = "",
+            group_name: str = "",
+            group_ranks=None,
+            reason: str = "",
+            extra: str = "") -> None:
+        if not self._elastic_group_seq_digest_enabled():
+            return
+        try:
+            seq = int(getattr(self, "_elastic_group_seq_digest_counter",
+                              0)) + 1
+            self._elastic_group_seq_digest_counter = seq
+            target_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_rebuild_target_ranks", ()) or ())
+            active_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_current_active_ranks", ()) or ())
+            seen_signatures = getattr(
+                self, "_elastic_seen_parallel_group_signatures", None)
+            seen_count = len(seen_signatures) if seen_signatures is not None else 0
+            logger.info(
+                "Elastic group seq digest: rank=%s seq=%s event=%s kind=%s "
+                "attr=%s group_name=%s ranks=%s target=%s active=%s "
+                "detached=%s seen=%s reason=%s extra=%s",
+                self.rank,
+                seq,
+                event,
+                group_kind,
+                attr_name,
+                group_name,
+                self._format_elastic_group_seq_ranks(group_ranks),
+                target_ranks,
+                active_ranks,
+                getattr(self, "elastic_parallel_detached", None),
+                seen_count,
+                reason,
+                extra,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Elastic group seq digest failed: rank=%s event=%s err=%s",
+                getattr(self, "rank", None),
+                event,
+                exc,
+            )
+
+    def _elastic_hccl_seq_digest_enabled(self) -> bool:
+        return _env_flag("VLLM_ASCEND_ELASTIC_HCCL_SEQ_DIGEST_LOG", "0")
+
+    def _elastic_hccl_seq_summary_enabled(self) -> bool:
+        default = os.getenv("VLLM_ASCEND_ELASTIC_HCCL_SEQ_DIGEST_LOG", "0")
+        return _env_flag("VLLM_ASCEND_ELASTIC_HCCL_SEQ_SUMMARY_LOG", default)
+
+    def _log_mode1_lifecycle_feature_once(self, context: str) -> None:
+        if getattr(self, "_mode1_lifecycle_feature_logged", False):
+            return
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return
+        self._mode1_lifecycle_feature_logged = True
+        try:
+            logger.info(
+                "Elastic mode1 lifecycle feature: rank=%s "
+                "feature=mode1_full_restore_defer_guard_v2 "
+                "context=%s stash_classify=%s group_seq_digest=%s "
+                "hccl_seq_digest=%s hccl_seq_summary=%s "
+                "defer_full_restore=%s defer_group_destroy=%s "
+                "destroy_cpu_placeholder_pg=%s",
+                self.rank,
+                context,
+                int(self._mode1_stash_classify_log_enabled()),
+                int(self._elastic_group_seq_digest_enabled()),
+                int(self._elastic_hccl_seq_digest_enabled()),
+                int(self._elastic_hccl_seq_summary_enabled()),
+                int(_env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE",
+                    "1")),
+                int(_env_flag("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY",
+                              "1")),
+                int(_env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_NON_MEMBER_PLACEHOLDER",
+                    os.getenv("VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE",
+                              "0"))),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Elastic mode1 lifecycle feature log failed: rank=%s "
+                "context=%s err=%s",
+                getattr(self, "rank", None),
+                context,
+                exc,
+            )
+
+    def _elastic_hccl_seq_counter_snapshot(self) -> dict[str, int]:
+        try:
+            import vllm.distributed.parallel_state as vllm_ps
+            get_counters = getattr(
+                vllm_ps, "get_elastic_groupcoordinator_seq_counters", None)
+            if get_counters is not None:
+                return {
+                    str(key): int(value)
+                    for key, value in get_counters().items()
+                }
+        except Exception:
+            pass
+        counters: dict[str, int] = {}
+        for name, value in vars(self).items():
+            if not name.startswith("_elastic_hccl_seq_"):
+                continue
+            counters[name.removeprefix("_elastic_hccl_seq_")] = int(value)
+        return counters
+
+    def _log_elastic_hccl_seq_summary(
+            self,
+            event: str,
+            group_ranks=None,
+            reason: str = "",
+            extra: str = "") -> None:
+        if not self._elastic_hccl_seq_summary_enabled():
+            return
+        try:
+            counters = self._elastic_hccl_seq_counter_snapshot()
+            seen_signatures = getattr(
+                self, "_elastic_seen_parallel_group_signatures", None)
+            target_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_rebuild_target_ranks", ()) or ())
+            active_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_current_active_ranks", ()) or ())
+            logger.info(
+                "Elastic HCCL seq summary: rank=%s event=%s create_seq=%s "
+                "destroy_seq=%s ranks=%s target=%s active=%s detached=%s "
+                "seen=%s reason=%s extra=%s",
+                self.rank,
+                event,
+                counters.get("create", 0),
+                counters.get("destroy", 0),
+                self._format_elastic_group_seq_ranks(group_ranks),
+                target_ranks,
+                active_ranks,
+                getattr(self, "elastic_parallel_detached", None),
+                len(seen_signatures) if seen_signatures is not None else 0,
+                reason,
+                extra,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Elastic HCCL seq summary failed: rank=%s event=%s err=%s",
+                getattr(self, "rank", None),
+                event,
+                exc,
+            )
+
+    def _mode1_seq_checkpoint_enabled(self) -> bool:
+        default = os.getenv("VLLM_ASCEND_ELASTIC_HCCL_SEQ_SUMMARY_LOG", "0")
+        return _env_flag("VLLM_ASCEND_MODE1_SEQ_CHECKPOINT_LOG", default)
+
+    def _log_mode1_seq_checkpoint(
+            self,
+            tag: str,
+            group_ranks=None,
+            reason: str = "",
+            extra: str = "") -> None:
+        """Log rank-local communicator state without touching live PG APIs.
+
+        This is deliberately a read-only snapshot.  It avoids get_dp_group() /
+        get_ep_group() and does not create/destroy/synchronize any process
+        group, so it can be used to diagnose rank-local HCCL sequence drift
+        after the first shrink/restore cycle.
+        """
+        if not self._mode1_seq_checkpoint_enabled():
+            return
+
+        def _fmt_ranks(ranks) -> str:
+            if ranks is None:
+                return "-"
+            try:
+                return "[" + ",".join(str(int(rank)) for rank in ranks) + "]"
+            except Exception:
+                return str(ranks)
+
+        def _fmt_group_map(mapping, max_items: int = 8) -> str:
+            if not mapping:
+                return "-"
+            parts = []
+            for key, groups_by_ranks in sorted(mapping.items(),
+                                               key=lambda item: str(item[0])):
+                if not groups_by_ranks:
+                    continue
+                rank_items = []
+                for ranks in sorted(groups_by_ranks.keys(),
+                                    key=lambda item: (len(item), item)):
+                    rank_items.append(_fmt_ranks(ranks))
+                    if len(rank_items) >= max_items:
+                        rank_items.append("...")
+                        break
+                if rank_items:
+                    parts.append(f"{key}:{','.join(rank_items)}")
+            return ";".join(parts) if parts else "-"
+
+        def _fmt_registry(registry, max_items: int = 8) -> str:
+            if not registry:
+                return "-"
+            parts = []
+            for kind, groups_by_ranks in sorted(registry.items()):
+                rank_items = []
+                for ranks, groups_by_id in sorted(
+                        groups_by_ranks.items(),
+                        key=lambda item: (len(item[0]), item[0])):
+                    rank_items.append(
+                        f"{_fmt_ranks(ranks)}x{len(groups_by_id)}")
+                    if len(rank_items) >= max_items:
+                        rank_items.append("...")
+                        break
+                if rank_items:
+                    parts.append(f"{kind}:{','.join(rank_items)}")
+            return ";".join(parts) if parts else "-"
+
+        def _fmt_seen(seen, max_items: int = 8) -> str:
+            if not seen:
+                return "-"
+            by_kind: dict[str, list[tuple[int, ...]]] = {}
+            for kind, ranks in seen:
+                by_kind.setdefault(str(kind), []).append(
+                    tuple(int(rank) for rank in ranks))
+            parts = []
+            for kind, ranks_list in sorted(by_kind.items()):
+                rank_items = [
+                    _fmt_ranks(ranks)
+                    for ranks in sorted(ranks_list,
+                                        key=lambda item: (len(item), item))
+                ][:max_items]
+                if len(ranks_list) > max_items:
+                    rank_items.append("...")
+                parts.append(f"{kind}:{len(ranks_list)}:{','.join(rank_items)}")
+            return ";".join(parts)
+
+        def _live_group_summary() -> str:
+            parts = []
+            try:
+                import vllm.distributed.parallel_state as vllm_ps
+                import vllm_ascend.distributed.parallel_state as ascend_ps
+                for label, module, attr_name in (
+                        ("dp", vllm_ps, "_DP"),
+                        ("ep", vllm_ps, "_EP"),
+                        ("mc2", ascend_ps, "_MC2"),
+                ):
+                    group = getattr(module, attr_name, None)
+                    if group is None:
+                        parts.append(f"{label}:-")
+                        continue
+                    ranks = tuple(
+                        int(rank) for rank in getattr(group, "ranks", []) or ())
+                    parts.append(f"{label}:{_fmt_ranks(ranks)}")
+            except Exception as exc:
+                parts.append(f"error:{exc}")
+            return ";".join(parts) if parts else "-"
+
+        try:
+            counters = self._elastic_hccl_seq_counter_snapshot()
+            worker_counters = {}
+            for name, value in vars(self).items():
+                if not name.startswith("_elastic_hccl_seq_"):
+                    continue
+                try:
+                    worker_counters[name.removeprefix("_elastic_hccl_seq_")] = (
+                        int(value))
+                except Exception:
+                    pass
+            active_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_current_active_ranks", ()) or ())
+            target_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_rebuild_target_ranks", ()) or ())
+            cached = getattr(self, "_elastic_cached_parallel_groups", {}) or {}
+            registry = getattr(self, "_elastic_parallel_group_registry", {}) or {}
+            seen = getattr(
+                self, "_elastic_seen_parallel_group_signatures", set()) or set()
+            deferred_ids = getattr(
+                self, "_elastic_deferred_destroy_group_ids", set()) or set()
+            retired_ids = getattr(
+                self, "_elastic_retired_group_ids", set()) or set()
+            deferred_groups = getattr(
+                self, "_elastic_deferred_destroy_groups", []) or []
+            deferred_device_placeholders = getattr(
+                self, "_elastic_deferred_non_member_placeholder_device_pgs",
+                []) or []
+            deferred_cpu_placeholders = getattr(
+                self, "_elastic_deferred_non_member_placeholder_cpu_pgs",
+                []) or []
+            logger.info(
+                "Elastic mode1 seq checkpoint: rank=%s tag=%s create_seq=%s "
+                "destroy_seq=%s worker_create_seq=%s worker_destroy_seq=%s "
+                "requested=%s active=%s target=%s detached=%s "
+                "cached=%s registry=%s seen=%s deferred_ids=%s retired_ids=%s "
+                "deferred_groups=%s deferred_device_placeholders=%s "
+                "deferred_cpu_placeholders=%s live=%s "
+                "reason=%s extra=%s",
+                self.rank,
+                tag,
+                counters.get("create", 0),
+                counters.get("destroy", 0),
+                worker_counters.get("create", 0),
+                worker_counters.get("destroy", 0),
+                _fmt_ranks(group_ranks),
+                _fmt_ranks(active_ranks),
+                _fmt_ranks(target_ranks),
+                getattr(self, "elastic_parallel_detached", None),
+                _fmt_group_map(cached),
+                _fmt_registry(registry),
+                _fmt_seen(seen),
+                len(deferred_ids),
+                len(retired_ids),
+                len(deferred_groups),
+                len(deferred_device_placeholders),
+                len(deferred_cpu_placeholders),
+                _live_group_summary(),
+                reason,
+                extra,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Elastic mode1 seq checkpoint failed: rank=%s tag=%s err=%s",
+                getattr(self, "rank", None),
+                tag,
+                exc,
+            )
+
+    def _next_elastic_hccl_seq(self, counter_name: str) -> int:
+        try:
+            import vllm.distributed.parallel_state as vllm_ps
+            next_seq = getattr(vllm_ps, "_next_elastic_groupcoordinator_seq",
+                               None)
+            if next_seq is not None:
+                return int(next_seq(counter_name))
+        except Exception:
+            pass
+        attr_name = f"_elastic_hccl_seq_{counter_name}"
+        seq = int(getattr(self, attr_name, 0)) + 1
+        setattr(self, attr_name, seq)
+        return seq
+
+    def _log_elastic_hccl_seq_digest(
+            self,
+            event: str,
+            op: str,
+            group_kind: str = "",
+            group_name: str = "",
+            group_ranks=None,
+            backend: str = "",
+            seq: int | None = None,
+            reason: str = "",
+            extra: str = "") -> int | None:
+        """Trace low-level elastic PG create/destroy ordering per rank.
+
+        This is intentionally separate from the higher-level group lifecycle
+        digest. It lets us verify whether HCCL/Gloo ProcessGroup create/destroy
+        call counts diverge after the first rollout without enabling noisy
+        framework-wide distributed logs.
+        """
+        if not self._elastic_hccl_seq_digest_enabled():
+            return seq
+        try:
+            if seq is None:
+                seq = self._next_elastic_hccl_seq(op)
+            active_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_current_active_ranks", ()) or ())
+            target_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_rebuild_target_ranks", ()) or ())
+            logger.info(
+                "Elastic HCCL seq digest: rank=%s op=%s seq=%s event=%s "
+                "group_kind=%s group_name=%s backend=%s group_ranks=%s "
+                "target=%s active=%s reason=%s extra=%s",
+                self.rank,
+                op,
+                seq,
+                event,
+                group_kind,
+                group_name,
+                backend,
+                self._format_elastic_group_seq_ranks(group_ranks),
+                target_ranks,
+                active_ranks,
+                reason,
+                extra,
+            )
+            return seq
+        except Exception as exc:
+            logger.warning(
+                "Elastic HCCL seq digest failed: rank=%s event=%s op=%s err=%s",
+                getattr(self, "rank", None),
+                event,
+                op,
+                exc,
+            )
+            return seq
+
+    def _mode1_stash_classify_log_enabled(self) -> bool:
+        return _env_flag("VLLM_ASCEND_MODE1_STASH_CLASSIFY_LOG", "1")
+
+    def _log_mode1_stash_classification(
+            self,
+            attr_name: str,
+            group_kind: str,
+            group_ranks: tuple[int, ...],
+            should_cache_group: bool,
+            destroy_for_single_live_mc2: bool,
+            destroy_for_mode1_full_restore: bool,
+            destroy_for_mode1_pre_rebuild: bool,
+            force_drop_fullworld_for_shrink: bool,
+            already_retired_group: bool) -> None:
+        if not self._mode1_stash_classify_log_enabled():
+            return
+        if group_kind not in ("dp", "ep", "mc2"):
+            return
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return
+        try:
+            target_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_rebuild_target_ranks", ()) or ())
+            active_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_current_active_ranks", ()) or ())
+            world_size = (int(torch.distributed.get_world_size())
+                          if torch.distributed.is_initialized() else 0)
+            full_world_ranks = tuple(range(world_size)) if world_size else ()
+            full_restore_context = (
+                bool(target_ranks)
+                and bool(group_ranks)
+                and target_ranks == full_world_ranks
+                and group_ranks != target_ranks)
+            fixed_keep = False
+            floor4_keep = False
+            if group_ranks and target_ranks:
+                fixed_keep = self._should_keep_mode1_fixed_topology_stale_group(
+                    group_kind, group_ranks, target_ranks)
+                floor4_keep = self._should_keep_mode1_floor4_group_cache(
+                    group_kind, group_ranks, target_ranks)
+            if already_retired_group:
+                predicted_reason = "already_retired"
+            elif destroy_for_single_live_mc2:
+                predicted_reason = "single_live_rebuild"
+            elif destroy_for_mode1_full_restore:
+                predicted_reason = "mode1_full_restore"
+            elif destroy_for_mode1_pre_rebuild:
+                predicted_reason = "mode1_pre_rebuild"
+            elif force_drop_fullworld_for_shrink:
+                predicted_reason = "mode1_fullworld_shrink_drop"
+            elif group_ranks and should_cache_group:
+                predicted_reason = "cache"
+            else:
+                predicted_reason = "stash_group"
+            defer_preview = (
+                False if predicted_reason == "cache" else
+                self._should_defer_stashed_group_destroy_for_mode1(
+                    group_kind, group_ranks, predicted_reason))
+            logger.info(
+                "Elastic mode1 stash classify: rank=%s attr=%s group_kind=%s "
+                "old_ranks=%s target_ranks=%s active_ranks=%s "
+                "full_restore_context=%s fixed_keep=%s floor4_keep=%s "
+                "should_cache=%s single_live=%s full_restore=%s "
+                "pre_rebuild=%s force_drop_fullworld=%s already_retired=%s "
+                "predicted_reason=%s defer_preview=%s",
+                self.rank,
+                attr_name,
+                group_kind,
+                group_ranks,
+                target_ranks,
+                active_ranks,
+                int(full_restore_context),
+                int(fixed_keep),
+                int(floor4_keep),
+                int(bool(should_cache_group)),
+                int(bool(destroy_for_single_live_mc2)),
+                int(bool(destroy_for_mode1_full_restore)),
+                int(bool(destroy_for_mode1_pre_rebuild)),
+                int(bool(force_drop_fullworld_for_shrink)),
+                int(bool(already_retired_group)),
+                predicted_reason,
+                int(bool(defer_preview)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Elastic mode1 stash classify failed: rank=%s attr=%s "
+                "group_kind=%s err=%s",
+                getattr(self, "rank", None),
+                attr_name,
+                group_kind,
+                exc,
+            )
+
     def _should_destroy_stashed_group_for_mode1_full_restore(
             self, attr_name: str, group_ranks: tuple[int, ...]) -> bool:
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
@@ -10791,8 +11801,19 @@ class NPUWorker(WorkerBase):
         full_world_ranks = tuple(range(world_size))
         if target_ranks != full_world_ranks:
             return False
-        if self._should_keep_mode1_fixed_topology_stale_group(
-                group_kind, group_ranks, target_ranks):
+        # A fixed-topology "keep" decision is only safe when the stale group
+        # will actually remain in the elastic group cache.  Otherwise the group
+        # falls through to the generic stash release path and can hot-destroy a
+        # stale MC2/HCCL communicator during full restore.  That exact
+        # misclassification showed up as reason=stash_group and 100s+ destroy
+        # time for the old floor4 MC2 group after rollout 1.
+        should_keep_fixed = self._should_keep_mode1_fixed_topology_stale_group(
+            group_kind, group_ranks, target_ranks)
+        should_keep_floor4 = self._should_keep_mode1_floor4_group_cache(
+            group_kind, group_ranks, target_ranks)
+        should_cache_stale_group = self._should_cache_elastic_parallel_group_ranks(
+            attr_name, group_ranks)
+        if (should_keep_fixed or should_keep_floor4) and should_cache_stale_group:
             return False
         # Keep only the previously stashed full-world EP cache across shrink.
         # During restore, the currently live shrink-stage DP/EP/MC2 groups are
@@ -10819,6 +11840,33 @@ class NPUWorker(WorkerBase):
                 sizes.add(size)
         return sizes
 
+    def _should_release_fullworld_group_before_mode1_shrink(
+            self, group_ranks: tuple[int, ...],
+            target_ranks: tuple[int, ...]) -> bool:
+        if not group_ranks or not target_ranks:
+            return False
+        if not torch.distributed.is_initialized():
+            return False
+        world_size = int(torch.distributed.get_world_size())
+        full_world_ranks = tuple(range(world_size))
+        return (
+            group_ranks == full_world_ranks
+            and target_ranks != full_world_ranks
+            and _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_DROP_FULLWORLD_GROUP_CACHE_AFTER_SHRINK",
+                "0")
+        )
+
+    def _should_force_drop_fullworld_group_for_mode1_shrink(
+            self, group_kind: str, group_ranks: tuple[int, ...]) -> bool:
+        if group_kind not in ("dp", "ep", "mc2"):
+            return False
+        target_ranks = tuple(
+            int(rank) for rank in getattr(
+                self, "_elastic_rebuild_target_ranks", ()) or ())
+        return self._should_release_fullworld_group_before_mode1_shrink(
+            group_ranks, target_ranks)
+
     def _should_destroy_stashed_group_for_mode1_pre_rebuild(
             self, attr_name: str, group_ranks: tuple[int, ...]) -> bool:
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
@@ -10837,18 +11885,24 @@ class NPUWorker(WorkerBase):
                 self, "_elastic_rebuild_target_ranks", ()) or ())
         if not target_ranks or group_ranks == target_ranks:
             return False
-        if len(group_ranks) not in self._mode1_pre_rebuild_destroy_floor_sizes():
-            return False
         if not torch.distributed.is_initialized():
             return False
         world_size = int(torch.distributed.get_world_size())
-        if group_ranks == tuple(range(world_size)):
+        release_fullworld = self._should_release_fullworld_group_before_mode1_shrink(
+            group_ranks, target_ranks)
+        if (not release_fullworld
+                and len(group_ranks)
+                not in self._mode1_pre_rebuild_destroy_floor_sizes()):
             return False
-        if self._should_keep_mode1_fixed_topology_stale_group(
-                group_kind, group_ranks, target_ranks):
+        if group_ranks == tuple(range(world_size)) and not release_fullworld:
             return False
-        if self._should_keep_mode1_floor4_group_cache(
-                group_kind, group_ranks, target_ranks):
+        if (not release_fullworld
+                and self._should_keep_mode1_fixed_topology_stale_group(
+                    group_kind, group_ranks, target_ranks)):
+            return False
+        if (not release_fullworld
+                and self._should_keep_mode1_floor4_group_cache(
+                    group_kind, group_ranks, target_ranks)):
             return False
         return True
 
@@ -10858,11 +11912,18 @@ class NPUWorker(WorkerBase):
         target_ranks = tuple(
             int(rank) for rank in getattr(
                 self, "_elastic_rebuild_target_ranks", ()) or ())
+        allow_same_ranks = reason in (
+            "stash_group",
+            "mode1_pre_rebuild",
+            "mode1_full_restore",
+            "mode1_fullworld_shrink_drop",
+        )
         return self._should_defer_mode1_group_destroy(
             group_kind,
             group_ranks,
             target_ranks,
             reason,
+            allow_same_ranks=allow_same_ranks,
         )
 
     def _stash_group_if_present(self, state_module, attr_name: str) -> None:
@@ -10872,6 +11933,12 @@ class NPUWorker(WorkerBase):
 
         group_ranks = tuple(int(rank) for rank in getattr(group, "ranks", []))
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
+        self._log_elastic_group_seq_digest(
+            "stash_enter",
+            group_kind=group_kind,
+            attr_name=attr_name,
+            group_ranks=group_ranks,
+        )
         self._register_elastic_parallel_group(attr_name, group_ranks, group)
         should_cache_group = self._should_cache_elastic_parallel_group_ranks(
             attr_name, group_ranks)
@@ -10884,9 +11951,23 @@ class NPUWorker(WorkerBase):
         destroy_for_mode1_pre_rebuild = (
             self._should_destroy_stashed_group_for_mode1_pre_rebuild(
                 attr_name, group_ranks))
+        force_drop_fullworld_for_shrink = (
+            self._should_force_drop_fullworld_group_for_mode1_shrink(
+                group_kind, group_ranks))
         already_retired_group = self._is_retired_elastic_group(group)
-        if already_retired_group:
+        if already_retired_group or force_drop_fullworld_for_shrink:
             should_cache_group = False
+        self._log_mode1_stash_classification(
+            attr_name,
+            group_kind,
+            group_ranks,
+            should_cache_group,
+            destroy_for_single_live_mc2,
+            destroy_for_mode1_full_restore,
+            destroy_for_mode1_pre_rebuild,
+            force_drop_fullworld_for_shrink,
+            already_retired_group,
+        )
         if destroy_for_single_live_mc2:
             target_ranks = tuple(
                 int(rank) for rank in getattr(
@@ -10909,7 +11990,7 @@ class NPUWorker(WorkerBase):
                 int(rank) for rank in getattr(
                     self, "_elastic_rebuild_target_ranks", ()) or ())
             logger.info(
-                "Elastic mode1 full-restore releases stale live floor group: "
+                "Elastic mode1 full-restore defers stale live floor group destroy: "
                 "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
                 self.rank,
                 attr_name,
@@ -10919,7 +12000,7 @@ class NPUWorker(WorkerBase):
             )
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
-                    "before_mode1_full_restore_mc2_release",
+                    "before_mode1_full_restore_mc2_defer",
                     f"old_ranks={group_ranks} target_ranks={target_ranks}",
                 )
             should_cache_group = False
@@ -10942,11 +12023,36 @@ class NPUWorker(WorkerBase):
                     f"old_ranks={group_ranks} target_ranks={target_ranks}",
                 )
             should_cache_group = False
+        elif force_drop_fullworld_for_shrink:
+            target_ranks = tuple(
+                int(rank) for rank in getattr(
+                    self, "_elastic_rebuild_target_ranks", ()) or ())
+            logger.info(
+                "Elastic mode1 drops stale full-world group before shrink target: "
+                "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
+                self.rank,
+                attr_name,
+                group_kind,
+                group_ranks,
+                target_ranks,
+            )
+            if group_kind == "mc2":
+                self._log_custom_mode1_worker_memory(
+                    "before_mode1_fullworld_shrink_drop_mc2",
+                    f"old_ranks={group_ranks} target_ranks={target_ranks}",
+                )
+            should_cache_group = False
         if group_ranks and should_cache_group:
             cached_groups = self._get_cached_elastic_parallel_groups()
             cached_groups.setdefault(attr_name, {})[group_ranks] = group
             self._get_seen_elastic_parallel_group_signatures().add(
                 (group_kind, group_ranks))
+            self._log_elastic_group_seq_digest(
+                "stash_cache_keep",
+                group_kind=group_kind,
+                attr_name=attr_name,
+                group_ranks=group_ranks,
+            )
         else:
             if group_ranks:
                 self._remove_cached_elastic_parallel_group_reference(
@@ -10961,12 +12067,23 @@ class NPUWorker(WorkerBase):
                 destroy_reason = "mode1_full_restore"
             elif destroy_for_mode1_pre_rebuild:
                 destroy_reason = "mode1_pre_rebuild"
+            elif force_drop_fullworld_for_shrink:
+                destroy_reason = "mode1_fullworld_shrink_drop"
             else:
                 destroy_reason = "stash_group"
             cleanup_ms = 0.0
             force_cleanup_after_release = (
                 self._should_force_cleanup_after_mode1_floor_group_release(
                     group_kind, group_ranks))
+            self._log_elastic_group_seq_digest(
+                "stash_release_start",
+                group_kind=group_kind,
+                attr_name=attr_name,
+                group_ranks=group_ranks,
+                reason=destroy_reason,
+                extra=(f"already_retired={already_retired_group} "
+                       f"defer={self._should_defer_stashed_group_destroy_for_mode1(group_kind, group_ranks, destroy_reason)}"),
+            )
             if already_retired_group:
                 destroy_ms = 0.0
                 self._remove_elastic_parallel_group_registry_entry(
@@ -10989,13 +12106,33 @@ class NPUWorker(WorkerBase):
                     cleanup_ms = float(cleanup_stats.get("total_ms", 0.0))
             else:
                 if self._is_mode1_low_floor_elastic_runtime():
+                    target_ranks = tuple(
+                        int(rank) for rank in getattr(
+                            self, "_elastic_rebuild_target_ranks", ()) or ())
+                    allow_same_ranks = destroy_reason in (
+                        "stash_group",
+                        "mode1_pre_rebuild",
+                        "mode1_full_restore",
+                    )
+                    defer_preview = self._should_defer_mode1_group_destroy(
+                        group_kind,
+                        group_ranks,
+                        target_ranks,
+                        destroy_reason,
+                        allow_same_ranks=allow_same_ranks,
+                    )
                     logger.warning(
                         "Elastic mode1 low-floor stashed group direct destroy fallback: "
-                        "rank=%s group_kind=%s group_ranks=%s reason=%s defer_env=%s defer_sizes=%s",
+                        "rank=%s group_kind=%s group_ranks=%s target_ranks=%s "
+                        "reason=%s allow_same_ranks=%s defer_preview=%s "
+                        "defer_env=%s defer_sizes=%s",
                         self.rank,
                         group_kind,
                         group_ranks,
+                        target_ranks,
                         destroy_reason,
+                        int(bool(allow_same_ranks)),
+                        int(bool(defer_preview)),
                         os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"),
                         os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES", "1,2,4,8"),
                     )
@@ -11028,6 +12165,16 @@ class NPUWorker(WorkerBase):
                     cleanup_ms,
                     already_retired_group,
                 )
+            self._log_elastic_group_seq_digest(
+                "stash_release_done",
+                group_kind=group_kind,
+                attr_name=attr_name,
+                group_ranks=group_ranks,
+                reason=destroy_reason,
+                extra=(f"destroy_ms={destroy_ms:.2f} "
+                       f"cleanup_ms={cleanup_ms:.2f} "
+                       f"already_retired={already_retired_group}"),
+            )
         setattr(state_module, attr_name, None)
 
     def _get_local_group_ranks(self,
@@ -11078,8 +12225,9 @@ class NPUWorker(WorkerBase):
                         group_kind,
                         tuple(int(rank) for rank in ranks),
                         keep_group_ranks,
-                    )
-                )
+            )
+        )
+
             ]
             kept_stale_group_ranks = [
                 ranks
@@ -11307,14 +12455,20 @@ class NPUWorker(WorkerBase):
             "log_ms": 0.0,
             "groups": 0.0,
             "reuse": 0.0,
+            "deferred_device_placeholder_groups": 0.0,
+            "deferred_cpu_placeholder_groups": 0.0,
         }
         group_kind = self._normalize_elastic_parallel_group_kind(group_name)
         unseen_group_ranks = []
         seen_signatures = self._get_seen_elastic_parallel_group_signatures()
+        seen_before = len(seen_signatures)
+        force_placeholder_new_group = (
+            self._force_mode1_non_member_placeholder_new_group())
         for ranks in group_ranks:
             ranks_key = tuple(int(rank) for rank in ranks)
             group_signature = (group_kind, ranks_key)
-            if group_signature in seen_signatures:
+            if (not force_placeholder_new_group
+                    and group_signature in seen_signatures):
                 continue
             unseen_group_ranks.append(ranks)
 
@@ -11331,6 +12485,27 @@ class NPUWorker(WorkerBase):
         if not unseen_group_ranks:
             stats["reuse"] = 1.0
             stats["total_ms"] = (time.perf_counter() - start_t) * 1000.0
+            self._log_elastic_group_seq_digest(
+                "non_member_reuse",
+                group_kind=group_kind,
+                group_name=group_name,
+                group_ranks=group_ranks,
+                extra=(f"groups={len(group_ranks)} "
+                       f"force_placeholder_new_group="
+                       f"{int(force_placeholder_new_group)} "
+                       f"total_ms={stats['total_ms']:.2f}"),
+            )
+            self._log_elastic_hccl_seq_summary(
+                "non_member_reuse",
+                group_ranks=group_ranks,
+                reason="non_member_placeholder",
+                extra=(f"group_name={group_name} group_kind={group_kind} "
+                       f"force_placeholder_new_group="
+                       f"{int(force_placeholder_new_group)} "
+                       f"seen_before={seen_before} "
+                       f"seen_after={len(seen_signatures)} "
+                       f"requested_groups={len(group_ranks)} unseen_groups=0"),
+            )
             if verbose_sequence_log or stats["total_ms"] >= slow_log_ms:
                 log_start_t = time.perf_counter()
                 logger.info(
@@ -11343,25 +12518,192 @@ class NPUWorker(WorkerBase):
             return stats
 
         placeholder_groups = []
+        log_hccl_seq = self._elastic_hccl_seq_digest_enabled()
         for ranks in unseen_group_ranks:
+            placeholder_ranks_key = tuple(int(rank) for rank in ranks)
+            self._log_elastic_group_seq_digest(
+                "non_member_device_new_group_start",
+                group_kind=group_kind,
+                group_name=group_name,
+                group_ranks=ranks,
+                extra=f"backend={backend}",
+            )
+            create_seq = None
+            if log_hccl_seq:
+                create_seq = self._next_elastic_hccl_seq("create")
+                self._log_elastic_hccl_seq_digest(
+                    "non_member_device_new_group_start",
+                    "create",
+                    group_kind=group_kind,
+                    group_name=group_name,
+                    group_ranks=ranks,
+                    backend=backend,
+                    seq=create_seq,
+                    reason="non_member_placeholder",
+                )
             device_group_start_t = time.perf_counter()
             placeholder_groups.append(
-                torch.distributed.new_group(ranks, backend=backend))
+                (torch.distributed.new_group(ranks, backend=backend),
+                 placeholder_ranks_key, backend))
             stats["device_new_group_ms"] += (
                 time.perf_counter() - device_group_start_t) * 1000.0
+            if log_hccl_seq:
+                self._log_elastic_hccl_seq_digest(
+                    "non_member_device_new_group_done",
+                    "create",
+                    group_kind=group_kind,
+                    group_name=group_name,
+                    group_ranks=ranks,
+                    backend=backend,
+                    seq=create_seq,
+                    reason="non_member_placeholder",
+                    extra=f"device_ms={stats['device_new_group_ms']:.2f}",
+                )
+            self._log_elastic_group_seq_digest(
+                "non_member_device_new_group_done",
+                group_kind=group_kind,
+                group_name=group_name,
+                group_ranks=ranks,
+                extra=(f"backend={backend} "
+                       f"device_ms={stats['device_new_group_ms']:.2f}"),
+            )
+            self._log_elastic_group_seq_digest(
+                "non_member_cpu_new_group_start",
+                group_kind=group_kind,
+                group_name=group_name,
+                group_ranks=ranks,
+                extra="backend=gloo",
+            )
+            create_seq = None
+            if log_hccl_seq:
+                create_seq = self._next_elastic_hccl_seq("create")
+                self._log_elastic_hccl_seq_digest(
+                    "non_member_cpu_new_group_start",
+                    "create",
+                    group_kind=group_kind,
+                    group_name=group_name,
+                    group_ranks=ranks,
+                    backend="gloo",
+                    seq=create_seq,
+                    reason="non_member_placeholder",
+                )
             cpu_group_start_t = time.perf_counter()
             placeholder_groups.append(
-                torch.distributed.new_group(ranks, backend="gloo"))
+                (torch.distributed.new_group(ranks, backend="gloo"),
+                 placeholder_ranks_key, "gloo"))
             stats["cpu_new_group_ms"] += (
                 time.perf_counter() - cpu_group_start_t) * 1000.0
+            if log_hccl_seq:
+                self._log_elastic_hccl_seq_digest(
+                    "non_member_cpu_new_group_done",
+                    "create",
+                    group_kind=group_kind,
+                    group_name=group_name,
+                    group_ranks=ranks,
+                    backend="gloo",
+                    seq=create_seq,
+                    reason="non_member_placeholder",
+                    extra=f"cpu_ms={stats['cpu_new_group_ms']:.2f}",
+                )
+            self._log_elastic_group_seq_digest(
+                "non_member_cpu_new_group_done",
+                group_kind=group_kind,
+                group_name=group_name,
+                group_ranks=ranks,
+                extra=f"backend=gloo cpu_ms={stats['cpu_new_group_ms']:.2f}",
+            )
 
+        self._log_elastic_group_seq_digest(
+            "non_member_destroy_start",
+            group_kind=group_kind,
+            group_name=group_name,
+            group_ranks=unseen_group_ranks,
+            extra=f"groups={len(placeholder_groups)}",
+        )
         destroy_start_t = time.perf_counter()
-        for group in placeholder_groups:
+        destroy_device_placeholder_pg = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_NON_MEMBER_PLACEHOLDER",
+            os.getenv("VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE",
+                      "0"))
+        destroy_cpu_placeholder_pg = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_NON_MEMBER_PLACEHOLDER",
+            os.getenv("VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE",
+                      "0"))
+        deferred_device_placeholder_pgs = getattr(
+            self, "_elastic_deferred_non_member_placeholder_device_pgs", None)
+        if deferred_device_placeholder_pgs is None:
+            deferred_device_placeholder_pgs = []
+            self._elastic_deferred_non_member_placeholder_device_pgs = (
+                deferred_device_placeholder_pgs)
+        deferred_cpu_placeholder_pgs = getattr(
+            self, "_elastic_deferred_non_member_placeholder_cpu_pgs", None)
+        if deferred_cpu_placeholder_pgs is None:
+            deferred_cpu_placeholder_pgs = []
+            self._elastic_deferred_non_member_placeholder_cpu_pgs = (
+                deferred_cpu_placeholder_pgs)
+        for group, placeholder_ranks, placeholder_backend in placeholder_groups:
             if group == dist.GroupMember.NON_GROUP_MEMBER:
                 continue
+            if placeholder_backend != "gloo" and not destroy_device_placeholder_pg:
+                deferred_device_placeholder_pgs.append(group)
+                stats["deferred_device_placeholder_groups"] += 1.0
+                self._log_elastic_group_seq_digest(
+                    "non_member_placeholder_device_destroy_deferred",
+                    group_kind=group_kind,
+                    group_name=group_name,
+                    group_ranks=placeholder_ranks,
+                    extra=(f"backend={placeholder_backend} pg_id={id(group)} "
+                           f"deferred_count={len(deferred_device_placeholder_pgs)}"),
+                )
+                continue
+            if placeholder_backend == "gloo" and not destroy_cpu_placeholder_pg:
+                deferred_cpu_placeholder_pgs.append(group)
+                stats["deferred_cpu_placeholder_groups"] += 1.0
+                self._log_elastic_group_seq_digest(
+                    "non_member_placeholder_cpu_destroy_deferred",
+                    group_kind=group_kind,
+                    group_name=group_name,
+                    group_ranks=placeholder_ranks,
+                    extra=(f"backend={placeholder_backend} pg_id={id(group)} "
+                           f"deferred_count={len(deferred_cpu_placeholder_pgs)}"),
+                )
+                continue
+            destroy_seq = None
+            if log_hccl_seq:
+                destroy_seq = self._next_elastic_hccl_seq("destroy")
+                self._log_elastic_hccl_seq_digest(
+                        "non_member_placeholder_destroy_start",
+                        "destroy",
+                        group_kind=group_kind,
+                        group_name=group_name,
+                        group_ranks=placeholder_ranks,
+                        backend=placeholder_backend,
+                        seq=destroy_seq,
+                        reason="non_member_placeholder",
+                        extra=f"pg_id={id(group)}",
+                )
             torch.distributed.destroy_process_group(group)
+            if log_hccl_seq:
+                self._log_elastic_hccl_seq_digest(
+                        "non_member_placeholder_destroy_done",
+                        "destroy",
+                        group_kind=group_kind,
+                        group_name=group_name,
+                        group_ranks=placeholder_ranks,
+                        backend=placeholder_backend,
+                        seq=destroy_seq,
+                        reason="non_member_placeholder",
+                        extra=f"pg_id={id(group)}",
+                )
         stats["destroy_ms"] = (time.perf_counter() -
                                destroy_start_t) * 1000.0
+        self._log_elastic_group_seq_digest(
+            "non_member_destroy_done",
+            group_kind=group_kind,
+            group_name=group_name,
+            group_ranks=unseen_group_ranks,
+            extra=f"destroy_ms={stats['destroy_ms']:.2f}",
+        )
 
         signature_start_t = time.perf_counter()
         for ranks in unseen_group_ranks:
@@ -11371,13 +12713,39 @@ class NPUWorker(WorkerBase):
                                  signature_start_t) * 1000.0
         stats["groups"] = float(len(unseen_group_ranks))
         stats["total_ms"] = (time.perf_counter() - start_t) * 1000.0
+        self._log_elastic_group_seq_digest(
+            "non_member_signature_done",
+            group_kind=group_kind,
+            group_name=group_name,
+            group_ranks=unseen_group_ranks,
+            extra=(f"groups={len(unseen_group_ranks)} "
+                   f"force_placeholder_new_group="
+                   f"{int(force_placeholder_new_group)} "
+                   f"total_ms={stats['total_ms']:.2f}"),
+        )
+        self._log_elastic_hccl_seq_summary(
+            "non_member_signature_done",
+            group_ranks=unseen_group_ranks,
+            reason="non_member_placeholder",
+            extra=(f"group_name={group_name} group_kind={group_kind} "
+                   f"force_placeholder_new_group="
+                   f"{int(force_placeholder_new_group)} "
+                   f"seen_before={seen_before} "
+                   f"seen_after={len(seen_signatures)} "
+                   f"requested_groups={len(group_ranks)} "
+                   f"unseen_groups={len(unseen_group_ranks)} "
+                   f"destroy_ms={stats['destroy_ms']:.2f} "
+                   f"deferred_cpu_placeholder_groups="
+                   f"{stats['deferred_cpu_placeholder_groups']:.0f}"),
+        )
         if verbose_sequence_log or stats["total_ms"] >= slow_log_ms:
             log_start_t = time.perf_counter()
             logger.info(
-                "Elastic parallel non-member group sequence advanced: rank=%s group_name=%s groups=%s total_ms=%.2f device_new_group_ms=%.2f cpu_new_group_ms=%.2f destroy_ms=%.2f signature_ms=%.2f",
+                "Elastic parallel non-member group sequence advanced: rank=%s group_name=%s groups=%s total_ms=%.2f device_new_group_ms=%.2f cpu_new_group_ms=%.2f destroy_ms=%.2f deferred_cpu_placeholder_groups=%.0f signature_ms=%.2f",
                 self.rank, group_name, len(unseen_group_ranks),
                 stats["total_ms"], stats["device_new_group_ms"],
                 stats["cpu_new_group_ms"], stats["destroy_ms"],
+                stats["deferred_cpu_placeholder_groups"],
                 stats["signature_ms"])
             stats["log_ms"] = (time.perf_counter() - log_start_t) * 1000.0
             stats["total_ms"] = (time.perf_counter() - start_t) * 1000.0
@@ -11387,6 +12755,12 @@ class NPUWorker(WorkerBase):
             self, world_group, backend: str) -> None:
         world_size = int(world_group.world_size)
         local_active_ranks = self._get_previous_active_ranks_for_shrink(world_size)
+        self._log_elastic_group_seq_digest(
+            "restore_reconcile_start",
+            group_ranks=local_active_ranks,
+            reason="before_restore",
+            extra=f"world_size={world_size}",
+        )
         local_stage_tensor = torch.full((world_size + 1, ),
                                         -1,
                                         dtype=torch.int64,
@@ -11417,6 +12791,12 @@ class NPUWorker(WorkerBase):
             observed_stages.append(stage)
 
         observed_stages.sort(key=lambda ranks: (-len(ranks), ranks))
+        self._log_elastic_group_seq_digest(
+            "restore_reconcile_observed",
+            group_ranks=observed_stages,
+            reason="before_restore",
+            extra=f"local_stage={tuple(local_active_ranks)}",
+        )
         current_stage = tuple(local_active_ranks)
         replayed_stages: list[tuple[int, ...]] = []
         for stage in observed_stages:
@@ -11424,12 +12804,15 @@ class NPUWorker(WorkerBase):
                 continue
             if not set(stage).issubset(set(current_stage)):
                 continue
+            # Keep the diagnostic group kind identical to the real restore
+            # groups. The low-level new_group key is still ranks/backend, but
+            # consistent names make sequence-digest mismatches actionable.
             self._advance_group_creation_sequence_for_non_member(
-                [list(stage)], backend, "restore_catchup_dp")
+                [list(stage)], backend, "dp")
             self._advance_group_creation_sequence_for_non_member(
-                [list(stage)], backend, "restore_catchup_ep")
+                [list(stage)], backend, "ep")
             self._advance_group_creation_sequence_for_non_member(
-                [list(stage)], backend, "restore_catchup_mc2")
+                [list(stage)], backend, "mc2")
             current_stage = stage
             replayed_stages.append(stage)
 
@@ -11438,13 +12821,28 @@ class NPUWorker(WorkerBase):
                 "Elastic restore sequence catch-up applied: rank=%s local_stage=%s replayed_stages=%s",
                 self.rank, local_active_ranks, replayed_stages)
             self._elastic_current_active_ranks = list(current_stage)
+        self._log_elastic_group_seq_digest(
+            "restore_reconcile_done",
+            group_ranks=replayed_stages,
+            reason="before_restore",
+            extra=f"current_stage={tuple(current_stage)}",
+        )
 
-    def _detach_from_elastic_parallel_groups(self) -> None:
+    def _detach_from_elastic_parallel_groups(
+            self, target_ranks: list[int] | tuple[int, ...] | None = None) -> None:
         import vllm.distributed.parallel_state as vllm_ps
         import vllm_ascend.distributed.parallel_state as ascend_ps
-        self._stash_group_if_present(vllm_ps, "_DP")
-        self._stash_group_if_present(vllm_ps, "_EP")
-        self._stash_group_if_present(ascend_ps, "_MC2")
+        previous_target_ranks = getattr(self, "_elastic_rebuild_target_ranks",
+                                        None)
+        if target_ranks is not None:
+            self._elastic_rebuild_target_ranks = tuple(
+                int(rank) for rank in target_ranks)
+        try:
+            self._stash_group_if_present(vllm_ps, "_DP")
+            self._stash_group_if_present(vllm_ps, "_EP")
+            self._stash_group_if_present(ascend_ps, "_MC2")
+        finally:
+            self._elastic_rebuild_target_ranks = previous_target_ranks
 
         model_runner = getattr(self, "model_runner", None)
         if model_runner is not None:
@@ -11494,6 +12892,7 @@ class NPUWorker(WorkerBase):
 
         world_size = int(torch.distributed.get_world_size())
         target_ranks = tuple(int(rank) for rank in active_ranks)
+        full_world_ranks = tuple(range(world_size))
         previous_target_ranks = getattr(self, "_elastic_rebuild_target_ranks",
                                         None)
         self._elastic_rebuild_target_ranks = target_ranks
@@ -11511,19 +12910,29 @@ class NPUWorker(WorkerBase):
                     continue
                 group_ranks = tuple(
                     int(rank) for rank in getattr(group, "ranks", []))
-                if (not group_ranks or group_ranks == target_ranks
-                        or len(group_ranks) >= world_size):
+                release_fullworld = (
+                    group_ranks == full_world_ranks
+                    and target_ranks != full_world_ranks
+                    and _env_flag(
+                        "VLLM_ASCEND_MODE1_PARITY_DROP_FULLWORLD_GROUP_CACHE_AFTER_SHRINK",
+                        "0")
+                )
+                if (not group_ranks or group_ranks == target_ranks or
+                        (len(group_ranks) >= world_size
+                         and not release_fullworld)):
                     continue
                 group_kind = self._normalize_elastic_parallel_group_kind(
                     attr_name)
                 logger.info(
-                    "Elastic mode1 pre-rebuild releases live old floor group: "
-                    "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s",
+                    "Elastic mode1 pre-rebuild releases live old group: "
+                    "rank=%s attr=%s group_kind=%s old_ranks=%s target_ranks=%s "
+                    "release_fullworld=%s",
                     self.rank,
                     attr_name,
                     group_kind,
                     group_ranks,
                     target_ranks,
+                    int(bool(release_fullworld)),
                 )
                 self._stash_group_if_present(state_module, attr_name)
                 released_groups += 1
@@ -11533,7 +12942,7 @@ class NPUWorker(WorkerBase):
         total_ms = (time.perf_counter() - release_start_t) * 1000.0
         if released_groups:
             logger.info(
-                "Elastic mode1 pre-rebuild live old floor release done: "
+                "Elastic mode1 pre-rebuild live old group release done: "
                 "rank=%s target_ranks=%s released_groups=%s released_kinds=%s total_ms=%.2f",
                 self.rank,
                 target_ranks,
@@ -11552,6 +12961,14 @@ class NPUWorker(WorkerBase):
         self._elastic_rebuild_target_ranks = local_group_ranks
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
         try:
+            self._log_elastic_group_seq_digest(
+                "rebuild_enter",
+                group_kind=group_kind,
+                attr_name=attr_name,
+                group_name=group_name,
+                group_ranks=local_group_ranks,
+                extra=f"backend={backend}",
+            )
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "before_rebuild_mc2_stash",
@@ -11566,32 +12983,74 @@ class NPUWorker(WorkerBase):
                 cached_group = cached_groups.get(attr_name,
                                                  {}).get(local_group_ranks)
                 if cached_group is not None:
-                    self._register_elastic_parallel_group(
-                        attr_name, local_group_ranks, cached_group)
-                    setattr(state_module, attr_name, cached_group)
-                    logger.info(
-                        "Elastic parallel group cache hit: rank=%s attr=%s group_name=%s ranks=%s",
-                        self.rank, attr_name, group_name, local_group_ranks)
-                    if group_kind == "mc2":
-                        self._log_custom_mode1_worker_memory(
-                            "after_rebuild_mc2_cache_hit",
-                            f"group_name={group_name} ranks={local_group_ranks}",
+                    if self._allow_elastic_rebuild_cache_hit(
+                            group_kind, local_group_ranks):
+                        self._register_elastic_parallel_group(
+                            attr_name, local_group_ranks, cached_group)
+                        setattr(state_module, attr_name, cached_group)
+                        self._log_elastic_group_seq_digest(
+                            "rebuild_cache_hit",
+                            group_kind=group_kind,
+                            attr_name=attr_name,
+                            group_name=group_name,
+                            group_ranks=local_group_ranks,
+                            extra=f"backend={backend}",
                         )
-                    return
+                        logger.info(
+                            "Elastic parallel group cache hit: rank=%s attr=%s group_name=%s ranks=%s",
+                            self.rank, attr_name, group_name,
+                            local_group_ranks)
+                        if group_kind == "mc2":
+                            self._log_custom_mode1_worker_memory(
+                                "after_rebuild_mc2_cache_hit",
+                                f"group_name={group_name} ranks={local_group_ranks}",
+                            )
+                        return
+                    self._log_elastic_group_seq_digest(
+                        "rebuild_cache_bypass_for_seq_alignment",
+                        group_kind=group_kind,
+                        attr_name=attr_name,
+                        group_name=group_name,
+                        group_ranks=local_group_ranks,
+                        extra=(
+                            f"backend={backend} "
+                            "force_non_member_placeholder=1"),
+                    )
+                    logger.info(
+                        "Elastic parallel group cache bypassed for seq alignment: rank=%s attr=%s group_name=%s ranks=%s",
+                        self.rank, attr_name, group_name, local_group_ranks)
 
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "before_rebuild_mc2_create",
                     f"group_name={group_name} ranks={local_group_ranks}",
                 )
+            self._log_elastic_group_seq_digest(
+                "rebuild_create_start",
+                group_kind=group_kind,
+                attr_name=attr_name,
+                group_name=group_name,
+                group_ranks=group_ranks,
+                extra=f"backend={backend}",
+            )
+            create_start_t = time.perf_counter()
             setattr(
                 state_module, attr_name,
                 init_model_parallel_group(group_ranks, world_group.local_rank,
                                           backend, group_name=group_name))
+            create_ms = (time.perf_counter() - create_start_t) * 1000.0
             created_group = getattr(state_module, attr_name)
             self._register_elastic_parallel_group(attr_name,
                                                   local_group_ranks,
                                                   created_group)
+            self._log_elastic_group_seq_digest(
+                "rebuild_create_done",
+                group_kind=group_kind,
+                attr_name=attr_name,
+                group_name=group_name,
+                group_ranks=local_group_ranks,
+                extra=f"backend={backend} create_ms={create_ms:.2f}",
+            )
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "after_rebuild_mc2_create",
@@ -11608,6 +13067,14 @@ class NPUWorker(WorkerBase):
                             self.rank, group_name, local_group_ranks)
                 self._get_seen_elastic_parallel_group_signatures().add(
                     (group_kind, local_group_ranks))
+                self._log_elastic_group_seq_digest(
+                    "rebuild_signature_done",
+                    group_kind=group_kind,
+                    attr_name=attr_name,
+                    group_name=group_name,
+                    group_ranks=local_group_ranks,
+                    extra=f"cache={should_cache_group}",
+                )
         finally:
             self._elastic_rebuild_target_ranks = previous_target_ranks
 
@@ -12075,6 +13542,7 @@ class NPUWorker(WorkerBase):
             active_ranks = [torch.distributed.get_rank()]
         current_rank = torch.distributed.get_rank()
         backend = torch.distributed.get_backend(world_group.device_group)
+        self._log_mode1_lifecycle_feature_once("shrink_enter")
         previous_active_ranks_for_mode4 = self._get_previous_active_ranks_for_shrink(
             world_size)
         (_source_ranks_for_barrier,
@@ -12082,16 +13550,59 @@ class NPUWorker(WorkerBase):
          _) = self._get_shrink_source_group_state(world_group)
         cached_active_ranks = getattr(self, "_elastic_current_active_ranks",
                                       None)
+        self._log_elastic_hccl_seq_summary(
+            "shrink_enter",
+            group_ranks=active_ranks,
+            reason="before_shrink",
+            extra=(f"cached_active={cached_active_ranks} "
+                   f"current_rank={current_rank}"),
+        )
+        self._log_mode1_seq_checkpoint(
+            "shrink_enter",
+            group_ranks=active_ranks,
+            reason="before_shrink",
+            extra=(f"cached_active={cached_active_ranks} "
+                   f"current_rank={current_rank}"),
+        )
+        if (self._is_mode1_low_floor_elastic_runtime()
+                and _env_flag(
+                    "VLLM_ASCEND_MODE1_RELEASE_MOE_COMM_RUNTIME_ON_SHRINK",
+                    "1")):
+            self._release_mode1_moe_comm_runtime_state(
+                f"before_shrink_rebuild:active_ranks={tuple(active_ranks)}",
+                trim_npu_cache=_env_flag(
+                    "VLLM_ASCEND_MODE1_RELEASE_MOE_COMM_RUNTIME_EMPTY_CACHE",
+                    "1"))
         if cached_active_ranks == active_ranks:
             if current_rank in active_ranks and not self.elastic_parallel_detached:
                 logger.info(
                     "Elastic parallel shrink skipped: rank=%s active_ranks=%s already active",
                     self.rank, active_ranks)
+                self._log_elastic_hccl_seq_summary(
+                    "shrink_skip_active",
+                    group_ranks=active_ranks,
+                    reason="already_active",
+                )
+                self._log_mode1_seq_checkpoint(
+                    "shrink_skip_active",
+                    group_ranks=active_ranks,
+                    reason="already_active",
+                )
                 return True
             if current_rank not in active_ranks and self.elastic_parallel_detached:
                 logger.info(
                     "Elastic parallel shrink skipped: rank=%s active_ranks=%s already detached",
                     self.rank, active_ranks)
+                self._log_elastic_hccl_seq_summary(
+                    "shrink_skip_detached",
+                    group_ranks=active_ranks,
+                    reason="already_detached",
+                )
+                self._log_mode1_seq_checkpoint(
+                    "shrink_skip_detached",
+                    group_ranks=active_ranks,
+                    reason="already_detached",
+                )
                 return True
         prefetch_drain_ms = 0.0
         prepare_payload_ms = 0.0
@@ -12260,13 +13771,19 @@ class NPUWorker(WorkerBase):
                 int(is_active_rank),
                 post_preload_source_barrier_ms,
             )
-        if not is_active_rank and not self.elastic_parallel_detached:
-            detach_start_t = time.perf_counter()
-            self._detach_from_elastic_parallel_groups()
-            detach_ms = (time.perf_counter() - detach_start_t) * 1000.0
-            logger.info(
-                "Elastic parallel detach done: rank=%s active_ranks=%s total_ms=%.2f",
-                self.rank, active_ranks, detach_ms)
+        if not is_active_rank:
+            if not self.elastic_parallel_detached:
+                detach_start_t = time.perf_counter()
+                self._detach_from_elastic_parallel_groups(active_ranks)
+                detach_ms = (time.perf_counter() - detach_start_t) * 1000.0
+                logger.info(
+                    "Elastic parallel detach done: rank=%s active_ranks=%s total_ms=%.2f",
+                    self.rank, active_ranks, detach_ms)
+            else:
+                logger.info(
+                    "Elastic parallel already detached rank advances non-member sequence: "
+                    "rank=%s active_ranks=%s",
+                    self.rank, active_ranks)
             elastic_group_ranks = [active_ranks]
             seq_stats = self._advance_group_creation_sequence_for_non_member(
                 elastic_group_ranks, backend, "dp")
@@ -12311,15 +13828,18 @@ class NPUWorker(WorkerBase):
                 drop_old_floor_stats, drop_old_floor_group_call_wall)
             old_floor_group_dropped_before_rebuild = True
 
-            post_old_floor_group_drop_barrier_start_t = time.perf_counter()
-            self._mode1_source_cpu_p2p_barrier(
-                _source_ranks_for_barrier,
-                world_group,
-                38092 + len(active_ranks) * 10,
-            )
-            post_old_floor_group_drop_barrier_ms += (
-                time.perf_counter() -
-                post_old_floor_group_drop_barrier_start_t) * 1000.0
+            if _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_BARRIER_AFTER_OLD_FLOOR_DROP",
+                    "0"):
+                post_old_floor_group_drop_barrier_start_t = time.perf_counter()
+                self._mode1_source_cpu_p2p_barrier(
+                    _source_ranks_for_barrier,
+                    world_group,
+                    38092 + len(active_ranks) * 10,
+                )
+                post_old_floor_group_drop_barrier_ms += (
+                    time.perf_counter() -
+                    post_old_floor_group_drop_barrier_start_t) * 1000.0
 
             old_floor_post_memory_log_start_t = time.perf_counter()
             self._log_custom_mode1_worker_memory(
@@ -12361,15 +13881,18 @@ class NPUWorker(WorkerBase):
                 drop_old_floor_stats, drop_old_floor_group_call_wall)
             old_floor_group_dropped_before_rebuild = True
 
-            post_old_floor_group_drop_barrier_start_t = time.perf_counter()
-            self._mode1_source_cpu_p2p_barrier(
-                _source_ranks_for_barrier,
-                world_group,
-                38092 + len(active_ranks) * 10,
-            )
-            post_old_floor_group_drop_barrier_ms += (
-                time.perf_counter() -
-                post_old_floor_group_drop_barrier_start_t) * 1000.0
+            if _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_BARRIER_AFTER_OLD_FLOOR_DROP",
+                    "0"):
+                post_old_floor_group_drop_barrier_start_t = time.perf_counter()
+                self._mode1_source_cpu_p2p_barrier(
+                    _source_ranks_for_barrier,
+                    world_group,
+                    38092 + len(active_ranks) * 10,
+                )
+                post_old_floor_group_drop_barrier_ms += (
+                    time.perf_counter() -
+                    post_old_floor_group_drop_barrier_start_t) * 1000.0
 
             old_floor_post_memory_log_start_t = time.perf_counter()
             self._log_custom_mode1_worker_memory(
@@ -12389,6 +13912,12 @@ class NPUWorker(WorkerBase):
         if is_active_rank:
             elastic_group_ranks = [active_ranks]
             rebuild_start_t = time.perf_counter()
+            self._log_mode1_seq_checkpoint(
+                "shrink_rebuild_before",
+                group_ranks=active_ranks,
+                reason="before_active_rebuild",
+                extra=f"backend={backend}",
+            )
             with set_current_vllm_config(self.vllm_config):
                 rebuild_dp_start_t = time.perf_counter()
                 self._rebuild_group(vllm_ps, "_DP", elastic_group_ranks,
@@ -12406,6 +13935,14 @@ class NPUWorker(WorkerBase):
                 rebuild_mc2_ms = (
                     time.perf_counter() - rebuild_mc2_start_t) * 1000.0
             rebuild_ms = (time.perf_counter() - rebuild_start_t) * 1000.0
+            self._log_mode1_seq_checkpoint(
+                "shrink_rebuild_after",
+                group_ranks=active_ranks,
+                reason="after_active_rebuild",
+                extra=(f"rebuild_dp_ms={rebuild_dp_ms:.2f} "
+                       f"rebuild_ep_ms={rebuild_ep_ms:.2f} "
+                       f"rebuild_mc2_ms={rebuild_mc2_ms:.2f}"),
+            )
 
         if (mode1_low_floor_runtime and _env_flag(
                 "VLLM_ASCEND_MODE1_PARITY_BARRIER_BEFORE_REFRESH", "1")):
@@ -12450,15 +13987,18 @@ class NPUWorker(WorkerBase):
                 drop_old_floor_stats, drop_old_floor_group_call_wall)
             old_floor_group_dropped_before_refresh = True
 
-            post_old_floor_group_drop_barrier_start_t = time.perf_counter()
-            self._mode1_source_cpu_p2p_barrier(
-                _source_ranks_for_barrier,
-                world_group,
-                38102 + len(active_ranks) * 10,
-            )
-            post_old_floor_group_drop_barrier_ms = (
-                time.perf_counter() -
-                post_old_floor_group_drop_barrier_start_t) * 1000.0
+            if _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_BARRIER_AFTER_OLD_FLOOR_DROP",
+                    "0"):
+                post_old_floor_group_drop_barrier_start_t = time.perf_counter()
+                self._mode1_source_cpu_p2p_barrier(
+                    _source_ranks_for_barrier,
+                    world_group,
+                    38102 + len(active_ranks) * 10,
+                )
+                post_old_floor_group_drop_barrier_ms = (
+                    time.perf_counter() -
+                    post_old_floor_group_drop_barrier_start_t) * 1000.0
 
             old_floor_post_memory_log_start_t = time.perf_counter()
             self._log_custom_mode1_worker_memory(
@@ -12479,6 +14019,13 @@ class NPUWorker(WorkerBase):
                 world_group,
                 participate_only=not is_active_rank)
         refresh_ms = (time.perf_counter() - refresh_start_t) * 1000.0
+        self._log_mode1_seq_checkpoint(
+            "shrink_refresh_after",
+            group_ranks=active_ranks,
+            reason="after_refresh",
+            extra=(f"is_active={int(is_active_rank)} "
+                   f"refresh_ms={refresh_ms:.2f}"),
+        )
 
         if self._has_mode4_remote_npu_lightweight_module():
             # Only cache/non-active ranks need to clear stale runtime slots
@@ -12504,6 +14051,15 @@ class NPUWorker(WorkerBase):
             # ranks that have just detached and no longer have a current DP
             # group. Use the pre-shrink source CPU group instead of get_dp_group().
             mode4_barrier_group = source_cpu_group_for_barrier
+            if mode4_barrier_group is None:
+                raise RuntimeError(
+                    "Mode4/5 post-shrink remote-cache source barrier group is "
+                    "unavailable; refusing to fall back to default world group. "
+                    f"rank={self.rank} active_ranks={active_ranks} "
+                    f"source_ranks={_source_ranks_for_barrier} "
+                    f"is_active={int(is_active_rank)} "
+                    f"detached={getattr(self, 'elastic_parallel_detached', None)}"
+                )
             logger.info(
                 "Mode%s post-shrink remote-cache barrier1 enter: rank=%s active_ranks=%s is_active=%s",
                 envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE,
@@ -12611,13 +14167,18 @@ class NPUWorker(WorkerBase):
             )
         elif mode1_low_floor_runtime:
             keep_group_ranks = tuple(int(rank) for rank in active_ranks)
-            if (not old_floor_group_dropped_before_refresh and _env_flag(
+            old_floor_group_already_dropped = (
+                old_floor_group_dropped_before_rebuild
+                or old_floor_group_dropped_before_refresh)
+            if (not old_floor_group_already_dropped and _env_flag(
                     "VLLM_ASCEND_MODE1_PARITY_BARRIER_BEFORE_OLD_FLOOR_DROP",
-                    "1")):
+                    "0")):
                 old_floor_group_drop_barrier_start_t = time.perf_counter()
-                # Only the previous active/source ranks participate in later
-                # shrink RPCs. A full-world barrier would wait for ranks that
-                # already detached after the earlier shrink step.
+                # This pre-drop barrier is retained only for explicit
+                # diagnostics. The post-drop barriers are off by default too:
+                # in staged 8->4 shrink they can leave a subset of source ranks
+                # waiting in Gloo even though the following shrink tail guard
+                # already provides the necessary global ordering.
                 self._mode1_source_cpu_p2p_barrier(
                     _source_ranks_for_barrier,
                     world_group,
@@ -12626,7 +14187,7 @@ class NPUWorker(WorkerBase):
                 old_floor_group_drop_barrier_ms = (
                     time.perf_counter() -
                     old_floor_group_drop_barrier_start_t) * 1000.0
-            if not old_floor_group_dropped_before_refresh:
+            if not old_floor_group_already_dropped:
                 old_floor_pre_memory_log_start_t = time.perf_counter()
                 self._log_custom_mode1_worker_memory(
                     "before_old_floor_group_cache_drop_after_shrink",
@@ -12653,6 +14214,16 @@ class NPUWorker(WorkerBase):
                 old_floor_post_memory_log_ms += (
                     time.perf_counter() -
                     old_floor_post_memory_log_start_t) * 1000.0
+            else:
+                logger.info(
+                    "Elastic old-floor group cache drop after shrink skipped: "
+                    "rank=%s active_ranks=%s dropped_before_rebuild=%s "
+                    "dropped_before_refresh=%s",
+                    self.rank,
+                    active_ranks,
+                    int(old_floor_group_dropped_before_rebuild),
+                    int(old_floor_group_dropped_before_refresh),
+                )
 
         if (not is_active_rank
                 and int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE) == 5):
@@ -12668,6 +14239,40 @@ class NPUWorker(WorkerBase):
             self._warmup_post_shrink_moe_dispatch(active_ranks)
             warmup_ms = (time.perf_counter() - warmup_start_t) * 1000.0
 
+        shrink_tail_sync_ms = 0.0
+        shrink_tail_barrier_ms = 0.0
+        if (_env_flag("VLLM_ASCEND_MODE1_SHRINK_TAIL_NPU_SYNC", "0")
+                and torch.npu.is_available()):
+            shrink_tail_sync_start_t = time.perf_counter()
+            torch.npu.synchronize()
+            shrink_tail_sync_ms = (
+                time.perf_counter() - shrink_tail_sync_start_t) * 1000.0
+        if _env_flag("VLLM_ASCEND_MODE1_SHRINK_TAIL_CPU_BARRIER", "0"):
+            if source_cpu_group_for_barrier is None:
+                raise RuntimeError(
+                    "Elastic shrink tail CPU barrier source group is unavailable; "
+                    f"rank={self.rank} active_ranks={active_ranks} "
+                    f"source_ranks={_source_ranks_for_barrier} "
+                    f"is_active={int(is_active_rank)} "
+                    f"detached={getattr(self, 'elastic_parallel_detached', None)}"
+                )
+            shrink_tail_barrier_start_t = time.perf_counter()
+            torch.distributed.barrier(group=source_cpu_group_for_barrier)
+            shrink_tail_barrier_ms = (
+                time.perf_counter() - shrink_tail_barrier_start_t) * 1000.0
+        if shrink_tail_sync_ms > 0.0 or shrink_tail_barrier_ms > 0.0:
+            logger.info(
+                "Elastic parallel shrink tail guard done: rank=%s "
+                "active_ranks=%s source_ranks=%s is_active=%s "
+                "npu_sync_ms=%.2f cpu_barrier_ms=%.2f",
+                self.rank,
+                active_ranks,
+                _source_ranks_for_barrier,
+                int(is_active_rank),
+                shrink_tail_sync_ms,
+                shrink_tail_barrier_ms,
+            )
+
         total_ms = (time.perf_counter() - start_t) * 1000.0
         hidden_tail_ms = total_ms - (
             prefetch_drain_ms + prepare_payload_ms + preload_import_ms +
@@ -12678,9 +14283,10 @@ class NPUWorker(WorkerBase):
             drop_old_floor_group_call_wall_ms + old_floor_pre_memory_log_ms +
             old_floor_post_memory_log_ms +
             post_old_floor_group_drop_barrier_ms +
-            release_mode5_cache_state_ms + warmup_ms)
+            release_mode5_cache_state_ms + warmup_ms +
+            shrink_tail_sync_ms + shrink_tail_barrier_ms)
         logger.info(
-            "Elastic parallel shrink phase breakdown: rank=%s active_ranks=%s is_active=%s prefetch_drain_ms=%.2f prepare_payload_ms=%.2f preload_import_ms=%.2f post_preload_source_barrier_ms=%.2f detach_ms=%.2f rebuild_ms=%.2f rebuild_dp_ms=%.2f rebuild_ep_ms=%.2f rebuild_mc2_ms=%.2f non_member_sequence_ms=%.2f non_member_sequence_dp_ms=%.2f non_member_sequence_ep_ms=%.2f non_member_sequence_mc2_ms=%.2f non_member_sequence_device_new_group_ms=%.2f non_member_sequence_cpu_new_group_ms=%.2f non_member_sequence_destroy_ms=%.2f non_member_sequence_signature_ms=%.2f non_member_sequence_log_ms=%.2f non_member_sequence_groups=%.0f pre_refresh_source_barrier_ms=%.2f refresh_ms=%.2f remote_cache_phase_ms=%.2f remote_cache_start_ms=%.2f remote_cache_barrier1_ms=%.2f remote_payload_warmup_ms=%.2f next_block_prime_ms=%.2f remote_cache_barrier2_ms=%.2f release_staging_ms=%.2f release_staging_clear_ms=%.2f release_staging_gc_ms=%.2f release_staging_empty_cache_ms=%.2f release_staging_sync_ms=%.2f drop_stale_group_cache_ms=%.2f old_floor_group_drop_barrier_ms=%.2f drop_old_floor_group_call_wall_ms=%.2f drop_old_floor_group_cache_ms=%.2f old_floor_pre_memory_log_ms=%.2f old_floor_post_memory_log_ms=%.2f drop_old_floor_group_destroy_ms=%.2f drop_old_floor_group_cleanup_ms=%.2f drop_old_floor_group_cleanup_gc_ms=%.2f drop_old_floor_group_cleanup_empty_cache_ms=%.2f drop_old_floor_group_cleanup_sync_ms=%.2f drop_old_floor_group_cleanup_memory_log_ms=%.2f drop_old_floor_group_memory_log_ms=%.2f drop_old_floor_group_row_log_ms=%.2f drop_old_floor_group_summary_log_ms=%.2f drop_old_floor_group_signature_sweep_ms=%.2f drop_old_floor_group_release_ref_ms=%.2f drop_old_floor_group_dropped_groups=%.0f drop_old_floor_group_deferred_groups=%.0f drop_old_floor_group_dropped_signatures=%.0f post_old_floor_group_drop_barrier_ms=%.2f release_mode5_cache_state_ms=%.2f warmup_ms=%.2f hidden_tail_ms=%.2f total_ms=%.2f",
+            "Elastic parallel shrink phase breakdown: rank=%s active_ranks=%s is_active=%s prefetch_drain_ms=%.2f prepare_payload_ms=%.2f preload_import_ms=%.2f post_preload_source_barrier_ms=%.2f detach_ms=%.2f rebuild_ms=%.2f rebuild_dp_ms=%.2f rebuild_ep_ms=%.2f rebuild_mc2_ms=%.2f non_member_sequence_ms=%.2f non_member_sequence_dp_ms=%.2f non_member_sequence_ep_ms=%.2f non_member_sequence_mc2_ms=%.2f non_member_sequence_device_new_group_ms=%.2f non_member_sequence_cpu_new_group_ms=%.2f non_member_sequence_destroy_ms=%.2f non_member_sequence_signature_ms=%.2f non_member_sequence_log_ms=%.2f non_member_sequence_groups=%.0f pre_refresh_source_barrier_ms=%.2f refresh_ms=%.2f remote_cache_phase_ms=%.2f remote_cache_start_ms=%.2f remote_cache_barrier1_ms=%.2f remote_payload_warmup_ms=%.2f next_block_prime_ms=%.2f remote_cache_barrier2_ms=%.2f release_staging_ms=%.2f release_staging_clear_ms=%.2f release_staging_gc_ms=%.2f release_staging_empty_cache_ms=%.2f release_staging_sync_ms=%.2f drop_stale_group_cache_ms=%.2f old_floor_group_drop_barrier_ms=%.2f drop_old_floor_group_call_wall_ms=%.2f drop_old_floor_group_cache_ms=%.2f old_floor_pre_memory_log_ms=%.2f old_floor_post_memory_log_ms=%.2f drop_old_floor_group_destroy_ms=%.2f drop_old_floor_group_cleanup_ms=%.2f drop_old_floor_group_cleanup_gc_ms=%.2f drop_old_floor_group_cleanup_empty_cache_ms=%.2f drop_old_floor_group_cleanup_sync_ms=%.2f drop_old_floor_group_cleanup_memory_log_ms=%.2f drop_old_floor_group_memory_log_ms=%.2f drop_old_floor_group_row_log_ms=%.2f drop_old_floor_group_summary_log_ms=%.2f drop_old_floor_group_signature_sweep_ms=%.2f drop_old_floor_group_release_ref_ms=%.2f drop_old_floor_group_dropped_groups=%.0f drop_old_floor_group_deferred_groups=%.0f drop_old_floor_group_dropped_signatures=%.0f post_old_floor_group_drop_barrier_ms=%.2f release_mode5_cache_state_ms=%.2f warmup_ms=%.2f shrink_tail_sync_ms=%.2f shrink_tail_barrier_ms=%.2f hidden_tail_ms=%.2f total_ms=%.2f",
             self.rank, active_ranks, int(is_active_rank), prefetch_drain_ms,
             prepare_payload_ms, preload_import_ms, post_preload_source_barrier_ms,
             detach_ms, rebuild_ms, rebuild_dp_ms, rebuild_ep_ms, rebuild_mc2_ms,
@@ -12716,15 +14322,36 @@ class NPUWorker(WorkerBase):
             drop_old_floor_group_deferred_groups,
             drop_old_floor_group_dropped_signatures,
             post_old_floor_group_drop_barrier_ms,
-            release_mode5_cache_state_ms, warmup_ms, hidden_tail_ms, total_ms)
+            release_mode5_cache_state_ms, warmup_ms,
+            shrink_tail_sync_ms, shrink_tail_barrier_ms,
+            hidden_tail_ms, total_ms)
 
         if is_active_rank:
             logger.info(
-                "Elastic parallel shrink done: rank=%s active_ranks=%s dp_size=%s ep_size=%s no_ep_tail=%s rebuild_ms=%.2f refresh_ms=%.2f warmup_ms=%.2f total_ms=%.2f",
-                self.rank, active_ranks, get_dp_group().world_size,
-                vllm_ps.get_ep_group().world_size, len(active_ranks) == 1,
-                rebuild_ms, refresh_ms, warmup_ms, total_ms)
+                "Elastic parallel shrink done: rank=%s active_ranks=%s dp_size=%s ep_size=%s no_ep_tail=%s rebuild_ms=%.2f refresh_ms=%.2f warmup_ms=%.2f tail_sync_ms=%.2f tail_barrier_ms=%.2f total_ms=%.2f",
+                self.rank, active_ranks, len(active_ranks),
+                len(active_ranks), len(active_ranks) == 1,
+                rebuild_ms, refresh_ms, warmup_ms,
+                shrink_tail_sync_ms, shrink_tail_barrier_ms, total_ms)
         self._elastic_current_active_ranks = active_ranks
+        self._log_elastic_hccl_seq_summary(
+            "shrink_done",
+            group_ranks=active_ranks,
+            reason="after_shrink",
+            extra=(f"is_active={int(is_active_rank)} total_ms={total_ms:.2f} "
+                   f"tail_sync_ms={shrink_tail_sync_ms:.2f} "
+                   f"tail_barrier_ms={shrink_tail_barrier_ms:.2f} "
+                   f"non_member_groups={non_member_sequence_groups:.0f}"),
+        )
+        self._log_mode1_seq_checkpoint(
+            "shrink_done",
+            group_ranks=active_ranks,
+            reason="after_shrink",
+            extra=(f"is_active={int(is_active_rank)} total_ms={total_ms:.2f} "
+                   f"tail_sync_ms={shrink_tail_sync_ms:.2f} "
+                   f"tail_barrier_ms={shrink_tail_barrier_ms:.2f} "
+                   f"non_member_groups={non_member_sequence_groups:.0f}"),
+        )
         return True
 
     def restore_elastic_parallel_groups(self) -> bool:
@@ -12740,6 +14367,29 @@ class NPUWorker(WorkerBase):
         world_group = get_world_group()
         world_size = torch.distributed.get_world_size()
         backend = torch.distributed.get_backend(world_group.device_group)
+        self._log_mode1_lifecycle_feature_once("restore_enter")
+        self._log_elastic_hccl_seq_summary(
+            "restore_enter",
+            group_ranks=tuple(range(world_size)),
+            reason="before_restore",
+            extra=f"world_size={world_size}",
+        )
+        self._log_mode1_seq_checkpoint(
+            "restore_enter",
+            group_ranks=tuple(range(world_size)),
+            reason="before_restore",
+            extra=f"world_size={world_size}",
+        )
+        release_moe_runtime_on_restore = (
+            self._is_mode1_low_floor_elastic_runtime()
+            and _env_flag("VLLM_ASCEND_MODE1_RELEASE_MOE_COMM_RUNTIME_ON_RESTORE",
+                          "1"))
+        if release_moe_runtime_on_restore:
+            self._release_mode1_moe_comm_runtime_state(
+                "before_restore_rebuild",
+                trim_npu_cache=_env_flag(
+                    "VLLM_ASCEND_MODE1_RELEASE_MOE_COMM_RUNTIME_EMPTY_CACHE",
+                    "1"))
 
         if self._has_mode4_remote_npu_lightweight_module():
             self._drain_mode4_double_buffer_prefetch("before_mode4_restore")
@@ -12749,6 +14399,20 @@ class NPUWorker(WorkerBase):
 
         self._reconcile_group_creation_sequence_before_restore(
             world_group, backend)
+
+        if os.environ.get("VLLM_ASCEND_MODE1_RESTORE_RECONCILE_WORLD_BARRIER",
+                          "1") != "0":
+            restore_reconcile_barrier_start_t = time.perf_counter()
+            torch.distributed.barrier(group=world_group.cpu_group)
+            restore_reconcile_barrier_ms = (
+                time.perf_counter() -
+                restore_reconcile_barrier_start_t) * 1000.0
+            self._log_elastic_group_seq_digest(
+                "restore_reconcile_barrier_done",
+                group_ranks=tuple(range(world_size)),
+                reason="before_restore_rebuild",
+                extra=f"barrier_ms={restore_reconcile_barrier_ms:.2f}",
+            )
 
         rebuild_start_t = time.perf_counter()
         with set_current_vllm_config(self.vllm_config):
@@ -12773,14 +14437,41 @@ class NPUWorker(WorkerBase):
         refresh_ms = (time.perf_counter() - refresh_start_t) * 1000.0
         self.elastic_parallel_detached = False
         self._elastic_current_active_ranks = list(range(world_size))
+        self._log_mode1_seq_checkpoint(
+            "restore_refresh_after",
+            group_ranks=tuple(range(world_size)),
+            reason="after_restore_refresh",
+            extra=(f"rebuild_ms={rebuild_ms:.2f} "
+                   f"refresh_ms={refresh_ms:.2f}"),
+        )
+        if self._is_mode1_low_floor_elastic_runtime():
+            logger.info(
+                "Elastic mode1 restore stale-cache sweep route: rank=%s "
+                "keep_ranks=%s reason=mode1_full_restore "
+                "feature=restore_stale_sweep_reason_mode1_full_restore "
+                "defer_full_restore=%s defer_group_destroy=%s "
+                "force_non_member_placeholder=%s",
+                self.rank,
+                tuple(range(world_size)),
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE",
+                    "1"),
+                os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY",
+                          "1"),
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_FORCE_NON_MEMBER_PLACEHOLDER_NEW_GROUP",
+                    "1"),
+            )
         stale_drop_stats = self._drop_stale_cached_elastic_parallel_groups(
-            tuple(range(world_size)))
+            tuple(range(world_size)),
+            reason="mode1_full_restore")
         if (stale_drop_stats.get("dropped_groups", 0.0) > 0.0
                 or stale_drop_stats.get("dropped_signatures", 0.0) > 0.0):
             logger.info(
                 "Elastic full-world restore stale floor group release summary: "
                 "rank=%s dropped_groups=%.0f deferred_groups=%.0f "
-                "dropped_signatures=%.0f cleanup_ms=%.2f total_ms=%.2f",
+                "dropped_signatures=%.0f reason=mode1_full_restore "
+                "cleanup_ms=%.2f total_ms=%.2f",
                 self.rank,
                 stale_drop_stats.get("dropped_groups", 0.0),
                 stale_drop_stats.get("deferred_groups", 0.0),
@@ -12788,15 +14479,62 @@ class NPUWorker(WorkerBase):
                 stale_drop_stats.get("cleanup_ms", 0.0),
                 stale_drop_stats.get("total_ms", 0.0),
             )
+        if release_moe_runtime_on_restore:
+            self._release_mode1_moe_comm_runtime_state(
+                "after_restore_refresh",
+                trim_npu_cache=_env_flag(
+                    "VLLM_ASCEND_MODE1_RELEASE_MOE_COMM_RUNTIME_EMPTY_CACHE",
+                    "1"))
         self._warmup_post_restore_mc2_dispatch_for_custom_mode1_parity(
             world_size)
         self._warmup_post_restore_alltoall_dispatch_for_custom_mode1_parity(
             world_size)
+        restore_tail_sync_ms = 0.0
+        restore_tail_barrier_ms = 0.0
+        if (_env_flag("VLLM_ASCEND_MODE1_RESTORE_TAIL_NPU_SYNC", "0")
+                and torch.npu.is_available()):
+            restore_tail_sync_start_t = time.perf_counter()
+            torch.npu.synchronize()
+            restore_tail_sync_ms = (
+                time.perf_counter() - restore_tail_sync_start_t) * 1000.0
+        if _env_flag("VLLM_ASCEND_MODE1_RESTORE_TAIL_CPU_BARRIER", "0"):
+            restore_tail_barrier_start_t = time.perf_counter()
+            torch.distributed.barrier(group=world_group.cpu_group)
+            restore_tail_barrier_ms = (
+                time.perf_counter() - restore_tail_barrier_start_t) * 1000.0
+        if restore_tail_sync_ms > 0.0 or restore_tail_barrier_ms > 0.0:
+            logger.info(
+                "Elastic parallel restore tail guard done: rank=%s "
+                "npu_sync_ms=%.2f cpu_barrier_ms=%.2f",
+                self.rank,
+                restore_tail_sync_ms,
+                restore_tail_barrier_ms,
+            )
 
         logger.info(
-            "Elastic parallel restore done: rank=%s dp_size=%s ep_size=%s rebuild_ms=%.2f refresh_ms=%.2f total_ms=%.2f",
-            self.rank, get_dp_group().world_size, vllm_ps.get_ep_group().world_size,
-            rebuild_ms, refresh_ms, (time.perf_counter() - start_t) * 1000.0)
+            "Elastic parallel restore done: rank=%s dp_size=%s ep_size=%s rebuild_ms=%.2f refresh_ms=%.2f tail_sync_ms=%.2f tail_barrier_ms=%.2f total_ms=%.2f",
+            self.rank, world_size, world_size,
+            rebuild_ms, refresh_ms, restore_tail_sync_ms,
+            restore_tail_barrier_ms,
+            (time.perf_counter() - start_t) * 1000.0)
+        self._log_elastic_hccl_seq_summary(
+            "restore_done",
+            group_ranks=tuple(range(world_size)),
+            reason="after_restore",
+            extra=(f"rebuild_ms={rebuild_ms:.2f} refresh_ms={refresh_ms:.2f} "
+                   f"tail_sync_ms={restore_tail_sync_ms:.2f} "
+                   f"tail_barrier_ms={restore_tail_barrier_ms:.2f} "
+                   f"total_ms={(time.perf_counter() - start_t) * 1000.0:.2f}"),
+        )
+        self._log_mode1_seq_checkpoint(
+            "restore_done",
+            group_ranks=tuple(range(world_size)),
+            reason="after_restore",
+            extra=(f"rebuild_ms={rebuild_ms:.2f} refresh_ms={refresh_ms:.2f} "
+                   f"tail_sync_ms={restore_tail_sync_ms:.2f} "
+                   f"tail_barrier_ms={restore_tail_barrier_ms:.2f} "
+                   f"total_ms={(time.perf_counter() - start_t) * 1000.0:.2f}"),
+        )
         return True
 
     def set_need_allreduce(self, value: bool):

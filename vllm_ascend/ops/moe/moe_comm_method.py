@@ -178,6 +178,10 @@ def _clone_moe_comm_config(moe_config: FusedMoEConfig) -> FusedMoEConfig:
 
 def reset_moe_comm_method_cache() -> None:
     global _MoECommMethodActiveKey
+    # Drop transient tensor references before removing method-cache entries.
+    # Otherwise a stale method kept alive by an external reference can retain
+    # dispatch/combine scratch tensors until the next shrink/restore sweep.
+    release_moe_comm_method_runtime_state()
     _MoECommMethods.clear()
     _MoECommMethodActiveKey = None
     if not _preserve_topology_cache():
@@ -466,6 +470,8 @@ def setup_moe_comm_method(moe_config):
         # Keep the current refresh cheap across all MoE layers, but do not keep
         # stale floor topologies resident in natural/free-running shrink mode.
         cached_methods = _MoECommMethodTopologyCache.get(topology_key)
+        if len(_MoECommMethodTopologyCache) > (1 if cached_methods else 0):
+            release_moe_comm_method_runtime_state()
         _MoECommMethodTopologyCache.clear()
         if cached_methods is not None:
             _MoECommMethodTopologyCache[topology_key] = cached_methods

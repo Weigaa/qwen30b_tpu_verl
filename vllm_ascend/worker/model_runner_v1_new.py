@@ -464,8 +464,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # ((maxBs * tokenNeedSizeDispatch * ep_worldsize * localMoeExpertNum) + (maxBs * tokenNeedSizeCombine * (k + sharedExpertNum))) * 2
         # so we have to limit the MC2 tokens to save memory, should fix this in the future.
         self.mc2_tokens_capacity = 512
-        self.reserved_mc2_mask = torch.zeros(
+        reserved_mc2_mask_tokens = max(
             self.mc2_tokens_capacity,
+            int(os.getenv("VLLM_ASCEND_RESERVED_MC2_MASK_TOKENS",
+                          str(self.mc2_tokens_capacity))),
+        )
+        self.reserved_mc2_mask = torch.zeros(
+            reserved_mc2_mask_tokens,
             dtype=torch.bool,
             device=self.device,
         )
@@ -1932,9 +1937,25 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         quant_type = getattr(self.vllm_config.model_config.hf_config,
                              'moe_quantize', None)
         model_type = self.vllm_config.model_config.hf_config.model_type
+        elastic_parallel_shrink_enabled = \
+            envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
+        force_alltoall_moe = getattr(
+            envs_ascend, "VLLM_ASCEND_FORCE_ALLTOALL_MOE", False)
+        force_mc2_moe = getattr(envs_ascend, "VLLM_ASCEND_FORCE_MC2_MOE",
+                                False)
+        current_ep_size = 1
+        if self.parallel_config.enable_expert_parallel:
+            if elastic_parallel_shrink_enabled:
+                current_ep_size = get_ep_group().world_size
+            else:
+                current_ep_size = self.parallel_config.world_size_across_dp
 
         if not self.parallel_config.enable_expert_parallel:
             moe_comm_type = MoECommType.ALLGATHER
+        elif current_ep_size <= 1:
+            moe_comm_type = MoECommType.ALLGATHER
+        elif force_mc2_moe:
+            moe_comm_type = MoECommType.MC2
         elif soc_version in {AscendSocVersion.A2}:
             if (num_tokens <= self.mc2_tokens_capacity
                     and self.parallel_config.world_size_across_dp >=
@@ -1963,8 +1984,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if model_type == "PanguProMoE":
             moe_comm_type = MoECommType.ALLGATHER
 
+        # In mode1 shrink-aware runs, only the full-world stage should use the
+        # AllToAllV MoE dispatcher. Lower floors are decode-only in our current
+        # rollout path, and keeping them on MC2 avoids exercising HcclAllToAllV
+        # after repeated shrink/restore lifecycle transitions.
+        avoid_shrink_alltoall = os.getenv(
+            "VLLM_ASCEND_AVOID_ALLTOALL_ON_SHRINK_STAGE", "1").strip().lower()
+        if (moe_comm_type == MoECommType.ALLTOALL
+                and avoid_shrink_alltoall in {"1", "true", "yes", "on"}
+                and elastic_parallel_shrink_enabled
+                and not force_alltoall_moe
+                and self.parallel_config.enable_expert_parallel
+                and 1 < current_ep_size < self.parallel_config.world_size_across_dp):
+            moe_comm_type = MoECommType.MC2
+
         if is_global_first_rank():
             logger.debug(f"num_tokens: {num_tokens}, "
+                         f"current_ep_size: {current_ep_size}, "
                          f"moe_comm_type: {moe_comm_type}")
         return moe_comm_type
 

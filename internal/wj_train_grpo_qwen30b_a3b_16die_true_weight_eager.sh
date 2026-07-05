@@ -1,15 +1,29 @@
 set -ex
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+echo "[pythonpath] staged repo root first: ${REPO_ROOT}"
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
 
-export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/asdsip/set_env.sh
-# ATB's set_env.sh can return non-zero under `set -e` when it auto-detects
-# torch's CXX ABI and an internal grep misses. Passing the ABI explicitly
-# avoids that false failure and keeps the environment initialization stable.
-source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+if [[ "${USE_CANN91_A3_WITH_NNAL91:-0}" == "1" ]]; then
+    CANN91_NNAL91_ENV="${CANN91_NNAL91_ENV:-/workspace/cann-recipes-train/llm_rl/qwen3/use_cann91_a3_with_nnal91.sh}"
+    if [[ ! -f "${CANN91_NNAL91_ENV}" ]]; then
+        echo "[cann91+nnal91] missing env script: ${CANN91_NNAL91_ENV}" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "${CANN91_NNAL91_ENV}"
+else
+    export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    source /usr/local/Ascend/nnal/asdsip/set_env.sh
+    # ATB's set_env.sh can return non-zero under `set -e` when it auto-detects
+    # torch's CXX ABI and an internal grep misses. Passing the ABI explicitly
+    # avoids that false failure and keeps the environment initialization stable.
+    source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+fi
 
 export HYDRA_FULL_ERROR=1
 #export ASCEND_LAUNCH_BLOCKING=1         
@@ -61,7 +75,7 @@ else
 export VLLM_ENABLE_MC2=1
 fi
 export VLLM_DP_SIZE=${VLLM_DP_SIZE:-16}                        # world_size // rollout.tp_sizebaseline dummy-run, 1: redundant experts only, 2: redundant experts + CPU/NPU hybrid tail
-export HCCL_BUFFSIZE=800
+export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-800}"
 
 export TASK_QUEUE_ENABLE=2
 
@@ -175,6 +189,7 @@ export VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE=${VLLM_ASCEND_MODE1_PARITY_
 export VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK:-0}
 export VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP=${VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP:-0}
 export VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE=${VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE:-0}
+export VLLM_ASCEND_MODE1_FORCE_NON_MEMBER_PLACEHOLDER_NEW_GROUP=${VLLM_ASCEND_MODE1_FORCE_NON_MEMBER_PLACEHOLDER_NEW_GROUP:-1}
 export VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP=${VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP:-0}
 export VLLM_ASCEND_MODE1_BATCH_DIRECT_NPU_IMPORT=${VLLM_ASCEND_MODE1_BATCH_DIRECT_NPU_IMPORT:-1}
 export VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT=${VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT:-0}
@@ -194,7 +209,7 @@ export VLLM_ASCEND_MODE1_PARITY_PRE_REBUILD_DESTROY_FLOOR_GROUP_SIZES=${VLLM_ASC
 export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY=${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY:-1}
 export VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES=${VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES:-1,2,4,8}
 export VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE=${VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE:-1}
-export VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE=${VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE:-1}
+export VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE=${VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE:-0}
 export VLLM_ASCEND_MODE1_PARITY_ENABLE_POST_SHRINK_DP_WARMUP=${VLLM_ASCEND_MODE1_PARITY_ENABLE_POST_SHRINK_DP_WARMUP:-0}
 export VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC=${VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC:-0}
 export VLLM_ASCEND_MODE1_PARITY_BARRIER_BEFORE_OLD_FLOOR_DROP=${VLLM_ASCEND_MODE1_PARITY_BARRIER_BEFORE_OLD_FLOOR_DROP:-1}
@@ -451,9 +466,16 @@ else
     echo "[elastic sidecar] enabled=0"
 fi
 
+worker_v1_sha256=$(sha256sum "${HOME}/vllm_ascend/worker/worker_v1.py" 2>/dev/null | awk '{print $1}' || true)
+llm_engine_sha256=$(sha256sum "${HOME}/vllm/v1/engine/llm_engine.py" 2>/dev/null | awk '{print $1}' || true)
+fused_moe_sha256=$(sha256sum "${HOME}/vllm_ascend/ops/fused_moe.py" 2>/dev/null | awk '{print $1}' || true)
+ray_trainer_sha256=$(sha256sum "${HOME}/verl/trainer/ppo/ray_trainer.py" 2>/dev/null | awk '{print $1}' || true)
+launcher_sha256=$(sha256sum "${BASH_SOURCE[0]}" 2>/dev/null | awk '{print $1}' || true)
+
 {
     echo "[run] start_time=$(date '+%Y-%m-%dT%H:%M:%S%z') logfile=${logfile}"
-    echo "[full redundancy experiment] enabled=${VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG} sidecar=${VERL_SIDECAR_ENABLE} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} mode4_runtime_floor=${VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode4_keep_stale_dp=${VLLM_ASCEND_MODE4_KEEP_STALE_DP_GROUP_CACHE:-} mode4_keep_stale_ep=${VLLM_ASCEND_MODE4_KEEP_STALE_EP_GROUP_CACHE:-} mode4_keep_stale_mc2=${VLLM_ASCEND_MODE4_KEEP_STALE_MC2_GROUP_CACHE:-} gloo_socket_ifname=${GLOO_SOCKET_IFNAME:-} hccl_if_base_port=${HCCL_IF_BASE_PORT:-} dp_size=${VLLM_DP_SIZE} draft_profile_mode=${DRAFT_PROFILE_MODE} model_path=${MODEL_PATH} train_file=${TRAIN_FILE} test_file=${TEST_FILE} train_batch_size=${TRAIN_BATCH_SIZE} max_num_seqs=${ROLLOUT_MAX_NUM_SEQS} max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS} max_prompt_length=${MAX_PROMPT_LENGTH} max_response_length=${MAX_RESPONSE_LENGTH} rollout_n=${ROLLOUT_N} gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION} total_epochs=${TRAINER_TOTAL_EPOCHS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES} mode1_native_kv_cap=${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS} mode1_keep_fullworld_ep_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE} mode1_keep_mc2_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE} mode1_drop_stale_after_shrink=${VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK} mode1_single_live_mc2=${VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP} disable_elastic_mc2_cache=${VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE} mode1_post_restore_alltoall_warmup=${VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP} mode1_batch_direct_npu_import=${VLLM_ASCEND_MODE1_BATCH_DIRECT_NPU_IMPORT} mode1_allow_scalar_direct_npu_import=${VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT} mode1_allow_batch_index_select_export=${VLLM_ASCEND_MODE1_ALLOW_BATCH_INDEX_SELECT_EXPORT} mode1_direct_npu_import_batch_experts=${VLLM_ASCEND_MODE1_DIRECT_NPU_IMPORT_BATCH_EXPERTS} post_shrink_release_empty_cache=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_EMPTY_CACHE} post_shrink_release_sync=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_SYNC} mode1_sync_after_mc2_destroy=${VLLM_ASCEND_MODE1_PARITY_SYNC_AFTER_MC2_GROUP_DESTROY} mode1_gc_after_mc2_destroy=${VLLM_ASCEND_MODE1_PARITY_GC_AFTER_MC2_GROUP_DESTROY} mode1_release_dp_warmup_cache=${VLLM_ASCEND_MODE1_PARITY_RELEASE_DP_WARMUP_CACHE} mode1_release_warmup_cache=${VLLM_ASCEND_MODE1_PARITY_RELEASE_WARMUP_CACHE} mode1_keep_floor4_group_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_CACHE} mode1_keep_floor4_group_kinds=${VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_KINDS} mode1_drop_old_floor_before_rebuild=${VLLM_ASCEND_MODE1_PARITY_DROP_OLD_FLOOR_BEFORE_REBUILD} mode1_release_live_old_floor_on_rebuild=${VLLM_ASCEND_MODE1_PARITY_RELEASE_LIVE_OLD_FLOOR_ON_REBUILD} mode1_defer_group_destroy=${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY} mode1_defer_destroy_floor_sizes=${VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES} mode1_sync_before_device_pg_retire=${VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE} mode1_destroy_device_pg_on_retire=${VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE} mode1_enable_post_shrink_dp_warmup=${VLLM_ASCEND_MODE1_PARITY_ENABLE_POST_SHRINK_DP_WARMUP} mode1_cpu_dp_metadata_sync=${VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC}"
+    echo "[full redundancy experiment] enabled=${VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG} sidecar=${VERL_SIDECAR_ENABLE} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} mode4_runtime_floor=${VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE:-} mode4_keep_stale_dp=${VLLM_ASCEND_MODE4_KEEP_STALE_DP_GROUP_CACHE:-} mode4_keep_stale_ep=${VLLM_ASCEND_MODE4_KEEP_STALE_EP_GROUP_CACHE:-} mode4_keep_stale_mc2=${VLLM_ASCEND_MODE4_KEEP_STALE_MC2_GROUP_CACHE:-} gloo_socket_ifname=${GLOO_SOCKET_IFNAME:-} hccl_if_base_port=${HCCL_IF_BASE_PORT:-} dp_size=${VLLM_DP_SIZE} draft_profile_mode=${DRAFT_PROFILE_MODE} model_path=${MODEL_PATH} train_file=${TRAIN_FILE} test_file=${TEST_FILE} train_batch_size=${TRAIN_BATCH_SIZE} max_num_seqs=${ROLLOUT_MAX_NUM_SEQS} max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS} max_prompt_length=${MAX_PROMPT_LENGTH} max_response_length=${MAX_RESPONSE_LENGTH} rollout_n=${ROLLOUT_N} gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION} total_epochs=${TRAINER_TOTAL_EPOCHS} custom_mode1_kv_headroom=${VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES} kv_cache_init_headroom=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES} mode1_native_kv_cap=${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS} mode1_keep_fullworld_ep_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_FULLWORLD_EP_CACHE} mode1_keep_mc2_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE} mode1_drop_stale_after_shrink=${VLLM_ASCEND_MODE1_PARITY_DROP_STALE_CACHE_AFTER_SHRINK} mode1_single_live_mc2=${VLLM_ASCEND_MODE1_PARITY_SINGLE_LIVE_MC2_GROUP} disable_elastic_mc2_cache=${VLLM_ASCEND_DISABLE_ELASTIC_MC2_GROUP_CACHE} mode1_post_restore_alltoall_warmup=${VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_ALLTOALL_WARMUP} mode1_batch_direct_npu_import=${VLLM_ASCEND_MODE1_BATCH_DIRECT_NPU_IMPORT} mode1_allow_scalar_direct_npu_import=${VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT} mode1_allow_batch_index_select_export=${VLLM_ASCEND_MODE1_ALLOW_BATCH_INDEX_SELECT_EXPORT} mode1_direct_npu_import_batch_experts=${VLLM_ASCEND_MODE1_DIRECT_NPU_IMPORT_BATCH_EXPERTS} post_shrink_release_empty_cache=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_EMPTY_CACHE} post_shrink_release_sync=${VLLM_ASCEND_POST_SHRINK_STAGING_RELEASE_SYNC} mode1_sync_after_mc2_destroy=${VLLM_ASCEND_MODE1_PARITY_SYNC_AFTER_MC2_GROUP_DESTROY} mode1_gc_after_mc2_destroy=${VLLM_ASCEND_MODE1_PARITY_GC_AFTER_MC2_GROUP_DESTROY} mode1_release_dp_warmup_cache=${VLLM_ASCEND_MODE1_PARITY_RELEASE_DP_WARMUP_CACHE} mode1_release_warmup_cache=${VLLM_ASCEND_MODE1_PARITY_RELEASE_WARMUP_CACHE} mode1_keep_floor4_group_cache=${VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_CACHE} mode1_keep_floor4_group_kinds=${VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_KINDS} mode1_drop_old_floor_before_rebuild=${VLLM_ASCEND_MODE1_PARITY_DROP_OLD_FLOOR_BEFORE_REBUILD} mode1_release_live_old_floor_on_rebuild=${VLLM_ASCEND_MODE1_PARITY_RELEASE_LIVE_OLD_FLOOR_ON_REBUILD} mode1_defer_group_destroy=${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY} mode1_defer_full_restore=${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE:-} mode1_defer_pre_rebuild=${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD:-} mode1_defer_stash=${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH:-} mode1_defer_destroy_floor_sizes=${VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES} mode1_sync_before_device_pg_retire=${VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE} mode1_destroy_device_pg_on_retire=${VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE} mode1_destroy_cpu_pg_on_retire=${VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE:-} mode1_destroy_cpu_placeholder_pg=${VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_NON_MEMBER_PLACEHOLDER:-} mode1_group_seq_digest=${VLLM_ASCEND_GROUP_SEQ_DIGEST_LOG:-} mode1_force_non_member_placeholder=${VLLM_ASCEND_MODE1_FORCE_NON_MEMBER_PLACEHOLDER_NEW_GROUP:-} allow_rebuild_cache_hit_with_placeholder=${VLLM_ASCEND_MODE1_ALLOW_REBUILD_CACHE_HIT_WITH_PLACEHOLDER:-} mode1_hccl_seq_digest=${VLLM_ASCEND_ELASTIC_HCCL_SEQ_DIGEST_LOG:-} mode1_hccl_seq_summary=${VLLM_ASCEND_ELASTIC_HCCL_SEQ_SUMMARY_LOG:-} mode1_seq_checkpoint=${VLLM_ASCEND_MODE1_SEQ_CHECKPOINT_LOG:-} mode1_moe_dispatch_digest=${VLLM_ASCEND_MOE_DISPATCH_SEQ_DIGEST_LOG:-} mode1_moe_dispatch_sample_every=${VLLM_ASCEND_MOE_DISPATCH_SEQ_DIGEST_SAMPLE_EVERY:-} mode1_enable_post_shrink_dp_warmup=${VLLM_ASCEND_MODE1_PARITY_ENABLE_POST_SHRINK_DP_WARMUP} mode1_cpu_dp_metadata_sync=${VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC}"
+    echo "[mode1 code] worker_v1_sha256=${worker_v1_sha256:-unknown} llm_engine_sha256=${llm_engine_sha256:-unknown} fused_moe_sha256=${fused_moe_sha256:-unknown} ray_trainer_sha256=${ray_trainer_sha256:-unknown} launcher_sha256=${launcher_sha256:-unknown}"
 } | tee -a "${logfile}"
 
 set -x
@@ -541,5 +563,38 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
 run_exit_code=$?
 set -e
 
+analysis_file="${logfile%.txt}_analysis.txt"
+if [[ "${VLLM_ASCEND_MODE1_AUTO_ANALYZE_LOG:-1}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+    set +e
+    generated_analysis=$(tools/write_mode1_threshold_analysis.sh "${logfile}" "${analysis_file}" 2>&1)
+    analysis_exit_code=$?
+    set -e
+    if [[ "${analysis_exit_code}" -eq 0 ]]; then
+        echo "[mode1 auto-analysis] analysis_file=${generated_analysis}" | tee -a "${logfile}"
+        summary_file="${generated_analysis%.txt}_summary.txt"
+        if [[ -f "${summary_file}" ]]; then
+            echo "[mode1 auto-analysis] summary_file=${summary_file}" | tee -a "${logfile}"
+            sed -n '1,80p' "${summary_file}" | tee -a "${logfile}"
+        fi
+    else
+        echo "[mode1 auto-analysis] failed exit_code=${analysis_exit_code} output=${generated_analysis} expected_file=${analysis_file}" | tee -a "${logfile}"
+    fi
+fi
+validation_exit_code=0
+if [[ -n "${MODE1_EXPECTED_ROLLOUT_STEPS:-}" ]]; then
+    set +e
+    python3 tools/validate_mode1_run_completion.py \
+        "${logfile}" \
+        --expected-steps "${MODE1_EXPECTED_ROLLOUT_STEPS}" \
+        --require-run-done 2>&1 | tee -a "${logfile}"
+    validation_exit_code=${PIPESTATUS[0]}
+    set -e
+    if [[ "${validation_exit_code}" -ne 0 ]]; then
+        echo "[mode1 completion validation] failed exit_code=${validation_exit_code} expected_steps=${MODE1_EXPECTED_ROLLOUT_STEPS}" | tee -a "${logfile}"
+        if [[ "${run_exit_code}" -eq 0 ]]; then
+            run_exit_code="${validation_exit_code}"
+        fi
+    fi
+fi
 echo "[run] end_time=$(date '+%Y-%m-%dT%H:%M:%S%z') exit_code=${run_exit_code}" | tee -a "${logfile}"
 exit "${run_exit_code}"

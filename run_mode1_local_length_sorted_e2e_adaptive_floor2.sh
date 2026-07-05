@@ -27,11 +27,15 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     exit 0
 fi
 
-MODEL_PATH="${MODEL_PATH:-/data/Qwen3-30B-A3B}"
-DISTCP_PATH="${DISTCP_PATH:-/data/Qwen3-30B-A3B_megatron}"
-TRAIN_FILE_ORIG="${TRAIN_FILE_ORIG:-/data/deepscaler/train.parquet}"
-TEST_FILE="${TEST_FILE:-/data/deepscaler/test.parquet}"
-BASELINE_DIR="${BASELINE_DIR:-$REPO_ROOT/mode1_baseline_random_batch_floor4}"
+# Keep this staged repo on the validated local CANN 9.1 A3 + torch2.9 stack by
+# default. Set USE_CANN91_A3_WITH_NNAL91=0 to use the caller environment.
+source "$SCRIPT_DIR/tools/use_default_cann91_a3_torch29_runtime.sh"
+
+MODEL_PATH="${MODEL_PATH:-/home/data/Qwen3-30B-A3B}"
+DISTCP_PATH="${DISTCP_PATH:-/home/data/Qwen3-30B-A3B_megatron}"
+TRAIN_FILE_ORIG="${TRAIN_FILE_ORIG:-/workspace/data/deepscaler/train.parquet}"
+TEST_FILE="${TEST_FILE:-/workspace/data/deepscaler/test.parquet}"
+BASELINE_DIR="${BASELINE_DIR:-$REPO_ROOT/mode1_baseline_random_batch_floor4_threshold_multistep}"
 
 if [[ "${CHECK_LOCAL_INPUTS:-1}" == "1" ]]; then
     for required_path in "$MODEL_PATH" "$DISTCP_PATH" "$TRAIN_FILE_ORIG" "$TEST_FILE" "$BASELINE_DIR"; do
@@ -44,15 +48,16 @@ fi
 
 export VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK=1
 export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=1
-export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=2
+export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE="${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE:-2}"
 export VLLM_ASCEND_SHRINK_AWARE_ENABLE=1
 export VLLM_ASCEND_REGISTER_CUSTOM_MODELS="${VLLM_ASCEND_REGISTER_CUSTOM_MODELS:-1}"
 export VLLM_ASCEND_USE_NATIVE_QWEN3_MOE=0
-export VLLM_ASCEND_SHRINK_AWARE_MODE=staged
-export VLLM_ASCEND_SHRINK_AWARE_STAGES=8,4
-export VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY=manual
-export VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS=8,9,10,11,12,13,14,15
-export VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS=12,13,14,15
+export VLLM_ASCEND_SHRINK_AWARE_MODE="${VLLM_ASCEND_SHRINK_AWARE_MODE:-staged}"
+export VLLM_ASCEND_SHRINK_AWARE_STAGES="${VLLM_ASCEND_SHRINK_AWARE_STAGES:-8,4}"
+export VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY="${VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY:-manual}"
+export VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY="${VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY:-natural}"
+export VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS="${VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS-8,9,10,11,12,13,14,15}"
+export VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS="${VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS-12,13,14,15}"
 export VLLM_EAGER_BASELINE_NO_RESAMPLE=0
 export VLLM_EPOCH_LENGTH_REGROUP_ENABLE=0
 export ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-True}"
@@ -147,6 +152,8 @@ ACTIVE_PEAK_SAFETY_FACTOR="${ACTIVE_PEAK_SAFETY_FACTOR:-1.16}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-16384}"
 MAX_CROSS_STEP_REPAIR_SWAPS="${MAX_CROSS_STEP_REPAIR_SWAPS:-8}"
 REPAIR_CANDIDATE_LIMIT="${REPAIR_CANDIDATE_LIMIT:-8}"
+FORCE_SELECTED_FLOOR="${FORCE_SELECTED_FLOOR:-}"
+IGNORE_TAIL_TIES_AT_RESPONSE_CAP="${IGNORE_TAIL_TIES_AT_RESPONSE_CAP:-0}"
 
 PLAN_DIR="${PLAN_DIR:-$REPO_ROOT/mode1_length_sorted_e2e_adaptive_floor2/oracle}"
 OPT_TRAIN_FILE="${OPT_TRAIN_FILE:-$PLAN_DIR/length_sorted_train.parquet}"
@@ -155,25 +162,34 @@ OPT_SUMMARY="${OPT_SUMMARY:-$PLAN_DIR/length_sorted_rank_plan_summary.json}"
 OPT_ORACLE="${OPT_ORACLE:-$PLAN_DIR/length_sorted_length_oracle.json}"
 mkdir -p "$PLAN_DIR"
 
-python3 "$PATCH_TREE/tools/build_mode1_length_sorted_e2e_plan.py" \
-    --baseline-dir "$BASELINE_DIR" \
-    --train-file "$TRAIN_FILE_ORIG" \
-    --output-train "$OPT_TRAIN_FILE" \
-    --output-plan "$OPT_RANK_PLAN" \
-    --output-summary "$OPT_SUMMARY" \
-    --output-oracle "$OPT_ORACLE" \
-    --steps 5 \
-    --batch-size "$TRAIN_BATCH_SIZE" \
-    --responses-per-prompt "$ROLLOUT_N" \
-    --dataset-fraction "$DATASET_FRACTION_FOR_ORACLE" \
-    --max-rank-peak-tokens "$MAX_RANK_PEAK_TOKENS" \
-    --adaptive-floor \
-    --min-adaptive-floor "$MIN_ADAPTIVE_FLOOR" \
-    --floor-kv-caps "$FLOOR_KV_CAPS" \
-    --active-peak-safety-factor "$ACTIVE_PEAK_SAFETY_FACTOR" \
-    --max-response-len "$MAX_RESPONSE_LEN" \
-    --max-cross-step-repair-swaps "$MAX_CROSS_STEP_REPAIR_SWAPS" \
+PLAN_BUILDER_ARGS=(
+    --baseline-dir "$BASELINE_DIR"
+    --train-file "$TRAIN_FILE_ORIG"
+    --output-train "$OPT_TRAIN_FILE"
+    --output-plan "$OPT_RANK_PLAN"
+    --output-summary "$OPT_SUMMARY"
+    --output-oracle "$OPT_ORACLE"
+    --steps 5
+    --batch-size "$TRAIN_BATCH_SIZE"
+    --responses-per-prompt "$ROLLOUT_N"
+    --dataset-fraction "$DATASET_FRACTION_FOR_ORACLE"
+    --max-rank-peak-tokens "$MAX_RANK_PEAK_TOKENS"
+    --adaptive-floor
+    --min-adaptive-floor "$MIN_ADAPTIVE_FLOOR"
+    --floor-kv-caps "$FLOOR_KV_CAPS"
+    --active-peak-safety-factor "$ACTIVE_PEAK_SAFETY_FACTOR"
+    --max-response-len "$MAX_RESPONSE_LEN"
+    --max-cross-step-repair-swaps "$MAX_CROSS_STEP_REPAIR_SWAPS"
     --repair-candidate-limit "$REPAIR_CANDIDATE_LIMIT"
+)
+if [[ -n "$FORCE_SELECTED_FLOOR" ]]; then
+    PLAN_BUILDER_ARGS+=(--force-selected-floor "$FORCE_SELECTED_FLOOR")
+fi
+if [[ "$IGNORE_TAIL_TIES_AT_RESPONSE_CAP" == "1" || "${IGNORE_TAIL_TIES_AT_RESPONSE_CAP,,}" == "true" ]]; then
+    PLAN_BUILDER_ARGS+=(--ignore-tail-ties-at-response-cap)
+fi
+
+python3 "$PATCH_TREE/tools/build_mode1_length_sorted_e2e_plan.py" "${PLAN_BUILDER_ARGS[@]}"
 
 TRAIN_FILE="$OPT_TRAIN_FILE"
 export TRAIN_FILE
@@ -197,31 +213,52 @@ printf '[mode1 length-sorted e2e adaptive] max_rank_peak_tokens=%s min_adaptive_
 printf '[mode1 length-sorted e2e] max_cross_step_repair_swaps=%s repair_candidate_limit=%s\n' \
     "$MAX_CROSS_STEP_REPAIR_SWAPS" "$REPAIR_CANDIDATE_LIMIT"
 
-bash "$LAUNCHER" \
-    data.train_files="$TRAIN_FILE" \
-    data.val_files="$TEST_FILE" \
-    data.train_batch_size="$TRAIN_BATCH_SIZE" \
-    data.max_prompt_length="$MAX_PROMPT_LENGTH" \
-    data.max_response_length="$MAX_RESPONSE_LENGTH" \
-    data.shuffle=False \
-    data.dataset_fraction=1.0 \
-    actor_rollout_ref.model.path="$MODEL_PATH" \
-    actor_rollout_ref.actor.megatron.dist_checkpointing_path="$DISTCP_PATH" \
-    actor_rollout_ref.ref.megatron.dist_checkpointing_path="$DISTCP_PATH" \
-    actor_rollout_ref.rollout.max_num_batched_tokens="$ROLLOUT_MAX_NUM_BATCHED_TOKENS" \
-    actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS" \
-    actor_rollout_ref.rollout.n="$ROLLOUT_N" \
-    actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
-    actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_scheduling=true \
-    actor_rollout_ref.rollout.shrink_aware.shrink_aware_mode=staged \
-    actor_rollout_ref.rollout.shrink_aware.shrink_stages='[8,4]' \
-    actor_rollout_ref.rollout.shrink_aware.survivor_selection_policy=manual \
-    actor_rollout_ref.rollout.shrink_aware.intermediate_survivor_ranks='[8,9,10,11,12,13,14,15]' \
-    actor_rollout_ref.rollout.shrink_aware.final_survivor_ranks='[12,13,14,15]' \
-    actor_rollout_ref.rollout.shrink_aware.length_prediction_source=oracle_trace \
-    actor_rollout_ref.rollout.shrink_aware.oracle_trace_path="$OPT_ORACLE" \
-    actor_rollout_ref.rollout.shrink_aware.assignment_policy=optimized_rank_plan \
-    actor_rollout_ref.rollout.shrink_aware.optimized_rank_plan_path="$OPT_RANK_PLAN" \
-    actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_logging="$SHRINK_AWARE_LOGGING" \
-    trainer.total_epochs="$TRAINER_TOTAL_EPOCHS" \
-    "$@" 2>&1 | tee "$tee_log"
+csv_to_hydra_list() {
+    local csv="${1// /}"
+    if [[ -z "$csv" ]]; then
+        printf '[]'
+    else
+        printf '[%s]' "$csv"
+    fi
+}
+
+SHRINK_STAGES_HYDRA="${SHRINK_STAGES_HYDRA:-$(csv_to_hydra_list "$VLLM_ASCEND_SHRINK_AWARE_STAGES")}"
+HYDRA_ARGS=(
+    data.train_files="$TRAIN_FILE"
+    data.val_files="$TEST_FILE"
+    data.train_batch_size="$TRAIN_BATCH_SIZE"
+    data.max_prompt_length="$MAX_PROMPT_LENGTH"
+    data.max_response_length="$MAX_RESPONSE_LENGTH"
+    data.shuffle=False
+    data.dataset_fraction=1.0
+    actor_rollout_ref.model.path="$MODEL_PATH"
+    actor_rollout_ref.actor.megatron.dist_checkpointing_path="$DISTCP_PATH"
+    actor_rollout_ref.ref.megatron.dist_checkpointing_path="$DISTCP_PATH"
+    actor_rollout_ref.rollout.max_num_batched_tokens="$ROLLOUT_MAX_NUM_BATCHED_TOKENS"
+    actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS"
+    actor_rollout_ref.rollout.n="$ROLLOUT_N"
+    actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION"
+    actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_scheduling=true
+    actor_rollout_ref.rollout.shrink_aware.shrink_aware_mode="$VLLM_ASCEND_SHRINK_AWARE_MODE"
+    actor_rollout_ref.rollout.shrink_aware.shrink_stages="$SHRINK_STAGES_HYDRA"
+    actor_rollout_ref.rollout.shrink_aware.survivor_selection_policy="$VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY"
+    actor_rollout_ref.rollout.shrink_aware.target_policy="$VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY"
+    actor_rollout_ref.rollout.shrink_aware.length_prediction_source=oracle_trace
+    actor_rollout_ref.rollout.shrink_aware.oracle_trace_path="$OPT_ORACLE"
+    actor_rollout_ref.rollout.shrink_aware.assignment_policy=optimized_rank_plan
+    actor_rollout_ref.rollout.shrink_aware.optimized_rank_plan_path="$OPT_RANK_PLAN"
+    actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_logging="$SHRINK_AWARE_LOGGING"
+    trainer.total_epochs="$TRAINER_TOTAL_EPOCHS"
+)
+if [[ -n "${VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS:-}" ]]; then
+    HYDRA_ARGS+=(
+        actor_rollout_ref.rollout.shrink_aware.intermediate_survivor_ranks="$(csv_to_hydra_list "$VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS")"
+    )
+fi
+if [[ -n "${VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS:-}" ]]; then
+    HYDRA_ARGS+=(
+        actor_rollout_ref.rollout.shrink_aware.final_survivor_ranks="$(csv_to_hydra_list "$VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS")"
+    )
+fi
+
+bash "$LAUNCHER" "${HYDRA_ARGS[@]}" "$@" 2>&1 | tee "$tee_log"

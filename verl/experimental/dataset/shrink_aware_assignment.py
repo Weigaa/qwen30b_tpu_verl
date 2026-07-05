@@ -148,7 +148,10 @@ def maybe_apply_shrink_aware_schedule(
         "shrink_stages": [
             len(stage_ranks) for stage_ranks in role_plan.stage_survivor_ranks
         ],
-        "survivor_selection_policy": "manual",
+        "survivor_selection_policy": str(_cfg_get(
+            shrink_cfg, "survivor_selection_policy", "topology_aware")),
+        "target_policy": str(_cfg_get(
+            shrink_cfg, "target_policy", "natural")),
         "max_rollout_overhead_ratio": float(_cfg_get(
             shrink_cfg, "max_rollout_overhead_ratio", 1.10)),
         "min_shrink_window_seconds": float(_cfg_get(

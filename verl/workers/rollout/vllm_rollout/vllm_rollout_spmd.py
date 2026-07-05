@@ -106,15 +106,23 @@ def _sync_shrink_aware_env_from_meta(meta_info: dict) -> None:
         os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGES"] = ",".join(
             str(int(stage)) for stage in stages)
     os.environ["VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY"] = str(
-        runtime.get("survivor_selection_policy", "manual"))
-    os.environ["VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS"] = ",".join(
-        str(rank) for rank in plan.get("intermediate_survivor_ranks", []))
-    os.environ["VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS"] = ",".join(
-        str(rank) for rank in plan.get("final_survivor_ranks", []))
-    stage_ranks = plan.get("stage_survivor_ranks")
-    if isinstance(stage_ranks, list):
-        os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS"] = json.dumps(
-            stage_ranks)
+        runtime.get("survivor_selection_policy", "topology_aware"))
+    target_policy = str(runtime.get("target_policy", os.getenv(
+        "VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY", "natural"))).lower().strip()
+    os.environ["VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY"] = target_policy
+    if target_policy in ("natural", "actual", "rank_aware"):
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS"] = ""
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS"] = ""
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS"] = ""
+    else:
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS"] = ",".join(
+            str(rank) for rank in plan.get("intermediate_survivor_ranks", []))
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS"] = ",".join(
+            str(rank) for rank in plan.get("final_survivor_ranks", []))
+        stage_ranks = plan.get("stage_survivor_ranks")
+        if isinstance(stage_ranks, list):
+            os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS"] = json.dumps(
+                stage_ranks)
     if "max_rollout_overhead_ratio" in runtime:
         os.environ["VLLM_ASCEND_SHRINK_AWARE_MAX_OVERHEAD_RATIO"] = str(
             runtime["max_rollout_overhead_ratio"])
@@ -544,10 +552,14 @@ def _materialize_rollout_weight_staging(
 ) -> list[tuple[str, torch.Tensor]]:
     """Create rollout-owned tensors for weight reload.
 
-    Mode=1 repeatedly reloads rollout weights while elastic groups and runtime
-    views are being rebuilt. Cloning cuts loader-side aliases to caller-owned
-    tensors so the rollout can release temporary NPU allocations promptly.
+    Cloning rollout weights used to cut loader-side aliases, but it also
+    doubles the active NPU footprint during mode=1 repeated weight reloads.
+    Keep the zero-copy path as the default and make the old clone behavior
+    opt-in for debugging only.
     """
+    if os.getenv("VLLM_ASCEND_ROLLOUT_WEIGHT_STAGING_CLONE",
+                 "0").lower() not in ("1", "true", "yes", "on"):
+        return list(weights)
     staged: list[tuple[str, torch.Tensor]] = []
     for name, weight in weights:
         staged.append((name, weight.detach().clone()))
@@ -1015,43 +1027,56 @@ class vLLMRollout(BaseRollout):
         _log_custom_mode1_rollout_state(self, "before_free_cache_engine")
         if os.environ['VLLM_USE_V1'] == '1':
             worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
-            ctx = worker.model_runner.vllm_config.compilation_config.static_forward_context
+            clear_fn = getattr(worker, "clear_kv_cache_for_resize", None)
+            if callable(clear_fn):
+                clear_fn()
+            else:
+                ctx = worker.model_runner.vllm_config.compilation_config.static_forward_context
+                from vllm.attention import AttentionType
+                layer_need_kv_cache = []
+                for layer_name in ctx:
+                    if hasattr(ctx[layer_name], 'attn_type') and ctx[layer_name].attn_type in (AttentionType.DECODER, AttentionType.ENCODER_DECODER):
+                        layer_need_kv_cache.append(layer_name)
+                pipeline_parallel_size = self.inference_engine.llm_engine.vllm_config.parallel_config.pipeline_parallel_size
+                for layer_name in layer_need_kv_cache:
+                    kv_cache = [torch.tensor([]) for _ in range(pipeline_parallel_size)]
+                    ctx[layer_name].kv_cache = kv_cache
+                    try:
+                        if hasattr(self.model, "named_modules"):
+                            module = dict(self.model.named_modules()).get(layer_name)
+                            if module is not None and hasattr(module, "kv_cache"):
+                                module.kv_cache = kv_cache
+                    except Exception:
+                        logger.exception(
+                            "Failed to clear module kv_cache reference for layer %s",
+                            layer_name)
+                worker.model_runner.kv_caches = []
+            release_moe_runtime_fn = getattr(
+                worker, "_release_mode1_moe_comm_runtime_state", None)
+            release_on_free_cache = os.environ.get(
+                "VLLM_ASCEND_MODE1_RELEASE_MOE_COMM_RUNTIME_ON_FREE_CACHE",
+                "1").lower() in ("1", "true", "yes", "on")
+            if callable(release_moe_runtime_fn) and release_on_free_cache:
+                try:
+                    release_moe_runtime_fn(
+                        "after_free_cache_engine_kv_clear",
+                        trim_npu_cache=os.environ.get(
+                            "VLLM_ASCEND_MODE1_RELEASE_MOE_COMM_RUNTIME_EMPTY_CACHE",
+                            "1").lower() in ("1", "true", "yes", "on"))
+                except Exception:
+                    logger.exception(
+                        "Failed to release MoE comm runtime state after free_cache_engine")
         else:
             ctx = self.inference_engine.llm_engine.model_executor.driver_worker.worker.compilation_config.static_forward_context
-        from vllm.attention import AttentionType
-
-        layer_need_kv_cache = []
-        for layer_name in ctx:
-            if hasattr(ctx[layer_name], 'attn_type') and ctx[layer_name].attn_type in (AttentionType.DECODER, AttentionType.ENCODER_DECODER):
-                layer_need_kv_cache.append(layer_name)
-
-        pipeline_parallel_size = self.inference_engine.llm_engine.vllm_config.parallel_config.pipeline_parallel_size
-        for layer_name in layer_need_kv_cache:
-            kv_cache = []
-            for _ in range(pipeline_parallel_size):
-                kv_cache.append(torch.tensor([]))
-            ctx[layer_name].kv_cache = kv_cache
-            # The layer modules themselves also keep strong `kv_cache`
-            # references. If we only replace the static forward-context entry,
-            # step-2 resume can still carry the previous large cache tensors
-            # through the model objects and leave attention/backend memory far
-            # above the native baseline.
-            try:
-                if hasattr(self.model, "named_modules"):
-                    module = dict(self.model.named_modules()).get(layer_name)
-                    if module is not None and hasattr(module, "kv_cache"):
-                        module.kv_cache = kv_cache
-            except Exception:
-                logger.exception(
-                    "Failed to clear module kv_cache reference for layer %s",
-                    layer_name)
-
-        if os.environ['VLLM_USE_V1'] == '1':
-            worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
-
-            # Clearing the cache engine
-            worker.model_runner.kv_caches = []
-        else:
+            from vllm.attention import AttentionType
+            layer_need_kv_cache = []
+            for layer_name in ctx:
+                if hasattr(ctx[layer_name], 'attn_type') and ctx[layer_name].attn_type in (AttentionType.DECODER, AttentionType.ENCODER_DECODER):
+                    layer_need_kv_cache.append(layer_name)
+            pipeline_parallel_size = self.inference_engine.llm_engine.vllm_config.parallel_config.pipeline_parallel_size
+            for layer_name in layer_need_kv_cache:
+                kv_cache = [torch.tensor([]) for _ in range(pipeline_parallel_size)]
+                ctx[layer_name].kv_cache = kv_cache
             self.inference_engine.llm_engine.model_executor.driver_worker.worker.cache_engine = None
             self.inference_engine.llm_engine.model_executor.driver_worker.worker.gpu_cache = None
 
@@ -1072,7 +1097,11 @@ class vLLMRollout(BaseRollout):
                     mla_impl.value_cache = None
 
         gc.collect()
-        torch.npu.empty_cache()
+        try:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception("Failed to empty/sync NPU cache after free_cache_engine")
         _log_custom_mode1_rollout_state(self, "after_free_cache_engine")
         _log_custom_mode1_rollout_memory("after_free_cache_engine")
 

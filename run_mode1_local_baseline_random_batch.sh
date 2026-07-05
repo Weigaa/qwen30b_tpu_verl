@@ -7,7 +7,7 @@ Usage:
   ./run_mode1_local_baseline_random_batch.sh [extra hydra args...]
 
 Baseline local test:
-  - uses elastic shrink mode=1 with floor=4
+  - uses elastic shrink mode=1 with MODE1_FLOOR, default floor=4
   - disables length-aware regroup and shrink-aware prompt scheduling
   - lets the dataset shuffle randomly form batches
 
@@ -30,6 +30,10 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     exit 0
 fi
 
+# Default this staged repo to the validated CANN 9.1 A3 + torch/torch_npu 2.9
+# runtime. Set USE_CANN91_A3_WITH_NNAL91=0 to use the caller-provided stack.
+source "$SCRIPT_DIR/tools/use_default_cann91_a3_torch29_runtime.sh"
+
 MODEL_PATH="${MODEL_PATH:-/data/Qwen3-30B-A3B}"
 DISTCP_PATH="${DISTCP_PATH:-/data/Qwen3-30B-A3B_megatron}"
 TRAIN_FILE="${TRAIN_FILE:-/data/deepscaler/train.parquet}"
@@ -47,21 +51,21 @@ fi
 
 floor="${MODE1_FLOOR:-4}"
 case "$floor" in
-    4) ;;
+    2|4|8|16) ;;
     *)
-        echo "baseline local test is fixed to mode=1 shrink floor=4; got MODE1_FLOOR=$floor" >&2
+        echo "baseline local test supports MODE1_FLOOR=2/4/8/16; got MODE1_FLOOR=$floor" >&2
         exit 2
         ;;
 esac
 
 export VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK=1
 export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=1
-export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=4
-export VLLM_ASCEND_SHRINK_AWARE_ENABLE=0
+export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE="${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE:-$floor}"
+export VLLM_ASCEND_SHRINK_AWARE_ENABLE="${VLLM_ASCEND_SHRINK_AWARE_ENABLE:-0}"
 export VLLM_ASCEND_REGISTER_CUSTOM_MODELS="${VLLM_ASCEND_REGISTER_CUSTOM_MODELS:-1}"
 export VLLM_ASCEND_USE_NATIVE_QWEN3_MOE=0
-export VLLM_EAGER_BASELINE_NO_RESAMPLE=1
-export VLLM_EPOCH_LENGTH_REGROUP_ENABLE=0
+export VLLM_EAGER_BASELINE_NO_RESAMPLE="${VLLM_EAGER_BASELINE_NO_RESAMPLE:-1}"
+export VLLM_EPOCH_LENGTH_REGROUP_ENABLE="${VLLM_EPOCH_LENGTH_REGROUP_ENABLE:-0}"
 export VLLM_ROLLOUT_EARLY_STOP_ENABLE="${VLLM_ROLLOUT_EARLY_STOP_ENABLE:-0}"
 export VLLM_ROLLOUT_EARLY_STOP_FACTOR="${VLLM_ROLLOUT_EARLY_STOP_FACTOR:-2.0}"
 export VLLM_ROLLOUT_EARLY_STOP_MIN_TOKENS="${VLLM_ROLLOUT_EARLY_STOP_MIN_TOKENS:-10000}"
@@ -108,13 +112,13 @@ export VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_KINDS="${VLLM_ASCEND_MODE1_PAR
 export VLLM_ASCEND_MODE1_PARITY_DROP_OLD_FLOOR_BEFORE_REBUILD="${VLLM_ASCEND_MODE1_PARITY_DROP_OLD_FLOOR_BEFORE_REBUILD:-1}"
 export VLLM_ASCEND_MODE1_PARITY_RELEASE_LIVE_OLD_FLOOR_ON_REBUILD="${VLLM_ASCEND_MODE1_PARITY_RELEASE_LIVE_OLD_FLOOR_ON_REBUILD:-1}"
 export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY:-1}"
-export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE:-0}"
+export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE:-1}"
 export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD:-0}"
 export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH:-0}"
 export VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES="${VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES:-1,2,4,8}"
 export VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE="${VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE:-1}"
 export VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE="${VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE:-1}"
-export VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE="${VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE:-1}"
+export VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE="${VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE:-0}"
 export VLLM_ASCEND_MODE1_PARITY_ENABLE_POST_SHRINK_DP_WARMUP="${VLLM_ASCEND_MODE1_PARITY_ENABLE_POST_SHRINK_DP_WARMUP:-0}"
 export VLLM_ASCEND_CUSTOM_MODE1_DEBUG=0
 export VLLM_ASCEND_CUSTOM_MODE1_TIMING_EVENTS=0
@@ -125,7 +129,11 @@ export VLLM_ASCEND_MODE1_BATCH_DIRECT_NPU_IMPORT="${VLLM_ASCEND_MODE1_BATCH_DIRE
 export VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT="${VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT:-0}"
 export VLLM_ASCEND_MODE1_ALLOW_BATCH_INDEX_SELECT_EXPORT="${VLLM_ASCEND_MODE1_ALLOW_BATCH_INDEX_SELECT_EXPORT:-0}"
 export VLLM_ASCEND_MODE1_DIRECT_NPU_IMPORT_BATCH_EXPERTS="${VLLM_ASCEND_MODE1_DIRECT_NPU_IMPORT_BATCH_EXPERTS:-8}"
-export VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC="${VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC:-0}"
+if [[ "${USE_CANN91_A3_WITH_NNAL91:-0}" == "1" ]]; then
+    export VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC="${VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC:-1}"
+else
+    export VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC="${VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC:-0}"
+fi
 
 export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-47241}"
 export MASTER_PORT="${MASTER_PORT:-26240}"
@@ -146,6 +154,9 @@ ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-32}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.8}"
 TRAINER_TOTAL_EPOCHS="${TRAINER_TOTAL_EPOCHS:-1}"
+ROLLOUT_SHRINK_AWARE_ENABLE="${ROLLOUT_SHRINK_AWARE_ENABLE:-false}"
+ROLLOUT_SHRINK_AWARE_MODE="${ROLLOUT_SHRINK_AWARE_MODE:-off}"
+ROLLOUT_SHRINK_AWARE_LOGGING="${ROLLOUT_SHRINK_AWARE_LOGGING:-false}"
 EXTRA_OVERRIDES=()
 if [[ -n "${DATASET_FRACTION:-}" ]]; then
     EXTRA_OVERRIDES+=("data.dataset_fraction=$DATASET_FRACTION")
@@ -159,8 +170,14 @@ printf '[mode1 local baseline random] runtime_cwd=%s\n' "$PATCH_TREE"
 printf '[mode1 local baseline random] launcher=%s tee_log=%s\n' "$LAUNCHER" "$tee_log"
 printf '[mode1 local baseline random] model=%s distcp=%s train=%s test=%s\n' \
     "$MODEL_PATH" "$DISTCP_PATH" "$TRAIN_FILE" "$TEST_FILE"
-printf '[mode1 local baseline random] mode=1 floor=4 length_regroup=%s baseline_no_resample=%s dataset_shuffle=True\n' \
+printf '[mode1 local baseline random] mode=1 floor=%s length_regroup=%s baseline_no_resample=%s dataset_shuffle=True\n' \
+    "$floor" \
     "$VLLM_EPOCH_LENGTH_REGROUP_ENABLE" "$VLLM_EAGER_BASELINE_NO_RESAMPLE"
+printf '[mode1 local baseline random] shrink_aware_env=%s shrink_aware_enable=%s shrink_aware_mode=%s shrink_aware_logging=%s\n' \
+    "$VLLM_ASCEND_SHRINK_AWARE_ENABLE" \
+    "$ROLLOUT_SHRINK_AWARE_ENABLE" \
+    "$ROLLOUT_SHRINK_AWARE_MODE" \
+    "$ROLLOUT_SHRINK_AWARE_LOGGING"
 printf '[mode1 local baseline random] dataset_fraction=%s moe_stats=%s moe_stats_timing=%s native_topk_debug=%s\n' \
     "${DATASET_FRACTION:-launcher_default}" \
     "$VLLM_MOE_PATTERN_STATS" \
@@ -206,9 +223,9 @@ bash "$LAUNCHER" \
     actor_rollout_ref.rollout.max_num_seqs="$ROLLOUT_MAX_NUM_SEQS" \
     actor_rollout_ref.rollout.n="$ROLLOUT_N" \
     actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
-    actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_scheduling=false \
-    actor_rollout_ref.rollout.shrink_aware.shrink_aware_mode=off \
-    actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_logging=false \
+    actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_scheduling="$ROLLOUT_SHRINK_AWARE_ENABLE" \
+    actor_rollout_ref.rollout.shrink_aware.shrink_aware_mode="$ROLLOUT_SHRINK_AWARE_MODE" \
+    actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_logging="$ROLLOUT_SHRINK_AWARE_LOGGING" \
     trainer.total_epochs="$TRAINER_TOTAL_EPOCHS" \
     "${EXTRA_OVERRIDES[@]}" \
     "$@" 2>&1 | tee "$tee_log"

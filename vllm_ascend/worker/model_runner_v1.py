@@ -579,8 +579,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # ((maxBs * tokenNeedSizeDispatch * ep_worldsize * localMoeExpertNum) + (maxBs * tokenNeedSizeCombine * (k + sharedExpertNum))) * 2
         # so we have to limit the MC2 tokens to save memory, should fix this in the future.
         self.mc2_tokens_capacity = 512
-        self.reserved_mc2_mask = torch.zeros(
+        reserved_mc2_mask_tokens = max(
             self.mc2_tokens_capacity,
+            int(os.getenv("VLLM_ASCEND_RESERVED_MC2_MASK_TOKENS",
+                          str(self.mc2_tokens_capacity))),
+        )
+        self.reserved_mc2_mask = torch.zeros(
+            reserved_mc2_mask_tokens,
             dtype=torch.bool,
             device=self.device,
         )
@@ -2262,6 +2267,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         elastic_parallel_shrink_enabled = \
             envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
         force_alltoall_moe = envs_ascend.VLLM_ASCEND_FORCE_ALLTOALL_MOE
+        force_mc2_moe = getattr(envs_ascend, "VLLM_ASCEND_FORCE_MC2_MOE",
+                                False)
         current_ep_size = 1
         if self.parallel_config.enable_expert_parallel:
             if elastic_parallel_shrink_enabled:
@@ -2276,6 +2283,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             moe_comm_type = MoECommType.ALLGATHER
         elif current_ep_size <= 1:
             moe_comm_type = MoECommType.ALLGATHER
+        elif force_mc2_moe:
+            moe_comm_type = MoECommType.MC2
         elif soc_version in {AscendSocVersion.A2}:
             if force_alltoall_moe and self.parallel_config.enable_expert_parallel:
                 moe_comm_type = MoECommType.ALLTOALL
@@ -2304,6 +2313,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # PanguProMoE only supports allgather
         if model_type == "PanguProMoE":
             moe_comm_type = MoECommType.ALLGATHER
+
+        # In mode1 shrink-aware runs, only the full-world stage should use the
+        # AllToAllV MoE dispatcher. Lower floors are decode-only in our current
+        # rollout path, and keeping them on MC2 avoids exercising HcclAllToAllV
+        # after repeated shrink/restore lifecycle transitions.
+        avoid_shrink_alltoall = os.getenv(
+            "VLLM_ASCEND_AVOID_ALLTOALL_ON_SHRINK_STAGE", "1").strip().lower()
+        if (moe_comm_type == MoECommType.ALLTOALL
+                and avoid_shrink_alltoall in {"1", "true", "yes", "on"}
+                and elastic_parallel_shrink_enabled
+                and not force_alltoall_moe
+                and self.parallel_config.enable_expert_parallel
+                and 1 < current_ep_size < self.parallel_config.world_size_across_dp):
+            moe_comm_type = MoECommType.MC2
 
         if is_global_first_rank():
             logger.debug("num_tokens: %s, current_ep_size: %s, moe_comm_type: %s",
@@ -3974,7 +3997,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             return
 
         num_tokens = int(num_tokens)
-        moe_comm_type = self._select_moe_comm_method(num_tokens, False)
+        force_mc2 = _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_FORCE_MC2_DISPATCHER_WARMUP", "0")
+        moe_comm_type = (MoECommType.MC2 if force_mc2 else
+                         self._select_moe_comm_method(num_tokens, False))
         if moe_comm_type != MoECommType.MC2:
             logger.info(
                 "Mode1 parity MC2 dispatcher-only warmup skipped: "
@@ -3983,6 +4009,25 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 moe_comm_type,
             )
             return
+
+        reserved_mc2_mask = self.reserved_mc2_mask
+        temp_mc2_mask = None
+        if force_mc2 and reserved_mc2_mask.shape[0] < num_tokens:
+            temp_mc2_mask = torch.zeros(
+                num_tokens,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            reserved_mc2_mask = temp_mc2_mask
+            logger.info(
+                "Mode1 parity MC2 dispatcher-only benchmark using temporary "
+                "mask: rank=%s tokens=%s default_mask_tokens=%s "
+                "temp_mask_tokens=%s",
+                dist.get_rank() if dist.is_initialized() else self.dp_rank,
+                num_tokens,
+                int(self.reserved_mc2_mask.shape[0]),
+                int(temp_mc2_mask.shape[0]),
+            )
 
         hidden_states = torch.zeros(
             (num_tokens, hidden_size),
@@ -4037,7 +4082,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_tokens=num_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 with_prefill=False,
-                reserved_mc2_mask=self.reserved_mc2_mask,
+                reserved_mc2_mask=reserved_mc2_mask,
                 moe_comm_type=moe_comm_type,
                 num_actual_tokens=num_tokens,
                 aclgraph_runtime_mode=CUDAGraphMode.NONE,
@@ -4070,7 +4115,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             token_dispatcher.top_k = top_k
             if hasattr(token_dispatcher, "expert_token_nums_type"):
                 token_dispatcher.expert_token_nums_type = 1
+            dispatch_ms = 0.0
+            combine_ms = 0.0
+            total_start = time.perf_counter()
             try:
+                if torch.npu.is_available():
+                    torch.npu.synchronize()
+                dispatch_start = time.perf_counter()
                 dispatch_results = token_dispatcher.token_dispatch(
                     hidden_states=hidden_states,
                     topk_weights=topk_weights,
@@ -4085,8 +4136,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     mc2_mask=getattr(forward_context, "mc2_mask", None),
                     apply_router_weight_on_input=False,
                     with_quant=False)
+                if torch.npu.is_available():
+                    torch.npu.synchronize()
+                dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
+                combine_start = time.perf_counter()
                 combined = token_dispatcher.token_combine(
                     dispatch_results["hidden_states"])
+                if torch.npu.is_available():
+                    torch.npu.synchronize()
+                combine_ms = (time.perf_counter() - combine_start) * 1000.0
                 del combined, dispatch_results
             finally:
                 token_dispatcher.num_experts = old_num_experts
@@ -4107,8 +4165,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 ):
                     if hasattr(token_dispatcher, attr):
                         setattr(token_dispatcher, attr, None)
+            total_ms = (time.perf_counter() - total_start) * 1000.0
 
         del hidden_states, topk_ids, topk_weights, row_idx, expert_map
+        if temp_mc2_mask is not None:
+            del temp_mc2_mask
         gc.collect()
         if torch.npu.is_available():
             torch.npu.empty_cache()
@@ -4119,6 +4180,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             rank,
             num_tokens,
             dispatch_num_experts,
+        )
+        logger.info(
+            "Mode1 parity dispatcher-only benchmark: backend=MC2 rank=%s "
+            "tokens=%s forced=%s dispatch_ms=%.3f combine_ms=%.3f "
+            "total_ms=%.3f",
+            rank,
+            num_tokens,
+            force_mc2,
+            dispatch_ms,
+            combine_ms,
+            total_ms,
         )
 
     @torch.inference_mode()
@@ -4300,7 +4372,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             old_top_k = int(getattr(token_dispatcher, "top_k", 0))
             token_dispatcher.num_experts = dispatch_num_experts
             token_dispatcher.top_k = top_k
+            dispatch_ms = 0.0
+            combine_ms = 0.0
+            total_start = time.perf_counter()
             try:
+                if torch.npu.is_available():
+                    torch.npu.synchronize()
+                dispatch_start = time.perf_counter()
                 dispatch_results = token_dispatcher.token_dispatch(
                     hidden_states=hidden_states,
                     topk_weights=topk_weights,
@@ -4315,8 +4393,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     mc2_mask=None,
                     apply_router_weight_on_input=False,
                     with_quant=False)
+                if torch.npu.is_available():
+                    torch.npu.synchronize()
+                dispatch_ms = (time.perf_counter() - dispatch_start) * 1000.0
+                combine_start = time.perf_counter()
                 combined = token_dispatcher.token_combine(
                     dispatch_results["hidden_states"])
+                if torch.npu.is_available():
+                    torch.npu.synchronize()
+                combine_ms = (time.perf_counter() - combine_start) * 1000.0
                 del combined, dispatch_results
             finally:
                 token_dispatcher.num_experts = old_num_experts
@@ -4335,6 +4420,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 ):
                     if hasattr(token_dispatcher, attr):
                         setattr(token_dispatcher, attr, None)
+            total_ms = (time.perf_counter() - total_start) * 1000.0
 
         del hidden_states, topk_ids, topk_weights, row_idx, expert_map
         gc.collect()
@@ -4348,6 +4434,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             num_tokens,
             max_tokens_across_dp,
             dispatch_num_experts,
+        )
+        logger.info(
+            "Mode1 parity dispatcher-only benchmark: backend=ALLTOALL rank=%s "
+            "tokens=%s max_tokens_across_dp=%s dispatch_ms=%.3f "
+            "combine_ms=%.3f total_ms=%.3f",
+            rank,
+            num_tokens,
+            max_tokens_across_dp,
+            dispatch_ms,
+            combine_ms,
+            total_ms,
         )
 
     def eplb_warmup(self):

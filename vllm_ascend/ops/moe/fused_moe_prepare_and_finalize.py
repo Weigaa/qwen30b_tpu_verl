@@ -451,6 +451,7 @@ class FusedMoEPrepareAndFinalizeWithNaiveMulticast(FusedMoEPrepareAndFinalize):
             hidden_states = get_dp_group().all_reduce(
                 hidden_states)  # Sum across DP
             hidden_states = hidden_states[start:end, :]
+            self.cu_tokens_across_dp_cpu = None
 
         if reduce_results and (self.moe_config.tp_size > 1
                                or self.moe_config.ep_size > 1):

@@ -586,6 +586,8 @@ class TokenDispatcherWithMoge(MoETokenDispatcher):
             0, unsorted_topk_ids)
         final_hidden_states = unsorted_hidden_states.reshape(
             self.bsz, self.top_k // self.ep_size, -1).sum(1)
+        self.sorted_topk_ids = None
+        self.bsz = None
         return final_hidden_states
 
 

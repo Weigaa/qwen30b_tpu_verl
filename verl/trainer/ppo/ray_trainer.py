@@ -85,12 +85,22 @@ def _export_shrink_aware_role_plan(role_plan, shrink_cfg) -> None:
     os.environ["VLLM_ASCEND_SHRINK_AWARE_ENABLE"] = "1"
     os.environ["VLLM_ASCEND_SHRINK_AWARE_MODE"] = str(
         _shrink_cfg_get(shrink_cfg, "shrink_aware_mode", "staged")).lower()
-    os.environ["VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS"] = ",".join(
-        str(rank) for rank in role_plan.intermediate_survivor_ranks)
-    os.environ["VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS"] = ",".join(
-        str(rank) for rank in role_plan.final_survivor_ranks)
-    os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS"] = json.dumps(
-        role_plan.stage_survivor_ranks)
+    target_policy = str(_shrink_cfg_get(
+        shrink_cfg, "target_policy",
+        os.getenv("VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY",
+                  "natural"))).lower().strip()
+    os.environ["VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY"] = target_policy
+    if target_policy in ("natural", "actual", "rank_aware"):
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS"] = ""
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS"] = ""
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS"] = ""
+    else:
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS"] = ",".join(
+            str(rank) for rank in role_plan.intermediate_survivor_ranks)
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS"] = ",".join(
+            str(rank) for rank in role_plan.final_survivor_ranks)
+        os.environ["VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS"] = json.dumps(
+            role_plan.stage_survivor_ranks)
     os.environ["VLLM_ASCEND_SHRINK_AWARE_MIN_WINDOW_SECONDS"] = str(
         _shrink_cfg_get(shrink_cfg, "min_shrink_window_seconds", 1.0))
 
@@ -1278,6 +1288,17 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     beginning_gen_time = time.time()
+                    logger.info(
+                        "Elastic rollout boundary: event=rollout_generate_start "
+                        "step=%s epoch=%s async=%s batch_size=%s "
+                        "response_cap=%s shrink_aware=%s",
+                        self.global_steps,
+                        epoch,
+                        int(bool(self.async_rollout_mode)),
+                        gen_batch.batch.batch_size[0],
+                        response_cap,
+                        int(bool(shrink_aware_result.enabled)),
+                    )
                     with marked_timer("gen", timing_raw, color="red"):
                         rollout_only_profile = (
                             os.getenv("VLLM_ASCEND_DUMMY_WASTE_PROFILE_ROLLOUT_ONLY", "0")
@@ -1301,6 +1322,13 @@ class RayPPOTrainer:
                             self._restore_rollout_elastic_parallel_groups_if_needed()
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        logger.info(
+                            "Elastic rollout boundary: event=rollout_generate_done "
+                            "step=%s epoch=%s async=%s",
+                            self.global_steps,
+                            epoch,
+                            int(bool(self.async_rollout_mode)),
+                        )
 
                         restore_shrink_aware_order(
                             gen_batch_output, shrink_aware_result)
@@ -1362,6 +1390,14 @@ class RayPPOTrainer:
                     logger.info("global_token_num: %s", batch.meta_info["global_token_num"])
                     logger.info("rollout_output_time_s: %.6f", batch_time)
                     logger.info("rollouts speed tokens/s: %.6f", rollout_tokens_per_sec)
+                    logger.info(
+                        "Elastic rollout boundary: event=rollout_metrics_done "
+                        "step=%s epoch=%s rollout_time_s=%.6f tokens_per_s=%.6f",
+                        self.global_steps,
+                        epoch,
+                        batch_time,
+                        rollout_tokens_per_sec,
+                    )
                     ######
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1463,13 +1499,25 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
+                    skip_actor_update = os.getenv(
+                        "VERL_DIAG_SKIP_ACTOR_UPDATE", "0").lower() in (
+                            "1", "true", "yes", "on")
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                        if skip_actor_update:
+                            print(
+                                "[VERL_DIAG_SKIP_ACTOR_UPDATE] skip update_actor "
+                                f"at global_step={self.global_steps}",
+                                flush=True,
+                            )
+                            timing_raw["update_actor"] = 0.0
+                            metrics["diag/skip_actor_update"] = 1.0
+                        else:
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
