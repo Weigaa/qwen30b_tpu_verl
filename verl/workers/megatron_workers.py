@@ -321,6 +321,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         os.environ["HCCL_IF_BASE_PORT"] = phase_port
         logger.info("Use HCCL_IF_BASE_PORT=%s for %s init", phase_port, phase)
 
+    def _mode1_step_timeline(self, message: str, *args) -> None:
+        if (os.environ.get("VLLM_ASCEND_MODE1_STEP_TIMELINE_LOG", "1")
+                .lower() not in ("1", "true", "yes", "on")):
+            return
+        text = message % args if args else message
+        logger.info("Mode1 step timeline: %s", text)
+        print(f"[mode1_timeline] {text}", flush=True)
+
     def _build_model_optimizer(
         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None
     ):
@@ -609,10 +617,32 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
+        start_t = time.perf_counter()
+        self._mode1_step_timeline(
+            "rollout_mode_entry rank=%s free_cache_engine=%s offload_param=%s",
+            self.rank,
+            self.config.rollout.free_cache_engine,
+            self._is_offload_param,
+        )
+        empty_start_t = time.perf_counter()
         aggressive_empty_cache(force_sync=True)
+        self._mode1_step_timeline(
+            "rollout_mode_after_initial_empty_cache rank=%s elapsed_s=%.3f total_s=%.3f",
+            self.rank,
+            time.perf_counter() - empty_start_t,
+            time.perf_counter() - start_t,
+        )
 
         if self._is_offload_param:
+            load_start_t = time.perf_counter()
             load_megatron_model_to_gpu(self.actor.actor_module, load_grad=False)
+            self._mode1_step_timeline(
+                "rollout_mode_after_load_actor_to_gpu rank=%s elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                time.perf_counter() - load_start_t,
+                time.perf_counter() - start_t,
+            )
+        export_start_t = time.perf_counter()
         if self.bridge is not None:
             per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
         else:
@@ -623,37 +653,108 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 self.tf_config,
                 self.layer_name_mapping,
             )
+        self._mode1_step_timeline(
+            "rollout_mode_after_export_weights rank=%s bridge=%s elapsed_s=%.3f total_s=%.3f",
+            self.rank,
+            self.bridge is not None,
+            time.perf_counter() - export_start_t,
+            time.perf_counter() - start_t,
+        )
 
         set_expandable_segments(False)
 
         if self.config.rollout.free_cache_engine:
+            wake_weights_start_t = time.perf_counter()
             await self.rollout.resume(tags=["weights"])
+            self._mode1_step_timeline(
+                "rollout_mode_after_resume_weights rank=%s elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                time.perf_counter() - wake_weights_start_t,
+                time.perf_counter() - start_t,
+            )
+        update_start_t = time.perf_counter()
+        os.environ["VLLM_ASCEND_MODE1_CURRENT_UPDATE_STEP"] = str(
+            getattr(self, "_mode1_current_step_id", -1))
+        os.environ["VLLM_ASCEND_MODE1_CURRENT_UPDATE_EPOCH"] = str(
+            getattr(self, "_mode1_current_epoch_id", -1))
         await self.rollout.update_weights(per_tensor_param)
+        self._mode1_step_timeline(
+            "rollout_mode_after_update_weights rank=%s elapsed_s=%.3f total_s=%.3f",
+            self.rank,
+            time.perf_counter() - update_start_t,
+            time.perf_counter() - start_t,
+        )
         del per_tensor_param
         if self._is_offload_param:
+            offload_start_t = time.perf_counter()
             offload_megatron_model_to_cpu(self.actor.actor_module)
+            self._mode1_step_timeline(
+                "rollout_mode_after_offload_actor_to_cpu rank=%s elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                time.perf_counter() - offload_start_t,
+                time.perf_counter() - start_t,
+            )
+        empty_after_update_start_t = time.perf_counter()
         aggressive_empty_cache(force_sync=True)
+        self._mode1_step_timeline(
+            "rollout_mode_after_export_release_empty_cache rank=%s elapsed_s=%.3f total_s=%.3f",
+            self.rank,
+            time.perf_counter() - empty_after_update_start_t,
+            time.perf_counter() - start_t,
+        )
         log_gpu_memory_usage("After actor export generator release", logger=logger)
         if self.config.rollout.free_cache_engine:
+            wake_kv_start_t = time.perf_counter()
             await self.rollout.resume(tags=["kv_cache"])
+            self._mode1_step_timeline(
+                "rollout_mode_after_resume_kv_cache rank=%s elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                time.perf_counter() - wake_kv_start_t,
+                time.perf_counter() - start_t,
+            )
 
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
         self.rollout.eplb_start()
+        self._mode1_step_timeline(
+            "rollout_mode_done rank=%s total_s=%.3f",
+            self.rank,
+            time.perf_counter() - start_t,
+        )
 
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
+        start_t = time.perf_counter()
+        self._mode1_step_timeline(
+            "trainer_mode_entry rank=%s free_cache_engine=%s",
+            self.rank,
+            self.config.rollout.free_cache_engine,
+        )
         self.rollout.eplb_end()
         if self.config.rollout.free_cache_engine:
+            release_start_t = time.perf_counter()
             log_gpu_memory_usage("Before rollout offload", logger=logger)
             await self.rollout.release()
+            self._mode1_step_timeline(
+                "trainer_mode_after_rollout_release rank=%s elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                time.perf_counter() - release_start_t,
+                time.perf_counter() - start_t,
+            )
             log_gpu_memory_usage("After rollout offload", logger=logger)
 
         for model in self.actor.actor_module:
             model.train()
         # add empty cache after each compute
+        empty_start_t = time.perf_counter()
         aggressive_empty_cache(force_sync=True)
+        self._mode1_step_timeline(
+            "trainer_mode_after_empty_cache rank=%s elapsed_s=%.3f total_s=%.3f",
+            self.rank,
+            time.perf_counter() - empty_start_t,
+            time.perf_counter() - start_t,
+        )
 
         # FIXME(@wuxibin): megatron+sglang failed with `expandable_segments:True` in ci,
         # can't reproduce it in dev environment, temporary disable it.
@@ -664,6 +765,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # restore random states
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
+        self._mode1_step_timeline(
+            "trainer_mode_done rank=%s total_s=%.3f",
+            self.rank,
+            time.perf_counter() - start_t,
+        )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @GPUMemoryLogger(role="update_actor", logger=logger)
@@ -712,8 +818,42 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     @GPUMemoryLogger(role="generate_sequences", logger=logger)
     @DistProfiler.annotate(color="red")
     def generate_sequences(self, prompts: DataProto):
+        def _timeline(message: str, *args) -> None:
+            self._mode1_step_timeline(message, *args)
+
+        outer_start_t = time.perf_counter()
+        step_id = prompts.meta_info.get("global_steps", -1)
+        epoch_id = prompts.meta_info.get("epoch", -1)
+        self._mode1_current_step_id = step_id
+        self._mode1_current_epoch_id = epoch_id
+        try:
+            batch_shape = tuple(prompts.batch["input_ids"].shape)
+        except Exception:
+            batch_shape = ()
+        _timeline(
+            "megatron_generate_entry rank=%s step=%s epoch=%s batch_shape=%s "
+            "is_actor=%s is_rollout=%s offload_param=%s offload_optimizer=%s",
+            self.rank,
+            step_id,
+            epoch_id,
+            batch_shape,
+            self._is_actor,
+            self._is_rollout,
+            self._is_offload_param,
+            self._is_offload_optimizer,
+        )
         assert self._is_rollout
+        to_device_start_t = time.perf_counter()
         prompts = prompts.to(get_device_name())
+        _timeline(
+            "megatron_generate_after_to_device rank=%s step=%s epoch=%s "
+            "elapsed_s=%.3f total_s=%.3f",
+            self.rank,
+            step_id,
+            epoch_id,
+            time.perf_counter() - to_device_start_t,
+            time.perf_counter() - outer_start_t,
+        )
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
             if self.generation_config is not None
@@ -724,7 +864,17 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         }
         prompts.meta_info.update(meta_info)
         if self._is_offload_optimizer:
+            offload_start_t = time.perf_counter()
             offload_megatron_optimizer(self.actor_optimizer)
+            _timeline(
+                "megatron_generate_after_optimizer_offload rank=%s step=%s "
+                "epoch=%s elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                step_id,
+                epoch_id,
+                time.perf_counter() - offload_start_t,
+                time.perf_counter() - outer_start_t,
+            )
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
@@ -733,11 +883,45 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             except RuntimeError:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+            rollout_mode_start_t = time.perf_counter()
+            _timeline(
+                "megatron_rollout_mode_start rank=%s step=%s epoch=%s total_s=%.3f",
+                self.rank,
+                step_id,
+                epoch_id,
+                time.perf_counter() - outer_start_t,
+            )
             loop.run_until_complete(self.rollout_mode())
+            _timeline(
+                "megatron_rollout_mode_done rank=%s step=%s epoch=%s "
+                "elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                step_id,
+                epoch_id,
+                time.perf_counter() - rollout_mode_start_t,
+                time.perf_counter() - outer_start_t,
+            )
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
+            rollout_call_start_t = time.perf_counter()
+            _timeline(
+                "megatron_rollout_call_start rank=%s step=%s epoch=%s total_s=%.3f",
+                self.rank,
+                step_id,
+                epoch_id,
+                time.perf_counter() - outer_start_t,
+            )
             output = self.rollout.generate_sequences(prompts=prompts)
+            _timeline(
+                "megatron_rollout_call_done rank=%s step=%s epoch=%s "
+                "elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                step_id,
+                epoch_id,
+                time.perf_counter() - rollout_call_start_t,
+                time.perf_counter() - outer_start_t,
+            )
 
         from vllm_ascend import envs as envs_ascend
         elastic_shrink_enabled = (
@@ -750,7 +934,24 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 getattr(llm_engine, "elastic_ep_scaled_once", False))
 
         if self._is_actor:
+            trainer_mode_start_t = time.perf_counter()
+            _timeline(
+                "megatron_trainer_mode_start rank=%s step=%s epoch=%s total_s=%.3f",
+                self.rank,
+                step_id,
+                epoch_id,
+                time.perf_counter() - outer_start_t,
+            )
             loop.run_until_complete(self.trainer_mode())
+            _timeline(
+                "megatron_trainer_mode_done rank=%s step=%s epoch=%s "
+                "elapsed_s=%.3f total_s=%.3f",
+                self.rank,
+                step_id,
+                epoch_id,
+                time.perf_counter() - trainer_mode_start_t,
+                time.perf_counter() - outer_start_t,
+            )
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         if self._is_actor and elastic_shrink_enabled and elastic_rollout_scaled:
@@ -782,6 +983,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = output.to("cpu")
         # clear kv cache
         aggressive_empty_cache(force_sync=True)
+        _timeline(
+            "megatron_generate_done rank=%s step=%s epoch=%s total_s=%.3f",
+            self.rank,
+            step_id,
+            epoch_id,
+            time.perf_counter() - outer_start_t,
+        )
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -791,11 +999,19 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         if llm_engine is None or not hasattr(
                 llm_engine, "restore_elastic_parallel_groups_if_needed"):
             return False
+        start_t = time.perf_counter()
         logger.info(
-            "Elastic parallel restore requested after rollout: rank=%s scaled_once=%s active_ranks=%s",
+            "Mode1 step timeline: worker_restore_rpc_entry rank=%s "
+            "scaled_once=%s active_ranks=%s",
             self.rank, getattr(llm_engine, "elastic_ep_scaled_once", False),
             getattr(llm_engine, "elastic_ep_active_ranks", None))
         llm_engine.restore_elastic_parallel_groups_if_needed()
+        logger.info(
+            "Mode1 step timeline: worker_restore_rpc_done rank=%s "
+            "elapsed_s=%.3f",
+            self.rank,
+            time.perf_counter() - start_t,
+        )
         return True
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

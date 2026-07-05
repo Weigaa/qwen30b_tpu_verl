@@ -23,6 +23,7 @@
 
 from abc import ABC, abstractmethod
 import os
+import time
 from typing import Any, Optional
 
 import torch
@@ -72,6 +73,60 @@ def _log_mc2_memory(tag: str, layer_idx: int, ep_world_size: int,
         )
     except Exception as exc:
         logger.warning("MC2 memory logging failed at %s: %s", tag, exc)
+
+
+def _mode1_mc2_runtime_diag_sync(tag: str, dispatch_phase: str,
+                                 restore_seq: str, layer_idx: int,
+                                 dispatcher_id: int, group_name: str,
+                                 ep_world_size: int, ep_rank_id: int,
+                                 hidden_tokens: int) -> None:
+    if not _env_flag("VLLM_ASCEND_MODE1_MC2_RUNTIME_DIAG_SYNC", "0"):
+        return
+    sync_all_layers = _env_flag(
+        "VLLM_ASCEND_MODE1_MC2_RUNTIME_DIAG_SYNC_ALL_LAYERS", "0")
+    if (not sync_all_layers and layer_idx != 0) or dispatch_phase != "runtime" or restore_seq == "0":
+        return
+    if not torch.npu.is_available():
+        return
+    sync_start_t = time.perf_counter()
+    try:
+        torch.npu.synchronize()
+    except Exception as exc:
+        logger.exception(
+            "MC2 runtime diag sync failed: tag=%s phase=%s restore_seq=%s "
+            "dispatcher_id=%s group_name=%s layer=%s ep_world_size=%s "
+            "ep_rank=%s hidden_tokens=%s",
+            tag,
+            dispatch_phase,
+            restore_seq,
+            dispatcher_id,
+            group_name,
+            layer_idx,
+            ep_world_size,
+            ep_rank_id,
+            hidden_tokens,
+        )
+        raise RuntimeError(
+            "MC2 runtime diag sync failed at "
+            f"{tag}: phase={dispatch_phase} restore_seq={restore_seq} "
+            f"group={group_name} layer={layer_idx} "
+            f"ep_world_size={ep_world_size} ep_rank={ep_rank_id}") from exc
+    if _env_flag("VLLM_ASCEND_MODE1_MC2_RUNTIME_DIAG_SYNC_LOG_DONE", "1"):
+        logger.info(
+            "MC2 runtime diag sync done: tag=%s phase=%s restore_seq=%s "
+            "dispatcher_id=%s group_name=%s layer=%s ep_world_size=%s "
+            "ep_rank=%s hidden_tokens=%s sync_ms=%.2f",
+            tag,
+            dispatch_phase,
+            restore_seq,
+            dispatcher_id,
+            group_name,
+            layer_idx,
+            ep_world_size,
+            ep_rank_id,
+            hidden_tokens,
+            (time.perf_counter() - sync_start_t) * 1000.0,
+        )
 
 
 class MoETokenDispatcher(ABC):
@@ -137,6 +192,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         self.ep_rank_id = mc2_group.rank_in_group
         self.ep_world_size = mc2_group.world_size
+        self.mc2_group_ranks = tuple(
+            int(rank) for rank in getattr(mc2_group, "ranks", []))
+        self.mc2_group_unique_name = str(
+            getattr(mc2_group, "unique_name", "") or "")
         self.enable_dispatch_v2 = hasattr(torch_npu,
                                           "npu_moe_distribute_dispatch_v2")
         self.need_extra_args = (
@@ -160,10 +219,13 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
         if _env_flag("VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG", "0"):
             logger.info(
                 "MC2 dispatcher init: dispatcher_id=%s ranks=%s "
-                "ep_world_size=%s ep_rank=%s local_rank=%s "
-                "expert_token_nums_type=%s dispatch_v2=%s a3_extra_args=%s",
+                "unique_name=%s group_name=%s ep_world_size=%s ep_rank=%s "
+                "local_rank=%s expert_token_nums_type=%s dispatch_v2=%s "
+                "a3_extra_args=%s",
                 id(self),
-                tuple(int(rank) for rank in getattr(mc2_group, "ranks", [])),
+                self.mc2_group_ranks,
+                self.mc2_group_unique_name,
+                self.moe_all_to_all_group_name,
                 self.ep_world_size,
                 self.ep_rank_id,
                 local_rank,
@@ -263,20 +325,66 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                 layer_idx = int(debug_info.get("layer_idx", -1))
             except Exception:
                 layer_idx = -1
-        if debug_info is not None and debug_info.get("layer_idx", -1) == 0:
+        if layer_idx < 0:
+            try:
+                layer_idx = int(getattr(forward_context, "layer_idx", -1))
+            except Exception:
+                layer_idx = -1
+        dispatch_phase = os.getenv(
+            "VLLM_ASCEND_MODE1_CURRENT_DISPATCH_PHASE", "initial")
+        restore_seq = os.getenv("VLLM_ASCEND_MODE1_CURRENT_RESTORE_SEQ", "0")
+        diag_budget = max(
+            0,
+            int(
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_FULLWORLD_RESTORE_DIAG_DISPATCH_BUDGET",
+                    "4")))
+        diag_key = (dispatch_phase, restore_seq, layer_idx, self.ep_world_size)
+        diag_counts = getattr(self, "_mode1_mc2_dispatch_diag_counts", None)
+        if diag_counts is None:
+            diag_counts = {}
+            self._mode1_mc2_dispatch_diag_counts = diag_counts
+        diag_count = int(diag_counts.get(diag_key, 0))
+        should_log_restore_layer0 = (
+            layer_idx == 0
+            and _env_flag("VLLM_ASCEND_MODE1_FULLWORLD_RESTORE_DIAG", "0")
+            and diag_count < diag_budget)
+        should_log_debug_layer0 = (
+            debug_info is not None and debug_info.get("layer_idx", -1) == 0)
+        should_log_dispatch_diag = (
+            should_log_debug_layer0 or should_log_restore_layer0)
+        if should_log_dispatch_diag:
             active_mask_count = (
                 int(torch.count_nonzero(self.mc2_mask).item())
                 if self.mc2_mask is not None else -1)
+            expert_map_len = int(expert_map.numel()) if expert_map is not None else -1
+            expert_map_device = str(expert_map.device) if expert_map is not None else "none"
+            expert_map_dtype = str(expert_map.dtype) if expert_map is not None else "none"
+            mc2_mask_shape = (
+                tuple(self.mc2_mask.shape) if self.mc2_mask is not None else ())
+            mc2_mask_device = (
+                str(self.mc2_mask.device) if self.mc2_mask is not None else "none")
             logger.info(
-                "MC2 dispatch args: layer=%s ep_world_size=%s ep_rank=%s "
-                "hidden_tokens=%s topk_shape=%s moe_expert_num=%s "
+                "MC2 dispatch args: phase=%s restore_seq=%s "
+                "dispatcher_id=%s group_name=%s group_uid=%s group_ranks=%s "
+                "layer=%s ep_world_size=%s ep_rank=%s hidden_tokens=%s "
+                "topk_shape=%s topk_dtype=%s moe_expert_num=%s "
                 "dispatcher_num_experts=%s expert_token_nums_type=%s "
-                "active_mask_count=%s topk_min=%s topk_max=%s topk_unique=%s",
-                debug_info.get("layer_idx", -1),
+                "active_mask_count=%s mc2_mask_shape=%s mc2_mask_device=%s "
+                "expert_map_len=%s expert_map_device=%s expert_map_dtype=%s "
+                "topk_min=%s topk_max=%s topk_unique=%s",
+                dispatch_phase,
+                restore_seq,
+                id(self),
+                self.moe_all_to_all_group_name,
+                self.mc2_group_unique_name,
+                self.mc2_group_ranks,
+                layer_idx,
                 self.ep_world_size,
                 self.ep_rank_id,
                 int(hidden_states.shape[0]),
                 tuple(topk_ids.shape),
+                str(topk_ids.dtype),
                 int(self.get_dispatch_mc2_kwargs(hidden_states, topk_weights,
                                                  topk_ids, expert_map,
                                                  global_redundant_expert_num)
@@ -284,6 +392,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                 int(getattr(self, "num_experts", -1)),
                 int(getattr(self, "expert_token_nums_type", -1)),
                 active_mask_count,
+                mc2_mask_shape,
+                mc2_mask_device,
+                expert_map_len,
+                expert_map_device,
+                expert_map_dtype,
                 int(topk_ids.min().item()) if topk_ids.numel() > 0 else -1,
                 int(topk_ids.max().item()) if topk_ids.numel() > 0 else -1,
                 int(torch.unique(topk_ids).numel()) if topk_ids.numel() > 0 else 0,
@@ -294,10 +407,40 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
                                                   global_redundant_expert_num)
         _log_mc2_memory("before_dispatch", layer_idx, self.ep_world_size,
                         self.ep_rank_id)
+        dispatch_start_t = time.perf_counter()
         self.output = torch_npu.npu_moe_distribute_dispatch_v2(
             **kwargs_mc2
         ) if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
             **kwargs_mc2)
+        dispatch_submit_ms = (time.perf_counter() - dispatch_start_t) * 1000.0
+        if should_log_dispatch_diag:
+            logger.info(
+                "MC2 dispatch submit: phase=%s restore_seq=%s "
+                "dispatcher_id=%s group_name=%s layer=%s ep_world_size=%s "
+                "ep_rank=%s hidden_tokens=%s submit_ms=%.2f",
+                dispatch_phase,
+                restore_seq,
+                id(self),
+                self.moe_all_to_all_group_name,
+                layer_idx,
+                self.ep_world_size,
+                self.ep_rank_id,
+                int(hidden_states.shape[0]),
+                dispatch_submit_ms,
+            )
+        _mode1_mc2_runtime_diag_sync(
+            "after_dispatch_submit",
+            dispatch_phase,
+            restore_seq,
+            layer_idx,
+            id(self),
+            self.moe_all_to_all_group_name,
+            self.ep_world_size,
+            self.ep_rank_id,
+            int(hidden_states.shape[0]),
+        )
+        if should_log_restore_layer0:
+            diag_counts[diag_key] = diag_count + 1
         _log_mc2_memory("after_dispatch_submit", layer_idx, self.ep_world_size,
                         self.ep_rank_id)
         # comm_stream.wait_stream(torch.npu.current_stream())
@@ -386,15 +529,42 @@ class TokenDispatcherWithMC2(MoETokenDispatcher):
     def token_combine(self,
                       hidden_states: torch.Tensor,
                       bias: torch.Tensor = None):
+        forward_context = get_forward_context()
+        debug_info = getattr(forward_context, "elastic_debug_info", None)
+        layer_idx = -1
+        if debug_info is not None:
+            try:
+                layer_idx = int(debug_info.get("layer_idx", -1))
+            except Exception:
+                layer_idx = -1
+        if layer_idx < 0:
+            try:
+                layer_idx = int(getattr(forward_context, "layer_idx", -1))
+            except Exception:
+                layer_idx = -1
+        dispatch_phase = os.getenv(
+            "VLLM_ASCEND_MODE1_CURRENT_DISPATCH_PHASE", "initial")
+        restore_seq = os.getenv("VLLM_ASCEND_MODE1_CURRENT_RESTORE_SEQ", "0")
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states)
-        _log_mc2_memory("before_combine", -1, self.ep_world_size,
+        _log_mc2_memory("before_combine", layer_idx, self.ep_world_size,
                         self.ep_rank_id)
         hidden_states = torch_npu.npu_moe_distribute_combine_v2(
             **kwargs_mc2
         ) if self.enable_dispatch_v2 else torch_npu.npu_moe_distribute_combine(
             **kwargs_mc2)
-        _log_mc2_memory("after_combine_submit", -1, self.ep_world_size,
+        _log_mc2_memory("after_combine_submit", layer_idx, self.ep_world_size,
                         self.ep_rank_id)
+        _mode1_mc2_runtime_diag_sync(
+            "after_combine_submit",
+            dispatch_phase,
+            restore_seq,
+            layer_idx,
+            id(self),
+            self.moe_all_to_all_group_name,
+            self.ep_world_size,
+            self.ep_rank_id,
+            int(hidden_states.shape[0]),
+        )
 
         # these values are no longer used, so they need to be set to None for memory release.
         self.output = None

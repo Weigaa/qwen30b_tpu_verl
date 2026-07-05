@@ -2450,9 +2450,19 @@ class NPUWorker(WorkerBase):
 
     def clear_mode1_stale_fullname_parameter_dicts_for_kv_resize(self) -> None:
         """Release stale full-name MoE Parameter caches before new KV alloc."""
+        refreshed_eplb_adaptors = 0
         cleared_stale_param_dicts = 0
         cleared_stale_param_entries = 0
         cleared_stale_param_bytes = 0
+        try:
+            refreshed_eplb_adaptors = (
+                _refresh_mode1_eplb_adaptor_references(self.model_runner))
+        except Exception:
+            logger.exception(
+                "Failed to refresh mode1 EPLB cached parameter references "
+                "during KV resize: rank=%s",
+                self.rank,
+            )
         try:
             model = self.model_runner.get_model()
             (cleared_stale_param_dicts, cleared_stale_param_entries,
@@ -2474,9 +2484,10 @@ class NPUWorker(WorkerBase):
                 "dict cleanup")
         logger.info(
             "Mode1 adaptive KV resize stale full-name parameter caches cleared: "
-            "rank=%s cleared_stale_param_dicts=%s "
+            "rank=%s refreshed_eplb_adaptors=%s cleared_stale_param_dicts=%s "
             "cleared_stale_param_entries=%s cleared_stale_param_bytes=%s",
             self.rank,
+            refreshed_eplb_adaptors,
             cleared_stale_param_dicts,
             cleared_stale_param_entries,
             cleared_stale_param_bytes,
@@ -2652,6 +2663,30 @@ class NPUWorker(WorkerBase):
                                                min_bytes=64 * 1024 * 1024,
                                                seen_objects=set(),
                                                max_depth=4)
+            for attr in ("eplb_adaptor", "adaptor"):
+                value = getattr(self.model_runner, attr, None)
+                known[f"model_runner.{attr}"] = _tensor_tree_storage_nbytes(value)
+                _append_large_npu_tensor_paths(
+                    value,
+                    f"model_runner.{attr}",
+                    owner_hits,
+                    min_bytes=64 * 1024 * 1024,
+                    seen_objects=set(),
+                    max_depth=5)
+            for owner_name in ("model", "model_runner.model"):
+                owner = model if owner_name == "model" else getattr(
+                    self.model_runner, "model", None)
+                for attr in ("eplb_adaptor", "adaptor"):
+                    value = getattr(owner, attr, None)
+                    known[f"{owner_name}.{attr}"] = (
+                        _tensor_tree_storage_nbytes(value))
+                    _append_large_npu_tensor_paths(
+                        value,
+                        f"{owner_name}.{attr}",
+                        owner_hits,
+                        min_bytes=64 * 1024 * 1024,
+                        seen_objects=set(),
+                        max_depth=5)
             try:
                 from vllm.forward_context import get_forward_context
                 forward_context = get_forward_context()
@@ -2747,7 +2782,393 @@ class NPUWorker(WorkerBase):
             ";".join(stale_referrers),
         )
 
-    def prepare_mode1_step_floor_for_kv_resize(self, target_floor: int) -> bool:
+    def _cleanup_mode1_upward_floor_residue_for_kv_resize(
+            self, target_floor: int, previous_floor: Optional[int],
+            world_size: int) -> dict[str, Any]:
+        """Compact low-floor MoE runtime state before growing shrink floor.
+
+        Moving from a deeper shrink floor to a shallower one, for example
+        floor2->floor4, must release the larger temporary expert storage that
+        was materialized by the deeper floor.  Otherwise KV profiling for the
+        next step sees the stale floor2 resident weights and badly underestimates
+        available KV memory.
+        """
+        stats: dict[str, Any] = {
+            "changed": 0.0,
+            "restored_layers": 0,
+            "compacted_layers": 0,
+            "released_model_slot_caches": 0,
+            "refreshed_eplb_adaptors": 0,
+            "cleared_stale_param_dicts": 0,
+            "cleared_stale_param_entries": 0,
+            "cleared_stale_param_bytes": 0,
+            "moe_weight_bytes": 0,
+            "moe_runtime_bytes": 0,
+            "release_ms": 0.0,
+            "pre_compact_empty_cache_ms": 0.0,
+            "restore_layout_ms": 0.0,
+            "eplb_ms": 0.0,
+            "stale_param_ms": 0.0,
+            "sync_ms": 0.0,
+        }
+        target_loaded_capacity_hint = 0
+        try:
+            target_floor_int = int(target_floor)
+            if target_floor_int > 0:
+                target_loaded_capacity_hint = max(0, 128 // target_floor_int)
+        except Exception:
+            target_loaded_capacity_hint = 0
+        target_loaded_capacity_hist: dict[int, int] = {}
+        model = None
+        try:
+            model = self.model_runner.get_model()
+        except Exception:
+            logger.exception(
+                "Failed to fetch model for mode1 upward-floor cleanup: "
+                "rank=%s previous_floor=%s target_floor=%s",
+                self.rank,
+                previous_floor,
+                target_floor,
+            )
+            return stats
+        if model is None:
+            return stats
+
+        released_model_slot_caches = 0
+        release_start_t = time.perf_counter()
+        try:
+            from vllm.forward_context import get_forward_context
+            try:
+                forward_context = get_forward_context()
+            except AssertionError:
+                forward_context = None
+            if hasattr(forward_context, "moe_double_buffer_manager"):
+                released_model_slot_caches += _release_mode1_double_buffer_owner(
+                    getattr(forward_context, "moe_double_buffer_manager", None))
+                setattr(forward_context, "moe_double_buffer_manager", None)
+                released_model_slot_caches += 1
+        except Exception:
+            logger.exception(
+                "Failed to release forward-context mode1 double-buffer cache "
+                "during upward-floor cleanup: rank=%s",
+                self.rank,
+            )
+        if hasattr(model, "_mode3_double_buffer_manager"):
+            try:
+                released_model_slot_caches += _release_mode1_double_buffer_owner(
+                    getattr(model, "_mode3_double_buffer_manager", None))
+                setattr(model, "_mode3_double_buffer_manager", None)
+                released_model_slot_caches += 1
+            except Exception:
+                logger.exception(
+                    "Failed to release model-level mode1 manager cache during "
+                    "upward-floor cleanup: rank=%s",
+                    self.rank,
+                )
+        for slot_attr in ("_mode3_cpu_npu_double_buffer_slots",
+                          "_mode4_remote_npu_double_buffer_slots"):
+            if hasattr(model, slot_attr):
+                try:
+                    released_model_slot_caches += _release_mode1_double_buffer_owner(
+                        getattr(model, slot_attr, None))
+                    setattr(model, slot_attr, None)
+                    released_model_slot_caches += 1
+                except Exception:
+                    logger.exception(
+                        "Failed to release model-level mode1 slot cache during "
+                        "upward-floor cleanup: rank=%s attr=%s",
+                        self.rank,
+                        slot_attr,
+                    )
+
+        restored_layers = 0
+        compacted_layers = 0
+        incremental_stale_param_dicts = 0
+        incremental_stale_param_entries = 0
+        incremental_stale_param_bytes = 0
+        compact_release_every = max(1, int(os.getenv(
+            "VLLM_ASCEND_MODE1_UPWARD_COMPACT_RELEASE_EVERY_LAYERS", "48")))
+        moe_weight_bytes = 0
+        moe_runtime_bytes = 0
+        moe_loaded_capacity_hist: dict[int, int] = {}
+        moe_weight_shape_hist: dict[str, int] = {}
+        restore_layout_start_t = time.perf_counter()
+        pre_compact_empty_cache_ms = 0.0
+        if _env_flag("VLLM_ASCEND_MODE1_EMPTY_CACHE_BEFORE_UPWARD_COMPACT",
+                     "1"):
+            pre_compact_empty_cache_start_t = time.perf_counter()
+            gc.collect()
+            try:
+                torch.npu.empty_cache()
+            except Exception:
+                logger.exception(
+                    "Failed to empty NPU cache before upward compact: rank=%s",
+                    self.rank,
+                )
+            pre_compact_empty_cache_ms = (
+                time.perf_counter() - pre_compact_empty_cache_start_t
+            ) * 1000.0
+        for module in model.modules():
+            if not _is_ascend_fused_moe_module(module):
+                continue
+            if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+                continue
+            if not _module_uses_lossless_elastic(module):
+                continue
+            restore_fn = getattr(module,
+                                 "restore_lossless_full_world_primary_layout",
+                                 None)
+            if callable(restore_fn):
+                restore_fn()
+            elif hasattr(module, "reset_expert_map_and_log2phy"):
+                module.reset_expert_map_and_log2phy()
+            release_transient_fn = getattr(
+                module, "release_mode1_full_world_transient_state", None)
+            if callable(release_transient_fn):
+                release_transient_fn()
+            if hasattr(module, "_mode3_double_buffer_manager"):
+                try:
+                    released_model_slot_caches += _release_mode1_double_buffer_owner(
+                        getattr(module, "_mode3_double_buffer_manager", None))
+                    setattr(module, "_mode3_double_buffer_manager", None)
+                except Exception:
+                    logger.exception(
+                        "Failed to release module mode1 manager cache during "
+                        "upward-floor cleanup: rank=%s layer=%s",
+                        self.rank,
+                        getattr(module, "layer_idx", "?"),
+                    )
+            compact_fn = getattr(module,
+                                 "shrink_lossless_loaded_weights_to_primary",
+                                 None)
+            target_loaded_capacity = target_loaded_capacity_hint
+            try:
+                reserve_fn = getattr(module,
+                                     "_get_reserved_local_expert_slots_for_floor",
+                                     None)
+                if callable(reserve_fn):
+                    target_loaded_capacity = int(reserve_fn(int(target_floor)))
+            except Exception:
+                target_loaded_capacity = target_loaded_capacity_hint
+            if callable(compact_fn) and compact_fn(
+                    min_capacity=target_loaded_capacity):
+                compacted_layers += 1
+                if compacted_layers % compact_release_every == 0:
+                    if _env_flag(
+                            "VLLM_ASCEND_MODE1_CLEAR_STALE_PARAMS_DURING_UPWARD_COMPACT",
+                            "0"):
+                        try:
+                            (inc_dicts, inc_entries, inc_bytes) = (
+                                _clear_stale_mode1_fullname_parameter_dicts(
+                                    model))
+                            incremental_stale_param_dicts += inc_dicts
+                            incremental_stale_param_entries += inc_entries
+                            incremental_stale_param_bytes += inc_bytes
+                        except Exception:
+                            logger.exception(
+                                "Failed to clear stale mode1 parameter dicts during "
+                                "upward compact: rank=%s compacted_layers=%s",
+                                self.rank,
+                                compacted_layers,
+                            )
+                    if _env_flag(
+                            "VLLM_ASCEND_MODE1_EMPTY_CACHE_DURING_UPWARD_COMPACT",
+                            "0"):
+                        gc.collect()
+                        try:
+                            torch.npu.empty_cache()
+                            torch.npu.synchronize()
+                        except Exception:
+                            logger.exception(
+                                "Failed to empty/sync NPU cache during upward "
+                                "compact: rank=%s compacted_layers=%s",
+                                self.rank,
+                                compacted_layers,
+                            )
+            target_loaded_capacity_hist[target_loaded_capacity] = (
+                target_loaded_capacity_hist.get(target_loaded_capacity, 0) + 1)
+            _set_module_active_expert_mask(module, None)
+            _set_module_elastic_runtime_log2phy(module, None)
+            original_num_experts = getattr(module,
+                                           "elastic_original_num_experts",
+                                           None)
+            if original_num_experts is not None:
+                module.num_experts = int(original_num_experts)
+                module.moe_config.num_experts = int(original_num_experts)
+            quant_method = getattr(module, "quant_method", None)
+            if (quant_method is not None and hasattr(
+                    quant_method,
+                    "invalidate_lossless_runtime_state_for_reload")):
+                quant_method.invalidate_lossless_runtime_state_for_reload(
+                    layer=module, reason="mode1_upward_floor_kv_resize")
+            else:
+                module.runtime_w13_weight = None
+                module.runtime_w2_weight = None
+                module.runtime_w13_buffer = None
+                module.runtime_w2_buffer = None
+                module.runtime_weight_capacity = 0
+                module.lossless_runtime_activated = False
+            restored_layers += 1
+            try:
+                w13 = getattr(module, "w13_weight", None)
+                w2 = getattr(module, "w2_weight", None)
+                for tensor in (w13, w2):
+                    if isinstance(tensor, torch.Tensor):
+                        try:
+                            moe_weight_bytes += int(
+                                tensor.untyped_storage().nbytes())
+                        except Exception:
+                            moe_weight_bytes += (int(tensor.numel()) *
+                                                 int(tensor.element_size()))
+                runtime_w13 = getattr(module, "runtime_w13_buffer", None)
+                runtime_w2 = getattr(module, "runtime_w2_buffer", None)
+                for tensor in (runtime_w13, runtime_w2):
+                    if isinstance(tensor, torch.Tensor):
+                        try:
+                            moe_runtime_bytes += int(
+                                tensor.untyped_storage().nbytes())
+                        except Exception:
+                            moe_runtime_bytes += (int(tensor.numel()) *
+                                                  int(tensor.element_size()))
+                capacity = int(getattr(module, "loaded_weight_capacity", -1))
+                moe_loaded_capacity_hist[capacity] = (
+                    moe_loaded_capacity_hist.get(capacity, 0) + 1)
+                shape_key = (
+                    f"{tuple(getattr(w13, 'shape', ()))}/"
+                    f"{tuple(getattr(w2, 'shape', ()))}")
+                moe_weight_shape_hist[shape_key] = (
+                    moe_weight_shape_hist.get(shape_key, 0) + 1)
+            except Exception:
+                logger.exception(
+                    "Failed to collect mode1 upward-floor cleanup memory stats: "
+                    "rank=%s",
+                    self.rank,
+                )
+        restore_layout_ms = (time.perf_counter() -
+                             restore_layout_start_t) * 1000.0
+
+        post_compact_sync_start_t = time.perf_counter()
+        post_compact_sync_ms = 0.0
+        if compacted_layers > 0 and _env_flag(
+                "VLLM_ASCEND_MODE1_EMPTY_CACHE_AFTER_UPWARD_COMPACT", "1"):
+            gc.collect()
+            try:
+                torch.npu.empty_cache()
+                torch.npu.synchronize()
+            except Exception:
+                logger.exception(
+                    "Failed to empty/sync NPU cache after upward compact: rank=%s",
+                    self.rank,
+                )
+            post_compact_sync_ms = (
+                time.perf_counter() - post_compact_sync_start_t) * 1000.0
+
+        eplb_start_t = time.perf_counter()
+        refreshed_eplb_adaptors = 0
+        try:
+            refreshed_eplb_adaptors = (
+                _refresh_mode1_eplb_adaptor_references(self.model_runner))
+        except Exception:
+            logger.exception(
+                "Failed to refresh mode1 EPLB cached parameter references "
+                "during upward-floor cleanup: rank=%s",
+                self.rank,
+            )
+        eplb_ms = (time.perf_counter() - eplb_start_t) * 1000.0
+
+        stale_param_start_t = time.perf_counter()
+        cleared_stale_param_dicts = 0
+        cleared_stale_param_entries = 0
+        cleared_stale_param_bytes = 0
+        try:
+            (cleared_stale_param_dicts, cleared_stale_param_entries,
+             cleared_stale_param_bytes) = (
+                 _clear_stale_mode1_fullname_parameter_dicts(model))
+            cleared_stale_param_dicts += incremental_stale_param_dicts
+            cleared_stale_param_entries += incremental_stale_param_entries
+            cleared_stale_param_bytes += incremental_stale_param_bytes
+        except Exception:
+            logger.exception(
+                "Failed to clear stale mode1 full-name parameter dicts during "
+                "upward-floor cleanup: rank=%s",
+                self.rank,
+            )
+            cleared_stale_param_dicts += incremental_stale_param_dicts
+            cleared_stale_param_entries += incremental_stale_param_entries
+            cleared_stale_param_bytes += incremental_stale_param_bytes
+        stale_param_ms = (time.perf_counter() - stale_param_start_t) * 1000.0
+
+        sync_start_t = time.perf_counter()
+        if _env_flag("VLLM_ASCEND_MODE1_UPWARD_CLEANUP_FINAL_EMPTY_CACHE",
+                     "1"):
+            gc.collect()
+            try:
+                torch.npu.empty_cache()
+                torch.npu.synchronize()
+            except Exception:
+                logger.exception(
+                    "Failed to empty/sync NPU cache after upward-floor cleanup")
+        release_ms = (restore_layout_start_t - release_start_t) * 1000.0
+        sync_ms = (time.perf_counter() - sync_start_t) * 1000.0
+        stats.update({
+            "changed": float(restored_layers > 0 or compacted_layers > 0
+                             or released_model_slot_caches > 0
+                             or cleared_stale_param_entries > 0),
+            "restored_layers": restored_layers,
+            "compacted_layers": compacted_layers,
+            "released_model_slot_caches": released_model_slot_caches,
+            "refreshed_eplb_adaptors": refreshed_eplb_adaptors,
+            "cleared_stale_param_dicts": cleared_stale_param_dicts,
+            "cleared_stale_param_entries": cleared_stale_param_entries,
+            "cleared_stale_param_bytes": cleared_stale_param_bytes,
+            "moe_weight_bytes": moe_weight_bytes,
+            "moe_runtime_bytes": moe_runtime_bytes,
+            "release_ms": release_ms,
+            "pre_compact_empty_cache_ms": pre_compact_empty_cache_ms,
+            "restore_layout_ms": restore_layout_ms,
+            "eplb_ms": eplb_ms,
+            "stale_param_ms": stale_param_ms,
+            "sync_ms": sync_ms,
+            "post_compact_sync_ms": post_compact_sync_ms,
+            "target_loaded_capacity": target_loaded_capacity_hint,
+            "target_loaded_capacity_hist": target_loaded_capacity_hist,
+        })
+        if restored_layers > 0:
+            logger.info(
+                "Mode1 upward floor cleanup compacted low-floor MoE residue: "
+                "rank=%s previous_floor=%s target_floor=%s world_size=%s "
+                "target_loaded_capacity_hint=%s target_loaded_capacity_hist=%s "
+                "layers=%s compacted_layers=%s "
+                "released_model_slot_caches=%s refreshed_eplb_adaptors=%s "
+                "cleared_stale_param_dicts=%s cleared_stale_param_entries=%s "
+                "cleared_stale_param_bytes=%s moe_weight_bytes=%s "
+                "moe_runtime_bytes=%s loaded_capacity_hist=%s "
+                "weight_shape_hist=%s post_compact_sync_ms=%.2f",
+                self.rank,
+                previous_floor,
+                target_floor,
+                world_size,
+                target_loaded_capacity_hint,
+                target_loaded_capacity_hist,
+                restored_layers,
+                compacted_layers,
+                released_model_slot_caches,
+                refreshed_eplb_adaptors,
+                cleared_stale_param_dicts,
+                cleared_stale_param_entries,
+                cleared_stale_param_bytes,
+                moe_weight_bytes,
+                moe_runtime_bytes,
+                moe_loaded_capacity_hist,
+                moe_weight_shape_hist,
+                post_compact_sync_ms,
+            )
+        return stats
+
+    def prepare_mode1_step_floor_for_kv_resize(
+            self,
+            target_floor: int,
+            previous_floor: Optional[int] = None) -> bool:
         """Adjust mode=1 resident MoE slots before per-step KV resizing.
 
         A full-world step needs the largest KV cache budget and should not keep
@@ -2756,21 +3177,97 @@ class NPUWorker(WorkerBase):
         full-world layout and clear per-shrink masks instead of keeping the
         low-floor parity runtime active.
         """
+        total_start_t = time.perf_counter()
+        timeline_log = _env_flag("VLLM_ASCEND_MODE1_STEP_TIMELINE_LOG", "1")
         try:
             target_floor = int(target_floor)
         except (TypeError, ValueError):
             return False
+        try:
+            previous_floor_int = (int(previous_floor)
+                                  if previous_floor is not None else None)
+        except (TypeError, ValueError):
+            previous_floor_int = None
         world_size = int(torch.distributed.get_world_size()
                          if torch.distributed.is_available()
                          and torch.distributed.is_initialized() else 1)
+        upward_floor_transition = (
+            previous_floor_int is not None
+            and target_floor > previous_floor_int
+            and previous_floor_int > 0)
+        if timeline_log:
+            logger.info(
+                "Mode1 step timeline: floor_prepare_worker_start rank=%s "
+                "target_floor=%s previous_floor=%s world_size=%s "
+                "upward_floor_transition=%s",
+                self.rank,
+                target_floor,
+                previous_floor_int,
+                world_size,
+                upward_floor_transition,
+            )
+        prune_start_t = time.perf_counter()
         prune_stats = self._prune_mode1_planned_floor_groups_for_current_step(
             target_floor, "kv_resize_prepare")
+        prune_ms = (time.perf_counter() - prune_start_t) * 1000.0
         if target_floor < world_size:
+            cleanup_stats: dict[str, Any] = {}
+            cleanup_ms = 0.0
+            if (upward_floor_transition and _env_flag(
+                    "VLLM_ASCEND_MODE1_CLEANUP_ON_UPWARD_FLOOR_RESIZE",
+                    "1")):
+                cleanup_start_t = time.perf_counter()
+                cleanup_stats = (
+                    self._cleanup_mode1_upward_floor_residue_for_kv_resize(
+                        target_floor, previous_floor_int, world_size))
+                cleanup_ms = (time.perf_counter() -
+                              cleanup_start_t) * 1000.0
+            precreate_start_t = time.perf_counter()
             precreate_stats = (
                 self._precreate_mode1_planned_floor_groups_before_kv_cache(
                     prefill_expert_slots=False))
+            precreate_ms = (time.perf_counter() - precreate_start_t) * 1000.0
+            if timeline_log:
+                logger.info(
+                    "Mode1 step timeline: floor_prepare_worker_done rank=%s "
+                    "target_floor=%s previous_floor=%s branch=shrink "
+                    "upward_floor_transition=%s prune_ms=%.2f "
+                    "upward_cleanup_ms=%.2f precreate_ms=%.2f "
+                    "total_ms=%.2f prune_changed=%.0f "
+                    "cleanup_changed=%.0f cleanup_restored_layers=%s "
+                    "cleanup_compacted_layers=%s "
+                    "cleanup_cleared_stale_param_bytes=%s "
+                    "cleanup_release_ms=%.2f "
+                    "cleanup_pre_compact_empty_cache_ms=%.2f "
+                    "cleanup_restore_layout_ms=%.2f cleanup_eplb_ms=%.2f "
+                    "cleanup_stale_param_ms=%.2f "
+                    "cleanup_sync_ms=%.2f cleanup_post_compact_sync_ms=%.2f "
+                    "precreate_stage_groups=%.0f",
+                    self.rank,
+                    target_floor,
+                    previous_floor_int,
+                    upward_floor_transition,
+                    prune_ms,
+                    cleanup_ms,
+                    precreate_ms,
+                    (time.perf_counter() - total_start_t) * 1000.0,
+                    prune_stats.get("changed", 0.0),
+                    cleanup_stats.get("changed", 0.0),
+                    cleanup_stats.get("restored_layers", 0),
+                    cleanup_stats.get("compacted_layers", 0),
+                    cleanup_stats.get("cleared_stale_param_bytes", 0),
+                    cleanup_stats.get("release_ms", 0.0),
+                    cleanup_stats.get("pre_compact_empty_cache_ms", 0.0),
+                    cleanup_stats.get("restore_layout_ms", 0.0),
+                    cleanup_stats.get("eplb_ms", 0.0),
+                    cleanup_stats.get("stale_param_ms", 0.0),
+                    cleanup_stats.get("sync_ms", 0.0),
+                    cleanup_stats.get("post_compact_sync_ms", 0.0),
+                    precreate_stats.get("stage_groups", 0.0),
+                )
             return bool(
                 prune_stats.get("changed", 0.0) > 0.0
+                or cleanup_stats.get("changed", 0.0) > 0.0
                 or precreate_stats.get("stage_groups", 0.0) > 0.0)
 
         model = None
@@ -2783,6 +3280,7 @@ class NPUWorker(WorkerBase):
             return False
 
         released_model_slot_caches = 0
+        release_start_t = time.perf_counter()
         try:
             from vllm.forward_context import get_forward_context
             try:
@@ -2826,7 +3324,7 @@ class NPUWorker(WorkerBase):
                         "rank=%s attr=%s",
                         self.rank,
                         slot_attr,
-                    )
+	                    )
 
         restored_layers = 0
         compacted_layers = 0
@@ -2838,6 +3336,7 @@ class NPUWorker(WorkerBase):
         moe_runtime_bytes = 0
         moe_loaded_capacity_hist: dict[int, int] = {}
         moe_weight_shape_hist: dict[str, int] = {}
+        restore_layout_start_t = time.perf_counter()
         for module in model.modules():
             if not _is_ascend_fused_moe_module(module):
                 continue
@@ -2929,7 +3428,9 @@ class NPUWorker(WorkerBase):
                     "Failed to collect mode1 MoE compact memory stats: rank=%s",
                     self.rank,
                 )
+        restore_layout_ms = (time.perf_counter() - restore_layout_start_t) * 1000.0
 
+        eplb_start_t = time.perf_counter()
         try:
             refreshed_eplb_adaptors = (
                 _refresh_mode1_eplb_adaptor_references(self.model_runner))
@@ -2939,7 +3440,9 @@ class NPUWorker(WorkerBase):
                 "rank=%s",
                 self.rank,
             )
+        eplb_ms = (time.perf_counter() - eplb_start_t) * 1000.0
 
+        stale_param_start_t = time.perf_counter()
         try:
             (cleared_stale_param_dicts, cleared_stale_param_entries,
              cleared_stale_param_bytes) = (
@@ -2949,13 +3452,17 @@ class NPUWorker(WorkerBase):
                 "Failed to clear stale mode1 full-name parameter dicts: rank=%s",
                 self.rank,
             )
+        stale_param_ms = (time.perf_counter() - stale_param_start_t) * 1000.0
 
+        sync_start_t = time.perf_counter()
         gc.collect()
         try:
             torch.npu.empty_cache()
             torch.npu.synchronize()
         except Exception:
             logger.exception("Failed to empty/sync NPU cache after floor prep")
+        release_ms = (restore_layout_start_t - release_start_t) * 1000.0
+        sync_ms = (time.perf_counter() - sync_start_t) * 1000.0
         if restored_layers > 0:
             logger.info(
                 "Mode1 step floor preparation restored full-world layout: "
@@ -2981,6 +3488,27 @@ class NPUWorker(WorkerBase):
                 moe_runtime_bytes,
                 moe_loaded_capacity_hist,
                 moe_weight_shape_hist,
+            )
+        if timeline_log:
+            logger.info(
+                "Mode1 step timeline: floor_prepare_worker_done rank=%s "
+                "target_floor=%s branch=fullworld prune_ms=%.2f "
+                "release_ms=%.2f restore_layout_ms=%.2f eplb_ms=%.2f "
+                "stale_param_ms=%.2f sync_ms=%.2f total_ms=%.2f "
+                "restored_layers=%s compacted_layers=%s "
+                "released_model_slot_caches=%s",
+                self.rank,
+                target_floor,
+                prune_ms,
+                release_ms,
+                restore_layout_ms,
+                eplb_ms,
+                stale_param_ms,
+                sync_ms,
+                (time.perf_counter() - total_start_t) * 1000.0,
+                restored_layers,
+                compacted_layers,
+                released_model_slot_caches,
             )
         return restored_layers > 0
 
@@ -4023,11 +4551,47 @@ class NPUWorker(WorkerBase):
         payload_remote_state_gather_ms = 0.0
         payload_store_ms = 0.0
         payload_module_count = 0
+        source_group_world_size = -1
+        try:
+            source_group_world_size = torch.distributed.get_world_size(
+                group=source_cpu_group)
+        except Exception:
+            source_group_world_size = -1
         if current_rank == source_ranks[0]:
             logger.info(
-                "Elastic shrink payload source group: rank=%s active_ranks=%s source_ranks=%s previous_active_ranks=%s",
-                current_rank, active_ranks, source_ranks, previous_active_ranks)
-        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (2, 3, 4, 5):
+                "Elastic shrink payload source group: rank=%s active_ranks=%s "
+                "source_ranks=%s previous_active_ranks=%s "
+                "source_group_world_size=%s",
+                current_rank, active_ranks, source_ranks,
+                previous_active_ranks, source_group_world_size)
+        mode1_payload_barrier = (
+            envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
+            and _env_flag("VLLM_ASCEND_MODE1_PAYLOAD_SOURCE_BARRIER", "1"))
+        if mode1_payload_barrier:
+            logger.info(
+                "Elastic shrink payload source p2p barrier enter: rank=%s "
+                "active_ranks=%s source_ranks=%s previous_active_ranks=%s",
+                current_rank, active_ranks, source_ranks,
+                previous_active_ranks)
+            barrier_start_t = time.perf_counter()
+            try:
+                self._mode1_source_cpu_p2p_barrier(
+                    source_ranks, world_group,
+                    38128 + len(active_ranks) * 10)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Elastic mode1 shrink payload source p2p barrier failed; "
+                    "source ranks did not enter payload preparation together. "
+                    f"rank={current_rank} active_ranks={active_ranks} "
+                    f"source_ranks={source_ranks} "
+                    f"previous_active_ranks={previous_active_ranks}") from exc
+            payload_barrier_ms = (time.perf_counter() -
+                                  barrier_start_t) * 1000.0
+            logger.info(
+                "Elastic shrink payload source p2p barrier done: rank=%s "
+                "active_ranks=%s source_ranks=%s total_ms=%.2f",
+                current_rank, active_ranks, source_ranks, payload_barrier_ms)
+        elif envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (2, 3, 4, 5):
             logger.info(
                 "Elastic shrink payload source barrier enter: rank=%s active_ranks=%s source_ranks=%s previous_active_ranks=%s",
                 current_rank, active_ranks, source_ranks,
@@ -4050,6 +4614,102 @@ class NPUWorker(WorkerBase):
             logger.info(
                 "Elastic shrink payload source barrier done: rank=%s active_ranks=%s source_ranks=%s",
                 current_rank, active_ranks, source_ranks)
+
+        payload_gather_trace = (
+            envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
+            and _env_flag("VLLM_ASCEND_MODE1_PAYLOAD_GATHER_TRACE", "0"))
+        try:
+            payload_gather_trace_modules = int(
+                os.getenv("VLLM_ASCEND_MODE1_PAYLOAD_GATHER_TRACE_MODULES",
+                          "1"))
+        except ValueError:
+            payload_gather_trace_modules = 1
+        payload_planning_diag = (
+            envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
+            and _env_flag("VLLM_ASCEND_MODE1_PAYLOAD_PLANNING_DIAG", "1"))
+
+        def _mode1_map_summary(tensor: torch.Tensor) -> dict[str, Any]:
+            values = [int(value) for value in tensor.reshape(-1).tolist()]
+            slots = [value for value in values if value >= 0]
+            sorted_slots = sorted(slots)
+            expected_prefix = list(range(len(sorted_slots)))
+            missing_prefix = [
+                value for value in expected_prefix
+                if value not in set(sorted_slots)
+            ][:8]
+            duplicate_slots = sorted({
+                value
+                for value in slots
+                if slots.count(value) > 1
+            })[:8]
+            expert_head = [
+                idx for idx, value in enumerate(values)
+                if int(value) >= 0
+            ][:8]
+            return {
+                "n": len(slots),
+                "min": min(slots) if slots else -1,
+                "max": max(slots) if slots else -1,
+                "unique": len(set(slots)),
+                "prefix": sorted_slots == expected_prefix,
+                "missing_prefix_head": missing_prefix,
+                "duplicate_slots_head": duplicate_slots,
+                "expert_head": expert_head,
+            }
+
+        def _mode1_rank_map_summaries(
+                maps_by_rank: dict[int, torch.Tensor]) -> dict[int, dict[str, Any]]:
+            return {
+                int(rank): _mode1_map_summary(tensor)
+                for rank, tensor in maps_by_rank.items()
+            }
+
+        def _mode1_rows_summary(rows_by_rank: dict[int, int]) -> dict[str, Any]:
+            rows = [int(value) for value in rows_by_rank.values()]
+            return {
+                "min": min(rows) if rows else -1,
+                "max": max(rows) if rows else -1,
+                "unique": sorted(set(rows)),
+                "by_rank": {int(rank): int(value)
+                            for rank, value in rows_by_rank.items()},
+            }
+
+        def _payload_all_gather(output_tensors: list[torch.Tensor],
+                                input_tensor: torch.Tensor, op_name: str,
+                                layer_idx: Any,
+                                module_count: int) -> None:
+            trace_this = (payload_gather_trace
+                          and module_count <= payload_gather_trace_modules)
+            gather_start_t = time.perf_counter()
+            if trace_this:
+                logger.info(
+                    "Elastic shrink payload metadata gather enter: rank=%s "
+                    "op=%s layer=%s module_idx=%s active_ranks=%s "
+                    "source_ranks=%s source_group_world_size=%s shape=%s "
+                    "dtype=%s",
+                    current_rank, op_name, layer_idx, module_count,
+                    active_ranks, source_ranks, source_group_world_size,
+                    tuple(input_tensor.shape), input_tensor.dtype)
+            try:
+                torch.distributed.all_gather(output_tensors,
+                                             input_tensor,
+                                             group=source_cpu_group)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Elastic shrink payload metadata all_gather failed. "
+                    f"rank={current_rank} op={op_name} layer={layer_idx} "
+                    f"module_idx={module_count} active_ranks={active_ranks} "
+                    f"source_ranks={source_ranks} "
+                    f"previous_active_ranks={previous_active_ranks} "
+                    f"source_group_world_size={source_group_world_size} "
+                    f"shape={tuple(input_tensor.shape)} "
+                    f"dtype={input_tensor.dtype}") from exc
+            if trace_this:
+                logger.info(
+                    "Elastic shrink payload metadata gather done: rank=%s "
+                    "op=%s layer=%s module_idx=%s total_ms=%.2f",
+                    current_rank, op_name, layer_idx, module_count,
+                    (time.perf_counter() - gather_start_t) * 1000.0)
 
         for module in model.modules():
             if not _is_ascend_fused_moe_module(module):
@@ -4075,9 +4735,10 @@ class NPUWorker(WorkerBase):
                 torch.empty_like(local_loaded_expert_map_cpu)
                 for _ in range(len(source_ranks))
             ]
-            torch.distributed.all_gather(gathered_loaded_maps_source,
-                                         local_loaded_expert_map_cpu,
-                                         group=source_cpu_group)
+            _payload_all_gather(gathered_loaded_maps_source,
+                                local_loaded_expert_map_cpu,
+                                "loaded_expert_map", module.layer_idx,
+                                payload_module_count)
             gathered_loaded_maps_by_rank = {
                 source_ranks[idx]: gathered_loaded_maps_source[idx]
                 for idx in range(len(source_ranks))
@@ -4088,9 +4749,9 @@ class NPUWorker(WorkerBase):
                 torch.empty_like(resident_expert_map)
                 for _ in range(len(source_ranks))
             ]
-            torch.distributed.all_gather(gathered_resident_maps_source,
-                                         resident_expert_map,
-                                         group=source_cpu_group)
+            _payload_all_gather(gathered_resident_maps_source,
+                                resident_expert_map, "resident_expert_map",
+                                module.layer_idx, payload_module_count)
             gathered_resident_maps_by_rank = {
                 source_ranks[idx]: gathered_resident_maps_source[idx]
                 for idx in range(len(source_ranks))
@@ -4103,9 +4764,9 @@ class NPUWorker(WorkerBase):
             gathered_w13_rows = [
                 torch.empty_like(local_w13_rows) for _ in range(len(source_ranks))
             ]
-            torch.distributed.all_gather(gathered_w13_rows,
-                                         local_w13_rows,
-                                         group=source_cpu_group)
+            _payload_all_gather(gathered_w13_rows, local_w13_rows,
+                                "w13_rows", module.layer_idx,
+                                payload_module_count)
             w13_rows_by_rank = {
                 source_ranks[idx]: int(gathered_w13_rows[idx].item())
                 for idx in range(len(source_ranks))
@@ -4118,15 +4779,44 @@ class NPUWorker(WorkerBase):
             gathered_w2_rows = [
                 torch.empty_like(local_w2_rows) for _ in range(len(source_ranks))
             ]
-            torch.distributed.all_gather(gathered_w2_rows,
-                                         local_w2_rows,
-                                         group=source_cpu_group)
+            _payload_all_gather(gathered_w2_rows, local_w2_rows, "w2_rows",
+                                module.layer_idx, payload_module_count)
             w2_rows_by_rank = {
                 source_ranks[idx]: int(gathered_w2_rows[idx].item())
                 for idx in range(len(source_ranks))
             }
             payload_metadata_gather_ms += (
                 time.perf_counter() - metadata_gather_start_t) * 1000.0
+            trace_module = (payload_gather_trace
+                            and payload_module_count
+                            <= payload_gather_trace_modules)
+            if trace_module:
+                logger.info(
+                    "Elastic shrink payload module planning enter: rank=%s "
+                    "layer=%s module_idx=%s active_ranks=%s source_ranks=%s "
+                    "logical_num_experts=%s loaded_map_attr=%s "
+                    "module_expert_map_device=%s module_loaded_map_device=%s "
+                    "w13_shape=%s w2_shape=%s",
+                    current_rank, module.layer_idx, payload_module_count,
+                    active_ranks, source_ranks, logical_num_experts,
+                    lossless_loaded_expert_map is not None,
+                    getattr(module.expert_map, "device", None),
+                    getattr(lossless_loaded_expert_map, "device", None),
+                    tuple(getattr(module, "w13_weight", torch.empty(0)).shape),
+                    tuple(getattr(module, "w2_weight", torch.empty(0)).shape))
+                if payload_planning_diag:
+                    logger.info(
+                        "Elastic shrink payload module map summary: rank=%s "
+                        "layer=%s module_idx=%s loaded=%s resident=%s "
+                        "w13_rows=%s w2_rows=%s",
+                        current_rank,
+                        module.layer_idx,
+                        payload_module_count,
+                        _mode1_rank_map_summaries(gathered_loaded_maps_by_rank),
+                        _mode1_rank_map_summaries(gathered_resident_maps_by_rank),
+                        _mode1_rows_summary(w13_rows_by_rank),
+                        _mode1_rows_summary(w2_rows_by_rank),
+                    )
             gathered_mode4_remote_sources_by_rank: dict[
                 int, dict[int, tuple[int, int]]] = {}
             gathered_mode4_owned_by_rank: dict[int, list[int]] = {}
@@ -4434,8 +5124,26 @@ class NPUWorker(WorkerBase):
             cpu_import_target_rank: dict[int, int] = {}
             mode4_remote_source_rank: dict[int, int] = {}
             remote_import_source_slot: dict[int, int] = {}
+            gathered_loaded_count_by_rank = {
+                int(rank): int(torch.count_nonzero(tensor >= 0).item())
+                for rank, tensor in gathered_loaded_maps_by_rank.items()
+            }
+            gathered_resident_count_by_rank = {
+                int(rank): int(torch.count_nonzero(tensor >= 0).item())
+                for rank, tensor in gathered_resident_maps_by_rank.items()
+            }
+            gathered_loaded_total = int(sum(gathered_loaded_count_by_rank.values()))
+            gathered_resident_total = int(
+                sum(gathered_resident_count_by_rank.values()))
+            raw_global_redundant = int(
+                getattr(module, "global_redundant_expert_num", 0))
+            inferred_loaded_redundant = max(
+                gathered_loaded_total - logical_num_experts, 0)
+            effective_global_redundant = raw_global_redundant
+            if effective_global_redundant <= 0 and inferred_loaded_redundant > 0:
+                effective_global_redundant = inferred_loaded_redundant
             use_paired_zero_redundancy = (
-                getattr(module, "global_redundant_expert_num", 0) <= 0
+                effective_global_redundant <= 0
                 and len(previous_active_ranks) == 2 * len(active_ranks)
                 and set(active_ranks).issubset(set(previous_active_ranks))
                 and logical_num_experts % len(active_ranks) == 0
@@ -4446,7 +5154,7 @@ class NPUWorker(WorkerBase):
                 hybrid_resident_capacity = int(
                     module._get_hybrid_resident_capacity())
             use_paired_redundant_transfer = (
-                int(getattr(module, "global_redundant_expert_num", 0)) > 0
+                effective_global_redundant > 0
                 and len(previous_active_ranks) == 2 * len(active_ranks)
                 and set(active_ranks).issubset(set(previous_active_ranks))
                 and logical_num_experts % len(active_ranks) == 0
@@ -4476,7 +5184,7 @@ class NPUWorker(WorkerBase):
                 use_paired_redundant_transfer = True
             prefer_preloaded_local_slots = (
                 envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
-                and int(getattr(module, "global_redundant_expert_num", 0)) > 0
+                and effective_global_redundant > 0
             )
             inactive_to_active_rank: dict[int, int] = {}
             inactive_ranks = sorted(
@@ -4490,6 +5198,37 @@ class NPUWorker(WorkerBase):
                     inactive_rank: active_ranks[idx]
                     for idx, inactive_rank in enumerate(inactive_ranks)
                 }
+            if trace_module and payload_planning_diag:
+                logger.info(
+                    "Elastic shrink payload branch decision: rank=%s layer=%s "
+                    "module_idx=%s exec_mode=%s previous_active_ranks=%s "
+                    "active_ranks=%s inactive_ranks=%s target_per_rank=%s "
+                    "global_redundant=%s effective_redundant=%s "
+                    "inferred_loaded_redundant=%s loaded_total=%s "
+                    "resident_total=%s hybrid_capacity=%s "
+                    "use_zero=%s use_redundant=%s prefer_preloaded=%s "
+                    "logical_divisible=%s active_subset=%s paired_count=%s",
+                    current_rank,
+                    module.layer_idx,
+                    payload_module_count,
+                    int(envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE),
+                    previous_active_ranks,
+                    active_ranks,
+                    inactive_ranks,
+                    target_per_rank,
+                    raw_global_redundant,
+                    effective_global_redundant,
+                    inferred_loaded_redundant,
+                    gathered_loaded_total,
+                    gathered_resident_total,
+                    hybrid_resident_capacity,
+                    use_paired_zero_redundancy,
+                    use_paired_redundant_transfer,
+                    prefer_preloaded_local_slots,
+                    logical_num_experts % len(active_ranks) == 0,
+                    set(active_ranks).issubset(set(previous_active_ranks)),
+                    len(previous_active_ranks) == 2 * len(active_ranks),
+                )
             if (use_paired_zero_redundancy and not logged_pairing_summary
                     and current_rank == active_ranks[0]
                     and module.layer_idx == 0):
@@ -4663,10 +5402,20 @@ class NPUWorker(WorkerBase):
                 continue
 
             if use_paired_redundant_transfer:
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload paired planning branch: rank=%s "
+                        "layer=%s module_idx=%s active_ranks=%s inactive_ranks=%s "
+                        "target_per_rank=%s redundant=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        active_ranks, inactive_ranks, target_per_rank,
+                        effective_global_redundant)
                 ordered_assignments: list[list[tuple[int, int]]] = []
-                runtime_log2phy_cpu = torch.full((logical_num_experts, ),
-                                                 -1,
-                                                 dtype=torch.int32)
+                # Keep this planning path in plain Python.  The paired
+                # redundant branch runs before any payload tensor transfer;
+                # avoiding incidental torch ops here makes failures easier to
+                # attribute to the real communication or import stage.
+                runtime_log2phy_values = [-1 for _ in range(logical_num_experts)]
                 dense_offset = 0
                 active_runtime_slots_by_rank: dict[int, dict[int, int]] = {}
                 active_free_slots_by_rank: dict[int, list[int]] = {}
@@ -4674,12 +5423,20 @@ class NPUWorker(WorkerBase):
                 active_free_count_by_rank: dict[int, int] = {}
                 inactive_export_count_by_rank: dict[int, int] = {}
                 paired_prefilled_hits = 0
+                loaded_maps_list_by_rank = {
+                    rank: [int(value) for value in tensor.tolist()]
+                    for rank, tensor in gathered_loaded_maps_by_rank.items()
+                }
+                resident_maps_list_by_rank = {
+                    rank: [int(value) for value in tensor.tolist()]
+                    for rank, tensor in gathered_resident_maps_by_rank.items()
+                }
 
                 for active_rank in active_ranks:
                     active_runtime_slots = {
                         expert_id: int(local_slot)
                         for expert_id, local_slot in enumerate(
-                            gathered_resident_maps_by_rank[active_rank].tolist())
+                            resident_maps_list_by_rank[active_rank])
                         if int(local_slot) >= 0
                     }
                     active_slot_values = sorted(active_runtime_slots.values())
@@ -4695,12 +5452,18 @@ class NPUWorker(WorkerBase):
                     active_runtime_slots_by_rank[active_rank] = active_runtime_slots
                     active_free_slots_by_rank[active_rank] = free_loaded_slots
                     active_free_count_by_rank[active_rank] = len(free_loaded_slots)
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload paired active slots ready: rank=%s "
+                        "layer=%s module_idx=%s active_free=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        active_free_count_by_rank)
 
                 for inactive_rank in inactive_ranks:
                     inactive_runtime_pairs = sorted(
                         ((expert_id, int(local_slot))
                          for expert_id, local_slot in enumerate(
-                             gathered_resident_maps_by_rank[inactive_rank].tolist())
+                             resident_maps_list_by_rank[inactive_rank])
                          if int(local_slot) >= 0),
                         key=lambda item: item[1],
                     )
@@ -4708,6 +5471,12 @@ class NPUWorker(WorkerBase):
                         inactive_rank] = inactive_runtime_pairs
                     inactive_export_count_by_rank[inactive_rank] = len(
                         inactive_runtime_pairs)
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload paired inactive slots ready: rank=%s "
+                        "layer=%s module_idx=%s inactive_exports=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        inactive_export_count_by_rank)
 
                 if (sum(active_free_count_by_rank.values()) != sum(
                         inactive_export_count_by_rank.values())):
@@ -4760,6 +5529,12 @@ class NPUWorker(WorkerBase):
                     active_rank: inactive_rank
                     for inactive_rank, active_rank in pairing_by_inactive.items()
                 }
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload paired matching ready: rank=%s "
+                        "layer=%s module_idx=%s pairing_by_inactive=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        pairing_by_inactive)
 
                 for pair_idx, active_rank in enumerate(active_ranks):
                     inactive_rank = pairing_by_active.get(active_rank)
@@ -4788,8 +5563,7 @@ class NPUWorker(WorkerBase):
                     for free_slot, (expert_id, inactive_local_slot) in zip(
                             free_loaded_slots, inactive_runtime_pairs):
                         prefilled_loaded_slot = int(
-                            gathered_loaded_maps_by_rank[active_rank][int(
-                                expert_id)].item())
+                            loaded_maps_list_by_rank[active_rank][int(expert_id)])
                         if int(prefilled_loaded_slot) == int(free_slot):
                             ordered_rank_assignments[free_slot] = (
                                 int(expert_id), int(prefilled_loaded_slot))
@@ -4818,14 +5592,32 @@ class NPUWorker(WorkerBase):
                     assigned_counts[pair_idx] = len(finalized_assignments)
                     for local_slot, (expert_id, _) in enumerate(
                             finalized_assignments):
-                        runtime_log2phy_cpu[int(expert_id)] = dense_offset + local_slot
+                        runtime_log2phy_values[int(
+                            expert_id)] = dense_offset + local_slot
                     dense_offset += len(finalized_assignments)
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload paired assignments ready: rank=%s "
+                        "layer=%s module_idx=%s assigned_counts=%s "
+                        "cpu_imports=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        assigned_counts, len(cpu_import_source_rank))
 
-                if int(torch.unique(runtime_log2phy_cpu).numel()) != logical_num_experts:
+                unique_runtime_slots = set(runtime_log2phy_values)
+                if (len(unique_runtime_slots) != logical_num_experts
+                        or any(value < 0 for value in runtime_log2phy_values)):
                     raise RuntimeError(
                         f"layer={module.layer_idx}: unique="
-                        f"{int(torch.unique(runtime_log2phy_cpu).numel())} "
+                        f"{len(unique_runtime_slots)} "
                         f"logical={logical_num_experts}")
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload paired runtime map validated: "
+                        "rank=%s layer=%s module_idx=%s unique=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        len(unique_runtime_slots))
+                runtime_log2phy_cpu = torch.tensor(runtime_log2phy_values,
+                                                   dtype=torch.int32)
 
                 mode5_import_candidate_experts = {
                     int(expert_id)
@@ -4833,6 +5625,12 @@ class NPUWorker(WorkerBase):
                     for expert_id, local_id in rank_assignments
                     if int(local_id) < 0
                 }
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload paired finalize enter: rank=%s "
+                        "layer=%s module_idx=%s import_candidates=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        len(mode5_import_candidate_experts))
 
                 (mode5_remote_experts,
                  mode5_cpu_import_experts,
@@ -4842,6 +5640,14 @@ class NPUWorker(WorkerBase):
                      remote_import_source_slot,
                      mode4_remote_source_rank,
                      mode5_import_candidate_experts)
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload paired finalize done: rank=%s "
+                        "layer=%s module_idx=%s mode5_remote=%s mode5_cpu=%s "
+                        "cpu_imports=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        len(mode5_remote_experts), len(mode5_cpu_import_experts),
+                        len(cpu_import_source_rank))
                 module_store_start_t = time.perf_counter()
                 self._lossless_shrink_payload[module.layer_idx] = {
                     "assignments": assignments,
@@ -4858,6 +5664,14 @@ class NPUWorker(WorkerBase):
                 }
                 payload_store_ms += (
                     time.perf_counter() - module_store_start_t) * 1000.0
+                if trace_module:
+                    logger.info(
+                        "Elastic shrink payload module stored: rank=%s "
+                        "layer=%s module_idx=%s path=paired assignments=%s "
+                        "cpu_imports=%s",
+                        current_rank, module.layer_idx, payload_module_count,
+                        [len(items) for items in assignments],
+                        len(cpu_import_source_rank))
                 if module.layer_idx == 0 and current_rank == active_ranks[0]:
                     logger.info(
                         "Elastic paired redundant shrink plan: rank=%s active_ranks=%s inactive_ranks=%s target_per_rank=%s pairings=%s paired_imports=%s prefilled_hits=%s",
@@ -5111,6 +5925,15 @@ class NPUWorker(WorkerBase):
             }
             payload_store_ms += (
                 time.perf_counter() - module_store_start_t) * 1000.0
+            if trace_module:
+                logger.info(
+                    "Elastic shrink payload module stored: rank=%s layer=%s "
+                    "module_idx=%s path=generic assignments=%s cpu_imports=%s "
+                    "remote_imports=%s",
+                    current_rank, module.layer_idx, payload_module_count,
+                    [len(items) for items in assignments],
+                    len(cpu_import_source_rank),
+                    len(mode4_remote_source_rank))
 
         if current_rank == source_ranks[0] and payload_module_count > 0:
             logger.info(
@@ -7065,9 +7888,27 @@ class NPUWorker(WorkerBase):
             and getattr(module, "global_redundant_expert_num", 0) <= 0
             and len(previous_active_ranks) == 2 * len(active_ranks)
             and set(active_ranks).issubset(set(previous_active_ranks)))
+        disable_direct_npu_import = _env_flag(
+            "VLLM_ASCEND_MODE1_DISABLE_DIRECT_NPU_IMPORT", "0")
         use_npu_import = (
-            zero_redundancy_paired_npu_import or use_direct_npu_slot_import
+            not disable_direct_npu_import
+            and (zero_redundancy_paired_npu_import
+                 or use_direct_npu_slot_import)
         )
+        if (disable_direct_npu_import and module.layer_idx == 0
+                and cpu_import_source_rank and current_rank == source_ranks[0]):
+            logger.info(
+                "Elastic shrink direct NPU import disabled by env: "
+                "rank=%s layer=%s active_ranks=%s target_owned_local=%s "
+                "zero_redundancy_pair=%s redundant_direct=%s; "
+                "falling back to object_broadcast import",
+                self.rank,
+                module.layer_idx,
+                active_ranks,
+                target_owned_local_expert_count,
+                zero_redundancy_paired_npu_import,
+                use_direct_npu_slot_import,
+            )
 
         if use_npu_import:
             import_start = time.perf_counter()
@@ -7110,9 +7951,19 @@ class NPUWorker(WorkerBase):
             }
             w13_tail_shape = tuple(module.w13_weight.shape[1:])
             w2_tail_shape = tuple(module.w2_weight.shape[1:])
-            direct_fill_preallocated_loaded = bool(
-                getattr(module, "lossless_zero_redundancy_preallocated_loaded",
-                        False)) or use_direct_npu_slot_import
+            # A paired shrink (16->8, 8->4, 4->2) with enough preallocated
+            # loaded slots must receive directly into those slots.  Otherwise
+            # the import silently falls back to temporary buffers and later CPU
+            # materialization, which breaks the expected floor layout and can
+            # leave the next MC2/runtime state inconsistent.
+            direct_fill_preallocated_loaded = (
+                bool(
+                    getattr(module,
+                            "lossless_zero_redundancy_preallocated_loaded",
+                            False))
+                or use_direct_npu_slot_import
+                or (zero_redundancy_paired_npu_import
+                    and can_direct_fill_loaded_slots))
             allow_scalar_direct_npu_import = _env_flag(
                 "VLLM_ASCEND_MODE1_ALLOW_SCALAR_DIRECT_NPU_IMPORT", "0")
             batch_direct_npu_import = (
@@ -7125,7 +7976,7 @@ class NPUWorker(WorkerBase):
             if (module.layer_idx == 0 and current_rank == source_ranks[0]
                     and cpu_import_source_rank):
                 logger.info(
-                    "Elastic shrink preload selected direct NPU import path: rank=%s layer=%s active_ranks=%s target_owned_local=%s loaded_capacity=%s direct_fill=%s redundancy=%s batch=%s batch_experts=%s allow_scalar=%s",
+                    "Elastic shrink preload selected direct NPU import path: rank=%s layer=%s active_ranks=%s target_owned_local=%s loaded_capacity=%s direct_fill=%s redundancy=%s zero_pair=%s slot_direct=%s can_direct_fill=%s batch=%s batch_experts=%s allow_scalar=%s",
                     self.rank,
                     module.layer_idx,
                     active_ranks,
@@ -7133,6 +7984,9 @@ class NPUWorker(WorkerBase):
                     int(getattr(module, "loaded_weight_capacity", 0)),
                     direct_fill_preallocated_loaded,
                     int(getattr(module, "global_redundant_expert_num", 0)),
+                    zero_redundancy_paired_npu_import,
+                    use_direct_npu_slot_import,
+                    can_direct_fill_loaded_slots,
                     batch_direct_npu_import,
                     batch_experts,
                     allow_scalar_direct_npu_import,
@@ -7333,20 +8187,47 @@ class NPUWorker(WorkerBase):
                             chunk_rows = len(chunk_ids)
                             if current_rank == source_rank:
                                 export_start_t = time.perf_counter()
-                                export_w13, export_w2 = (
-                                    module.export_lossless_expert_npu_weights(
-                                        chunk_ids))
+                                first_expert = int(chunk_ids[0])
+                                source_start_slot = int(
+                                    source_slot_by_expert[first_expert])
+                                send_range_fn = getattr(
+                                    module,
+                                    "get_lossless_expert_npu_slot_range_send_buffers",
+                                    None)
+                                used_direct_source_range = False
+                                if callable(send_range_fn):
+                                    export_w13, export_w2 = send_range_fn(
+                                        source_start_slot, chunk_rows)
+                                    used_direct_source_range = True
+                                else:
+                                    export_w13, export_w2 = (
+                                        module.
+                                        export_lossless_expert_npu_weights(
+                                            chunk_ids))
                                 export_ms = (
                                     time.perf_counter() - export_start_t
                                 ) * 1000.0
                                 direct_stats["send_export_ms"] = (
                                     float(direct_stats["send_export_ms"]) +
                                     export_ms)
-                                direct_stats["send_pack_copy_ms"] = (
-                                    float(direct_stats["send_pack_copy_ms"]) +
-                                    export_ms)
-                                export_debug = getattr(
-                                    module, "_last_lossless_npu_export_debug", {})
+                                if used_direct_source_range:
+                                    direct_stats["send_export_view_ms"] = (
+                                        float(direct_stats[
+                                            "send_export_view_ms"]) + export_ms)
+                                    direct_stats[
+                                        "send_export_contiguous_chunks"] = (
+                                            float(direct_stats[
+                                                "send_export_contiguous_chunks"])
+                                            + 1.0)
+                                else:
+                                    direct_stats["send_pack_copy_ms"] = (
+                                        float(direct_stats[
+                                            "send_pack_copy_ms"]) + export_ms)
+                                export_debug = (
+                                    {}
+                                    if used_direct_source_range else getattr(
+                                        module,
+                                        "_last_lossless_npu_export_debug", {}))
                                 if export_debug:
                                     direct_stats["send_export_source_select_ms"] = (
                                         float(direct_stats[
@@ -7736,7 +8617,8 @@ class NPUWorker(WorkerBase):
             return (local_cpu_import_weights, local_direct_import_slots,
                     direct_stats)
 
-        if requires_redundant_direct_npu and cpu_import_source_rank:
+        if (requires_redundant_direct_npu and cpu_import_source_rank
+                and not disable_direct_npu_import):
             raise RuntimeError(
                 "Redundant-expert elastic shrink fell back to CPU/object import "
                 f"at layer={module.layer_idx}. This mode requires direct NPU "
@@ -8255,6 +9137,37 @@ class NPUWorker(WorkerBase):
                 exc,
             )
 
+    def _mode1_fullworld_restore_diag_enabled(self) -> bool:
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE != 1:
+            return False
+        return (_env_flag("VLLM_ASCEND_MODE1_FULLWORLD_RESTORE_DIAG", "0")
+                or _env_flag("VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG", "0")
+                or _env_flag("VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG", "0"))
+
+    def _log_mode1_fullworld_restore_diag(self, tag: str,
+                                          extra: str = "") -> None:
+        if not self._mode1_fullworld_restore_diag_enabled():
+            return
+        active_ranks = tuple(
+            int(rank) for rank in getattr(self, "_elastic_current_active_ranks",
+                                          ()) or ())
+        target_ranks = tuple(
+            int(rank) for rank in getattr(self, "_elastic_rebuild_target_ranks",
+                                          ()) or ())
+        restore_seq = int(getattr(self, "_mode1_fullworld_restore_seq", 0))
+        logger.info(
+            "Mode1 fullworld restore diag: tag=%s rank=%s restore_seq=%s "
+            "active_ranks=%s target_ranks=%s elastic_detached=%s%s",
+            tag,
+            self.rank,
+            restore_seq,
+            active_ranks,
+            target_ranks,
+            bool(getattr(self, "elastic_parallel_detached", False)),
+            f" {extra}" if extra else "",
+        )
+        self.mode1_log_comm_cache_state(f"fullworld_restore:{tag}")
+
     def mode1_log_comm_cache_state(self, tag: str) -> None:
         """Log planned/natural communicator cache state and NPU memory."""
         if not torch.npu.is_available():
@@ -8341,27 +9254,62 @@ class NPUWorker(WorkerBase):
             free_bytes = total_bytes = torch_current = torch_reserved = 0
             total_allocated = non_torch = 0
 
-        logger.info(
-            "Mode1 comm cache state: tag=%s rank=%s cached_groups=%s "
-            "registry_groups=%s seen_signatures=%s topology_count=%s "
-            "topology_methods=%s topology_groups=%s free_bytes=%s "
-            "total_bytes=%s torch_current=%s torch_reserved=%s "
-            "non_torch=%s total_allocated=%s",
-            tag,
-            self.rank,
-            _fmt_cached_groups(),
-            _fmt_registry(),
-            _fmt_seen(),
-            topology_stats.get("topology_count", 0),
-            topology_stats.get("method_count", 0),
-            topology_desc,
-            free_bytes,
-            total_bytes,
-            torch_current,
-            torch_reserved,
-            non_torch,
-            total_allocated,
-        )
+        cached = getattr(self, "_elastic_cached_parallel_groups", {}) or {}
+        cached_group_count = sum(
+            len(groups_by_ranks) for groups_by_ranks in cached.values())
+        registry = getattr(self, "_elastic_parallel_group_registry", {}) or {}
+        registry_group_count = sum(
+            len(groups_by_id)
+            for groups_by_ranks in registry.values()
+            for groups_by_id in groups_by_ranks.values())
+        seen_count = len(
+            getattr(self, "_elastic_seen_parallel_group_signatures", set())
+            or set())
+        detailed = _env_flag(
+            "VLLM_ASCEND_MODE1_COMM_CACHE_STATE_DETAILED", "0")
+        if detailed:
+            logger.info(
+                "Mode1 comm cache state: tag=%s rank=%s cached_groups=%s "
+                "registry_groups=%s seen_signatures=%s topology_count=%s "
+                "topology_methods=%s topology_groups=%s free_bytes=%s "
+                "total_bytes=%s torch_current=%s torch_reserved=%s "
+                "non_torch=%s total_allocated=%s",
+                tag,
+                self.rank,
+                _fmt_cached_groups(),
+                _fmt_registry(),
+                _fmt_seen(),
+                topology_stats.get("topology_count", 0),
+                topology_stats.get("method_count", 0),
+                topology_desc,
+                free_bytes,
+                total_bytes,
+                torch_current,
+                torch_reserved,
+                non_torch,
+                total_allocated,
+            )
+        else:
+            logger.info(
+                "Mode1 comm cache compact: tag=%s rank=%s cached_group_count=%s "
+                "registry_group_count=%s seen_signature_count=%s "
+                "topology_count=%s topology_methods=%s free_bytes=%s "
+                "total_bytes=%s torch_current=%s torch_reserved=%s "
+                "non_torch=%s total_allocated=%s",
+                tag,
+                self.rank,
+                cached_group_count,
+                registry_group_count,
+                seen_count,
+                topology_stats.get("topology_count", 0),
+                topology_stats.get("method_count", 0),
+                free_bytes,
+                total_bytes,
+                torch_current,
+                torch_reserved,
+                non_torch,
+                total_allocated,
+            )
 
     def _cleanup_after_elastic_group_release(
             self, reason: str, force: bool = False) -> dict[str, float]:
@@ -8450,8 +9398,123 @@ class NPUWorker(WorkerBase):
                 except Exception:
                     pass
 
+    def _describe_elastic_group_refs(self, group) -> dict[str, object]:
+        communicator = getattr(group, "device_communicator", None)
+        group_device_pg = getattr(group, "device_group", None)
+        group_cpu_pg = getattr(group, "cpu_group", None)
+        comm_device_pg = None
+        comm_cpu_pg = None
+        if communicator is not None:
+            comm_device_pg = getattr(communicator, "device_group", None)
+            comm_cpu_pg = getattr(communicator, "cpu_group", None)
+        return {
+            "group_id": id(group) if group is not None else 0,
+            "communicator_id": id(communicator) if communicator is not None else 0,
+            "group_device_pg_id": id(group_device_pg) if group_device_pg is not None else 0,
+            "group_cpu_pg_id": id(group_cpu_pg) if group_cpu_pg is not None else 0,
+            "comm_device_pg_id": id(comm_device_pg) if comm_device_pg is not None else 0,
+            "comm_cpu_pg_id": id(comm_cpu_pg) if comm_cpu_pg is not None else 0,
+            "has_device_communicator": communicator is not None,
+            "has_group_device_pg": group_device_pg is not None,
+            "has_group_cpu_pg": group_cpu_pg is not None,
+            "has_comm_device_pg": comm_device_pg is not None,
+            "has_comm_cpu_pg": comm_cpu_pg is not None,
+        }
+
+    def _log_mode1_direct_group_destroy_event(
+            self, event: str, group_kind: str, group_ranks: tuple[int, ...],
+            reason: str, refs: dict[str, object],
+            keep_group_ranks: tuple[int, ...] | None = None,
+            attr_name: str | None = None,
+            destroy_call_ms: float | None = None,
+            detach_ms: float | None = None,
+            registry_ms: float | None = None,
+            total_ms: float | None = None,
+            cleanup_force: bool | None = None) -> None:
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return
+        logger.info(
+            "Mode1 direct group destroy %s: rank=%s attr=%s group_kind=%s "
+            "group_ranks=%s keep_ranks=%s reason=%s group_id=%s "
+            "communicator_id=%s group_device_pg_id=%s group_cpu_pg_id=%s "
+            "comm_device_pg_id=%s comm_cpu_pg_id=%s has_device_communicator=%s "
+            "has_group_device_pg=%s has_group_cpu_pg=%s has_comm_device_pg=%s "
+            "has_comm_cpu_pg=%s destroy_call_ms=%s detach_ms=%s "
+            "registry_ms=%s total_ms=%s cleanup_force=%s",
+            event,
+            self.rank,
+            attr_name,
+            group_kind,
+            group_ranks,
+            keep_group_ranks,
+            reason,
+            refs.get("group_id"),
+            refs.get("communicator_id"),
+            refs.get("group_device_pg_id"),
+            refs.get("group_cpu_pg_id"),
+            refs.get("comm_device_pg_id"),
+            refs.get("comm_cpu_pg_id"),
+            refs.get("has_device_communicator"),
+            refs.get("has_group_device_pg"),
+            refs.get("has_group_cpu_pg"),
+            refs.get("has_comm_device_pg"),
+            refs.get("has_comm_cpu_pg"),
+            "%.2f" % destroy_call_ms if destroy_call_ms is not None else "-",
+            "%.2f" % detach_ms if detach_ms is not None else "-",
+            "%.2f" % registry_ms if registry_ms is not None else "-",
+            "%.2f" % total_ms if total_ms is not None else "-",
+            cleanup_force,
+        )
+
+    def _should_preserve_device_pg_on_retire(
+            self,
+            group_kind: str | None,
+            group_ranks: tuple[int, ...],
+            reason: str | None) -> bool:
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return False
+        if group_kind not in ("dp", "ep", "mc2"):
+            return False
+        if not group_ranks:
+            return False
+        if reason == "mode1_full_restore":
+            return _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_PRESERVE_DEVICE_PG_ON_FULL_RESTORE",
+                "0")
+        return False
+
+    def _should_preserve_group_refs_on_retire(
+            self,
+            group_kind: str | None,
+            group_ranks: tuple[int, ...],
+            reason: str | None) -> bool:
+        if not self._should_preserve_device_pg_on_retire(
+                group_kind, group_ranks, reason):
+            return False
+        return _env_flag(
+            "VLLM_ASCEND_MODE1_PARITY_PRESERVE_GROUP_REFS_ON_FULL_RESTORE",
+            "0")
+
+    def _should_skip_cleanup_after_preserved_full_restore_release(
+            self,
+            group_kind: str,
+            group_ranks: tuple[int, ...],
+            reason: str) -> bool:
+        if reason != "mode1_full_restore":
+            return False
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_SKIP_CLEANUP_ON_PRESERVED_FULL_RESTORE",
+                "0"):
+            return False
+        return self._should_preserve_group_refs_on_retire(
+            group_kind, group_ranks, reason)
+
     def _retire_group_wrapper_defer_pg_destroy(
-            self, group) -> dict[str, float]:
+            self,
+            group,
+            group_kind: str | None = None,
+            group_ranks: tuple[int, ...] | None = None,
+            reason: str | None = None) -> dict[str, float]:
         """Retire a GroupCoordinator wrapper without hot-path PG destroy.
 
         Low-floor mode=1 GroupCoordinator.destroy() can block for hundreds of
@@ -8462,11 +9525,17 @@ class NPUWorker(WorkerBase):
         reused but low-level PG destruction is not forced inside the shrink RPC.
 
         Device PG destruction is enabled by default to release HCCL/HBM
-        workspace. Only CPU/Gloo PG teardown is deferred, because the observed
-        350s stall comes from hot-path GroupCoordinator teardown while retaining
-        stale device PGs can OOM later HCCL collectives.
+        workspace.  One exception is mode1 full-world restore from low floors:
+        floor2 introduced a 4->2->full-world path where destroying the old
+        floor2 device PG during an active run can invalidate HCCL/MC2 runtime
+        state before the next step starts.  In that case, remove the stale group
+        from Python live/cache paths but keep the raw device PG until a later
+        safe boundary.
         """
         retire_start_t = time.perf_counter()
+        effective_group_ranks = tuple(
+            int(rank) for rank in (group_ranks
+                                   or tuple(getattr(group, "ranks", []))))
         npu_sync_ms = 0.0
         device_pg_destroy_ms = 0.0
         cpu_pg_destroy_ms = 0.0
@@ -8475,6 +9544,16 @@ class NPUWorker(WorkerBase):
         deferred_cpu_pg_refs = 0.0
         device_pgs: list[object] = []
         cpu_pgs: list[object] = []
+        preserve_device_pg = self._should_preserve_device_pg_on_retire(
+            group_kind,
+            effective_group_ranks,
+            reason,
+        )
+        preserve_group_refs = self._should_preserve_group_refs_on_retire(
+            group_kind,
+            effective_group_ranks,
+            reason,
+        )
         if _env_flag("VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE",
                      "1"):
             sync_start_t = time.perf_counter()
@@ -8485,7 +9564,7 @@ class NPUWorker(WorkerBase):
                     "Elastic retired group NPU sync failed: rank=%s "
                     "group_ranks=%s",
                     self.rank,
-                    tuple(int(rank) for rank in getattr(group, "ranks", [])),
+                    effective_group_ranks,
                 )
             npu_sync_ms = (time.perf_counter() - sync_start_t) * 1000.0
 
@@ -8495,41 +9574,45 @@ class NPUWorker(WorkerBase):
                 device_pg = getattr(communicator, "device_group", None)
                 if device_pg is not None:
                     device_pgs.append(device_pg)
-            for attr_name in ("device_group", ):
-                if hasattr(communicator, attr_name):
-                    try:
-                        setattr(communicator, attr_name, None)
-                        dropped_device_pg_refs += 1.0
-                    except Exception:
-                        pass
+            if not preserve_group_refs:
+                for attr_name in ("device_group", ):
+                    if hasattr(communicator, attr_name):
+                        try:
+                            setattr(communicator, attr_name, None)
+                            dropped_device_pg_refs += 1.0
+                        except Exception:
+                            pass
             if hasattr(communicator, "cpu_group"):
                 cpu_pg = getattr(communicator, "cpu_group", None)
                 if cpu_pg is not None:
                     cpu_pgs.append(cpu_pg)
                     deferred_cpu_pg_refs += 1.0
-                try:
-                    setattr(communicator, "cpu_group", None)
-                except Exception:
-                    pass
+                if not preserve_group_refs:
+                    try:
+                        setattr(communicator, "cpu_group", None)
+                    except Exception:
+                        pass
 
         if hasattr(group, "device_group"):
             device_pg = getattr(group, "device_group", None)
             if device_pg is not None:
                 device_pgs.append(device_pg)
-            try:
-                delattr(group, "device_group")
-                dropped_device_pg_refs += 1.0
-            except Exception:
-                pass
+            if not preserve_group_refs:
+                try:
+                    delattr(group, "device_group")
+                    dropped_device_pg_refs += 1.0
+                except Exception:
+                    pass
         if hasattr(group, "cpu_group"):
             cpu_pg = getattr(group, "cpu_group", None)
             if cpu_pg is not None:
                 cpu_pgs.append(cpu_pg)
                 deferred_cpu_pg_refs += 1.0
-            try:
-                delattr(group, "cpu_group")
-            except Exception:
-                pass
+            if not preserve_group_refs:
+                try:
+                    delattr(group, "cpu_group")
+                except Exception:
+                    pass
 
         seen_pg_ids: set[int] = set()
         unique_device_pgs = []
@@ -8539,8 +9622,9 @@ class NPUWorker(WorkerBase):
                 continue
             seen_pg_ids.add(device_pg_id)
             unique_device_pgs.append(device_pg)
-        destroy_device_pg = _env_flag(
+        destroy_device_pg = (_env_flag(
             "VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE", "1")
+                             and not preserve_device_pg)
         if destroy_device_pg:
             destroy_start_t = time.perf_counter()
             for device_pg in unique_device_pgs:
@@ -8551,8 +9635,7 @@ class NPUWorker(WorkerBase):
                         "Elastic retired group device ProcessGroup destroy failed: "
                         "rank=%s group_ranks=%s",
                         self.rank,
-                        tuple(int(rank)
-                              for rank in getattr(group, "ranks", [])),
+                        effective_group_ranks,
                     )
             device_pg_destroy_ms = (
                 time.perf_counter() - destroy_start_t) * 1000.0
@@ -8561,12 +9644,13 @@ class NPUWorker(WorkerBase):
             deferred_device_pg_refs = float(len(unique_device_pgs))
             deferred_device_pgs = unique_device_pgs
 
-        for attr_name in ("device_communicator", "mq_broadcaster"):
-            if hasattr(group, attr_name):
-                try:
-                    setattr(group, attr_name, None)
-                except Exception:
-                    pass
+        if not preserve_group_refs:
+            for attr_name in ("device_communicator", "mq_broadcaster"):
+                if hasattr(group, attr_name):
+                    try:
+                        setattr(group, attr_name, None)
+                    except Exception:
+                        pass
         seen_cpu_pg_ids: set[int] = set()
         unique_cpu_pgs = []
         for cpu_pg in cpu_pgs:
@@ -8575,8 +9659,9 @@ class NPUWorker(WorkerBase):
                 continue
             seen_cpu_pg_ids.add(cpu_pg_id)
             unique_cpu_pgs.append(cpu_pg)
-        destroy_cpu_pg = _env_flag(
+        destroy_cpu_pg = (_env_flag(
             "VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE", "1")
+                          and not preserve_group_refs)
         if destroy_cpu_pg:
             cpu_destroy_start_t = time.perf_counter()
             for cpu_pg in unique_cpu_pgs:
@@ -8587,8 +9672,7 @@ class NPUWorker(WorkerBase):
                         "Elastic retired group CPU ProcessGroup destroy failed: "
                         "rank=%s group_ranks=%s",
                         self.rank,
-                        tuple(int(rank)
-                              for rank in getattr(group, "ranks", [])),
+                        effective_group_ranks,
                     )
             cpu_pg_destroy_ms = (
                 time.perf_counter() - cpu_destroy_start_t) * 1000.0
@@ -8602,11 +9686,14 @@ class NPUWorker(WorkerBase):
             "cpu_pg_destroy_ms": cpu_pg_destroy_ms,
             "destroy_device_pg": 1.0 if destroy_device_pg else 0.0,
             "destroy_cpu_pg": 1.0 if destroy_cpu_pg else 0.0,
+            "preserve_device_pg": 1.0 if preserve_device_pg else 0.0,
+            "preserve_group_refs": 1.0 if preserve_group_refs else 0.0,
             "dropped_pg_refs": dropped_device_pg_refs,
             "deferred_device_pg_refs": deferred_device_pg_refs,
             "deferred_cpu_pg_refs": deferred_cpu_pg_refs,
             "device_pgs": deferred_device_pgs,
             "cpu_pgs": unique_cpu_pgs,
+            "group": group if preserve_group_refs else None,
         }
 
     def _get_deferred_elastic_group_ids(self) -> set[int]:
@@ -8660,7 +9747,12 @@ class NPUWorker(WorkerBase):
             return False
         deferred_ids.add(group_id)
         self._mark_retired_elastic_group(group)
-        retire_stats = self._retire_group_wrapper_defer_pg_destroy(group)
+        retire_stats = self._retire_group_wrapper_defer_pg_destroy(
+            group,
+            group_kind=group_kind,
+            group_ranks=group_ranks,
+            reason=reason,
+        )
         deferred_device_pgs = list(retire_stats.get("device_pgs", []) or [])
         deferred_cpu_pgs = list(retire_stats.get("cpu_pgs", []) or [])
         self._remove_elastic_parallel_group_registry_entry(
@@ -8673,6 +9765,7 @@ class NPUWorker(WorkerBase):
                 "retire_wrapper_ms=%.2f npu_sync_ms=%.2f "
                 "device_pg_destroy_ms=%.2f cpu_pg_destroy_ms=%.2f "
                 "destroy_device_pg=%.0f destroy_cpu_pg=%.0f "
+                "preserve_device_pg=%.0f preserve_group_refs=%.0f "
                 "dropped_pg_refs=%.0f",
                 self.rank,
                 group_kind,
@@ -8684,6 +9777,8 @@ class NPUWorker(WorkerBase):
                 float(retire_stats.get("cpu_pg_destroy_ms", 0.0)),
                 float(retire_stats.get("destroy_device_pg", 0.0)),
                 float(retire_stats.get("destroy_cpu_pg", 0.0)),
+                float(retire_stats.get("preserve_device_pg", 0.0)),
+                float(retire_stats.get("preserve_group_refs", 0.0)),
                 float(retire_stats.get("dropped_pg_refs", 0.0)),
             )
             return True
@@ -8695,6 +9790,7 @@ class NPUWorker(WorkerBase):
         deferred.append({
             "device_pgs": deferred_device_pgs,
             "cpu_pgs": deferred_cpu_pgs,
+            "group": retire_stats.get("group"),
             "group_id": group_id,
             "group_kind": group_kind,
             "group_ranks": group_ranks,
@@ -8706,6 +9802,7 @@ class NPUWorker(WorkerBase):
             "retire_wrapper_ms=%.2f npu_sync_ms=%.2f "
             "device_pg_destroy_ms=%.2f cpu_pg_destroy_ms=%.2f "
             "destroy_device_pg=%.0f destroy_cpu_pg=%.0f "
+            "preserve_device_pg=%.0f preserve_group_refs=%.0f "
             "dropped_pg_refs=%.0f deferred_device_pg_refs=%.0f "
             "deferred_cpu_pg_refs=%.0f",
             self.rank,
@@ -8719,6 +9816,8 @@ class NPUWorker(WorkerBase):
             float(retire_stats.get("cpu_pg_destroy_ms", 0.0)),
             float(retire_stats.get("destroy_device_pg", 0.0)),
             float(retire_stats.get("destroy_cpu_pg", 0.0)),
+            float(retire_stats.get("preserve_device_pg", 0.0)),
+            float(retire_stats.get("preserve_group_refs", 0.0)),
             float(retire_stats.get("dropped_pg_refs", 0.0)),
             float(retire_stats.get("deferred_device_pg_refs", 0.0)),
             float(retire_stats.get("deferred_cpu_pg_refs", 0.0)),
@@ -8754,6 +9853,9 @@ class NPUWorker(WorkerBase):
         force_cleanup_after_release = (
             self._should_force_cleanup_after_mode1_floor_group_release(
                 group_kind, group_ranks))
+        if self._should_skip_cleanup_after_preserved_full_restore_release(
+                group_kind, group_ranks, reason):
+            force_cleanup_after_release = False
         if self._is_retired_elastic_group(group):
             destroyed_group_ids.add(group_id)
             self._remove_elastic_parallel_group_registry_entry(
@@ -8794,7 +9896,8 @@ class NPUWorker(WorkerBase):
             logger.warning(
                 "Elastic mode1 low-floor group direct destroy fallback: "
                 "rank=%s group_kind=%s group_ranks=%s keep_ranks=%s "
-                "reason=%s defer_env=%s defer_sizes=%s",
+                "reason=%s defer_env=%s defer_full_restore=%s "
+                "defer_pre_rebuild=%s defer_stash=%s defer_sizes=%s",
                 self.rank,
                 group_kind,
                 group_ranks,
@@ -8803,17 +9906,57 @@ class NPUWorker(WorkerBase):
                 os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY",
                           "1"),
                 os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE",
+                    "0"),
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD",
+                    "0"),
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH",
+                    "0"),
+                os.getenv(
                     "VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES",
                     "1,2,4,8"),
             )
+        refs_before_destroy = self._describe_elastic_group_refs(group)
+        self._log_mode1_direct_group_destroy_event(
+            "start",
+            group_kind,
+            group_ranks,
+            reason,
+            refs_before_destroy,
+            keep_group_ranks=keep_group_ranks,
+            cleanup_force=force_cleanup_after_release,
+        )
         destroy_start_t = time.perf_counter()
+        destroy_call_start_t = time.perf_counter()
         group.destroy()
+        destroy_call_ms = (
+            time.perf_counter() - destroy_call_start_t) * 1000.0
+        detach_start_t = time.perf_counter()
         self._detach_destroyed_group_references(group)
+        detach_ms = (time.perf_counter() - detach_start_t) * 1000.0
         self._mark_retired_elastic_group(group)
+        registry_start_t = time.perf_counter()
         self._remove_elastic_parallel_group_registry_entry(
             group_kind, group_ranks, group)
+        registry_ms = (time.perf_counter() - registry_start_t) * 1000.0
         stats["destroy_ms"] = (
             time.perf_counter() - destroy_start_t) * 1000.0
+        refs_after_destroy = self._describe_elastic_group_refs(group)
+        self._log_mode1_direct_group_destroy_event(
+            "done",
+            group_kind,
+            group_ranks,
+            reason,
+            refs_after_destroy,
+            keep_group_ranks=keep_group_ranks,
+            destroy_call_ms=destroy_call_ms,
+            detach_ms=detach_ms,
+            registry_ms=registry_ms,
+            total_ms=stats["destroy_ms"],
+            cleanup_force=force_cleanup_after_release,
+        )
         destroyed_group_ids.add(group_id)
         stats["released_groups"] = 1.0
         if group_kind == "mc2" and (
@@ -10212,12 +11355,17 @@ class NPUWorker(WorkerBase):
                                 logger.warning(
                                     "Elastic mode1 low-floor group direct destroy fallback: "
                                     "rank=%s group_kind=%s group_ranks=%s keep_ranks=%s "
-                                    "reason=old_floor_after_shrink defer_env=%s defer_sizes=%s",
+                                    "reason=old_floor_after_shrink defer_env=%s "
+                                    "defer_full_restore=%s defer_pre_rebuild=%s "
+                                    "defer_stash=%s defer_sizes=%s",
                                     self.rank,
                                     group_kind,
                                     ranks,
                                     keep_group_ranks,
                                     os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"),
+                                    os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE", "0"),
+                                    os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD", "0"),
+                                    os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH", "0"),
                                     os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES", "1,2,4,8"),
                                 )
                             destroy_start_t = time.perf_counter()
@@ -10752,6 +11900,10 @@ class NPUWorker(WorkerBase):
                 warmup_tokens,
             )
             return
+        self._log_mode1_fullworld_restore_diag(
+            "before_post_restore_mc2_warmup",
+            f"world_size={world_size} tokens={warmup_tokens}",
+        )
         self._log_custom_mode1_worker_memory(
             "before_post_restore_mc2_dispatcher_warmup",
             f"world_size={world_size} tokens={warmup_tokens}",
@@ -10778,6 +11930,10 @@ class NPUWorker(WorkerBase):
             torch.npu.synchronize()
         self._log_custom_mode1_worker_memory(
             "after_post_restore_mc2_dispatcher_warmup",
+            f"world_size={world_size} tokens={warmup_tokens}",
+        )
+        self._log_mode1_fullworld_restore_diag(
+            "after_post_restore_mc2_warmup",
             f"world_size={world_size} tokens={warmup_tokens}",
         )
 
@@ -11065,6 +12221,9 @@ class NPUWorker(WorkerBase):
             force_cleanup_after_release = (
                 self._should_force_cleanup_after_mode1_floor_group_release(
                     group_kind, group_ranks))
+            if self._should_skip_cleanup_after_preserved_full_restore_release(
+                    group_kind, group_ranks, destroy_reason):
+                force_cleanup_after_release = False
             if already_retired_group:
                 destroy_ms = 0.0
                 self._remove_elastic_parallel_group_registry_entry(
@@ -11089,21 +12248,58 @@ class NPUWorker(WorkerBase):
                 if self._is_mode1_low_floor_elastic_runtime():
                     logger.warning(
                         "Elastic mode1 low-floor stashed group direct destroy fallback: "
-                        "rank=%s group_kind=%s group_ranks=%s reason=%s defer_env=%s defer_sizes=%s",
+                        "rank=%s group_kind=%s group_ranks=%s reason=%s "
+                        "defer_env=%s defer_full_restore=%s defer_pre_rebuild=%s "
+                        "defer_stash=%s defer_sizes=%s",
                         self.rank,
                         group_kind,
                         group_ranks,
                         destroy_reason,
                         os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"),
+                        os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE", "0"),
+                        os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD", "0"),
+                        os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH", "0"),
                         os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES", "1,2,4,8"),
                     )
+                refs_before_destroy = self._describe_elastic_group_refs(group)
+                self._log_mode1_direct_group_destroy_event(
+                    "start",
+                    group_kind,
+                    group_ranks,
+                    destroy_reason,
+                    refs_before_destroy,
+                    attr_name=attr_name,
+                    cleanup_force=force_cleanup_after_release,
+                )
                 destroy_start_t = time.perf_counter()
+                destroy_call_start_t = time.perf_counter()
                 group.destroy()
+                destroy_call_ms = (
+                    time.perf_counter() - destroy_call_start_t) * 1000.0
+                detach_start_t = time.perf_counter()
                 self._detach_destroyed_group_references(group)
+                detach_ms = (time.perf_counter() - detach_start_t) * 1000.0
                 self._mark_retired_elastic_group(group)
+                registry_start_t = time.perf_counter()
                 self._remove_elastic_parallel_group_registry_entry(
                     group_kind, group_ranks, group)
+                registry_ms = (
+                    time.perf_counter() - registry_start_t) * 1000.0
                 destroy_ms = (time.perf_counter() - destroy_start_t) * 1000.0
+                refs_after_destroy = self._describe_elastic_group_refs(group)
+                self._log_mode1_direct_group_destroy_event(
+                    "done",
+                    group_kind,
+                    group_ranks,
+                    destroy_reason,
+                    refs_after_destroy,
+                    attr_name=attr_name,
+                    destroy_call_ms=destroy_call_ms,
+                    detach_ms=detach_ms,
+                    registry_ms=registry_ms,
+                    total_ms=destroy_ms,
+                    cleanup_force=force_cleanup_after_release,
+                )
                 if group_kind == "mc2":
                     cleanup_stats = self._cleanup_after_elastic_group_release(
                         destroy_reason, force=force_cleanup_after_release)
@@ -11256,7 +12452,9 @@ class NPUWorker(WorkerBase):
                                     logger.warning(
                                         "Elastic mode1 low-floor stale cache direct destroy fallback: "
                                         "rank=%s group_kind=%s group_ranks=%s keep_ranks=%s "
-                                        "reason=%s force_destroy=%s defer_env=%s defer_sizes=%s",
+                                        "reason=%s force_destroy=%s defer_env=%s "
+                                        "defer_full_restore=%s defer_pre_rebuild=%s "
+                                        "defer_stash=%s defer_sizes=%s",
                                         self.rank,
                                         group_kind,
                                         tuple(int(rank) for rank in ranks),
@@ -11264,6 +12462,9 @@ class NPUWorker(WorkerBase):
                                         reason,
                                         force_destroy,
                                         os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY", "1"),
+                                        os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE", "0"),
+                                        os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD", "0"),
+                                        os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH", "0"),
                                         os.getenv("VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES", "1,2,4,8"),
                                     )
                                 group.destroy()
@@ -12156,6 +13357,264 @@ class NPUWorker(WorkerBase):
             "total_ms": total_ms,
         }
 
+    def _offload_mode1_loaded_weights_after_full_restore(
+            self) -> dict[str, float]:
+        default_enabled = (
+            "1" if self._is_mode1_low_floor_elastic_runtime() else "0")
+        enabled = _env_flag(
+            "VLLM_ASCEND_MODE1_OFFLOAD_LOADED_WEIGHTS_AFTER_FULL_RESTORE",
+            default_enabled)
+        stats: dict[str, float] = {
+            "enabled": float(enabled),
+            "visited_modules": 0.0,
+            "transient_released_modules": 0.0,
+            "offloaded_modules": 0.0,
+            "already_offloaded_modules": 0.0,
+            "canonical_offload_enabled": 0.0,
+            "estimated_npu_bytes": 0.0,
+            "gc_ms": 0.0,
+            "empty_cache_ms": 0.0,
+            "sync_ms": 0.0,
+            "total_ms": 0.0,
+        }
+        if not enabled:
+            return stats
+
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return stats
+
+        storage_diag = _env_flag(
+            "VLLM_ASCEND_MODE1_FULL_RESTORE_OFFLOAD_STORAGE_DIAG", "1")
+        canonical_offload_enabled = _env_flag(
+            "VLLM_ASCEND_MODE1_OFFLOAD_CANONICAL_LOADED_WEIGHTS_AFTER_FULL_RESTORE",
+            "0")
+        stats["canonical_offload_enabled"] = float(canonical_offload_enabled)
+
+        def _collect_storage_snapshot(label: str) -> dict[str, object]:
+            group_attrs = {
+                "loaded_param": ("w13_weight", "w2_weight"),
+                "runtime_view": ("runtime_w13_weight", "runtime_w2_weight"),
+                "runtime_buffer": ("runtime_w13_buffer", "runtime_w2_buffer"),
+                "saved_prefix": ("lossless_saved_primary_prefix_w13",
+                                 "lossless_saved_primary_prefix_w2"),
+                "cpu_shadow": ("lossless_cpu_shadow_w13_buffer",
+                               "lossless_cpu_shadow_w2_buffer"),
+            }
+            group_bytes = {key: 0 for key in group_attrs}
+            group_bytes["p2p_alias_cache"] = 0
+            total_seen: set[int] = set()
+            group_seen: dict[str, set[int]] = {
+                key: set() for key in group_bytes
+            }
+            samples: list[str] = []
+
+            def _record_tensor(group_name: str, tensor: object,
+                               layer_idx: object, attr_name: str) -> None:
+                if not torch.is_tensor(tensor):
+                    return
+                if tensor.device.type != "npu":
+                    return
+                ptr, nbytes = _tensor_storage_key_and_nbytes(tensor)
+                if not ptr or not nbytes:
+                    return
+                if ptr not in total_seen:
+                    total_seen.add(ptr)
+                if ptr not in group_seen[group_name]:
+                    group_seen[group_name].add(ptr)
+                    group_bytes[group_name] += int(nbytes)
+                    if len(samples) < 10:
+                        samples.append(
+                            "%s:l%s:%s:%s:%s" %
+                            (group_name, layer_idx, attr_name, int(nbytes),
+                             tuple(tensor.shape)))
+
+            for module in model.modules():
+                if not _is_ascend_fused_moe_module(module):
+                    continue
+                if not _module_uses_lossless_elastic(module):
+                    continue
+                if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+                    continue
+                layer_idx = getattr(module, "layer_idx", -1)
+                for group_name, attr_names in group_attrs.items():
+                    for attr_name in attr_names:
+                        _record_tensor(group_name,
+                                       getattr(module, attr_name, None),
+                                       layer_idx, attr_name)
+                alias_cache = getattr(module, "_lossless_p2p_alias_cache", None)
+                if isinstance(alias_cache, dict):
+                    for alias_idx, alias in enumerate(alias_cache.values()):
+                        _record_tensor("p2p_alias_cache", alias, layer_idx,
+                                       f"alias{alias_idx}")
+
+            total_unique_bytes = 0
+            all_group_ptrs: set[int] = set()
+            # Sum unique storages across all tracked groups. A storage can appear
+            # in more than one group, for example as both a loaded parameter and
+            # a runtime prefix view.
+            for ptr_set in group_seen.values():
+                all_group_ptrs.update(ptr_set)
+            ptr_to_bytes: dict[int, int] = {}
+            for module in model.modules():
+                if not _is_ascend_fused_moe_module(module):
+                    continue
+                if not _module_uses_lossless_elastic(module):
+                    continue
+                if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+                    continue
+                for attr_names in group_attrs.values():
+                    for attr_name in attr_names:
+                        tensor = getattr(module, attr_name, None)
+                        if torch.is_tensor(tensor) and tensor.device.type == "npu":
+                            ptr, nbytes = _tensor_storage_key_and_nbytes(tensor)
+                            if ptr in all_group_ptrs:
+                                ptr_to_bytes[ptr] = int(nbytes)
+                alias_cache = getattr(module, "_lossless_p2p_alias_cache", None)
+                if isinstance(alias_cache, dict):
+                    for alias in alias_cache.values():
+                        if torch.is_tensor(alias) and alias.device.type == "npu":
+                            ptr, nbytes = _tensor_storage_key_and_nbytes(alias)
+                            if ptr in all_group_ptrs:
+                                ptr_to_bytes[ptr] = int(nbytes)
+            total_unique_bytes = sum(ptr_to_bytes.values())
+
+            snapshot: dict[str, object] = {
+                "label": label,
+                "total_unique_bytes": total_unique_bytes,
+                "samples": samples,
+            }
+            snapshot.update(group_bytes)
+            if storage_diag:
+                logger.info(
+                    "Mode1 full-restore offload storage snapshot: rank=%s "
+                    "label=%s total_unique_bytes=%s loaded_param=%s "
+                    "runtime_view=%s runtime_buffer=%s saved_prefix=%s "
+                    "cpu_shadow=%s p2p_alias_cache=%s samples=%s",
+                    self.rank,
+                    label,
+                    total_unique_bytes,
+                    group_bytes["loaded_param"],
+                    group_bytes["runtime_view"],
+                    group_bytes["runtime_buffer"],
+                    group_bytes["saved_prefix"],
+                    group_bytes["cpu_shadow"],
+                    group_bytes["p2p_alias_cache"],
+                    ";".join(samples),
+                )
+            return snapshot
+
+        start_t = time.perf_counter()
+        seen_storage: set[int] = set()
+        before_snapshot = _collect_storage_snapshot("before_release")
+        for module in model.modules():
+            if not _is_ascend_fused_moe_module(module):
+                continue
+            if not _module_uses_lossless_elastic(module):
+                continue
+            if int(getattr(module, "elastic_execution_mode", 0) or 0) != 1:
+                continue
+            stats["visited_modules"] += 1.0
+            already_offloaded = bool(
+                getattr(module, "lossless_loaded_offloaded", False))
+            if already_offloaded:
+                stats["already_offloaded_modules"] += 1.0
+
+            for tensor_name in (
+                    "w13_weight",
+                    "w2_weight",
+                    "runtime_w13_weight",
+                    "runtime_w2_weight",
+                    "runtime_w13_buffer",
+                    "runtime_w2_buffer",
+                    "lossless_saved_primary_prefix_w13",
+                    "lossless_saved_primary_prefix_w2",
+            ):
+                tensor = getattr(module, tensor_name, None)
+                if torch.is_tensor(tensor) and tensor.device.type == "npu":
+                    ptr, nbytes = _tensor_storage_key_and_nbytes(tensor)
+                    if ptr and ptr not in seen_storage:
+                        seen_storage.add(ptr)
+                        stats["estimated_npu_bytes"] += float(nbytes)
+
+            try:
+                release_transient = getattr(
+                    module, "release_mode1_full_world_transient_state", None)
+                if callable(release_transient):
+                    release_transient()
+                    stats["transient_released_modules"] += 1.0
+                if canonical_offload_enabled and not already_offloaded:
+                    offload = getattr(
+                        module, "offload_lossless_loaded_weights_to_cpu",
+                        None)
+                    if callable(offload):
+                        offload()
+                        stats["offloaded_modules"] += 1.0
+            except Exception:
+                logger.exception(
+                    "Mode1 full-restore transient cleanup failed: "
+                    "rank=%s layer=%s",
+                    self.rank,
+                    getattr(module, "layer_idx", -1),
+                )
+                raise
+
+        after_release_snapshot = _collect_storage_snapshot("after_release")
+        gc_start_t = time.perf_counter()
+        gc.collect()
+        stats["gc_ms"] = (time.perf_counter() - gc_start_t) * 1000.0
+
+        if torch.npu.is_available():
+            empty_cache_start_t = time.perf_counter()
+            torch.npu.empty_cache()
+            stats["empty_cache_ms"] = (
+                time.perf_counter() - empty_cache_start_t) * 1000.0
+            if _env_flag(
+                    "VLLM_ASCEND_MODE1_SYNC_AFTER_FULL_RESTORE_WEIGHT_OFFLOAD",
+                    "1"):
+                sync_start_t = time.perf_counter()
+                torch.npu.synchronize()
+                stats["sync_ms"] = (
+                    time.perf_counter() - sync_start_t) * 1000.0
+
+        after_gc_snapshot = _collect_storage_snapshot("after_gc")
+        stats["pre_tracked_npu_bytes"] = float(
+            before_snapshot.get("total_unique_bytes", 0))
+        stats["post_release_tracked_npu_bytes"] = float(
+            after_release_snapshot.get("total_unique_bytes", 0))
+        stats["post_gc_tracked_npu_bytes"] = float(
+            after_gc_snapshot.get("total_unique_bytes", 0))
+        stats["total_ms"] = (time.perf_counter() - start_t) * 1000.0
+        if (stats["transient_released_modules"] > 0.0
+                or stats["offloaded_modules"] > 0.0
+                or _env_flag("VLLM_ASCEND_MODE1_LOG_ZERO_FULL_RESTORE_OFFLOAD",
+                             "0")):
+            logger.info(
+                "Mode1 full-restore transient cleanup: rank=%s "
+                "visited_modules=%.0f transient_released_modules=%.0f "
+                "canonical_offload_enabled=%.0f offloaded_modules=%.0f "
+                "already_offloaded_modules=%.0f estimated_npu_bytes=%.0f "
+                "pre_tracked_npu_bytes=%.0f post_release_tracked_npu_bytes=%.0f "
+                "post_gc_tracked_npu_bytes=%.0f "
+                "gc_ms=%.2f empty_cache_ms=%.2f sync_ms=%.2f total_ms=%.2f",
+                self.rank,
+                stats["visited_modules"],
+                stats["transient_released_modules"],
+                stats["canonical_offload_enabled"],
+                stats["offloaded_modules"],
+                stats["already_offloaded_modules"],
+                stats["estimated_npu_bytes"],
+                stats["pre_tracked_npu_bytes"],
+                stats["post_release_tracked_npu_bytes"],
+                stats["post_gc_tracked_npu_bytes"],
+                stats["gc_ms"],
+                stats["empty_cache_ms"],
+                stats["sync_ms"],
+                stats["total_ms"],
+            )
+        return stats
+
     def rebuild_elastic_ep_group(self, active_global_ranks: list[int]) -> bool:
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return False
@@ -12327,6 +13786,18 @@ class NPUWorker(WorkerBase):
                 f"before_elastic_shrink:{active_ranks}")
             prefetch_drain_ms = (
                 time.perf_counter() - prefetch_drain_start_t) * 1000.0
+        if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
+                and _env_flag("VLLM_ASCEND_MODE1_SYNC_BEFORE_SHRINK_PAYLOAD",
+                              "1")
+                and torch.npu.is_available()):
+            sync_start_t = time.perf_counter()
+            torch.npu.synchronize()
+            logger.info(
+                "Elastic mode1 pre-shrink payload NPU sync done: "
+                "rank=%s active_ranks=%s total_ms=%.2f",
+                self.rank, active_ranks,
+                (time.perf_counter() - sync_start_t) * 1000.0)
+
         prepare_payload_start_t = time.perf_counter()
         self._prepare_lossless_shrink_payload(active_ranks, world_group)
         prepare_payload_ms = (
@@ -12838,6 +14309,15 @@ class NPUWorker(WorkerBase):
         world_group = get_world_group()
         world_size = torch.distributed.get_world_size()
         backend = torch.distributed.get_backend(world_group.device_group)
+        restore_seq = int(getattr(self, "_mode1_fullworld_restore_seq", 0)) + 1
+        self._mode1_fullworld_restore_seq = restore_seq
+        os.environ["VLLM_ASCEND_MODE1_CURRENT_DISPATCH_PHASE"] = (
+            "post_floor_restore")
+        os.environ["VLLM_ASCEND_MODE1_CURRENT_RESTORE_SEQ"] = str(restore_seq)
+        self._log_mode1_fullworld_restore_diag(
+            "restore_entry",
+            f"world_size={world_size} backend={backend}",
+        )
 
         if self._has_mode4_remote_npu_lightweight_module():
             self._drain_mode4_double_buffer_prefetch("before_mode4_restore")
@@ -12847,6 +14327,10 @@ class NPUWorker(WorkerBase):
 
         self._reconcile_group_creation_sequence_before_restore(
             world_group, backend)
+        self._log_mode1_fullworld_restore_diag(
+            "after_reconcile_before_rebuild",
+            f"world_size={world_size}",
+        )
 
         rebuild_start_t = time.perf_counter()
         with set_current_vllm_config(self.vllm_config):
@@ -12861,6 +14345,10 @@ class NPUWorker(WorkerBase):
                 self._build_original_mc2_group_ranks(world_size),
                 world_group, backend, "mc2")
         rebuild_ms = (time.perf_counter() - rebuild_start_t) * 1000.0
+        self._log_mode1_fullworld_restore_diag(
+            "after_rebuild_before_refresh",
+            f"world_size={world_size} rebuild_ms={rebuild_ms:.2f}",
+        )
 
         refresh_start_t = time.perf_counter()
         self._reset_elastic_moe_comm_setup_cache(
@@ -12871,6 +14359,10 @@ class NPUWorker(WorkerBase):
         refresh_ms = (time.perf_counter() - refresh_start_t) * 1000.0
         self.elastic_parallel_detached = False
         self._elastic_current_active_ranks = list(range(world_size))
+        self._log_mode1_fullworld_restore_diag(
+            "after_refresh_before_stale_drop",
+            f"world_size={world_size} refresh_ms={refresh_ms:.2f}",
+        )
         stale_drop_stats = self._drop_stale_cached_elastic_parallel_groups(
             tuple(range(world_size)))
         if (stale_drop_stats.get("dropped_groups", 0.0) > 0.0
@@ -12886,15 +14378,65 @@ class NPUWorker(WorkerBase):
                 stale_drop_stats.get("cleanup_ms", 0.0),
                 stale_drop_stats.get("total_ms", 0.0),
             )
+        self._log_mode1_fullworld_restore_diag(
+            "after_stale_drop_before_warmup",
+            "dropped_groups=%.0f deferred_groups=%.0f dropped_signatures=%.0f "
+            "cleanup_ms=%.2f total_ms=%.2f" % (
+                stale_drop_stats.get("dropped_groups", 0.0),
+                stale_drop_stats.get("deferred_groups", 0.0),
+                stale_drop_stats.get("dropped_signatures", 0.0),
+                stale_drop_stats.get("cleanup_ms", 0.0),
+                stale_drop_stats.get("total_ms", 0.0),
+            ),
+        )
+        mc2_warmup_start_t = time.perf_counter()
         self._warmup_post_restore_mc2_dispatch_for_custom_mode1_parity(
             world_size)
+        mc2_warmup_ms = (time.perf_counter() - mc2_warmup_start_t) * 1000.0
+        alltoall_warmup_start_t = time.perf_counter()
         self._warmup_post_restore_alltoall_dispatch_for_custom_mode1_parity(
             world_size)
+        alltoall_warmup_ms = (
+            time.perf_counter() - alltoall_warmup_start_t) * 1000.0
+        loaded_weight_offload_stats = (
+            self._offload_mode1_loaded_weights_after_full_restore())
+        loaded_weight_offload_ms = loaded_weight_offload_stats.get(
+            "total_ms", 0.0)
+        self._log_mode1_fullworld_restore_diag(
+            "after_all_post_restore_warmups",
+            "world_size=%s loaded_weight_offloaded_modules=%.0f "
+            "loaded_weight_estimated_npu_bytes=%.0f "
+            "loaded_weight_offload_ms=%.2f" % (
+                world_size,
+                loaded_weight_offload_stats.get("offloaded_modules", 0.0),
+                loaded_weight_offload_stats.get("estimated_npu_bytes", 0.0),
+                loaded_weight_offload_ms,
+            ),
+        )
+        os.environ["VLLM_ASCEND_MODE1_CURRENT_DISPATCH_PHASE"] = "runtime"
 
+        total_ms = (time.perf_counter() - start_t) * 1000.0
+        logger.info(
+            "Elastic full-world restore segmented timing: rank=%s "
+            "restore_seq=%s world_size=%s rebuild_ms=%.2f refresh_ms=%.2f "
+            "stale_drop_ms=%.2f mc2_warmup_ms=%.2f "
+            "alltoall_warmup_ms=%.2f loaded_weight_offload_ms=%.2f "
+            "total_ms=%.2f",
+            self.rank,
+            restore_seq,
+            world_size,
+            rebuild_ms,
+            refresh_ms,
+            stale_drop_stats.get("total_ms", 0.0),
+            mc2_warmup_ms,
+            alltoall_warmup_ms,
+            loaded_weight_offload_ms,
+            total_ms,
+        )
         logger.info(
             "Elastic parallel restore done: rank=%s dp_size=%s ep_size=%s rebuild_ms=%.2f refresh_ms=%.2f total_ms=%.2f",
             self.rank, get_dp_group().world_size, vllm_ps.get_ep_group().world_size,
-            rebuild_ms, refresh_ms, (time.perf_counter() - start_t) * 1000.0)
+            rebuild_ms, refresh_ms, total_ms)
         return True
 
     def set_need_allreduce(self, value: bool):

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${DYNAMIC_DRIVER_XTRACE:-0}" == "1" ]]; then
+    set -x
+fi
 
 usage() {
     cat <<'EOF'
@@ -16,6 +19,7 @@ Key environment variables:
   DYNAMIC_SHRINK_POLICY=planned planned or natural for mode=1 epochs.
   DYNAMIC_RUN_NAME=...          Output subdirectory prefix.
   DYNAMIC_SKIP_MODE0_PROBE=0    Set to 1 to start from DYNAMIC_INITIAL_BASELINE_DIR.
+  DYNAMIC_START_EPOCH=1         First mode1 epoch index when skipping mode0.
   DYNAMIC_INITIAL_BASELINE_DIR= Existing rollout directory when skipping probe.
   DYNAMIC_ENABLE_CKPT_CHAIN=1   Save/resume checkpoints across child epochs.
   DYNAMIC_LENGTH_EMA_DECAY=0.7  EMA decay for historical rollout lengths.
@@ -24,6 +28,9 @@ Key environment variables:
   DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS=
                                  Optional runtime-only tail validation caps.
                                  This does not change offline length planning.
+  DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP=
+                                 Optional semicolon-separated per-step runtime
+                                 caps, e.g. "64,64,32,32;64,64,32,32;32,32,32".
   DYNAMIC_SHORT_STEP_CAP_ENABLE=0
                                  Optional runtime guard for predicted-short
                                  shrink steps. When enabled, only selected
@@ -70,6 +77,7 @@ DYNAMIC_DATASET_FRACTION="${DYNAMIC_DATASET_FRACTION:-${DATASET_FRACTION_FOR_ORA
 DYNAMIC_PLAN_STEPS="${DYNAMIC_PLAN_STEPS:-${PLAN_STEPS:-5}}"
 DYNAMIC_TRAIN_STEPS="${DYNAMIC_TRAIN_STEPS:-}"
 DYNAMIC_SKIP_MODE0_PROBE="${DYNAMIC_SKIP_MODE0_PROBE:-0}"
+DYNAMIC_START_EPOCH="${DYNAMIC_START_EPOCH:-1}"
 DYNAMIC_INITIAL_BASELINE_DIR="${DYNAMIC_INITIAL_BASELINE_DIR:-}"
 DYNAMIC_ENABLE_CKPT_CHAIN="${DYNAMIC_ENABLE_CKPT_CHAIN:-1}"
 DYNAMIC_INITIAL_RESUME_CKPT="${DYNAMIC_INITIAL_RESUME_CKPT:-}"
@@ -78,6 +86,7 @@ DYNAMIC_ENABLE_THRESHOLD_CONTROL="${DYNAMIC_ENABLE_THRESHOLD_CONTROL:-0}"
 DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP="${DYNAMIC_IGNORE_TAIL_TIES_AT_RESPONSE_CAP:-auto}"
 DYNAMIC_NATURAL_FLOOR8_RUNTIME_CAP="${DYNAMIC_NATURAL_FLOOR8_RUNTIME_CAP:-315648}"
 DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS="${DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS:-}"
+DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP="${DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP:-}"
 DYNAMIC_SHORT_STEP_CAP_ENABLE="${DYNAMIC_SHORT_STEP_CAP_ENABLE:-0}"
 DYNAMIC_SHORT_STEP_EXIT_THRESHOLD="${DYNAMIC_SHORT_STEP_EXIT_THRESHOLD:-4096}"
 DYNAMIC_SHORT_STEP_CAP_TOKENS="${DYNAMIC_SHORT_STEP_CAP_TOKENS:-4096}"
@@ -87,6 +96,7 @@ DYNAMIC_TAIL_GUARD_RATIO_WINDOW="${DYNAMIC_TAIL_GUARD_RATIO_WINDOW:-3}"
 DYNAMIC_TAIL_GUARD_DEFAULT_RATIO="${DYNAMIC_TAIL_GUARD_DEFAULT_RATIO:-1.20}"
 DYNAMIC_TAIL_GUARD_MIN_CAP="${DYNAMIC_TAIL_GUARD_MIN_CAP:-4096}"
 DYNAMIC_TAIL_GUARD_ROUND_TO="${DYNAMIC_TAIL_GUARD_ROUND_TO:-512}"
+DYNAMIC_MODE1_CHILD_SCRIPT="${DYNAMIC_MODE1_CHILD_SCRIPT:-}"
 
 if [[ "$DYNAMIC_SHRINK_POLICY" == "natural" && -z "${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR8+x}" ]]; then
     # Natural policy does not keep planned floor groups resident, but after
@@ -103,6 +113,11 @@ if [[ "$DYNAMIC_ENABLE_THRESHOLD_CONTROL" != "1" ]]; then
         export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS="$DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS"
     else
         unset VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS
+    fi
+    if [[ -n "$DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP" ]]; then
+        export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP="$DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP"
+    else
+        unset VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP
     fi
     export MAX_PROMPT_LENGTH="${DYNAMIC_FULL_MAX_PROMPT_LENGTH:-1024}"
     export MAX_RESPONSE_LENGTH="${DYNAMIC_FULL_MAX_RESPONSE_LENGTH:-16384}"
@@ -233,6 +248,20 @@ run_mode1_epoch() {
     local save_ckpt_enable="${SAVE_CKPT_ENABLE:-0}"
     local train_steps="${DYNAMIC_TRAIN_STEPS:-$DYNAMIC_PLAN_STEPS}"
     local trainer_save_freq="${TRAINER_SAVE_FREQ:-$train_steps}"
+    local child_script="$DYNAMIC_MODE1_CHILD_SCRIPT"
+
+    if [[ -z "$child_script" ]]; then
+        if [[ "${MIN_ADAPTIVE_FLOOR:-}" == "2" \
+            || ",${VLLM_ASCEND_SHRINK_AWARE_STAGES:-}," == *,2,* \
+            || ",${DYNAMIC_FORCE_SELECTED_FLOORS:-}," == *,2,* \
+            || "${DYNAMIC_FORCE_SELECTED_FLOOR:-}" == "2" ]]; then
+            child_script="$REPO_ROOT/run_mode1_local_length_sorted_e2e_adaptive_floor2.sh"
+        else
+            child_script="$REPO_ROOT/run_mode1_local_length_sorted_e2e_adaptive_floor4.sh"
+        fi
+    elif [[ "$child_script" != /* ]]; then
+        child_script="$REPO_ROOT/$child_script"
+    fi
 
     if [[ "$DYNAMIC_ENABLE_CKPT_CHAIN" == "1" ]]; then
         save_ckpt_enable=1
@@ -244,9 +273,11 @@ run_mode1_epoch() {
     fi
 
     echo "[dynamic length-aware] epoch=$epoch policy=$DYNAMIC_SHRINK_POLICY baseline_dirs=$baseline_dirs output_dir=$output_dir"
+    echo "[dynamic length-aware] epoch=$epoch child_script=$child_script"
     if [[ -n "$resume_ckpt" ]]; then
         echo "[dynamic length-aware] epoch=$epoch resume_ckpt=$resume_ckpt"
     fi
+    local child_rc=0
     OUTPUT_ROOT="$DYNAMIC_OUTPUT_ROOT" \
     OUTPUT_SUBDIR="$subdir" \
     BASELINE_DIRS="$baseline_dirs" \
@@ -272,9 +303,15 @@ run_mode1_epoch() {
     VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_EXIT_THRESHOLD="$DYNAMIC_SHORT_STEP_EXIT_THRESHOLD" \
     VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_CAP_TOKENS="$DYNAMIC_SHORT_STEP_CAP_TOKENS" \
     VLLM_ROLLOUT_SHRINK_AWARE_SHORT_STEP_CAP_FLOORS="$DYNAMIC_SHORT_STEP_CAP_FLOORS" \
+    FORCE_SELECTED_FLOOR="${DYNAMIC_FORCE_SELECTED_FLOOR:-}" \
+    FORCE_SELECTED_FLOORS="${DYNAMIC_FORCE_SELECTED_FLOORS:-}" \
     VERL_RESET_TRAINER_PROGRESS_AFTER_RESUME="${DYNAMIC_RESET_PROGRESS_AFTER_RESUME:-1}" \
-    "$REPO_ROOT/run_mode1_local_length_sorted_e2e_adaptive_floor4.sh" \
-        "trainer.total_training_steps=$train_steps" "${child_args[@]}"
+    "$child_script" \
+        "trainer.total_training_steps=$train_steps" "${child_args[@]}" || child_rc=$?
+    if (( child_rc != 0 )); then
+        echo "[dynamic length-aware] epoch=$epoch child run failed with exit_code=$child_rc output_dir=$output_dir" >&2
+        exit "$child_rc"
+    fi
 
     validate_rollout_dir "$output_dir" "epoch $epoch mode1"
     NEXT_ROLLOUT_DIR="$output_dir"
@@ -304,6 +341,14 @@ echo "[dynamic length-aware] tail_guard_ratio_q=$DYNAMIC_TAIL_GUARD_RATIO_QUANTI
 previous_rollout_dir=""
 baseline_history=""
 if [[ "$DYNAMIC_SKIP_MODE0_PROBE" == "1" ]]; then
+    if (( DYNAMIC_START_EPOCH < 1 )); then
+        echo "DYNAMIC_START_EPOCH must be >= 1 when DYNAMIC_SKIP_MODE0_PROBE=1" >&2
+        exit 2
+    fi
+    if (( DYNAMIC_START_EPOCH >= DYNAMIC_TOTAL_EPOCHS )); then
+        echo "DYNAMIC_START_EPOCH=$DYNAMIC_START_EPOCH must be < DYNAMIC_TOTAL_EPOCHS=$DYNAMIC_TOTAL_EPOCHS" >&2
+        exit 2
+    fi
     if [[ -z "$DYNAMIC_INITIAL_BASELINE_DIR" ]]; then
         echo "DYNAMIC_SKIP_MODE0_PROBE=1 requires DYNAMIC_INITIAL_BASELINE_DIR" >&2
         exit 2
@@ -311,13 +356,14 @@ if [[ "$DYNAMIC_SKIP_MODE0_PROBE" == "1" ]]; then
     baseline_history=$(validate_rollout_history "$DYNAMIC_INITIAL_BASELINE_DIR" "initial baseline")
     previous_rollout_dir="${baseline_history##*:}"
 else
+    DYNAMIC_START_EPOCH=1
     run_mode0_probe "$@"
     previous_rollout_dir="$NEXT_ROLLOUT_DIR"
     baseline_history="$previous_rollout_dir"
     DYNAMIC_INITIAL_RESUME_CKPT="$NEXT_CKPT_PATH"
 fi
 
-for (( epoch = 1; epoch < DYNAMIC_TOTAL_EPOCHS; epoch++ )); do
+for (( epoch = DYNAMIC_START_EPOCH; epoch < DYNAMIC_TOTAL_EPOCHS; epoch++ )); do
     run_mode1_epoch "$epoch" "$baseline_history" "$DYNAMIC_INITIAL_RESUME_CKPT" "$@"
     previous_rollout_dir="$NEXT_ROLLOUT_DIR"
     baseline_history="${baseline_history}:$previous_rollout_dir"

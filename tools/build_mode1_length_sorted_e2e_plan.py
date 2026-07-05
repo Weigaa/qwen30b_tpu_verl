@@ -594,6 +594,7 @@ def _solve_one_batch(
     floor_kv_caps: dict[int, float] | None = None,
     adaptive_floor: bool = False,
     min_adaptive_floor: int = 2,
+    force_selected_floor: int | None = None,
     active_peak_safety_factor: float,
     max_response_len: float,
     ignore_tail_ties_at_response_cap: bool = False,
@@ -604,6 +605,10 @@ def _solve_one_batch(
     if not cap_by_floor:
         cap_by_floor = {4: float(max_rank_peak_tokens)}
     cap_by_floor.setdefault(16, float(max_rank_peak_tokens))
+    if force_selected_floor is not None and force_selected_floor not in FLOOR_CANDIDATES:
+        raise ValueError(
+            f"unsupported forced floor={force_selected_floor}; "
+            f"expected one of {FLOOR_CANDIDATES}")
 
     probe_pairs, _probe_feasible = _capacity_constrained_load_gap_matching(
         batch,
@@ -660,11 +665,14 @@ def _solve_one_batch(
         schedule_quotas = ()
         release_area = 0.0
         rank_matching_objective = "probe"
-        start_floor = max(int(min_adaptive_floor),
-                          int(theoretical_floor_for_selection))
-        for floor in FLOOR_CANDIDATES:
-            if floor < start_floor:
-                continue
+        if force_selected_floor is not None:
+            candidate_floors = (int(force_selected_floor),)
+        else:
+            start_floor = max(int(min_adaptive_floor),
+                              int(theoretical_floor_for_selection))
+            candidate_floors = tuple(
+                floor for floor in FLOOR_CANDIDATES if floor >= start_floor)
+        for floor in candidate_floors:
             cap = float(cap_by_floor.get(floor, cap_by_floor.get(16, max_rank_peak_tokens)))
             (
                 candidate_pairs,
@@ -761,6 +769,7 @@ def _solve_group(
     floor_kv_caps: dict[int, float] | None = None,
     adaptive_floor: bool = False,
     min_adaptive_floor: int = 2,
+    force_selected_floor: int | None = None,
     active_peak_safety_factor: float,
     max_response_len: float,
     ignore_tail_ties_at_response_cap: bool = False,
@@ -771,6 +780,7 @@ def _solve_group(
         floor_kv_caps=floor_kv_caps,
         adaptive_floor=adaptive_floor,
         min_adaptive_floor=min_adaptive_floor,
+        force_selected_floor=force_selected_floor,
         active_peak_safety_factor=active_peak_safety_factor,
         max_response_len=max_response_len,
         ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
@@ -789,6 +799,7 @@ def _solve_group_cached(
     floor_kv_caps: dict[int, float] | None = None,
     adaptive_floor: bool = False,
     min_adaptive_floor: int = 2,
+    force_selected_floor: int | None = None,
     active_peak_safety_factor: float,
     max_response_len: float,
     ignore_tail_ties_at_response_cap: bool = False,
@@ -803,6 +814,7 @@ def _solve_group_cached(
         floor_kv_caps=floor_kv_caps,
         adaptive_floor=adaptive_floor,
         min_adaptive_floor=min_adaptive_floor,
+        force_selected_floor=force_selected_floor,
         active_peak_safety_factor=active_peak_safety_factor,
         max_response_len=max_response_len,
         ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
@@ -852,6 +864,7 @@ def _best_single_swap_repair(
     floor_kv_caps: dict[int, float] | None,
     adaptive_floor: bool,
     min_adaptive_floor: int,
+    force_selected_floor: int | None,
     active_peak_safety_factor: float,
     max_response_len: float,
     repair_candidate_limit: int,
@@ -927,6 +940,7 @@ def _best_single_swap_repair(
                     floor_kv_caps=floor_kv_caps,
                     adaptive_floor=adaptive_floor,
                     min_adaptive_floor=min_adaptive_floor,
+                    force_selected_floor=force_selected_floor,
                     active_peak_safety_factor=active_peak_safety_factor,
                     max_response_len=max_response_len,
                     ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
@@ -938,6 +952,7 @@ def _best_single_swap_repair(
                     floor_kv_caps=floor_kv_caps,
                     adaptive_floor=adaptive_floor,
                     min_adaptive_floor=min_adaptive_floor,
+                    force_selected_floor=force_selected_floor,
                     active_peak_safety_factor=active_peak_safety_factor,
                     max_response_len=max_response_len,
                     ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
@@ -969,6 +984,7 @@ def _repair_infeasible_groups(
     floor_kv_caps: dict[int, float] | None,
     adaptive_floor: bool,
     min_adaptive_floor: int,
+    force_selected_floor: int | None,
     active_peak_safety_factor: float,
     max_response_len: float,
     max_cross_step_repair_swaps: int,
@@ -984,6 +1000,7 @@ def _repair_infeasible_groups(
             floor_kv_caps=floor_kv_caps,
             adaptive_floor=adaptive_floor,
             min_adaptive_floor=min_adaptive_floor,
+            force_selected_floor=force_selected_floor,
             active_peak_safety_factor=active_peak_safety_factor,
             max_response_len=max_response_len,
             ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
@@ -1008,6 +1025,7 @@ def _repair_infeasible_groups(
                     floor_kv_caps=floor_kv_caps,
                     adaptive_floor=adaptive_floor,
                     min_adaptive_floor=min_adaptive_floor,
+                    force_selected_floor=force_selected_floor,
                     active_peak_safety_factor=active_peak_safety_factor,
                     max_response_len=max_response_len,
                     repair_candidate_limit=repair_candidate_limit,
@@ -1051,6 +1069,8 @@ def _solve_batches(
     floor_kv_caps: dict[int, float] | None,
     adaptive_floor: bool,
     min_adaptive_floor: int,
+    force_selected_floor: int | None,
+    force_selected_floors: list[int] | None = None,
     active_peak_safety_factor: float,
     max_response_len: float,
     max_cross_step_repair_swaps: int,
@@ -1067,6 +1087,10 @@ def _solve_batches(
         list(ordered[step * batch_size:(step + 1) * batch_size])
         for step in range(steps)
     ]
+    if force_selected_floors is not None and len(force_selected_floors) != len(groups):
+        raise ValueError(
+            f"force_selected_floors length mismatch: "
+            f"{len(force_selected_floors)} floors for {len(groups)} groups")
     if max_cross_step_repair_swaps <= 0:
         return [
             _solve_group(
@@ -1075,10 +1099,28 @@ def _solve_batches(
                 floor_kv_caps=floor_kv_caps,
                 adaptive_floor=adaptive_floor,
                 min_adaptive_floor=min_adaptive_floor,
+                force_selected_floor=(
+                    force_selected_floors[idx]
+                    if force_selected_floors is not None
+                    else force_selected_floor),
                 active_peak_safety_factor=active_peak_safety_factor,
                 max_response_len=max_response_len,
                 ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
-            ) for group in groups
+            ) for idx, group in enumerate(groups)
+        ]
+    if force_selected_floors is not None:
+        return [
+            _solve_group(
+                group,
+                max_rank_peak_tokens=max_rank_peak_tokens,
+                floor_kv_caps=floor_kv_caps,
+                adaptive_floor=adaptive_floor,
+                min_adaptive_floor=min_adaptive_floor,
+                force_selected_floor=force_selected_floors[idx],
+                active_peak_safety_factor=active_peak_safety_factor,
+                max_response_len=max_response_len,
+                ignore_tail_ties_at_response_cap=ignore_tail_ties_at_response_cap,
+            ) for idx, group in enumerate(groups)
         ]
     return _repair_infeasible_groups(
         groups,
@@ -1086,6 +1128,7 @@ def _solve_batches(
         floor_kv_caps=floor_kv_caps,
         adaptive_floor=adaptive_floor,
         min_adaptive_floor=min_adaptive_floor,
+        force_selected_floor=force_selected_floor,
         active_peak_safety_factor=active_peak_safety_factor,
         max_response_len=max_response_len,
         max_cross_step_repair_swaps=max_cross_step_repair_swaps,
@@ -1348,6 +1391,29 @@ def _parse_floor_kv_caps(value: str | None,
     return caps
 
 
+def _parse_forced_floors(value: str | None, steps: int) -> list[int] | None:
+    if value is None:
+        return None
+    floors: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        floor = int(item)
+        if floor not in FLOOR_CANDIDATES:
+            raise ValueError(
+                f"unsupported forced floor={floor}; "
+                f"expected one of {FLOOR_CANDIDATES}")
+        floors.append(floor)
+    if not floors:
+        return None
+    if len(floors) != steps:
+        raise ValueError(
+            f"--force-selected-floors length must match --steps: "
+            f"got {len(floors)} floors for {steps} steps")
+    return floors
+
+
 def _ceil_to_multiple(value: float, multiple: int) -> int:
     if multiple <= 1:
         return int(np.ceil(value))
@@ -1446,6 +1512,21 @@ def main() -> None:
             "floor16, in which case bounded neighbor repair may swap prompts."))
     parser.add_argument("--min-adaptive-floor", type=int, default=2)
     parser.add_argument(
+        "--force-selected-floor",
+        type=int,
+        default=0,
+        help=(
+            "Force every step to use this selected floor. This is intended for "
+            "runtime capacity probes, e.g. validating floor2 without allowing "
+            "a tail-tied smoke-test step to expand back to floor16."))
+    parser.add_argument(
+        "--force-selected-floors",
+        default=None,
+        help=(
+            "Comma-separated per-step selected floors, e.g. 2,2,4. This is "
+            "intended for short transition probes and disables cross-step "
+            "repair to preserve the requested floor sequence."))
+    parser.add_argument(
         "--floor-kv-caps",
         default=None,
         help=(
@@ -1502,6 +1583,8 @@ def main() -> None:
     )
     floor_kv_caps = _parse_floor_kv_caps(
         args.floor_kv_caps, args.max_rank_peak_tokens)
+    force_selected_floors = _parse_forced_floors(
+        args.force_selected_floors, args.steps)
     plans = _solve_batches(
         stats,
         args.batch_size,
@@ -1510,6 +1593,10 @@ def main() -> None:
         floor_kv_caps=floor_kv_caps,
         adaptive_floor=args.adaptive_floor,
         min_adaptive_floor=args.min_adaptive_floor,
+        force_selected_floor=(
+            int(args.force_selected_floor)
+            if int(args.force_selected_floor) > 0 else None),
+        force_selected_floors=force_selected_floors,
         active_peak_safety_factor=args.active_peak_safety_factor,
         max_response_len=args.max_response_len,
         max_cross_step_repair_swaps=args.max_cross_step_repair_swaps,

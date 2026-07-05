@@ -231,6 +231,30 @@ class EngineCore:
                 len(kv_cache_config.kv_cache_groups) * min_block_size *
                 dcp_world_size)
 
+    def _mode1_effective_blocks_for_token_cap(
+            self, kv_cache_config: KVCacheConfig,
+            effective_target_tokens: int) -> tuple[int, int]:
+        """Return the scheduler blocks/tokens produced by a mode=1 token cap."""
+        if effective_target_tokens <= 0 or not kv_cache_config.kv_cache_groups:
+            return 0, 0
+        min_block_size = min(
+            group.kv_cache_spec.block_size
+            for group in kv_cache_config.kv_cache_groups)
+        dcp_world_size = max(
+            int(self.vllm_config.parallel_config.
+                decode_context_parallel_size), 1)
+        tokens_per_block_group = min_block_size * dcp_world_size
+        if tokens_per_block_group <= 0:
+            return kv_cache_config.num_blocks, self._kv_cache_token_capacity(
+                kv_cache_config)
+        num_groups = len(kv_cache_config.kv_cache_groups)
+        blocks_per_group = effective_target_tokens // tokens_per_block_group
+        target_blocks = blocks_per_group * num_groups
+        if target_blocks <= 0:
+            return 0, 0
+        target_tokens = blocks_per_group * tokens_per_block_group
+        return target_blocks, target_tokens
+
     def _build_scheduler(
             self, kv_cache_config: KVCacheConfig) -> SchedulerInterface:
         if isinstance(self.vllm_config.scheduler_config.scheduler_cls, str):
@@ -359,6 +383,10 @@ class EngineCore:
         old_scheduler_config = generate_scheduler_kv_cache_config(
             self.kv_cache_configs)
         old_tokens = self._kv_cache_token_capacity(old_scheduler_config)
+        old_blocks = old_scheduler_config.num_blocks
+        target_blocks, rounded_target_tokens = (
+            self._mode1_effective_blocks_for_token_cap(
+                old_scheduler_config, effective_target_tokens))
         dp_world_size = max(
             int(getattr(self.vllm_config.parallel_config,
                         "data_parallel_size", 1) or 1), 1)
@@ -390,7 +418,34 @@ class EngineCore:
                     tag,
                 )
 
-        if old_tokens == effective_target_tokens and not planned_expert_prefill_on_resize:
+        current_floor_env = os.environ.get(
+            "VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR")
+        last_resized_floor_env = os.environ.get(
+            "VLLM_ASCEND_MODE1_PARITY_LAST_RESIZED_FLOOR")
+        previous_floor_env = last_resized_floor_env or current_floor_env
+        previous_floor_int: int | None = None
+        if previous_floor_env is not None:
+            try:
+                previous_floor_int = int(previous_floor_env.strip())
+            except (TypeError, ValueError):
+                previous_floor_int = None
+        upward_floor_transition = (
+            previous_floor_int is not None and target_floor_int is not None
+            and target_floor_int > previous_floor_int
+            and previous_floor_int > 0)
+        current_floor_matches = (
+            target_floor_int is None or
+            (current_floor_env is not None
+             and current_floor_env.strip() == str(target_floor_int)))
+        if (old_tokens == effective_target_tokens and current_floor_matches
+                and not planned_expert_prefill_on_resize):
+            os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_KV_TOKENS"] = str(
+                old_tokens)
+            if target_floor_int is not None:
+                os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR"] = str(
+                    target_floor_int)
+                os.environ["VLLM_ASCEND_MODE1_PARITY_LAST_RESIZED_FLOOR"] = str(
+                    target_floor_int)
             if planned_floor_headroom_tokens:
                 logger.info(
                     "Skip mode1 adaptive KV resize because effective target "
@@ -406,6 +461,34 @@ class EngineCore:
                     target_includes_planned_headroom,
                 )
             _log_comm_cache_state("resize_skip_same_target")
+            return False
+        if (old_blocks == target_blocks and current_floor_matches
+                and not planned_expert_prefill_on_resize
+                and self._env_flag(
+                    "VLLM_ASCEND_MODE1_SKIP_SAME_BLOCK_KV_RESIZE", "1")):
+            os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_KV_TOKENS"] = str(
+                rounded_target_tokens or old_tokens)
+            if target_floor_int is not None:
+                os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR"] = str(
+                    target_floor_int)
+                os.environ["VLLM_ASCEND_MODE1_PARITY_LAST_RESIZED_FLOOR"] = str(
+                    target_floor_int)
+            logger.info(
+                "Skip mode1 adaptive KV resize because target maps to the "
+                "current KV block count: old_tokens=%s target_tokens=%s "
+                "effective_target_tokens=%s rounded_target_tokens=%s "
+                "target_floor=%s current_floor=%s old_blocks=%s "
+                "target_blocks=%s",
+                old_tokens,
+                target_tokens,
+                effective_target_tokens,
+                rounded_target_tokens,
+                target_floor_int,
+                current_floor_env,
+                old_blocks,
+                target_blocks,
+            )
+            _log_comm_cache_state("resize_skip_same_blocks")
             return False
         if old_tokens == effective_target_tokens and planned_expert_prefill_on_resize:
             logger.info(
@@ -470,9 +553,8 @@ class EngineCore:
             return False
 
         start = time.time()
-        old_blocks = old_scheduler_config.num_blocks
         os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_KV_TOKENS"] = str(
-            target_tokens)
+            rounded_target_tokens or effective_target_tokens)
         if target_floor_int is not None:
             os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR"] = str(
                 target_floor_int)
@@ -480,7 +562,8 @@ class EngineCore:
             "Mode1 adaptive KV resize phase=start old_tokens=%s "
             "target_tokens=%s effective_target_tokens=%s target_floor=%s "
             "planned_floor_headroom_tokens=%s "
-            "target_includes_planned_headroom=%s old_blocks=%s",
+            "target_includes_planned_headroom=%s old_blocks=%s "
+            "predicted_target_blocks=%s rounded_target_tokens=%s",
             old_tokens,
             target_tokens,
             effective_target_tokens,
@@ -488,8 +571,45 @@ class EngineCore:
             planned_floor_headroom_tokens,
             target_includes_planned_headroom,
             old_blocks,
+            target_blocks,
+            rounded_target_tokens,
         )
         _log_comm_cache_state("resize_start")
+        old_kv_cleared_before_floor_prepare = False
+        if (upward_floor_transition and self._env_flag(
+                "VLLM_ASCEND_MODE1_CLEAR_OLD_KV_BEFORE_UPWARD_FLOOR_PREPARE",
+                "1")):
+            # Upward transitions such as floor2->floor4 compact temporary MoE
+            # storage before allocating the new KV cache. Release the previous
+            # step's KV first so compact does not peak on top of old KV.
+            logger.info(
+                "Mode1 adaptive KV resize "
+                "phase=clear_old_kv_before_floor_prepare_start "
+                "target_floor=%s previous_floor=%s old_tokens=%s",
+                target_floor_int,
+                previous_floor_int,
+                old_tokens,
+            )
+            self.collective_rpc("clear_kv_cache_for_resize")
+            gc.collect()
+            old_kv_cleared_before_floor_prepare = True
+            logger.info(
+                "Mode1 adaptive KV resize "
+                "phase=clear_old_kv_before_floor_prepare_done "
+                "target_floor=%s previous_floor=%s old_tokens=%s",
+                target_floor_int,
+                previous_floor_int,
+                old_tokens,
+            )
+            _log_comm_cache_state("after_clear_old_kv_before_floor_prepare")
+            self.collective_rpc(
+                "mode1_resize_world_barrier",
+                args=("after_clear_old_kv_before_floor_prepare", ))
+            if self._env_flag("VLLM_ASCEND_MODE1_KV_RESIZE_LIVE_TENSOR_SCAN",
+                              "0"):
+                self.collective_rpc(
+                    "mode1_resize_live_tensor_scan",
+                    args=("after_clear_old_kv_before_floor_prepare", ))
         if target_floor_int is not None:
             logger.info(
                 "Mode1 adaptive KV resize phase=floor_prepare_start "
@@ -497,7 +617,7 @@ class EngineCore:
                 target_floor_int,
             )
             self.collective_rpc("prepare_mode1_step_floor_for_kv_resize",
-                                args=(target_floor_int, ))
+                                args=(target_floor_int, previous_floor_int))
             gc.collect()
             logger.info(
                 "Mode1 adaptive KV resize phase=floor_prepare_done "
@@ -531,16 +651,22 @@ class EngineCore:
                                 args=("after_floor_prepare", ))
 
         # Release old tensors before allocating the new per-step cache size.
-        logger.info("Mode1 adaptive KV resize phase=clear_old_kv_start")
-        self.collective_rpc("clear_kv_cache_for_resize")
-        gc.collect()
-        logger.info("Mode1 adaptive KV resize phase=clear_old_kv_done")
-        _log_comm_cache_state("after_clear_old_kv")
-        self.collective_rpc("mode1_resize_world_barrier",
-                            args=("after_clear_old_kv", ))
-        if self._env_flag("VLLM_ASCEND_MODE1_KV_RESIZE_LIVE_TENSOR_SCAN", "0"):
-            self.collective_rpc("mode1_resize_live_tensor_scan",
+        if old_kv_cleared_before_floor_prepare:
+            logger.info(
+                "Mode1 adaptive KV resize phase=clear_old_kv_skipped "
+                "reason=already_cleared_before_floor_prepare")
+        else:
+            logger.info("Mode1 adaptive KV resize phase=clear_old_kv_start")
+            self.collective_rpc("clear_kv_cache_for_resize")
+            gc.collect()
+            logger.info("Mode1 adaptive KV resize phase=clear_old_kv_done")
+            _log_comm_cache_state("after_clear_old_kv")
+            self.collective_rpc("mode1_resize_world_barrier",
                                 args=("after_clear_old_kv", ))
+            if self._env_flag("VLLM_ASCEND_MODE1_KV_RESIZE_LIVE_TENSOR_SCAN",
+                              "0"):
+                self.collective_rpc("mode1_resize_live_tensor_scan",
+                                    args=("after_clear_old_kv", ))
         if self._env_flag(
                 "VLLM_ASCEND_MODE1_CLEAR_STALE_PARAM_DICTS_AFTER_OLD_KV",
                 "0"):
@@ -713,15 +839,21 @@ class EngineCore:
         logger.info(
             "Mode1 adaptive KV cache resized for step: old_tokens=%s "
             "target_tokens=%s effective_target_tokens=%s new_tokens=%s "
-            "old_blocks=%s new_blocks=%s elapsed_s=%.2f",
+            "old_blocks=%s new_blocks=%s previous_floor=%s "
+            "target_floor=%s elapsed_s=%.2f",
             old_tokens,
             target_tokens,
             effective_target_tokens,
             new_tokens,
             old_blocks,
             new_scheduler_config.num_blocks,
+            previous_floor_int,
+            target_floor_int,
             time.time() - start,
         )
+        if target_floor_int is not None:
+            os.environ["VLLM_ASCEND_MODE1_PARITY_LAST_RESIZED_FLOOR"] = str(
+                target_floor_int)
         return True
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:

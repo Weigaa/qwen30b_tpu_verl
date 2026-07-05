@@ -79,6 +79,23 @@ _ENABLE_NATIVE_MOE_TOPK_DEBUG = os.getenv(
         "1", "true", "yes", "on")
 
 
+def _mode1_load_weights_deep_diag_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_MODE1_LOAD_WEIGHTS_DEEP_DIAG",
+                     "0").lower() in ("1", "true", "yes", "on")
+
+
+def _mode1_current_rank_for_diag() -> int:
+    try:
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+    except Exception:
+        pass
+    try:
+        return int(get_ep_group().rank_in_group)
+    except Exception:
+        return -1
+
+
 def _profile_rank() -> int:
     try:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -664,19 +681,70 @@ class Qwen3MoeModel(nn.Module):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         lossless_reload_modules: list[tuple[nn.Module, object]] = []
+        deep_diag = _mode1_load_weights_deep_diag_enabled()
+        diag_step = os.getenv("VLLM_ASCEND_MODE1_CURRENT_UPDATE_STEP", "-1")
+        diag_epoch = os.getenv("VLLM_ASCEND_MODE1_CURRENT_UPDATE_EPOCH", "-1")
+        diag_rank = _mode1_current_rank_for_diag() if deep_diag else -1
+        load_start_t = time.perf_counter()
+        invalidate_s = 0.0
+        post_process_s = 0.0
+        stacked_s = 0.0
+        expert_s = 0.0
+        default_s = 0.0
+        ignored_expert_s = 0.0
+        unknown_skip_s = 0.0
+        loaded_bytes = 0
+        stacked_calls = 0
+        expert_calls = 0
+        default_calls = 0
+        ignored_expert_count = 0
+        unknown_skip_count = 0
+        invalidated_count = 0
+        post_process_count = 0
+        slow_events: list[tuple[float, str]] = []
+
+        def _record_slow(elapsed_s: float, tag: str) -> None:
+            if not deep_diag:
+                return
+            threshold_s = float(os.getenv(
+                "VLLM_ASCEND_MODE1_LOAD_WEIGHTS_SLOW_EVENT_THRESHOLD_S",
+                "0.25") or "0.25")
+            if elapsed_s < threshold_s and len(slow_events) >= 8:
+                return
+            slow_events.append((elapsed_s, tag))
+            slow_events.sort(key=lambda item: item[0], reverse=True)
+            del slow_events[8:]
+
+        def _weight_nbytes(weight: torch.Tensor) -> int:
+            try:
+                return int(weight.numel()) * int(weight.element_size())
+            except Exception:
+                return 0
+
         _lossless_log_moe_load_snapshot("enter")
+        invalidate_start_t = time.perf_counter()
         for module in self.modules():
             quant_method = getattr(module, "quant_method", None)
             invalidate_runtime = getattr(quant_method,
                                          "invalidate_lossless_runtime_state_for_reload",
                                          None)
             if callable(invalidate_runtime):
+                one_start_t = time.perf_counter()
                 invalidated = invalidate_runtime(
                     layer=module, reason="Qwen3MoeModel.load_weights")
+                one_elapsed_s = time.perf_counter() - one_start_t
+                _record_slow(
+                    one_elapsed_s,
+                    f"invalidate:{module.__class__.__name__}:"
+                    f"{getattr(module, 'layer_idx', '?')}")
                 if invalidated:
+                    invalidated_count += 1
                     lossless_reload_modules.append((module, quant_method))
+        invalidate_s = time.perf_counter() - invalidate_start_t
         # print("vllm moe expert_params_mapping is", expert_params_mapping)
         for name, loaded_weight in weights:
+            if deep_diag and isinstance(loaded_weight, torch.Tensor):
+                loaded_bytes += _weight_nbytes(loaded_weight)
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -709,10 +777,15 @@ class Qwen3MoeModel(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
+                one_start_t = time.perf_counter()
                 if weight_loader == default_weight_loader:
                     weight_loader(param, loaded_weight)
                 else:
                     weight_loader(param, loaded_weight, shard_id)
+                elapsed_s = time.perf_counter() - one_start_t
+                stacked_s += elapsed_s
+                stacked_calls += 1
+                _record_slow(elapsed_s, f"stacked:{name}")
                 break
             else:
                 is_expert_weight = False
@@ -749,12 +822,20 @@ class Qwen3MoeModel(nn.Module):
                     # if self.ep_group.rank() == 0:
                     #     print("name is", name, "param_name is", param_name)
                     #     print("ep_rank is ", self.ep_group.rank(), "load_weight is", loaded_weight, "name_mapped", name_mapped, "shard_id", shard_id, "expert_id", expert_id)
+                    one_start_t = time.perf_counter()
                     success = weight_loader(param,
                                             loaded_weight,
                                             name_mapped,
                                             shard_id=shard_id,
                                             expert_id=expert_id,
                                             return_success=True)
+                    elapsed_s = time.perf_counter() - one_start_t
+                    expert_s += elapsed_s
+                    expert_calls += 1
+                    _record_slow(
+                        elapsed_s,
+                        f"expert:{name_mapped}:expert={expert_id}:"
+                        f"shard={shard_id}")
                     if success:
                         name = name_mapped
                         break
@@ -763,6 +844,8 @@ class Qwen3MoeModel(nn.Module):
                         # We've checked that this is an expert weight
                         # However it's not mapped locally to this rank
                         # So we simply skip it
+                        if deep_diag:
+                            ignored_expert_count += 1
                         continue
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
@@ -788,7 +871,12 @@ class Qwen3MoeModel(nn.Module):
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
+                    one_start_t = time.perf_counter()
                     weight_loader(param, loaded_weight)
+                    elapsed_s = time.perf_counter() - one_start_t
+                    default_s += elapsed_s
+                    default_calls += 1
+                    _record_slow(elapsed_s, f"default:{name}")
             loaded_params.add(name)
 
         for module, quant_method in lossless_reload_modules:
@@ -796,7 +884,51 @@ class Qwen3MoeModel(nn.Module):
                                            "process_weights_after_loading",
                                            None)
             if callable(process_after_reload):
+                one_start_t = time.perf_counter()
                 process_after_reload(module)
+                elapsed_s = time.perf_counter() - one_start_t
+                post_process_s += elapsed_s
+                post_process_count += 1
+                _record_slow(
+                    elapsed_s,
+                    f"post_process:{module.__class__.__name__}:"
+                    f"{getattr(module, 'layer_idx', '?')}")
+
+        if deep_diag:
+            total_s = time.perf_counter() - load_start_t
+            slow_summary = "; ".join(
+                f"{tag}={elapsed_s:.3f}s" for elapsed_s, tag in slow_events)
+            logger.info(
+                "Mode1 load_weights deep timing: rank=%s step=%s epoch=%s "
+                "total_s=%.3f invalidate_s=%.3f invalidated=%s "
+                "stacked_s=%.3f stacked_calls=%s default_s=%.3f "
+                "default_calls=%s expert_s=%.3f expert_calls=%s "
+                "ignored_expert_count=%s ignored_expert_s=%.3f "
+                "unknown_skip_count=%s unknown_skip_s=%.3f "
+                "post_process_s=%.3f post_process_count=%s "
+                "loaded_params=%s input_bytes=%s slow=%s",
+                diag_rank,
+                diag_step,
+                diag_epoch,
+                total_s,
+                invalidate_s,
+                invalidated_count,
+                stacked_s,
+                stacked_calls,
+                default_s,
+                default_calls,
+                expert_s,
+                expert_calls,
+                ignored_expert_count,
+                ignored_expert_s,
+                unknown_skip_count,
+                unknown_skip_s,
+                post_process_s,
+                post_process_count,
+                len(loaded_params),
+                loaded_bytes,
+                slow_summary,
+            )
 
         _lossless_log_moe_load_snapshot("exit")
         return loaded_params

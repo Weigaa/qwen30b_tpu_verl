@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import csv
 import json
 import logging
 import os
@@ -70,9 +71,6 @@ from vllm.utils.moe_stats import (merge_moe_pattern_records,
                                   write_moe_pattern_csvs,
                                   write_prompt_token_epoch_artifact_from_worker_records)
 
-#新增开始
-import json
-#新增结束
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -417,8 +415,13 @@ class RayPPOTrainer:
                              "restore_rollout_elastic_parallel_groups", None)
         if restore_fn is None:
             return
-        logger.info("Elastic parallel restore requested before rollout restore rpc")
+        start = time.perf_counter()
+        logger.info("Mode1 step timeline: driver_restore_rpc_start")
         restore_fn()
+        logger.info(
+            "Mode1 step timeline: driver_restore_rpc_done elapsed_s=%.3f",
+            time.perf_counter() - start,
+        )
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1242,6 +1245,169 @@ class RayPPOTrainer:
         )
         print(f"MoE pattern CSVs written to {output_dir} for epoch={epoch}.")
 
+    def _run_rollout_decode_batchsize_benchmark(self) -> dict:
+        """Run verl-initialized rollout workers only and report decode-length metrics."""
+        warmup_steps = int(os.getenv("VERL_ROLLOUT_BENCH_WARMUP_STEPS", "1"))
+        measure_steps = int(os.getenv("VERL_ROLLOUT_BENCH_MEASURE_STEPS", "3"))
+        configured_batch_size = int(
+            os.getenv(
+                "VERL_ROLLOUT_BENCH_BATCH_SIZE",
+                str(self.config.data.get("gen_batch_size", self.config.data.train_batch_size)),
+            )
+        )
+        output_dir = os.getenv("VERL_ROLLOUT_BENCH_OUTPUT_DIR", "./rollout_decode_batchsize_benchmark")
+        csv_path = os.getenv("VERL_ROLLOUT_BENCH_CSV", os.path.join(output_dir, "summary.csv"))
+        jsonl_path = os.getenv("VERL_ROLLOUT_BENCH_JSONL", os.path.join(output_dir, "steps.jsonl"))
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(jsonl_path) or ".", exist_ok=True)
+
+        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+        max_response_length = int(self.config.data.max_response_length)
+        max_prompt_length = int(self.config.data.max_prompt_length)
+        total_steps = warmup_steps + measure_steps
+        if measure_steps <= 0:
+            raise ValueError(f"VERL_ROLLOUT_BENCH_MEASURE_STEPS must be > 0, got {measure_steps}")
+
+        print(
+            "[rollout decode bench] verl-flow start "
+            f"batch_size={configured_batch_size} n={rollout_n} "
+            f"prompt_len={max_prompt_length} decode_len={max_response_length} "
+            f"warmup_steps={warmup_steps} measure_steps={measure_steps}"
+        )
+
+        records = []
+        dataloader_iter = iter(self.train_dataloader)
+        for local_step in range(total_steps):
+            try:
+                batch_dict = next(dataloader_iter)
+            except StopIteration:
+                dataloader_iter = iter(self.train_dataloader)
+                batch_dict = next(dataloader_iter)
+
+            batch: DataProto = DataProto.from_single_dict(batch_dict)
+            batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+            )
+            gen_batch = self._get_gen_batch(batch)
+            gen_batch.meta_info["global_steps"] = local_step
+            gen_batch.meta_info["epoch"] = 0
+
+            data_rebalance = False
+            gen_batch = gen_batch.repeat(repeat_times=rollout_n, interleave=not data_rebalance)
+
+            shrink_aware_result = maybe_apply_shrink_aware_schedule(
+                gen_batch,
+                self.config.actor_rollout_ref.rollout,
+                sampler=self.train_dataloader.sampler,
+            )
+            if shrink_aware_result.enabled:
+                _export_shrink_aware_role_plan(
+                    shrink_aware_result.role_plan,
+                    self.config.actor_rollout_ref.rollout.get("shrink_aware", {}),
+                )
+
+            response_cap = self._maybe_compute_rollout_response_cap(gen_batch)
+            if response_cap is not None:
+                gen_batch.meta_info["response_max_tokens_cap"] = int(response_cap)
+
+            start_s = time.perf_counter()
+            if not self.async_rollout_mode:
+                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                self._restore_rollout_elastic_parallel_groups_if_needed()
+            else:
+                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+            wall_s = time.perf_counter() - start_s
+
+            restore_shrink_aware_order(gen_batch_output, shrink_aware_result)
+            timing = dict(gen_batch_output.meta_info.get("timing", {}))
+            if "response_mask" not in gen_batch_output.batch.keys():
+                gen_batch_output.batch["response_mask"] = compute_response_mask(gen_batch_output)
+            response_mask = gen_batch_output.batch["response_mask"]
+            decode_tokens = int(response_mask.sum().item())
+            generated_samples = int(response_mask.shape[0])
+            latency_per_sample_s = wall_s / generated_samples if generated_samples else float("inf")
+            tokens_per_s = decode_tokens / wall_s if wall_s > 0 else float("inf")
+            samples_per_s = generated_samples / wall_s if wall_s > 0 else float("inf")
+            is_warmup = local_step < warmup_steps
+            record = {
+                "batch_size": configured_batch_size,
+                "rollout_n": rollout_n,
+                "prompt_len": max_prompt_length,
+                "decode_len": max_response_length,
+                "step": local_step,
+                "phase": "warmup" if is_warmup else "measure",
+                "generated_samples": generated_samples,
+                "decode_tokens": decode_tokens,
+                "wall_s": wall_s,
+                "decode_latency_s": wall_s,
+                "decode_latency_ms": wall_s * 1000.0,
+                "tokens_per_s": tokens_per_s,
+                "samples_per_s": samples_per_s,
+                "latency_per_sample_ms": latency_per_sample_s * 1000.0,
+                "timing": timing,
+            }
+            records.append(record)
+            with open(jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print(
+                "[rollout decode bench] "
+                f"batch_size={configured_batch_size} step={local_step} phase={record['phase']} "
+                f"generated_samples={generated_samples} decode_tokens={decode_tokens} "
+                f"wall_s={wall_s:.6f} tokens_per_s={tokens_per_s:.3f} "
+                f"decode_latency_ms={record['decode_latency_ms']:.3f}"
+            )
+            del batch, gen_batch, gen_batch_output
+            gc.collect()
+
+        measured = [record for record in records if record["phase"] == "measure"]
+        avg_wall_s = float(np.mean([record["wall_s"] for record in measured]))
+        avg_tokens_per_s = float(np.mean([record["tokens_per_s"] for record in measured]))
+        avg_samples_per_s = float(np.mean([record["samples_per_s"] for record in measured]))
+        avg_decode_latency_s = avg_wall_s
+        avg_decode_latency_ms = avg_decode_latency_s * 1000.0
+        avg_latency_per_sample_ms = float(np.mean([record["latency_per_sample_ms"] for record in measured]))
+        total_decode_tokens = int(sum(record["decode_tokens"] for record in measured))
+        total_wall_s = float(sum(record["wall_s"] for record in measured))
+        aggregate_tokens_per_s = total_decode_tokens / total_wall_s if total_wall_s > 0 else float("inf")
+        summary = {
+            "batch_size": configured_batch_size,
+            "rollout_n": rollout_n,
+            "prompt_len": max_prompt_length,
+            "decode_len": max_response_length,
+            "warmup_steps": warmup_steps,
+            "measure_steps": measure_steps,
+            "avg_wall_s": avg_wall_s,
+            "avg_decode_latency_s": avg_decode_latency_s,
+            "avg_decode_latency_ms": avg_decode_latency_ms,
+            "avg_tokens_per_s": avg_tokens_per_s,
+            "aggregate_tokens_per_s": aggregate_tokens_per_s,
+            "avg_samples_per_s": avg_samples_per_s,
+            "avg_latency_per_sample_ms": avg_latency_per_sample_ms,
+            "total_decode_tokens": total_decode_tokens,
+            "total_wall_s": total_wall_s,
+        }
+        summary_path = os.path.join(output_dir, f"summary_batch_{configured_batch_size}.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        fieldnames = list(summary.keys())
+        write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(summary)
+
+        print(
+            "[rollout decode bench] verl-flow done "
+            f"batch_size={configured_batch_size} avg_tokens_per_s={avg_tokens_per_s:.3f} "
+            f"aggregate_tokens_per_s={aggregate_tokens_per_s:.3f} "
+            f"avg_decode_latency_ms={avg_decode_latency_ms:.3f} "
+            f"summary={summary_path} csv={csv_path}"
+        )
+        return summary
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1253,14 +1419,17 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
+        self.global_steps = 0
+        if os.getenv("VERL_ROLLOUT_BENCHMARK_ONLY", "0").lower() in ("1", "true", "yes", "on"):
+            self._run_rollout_decode_batchsize_benchmark()
+            return
+
         tracker = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
-
-        self.global_steps = 0
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1370,6 +1539,18 @@ class RayPPOTrainer:
                                 self.actor_rollout_wg.start_profile(
                                     role="dummy_waste_rollout",
                                     profile_step=self.global_steps)
+                            step_timeline_log = (
+                                os.getenv("VLLM_ASCEND_MODE1_STEP_TIMELINE_LOG",
+                                          "1").lower()
+                                in ("1", "true", "yes", "on"))
+                            gen_driver_start = time.perf_counter()
+                            if step_timeline_log:
+                                logger.info(
+                                    "Mode1 step timeline: driver_generate_start "
+                                    "step=%s epoch=%s",
+                                    self.global_steps,
+                                    epoch,
+                                )
                             try:
                                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                             finally:
@@ -1378,6 +1559,14 @@ class RayPPOTrainer:
                                         "Stopping rollout-only dummy waste NPU profile: step=%s",
                                         self.global_steps)
                                     self.actor_rollout_wg.stop_profile()
+                            if step_timeline_log:
+                                logger.info(
+                                    "Mode1 step timeline: driver_generate_done "
+                                    "step=%s epoch=%s elapsed_s=%.3f",
+                                    self.global_steps,
+                                    epoch,
+                                    time.perf_counter() - gen_driver_start,
+                                )
                             self._restore_rollout_elastic_parallel_groups_if_needed()
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)

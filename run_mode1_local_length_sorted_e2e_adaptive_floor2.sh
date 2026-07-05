@@ -32,11 +32,20 @@ DISTCP_PATH="${DISTCP_PATH:-/data/Qwen3-30B-A3B_megatron}"
 TRAIN_FILE_ORIG="${TRAIN_FILE_ORIG:-/data/deepscaler/train.parquet}"
 TEST_FILE="${TEST_FILE:-/data/deepscaler/test.parquet}"
 BASELINE_DIR="${BASELINE_DIR:-$REPO_ROOT/mode1_baseline_random_batch_floor4}"
+BASELINE_DIRS="${BASELINE_DIRS:-$BASELINE_DIR}"
+BASELINE_DIRS="${BASELINE_DIRS//,/:}"
+IFS=':' read -r -a BASELINE_DIR_ARRAY <<< "$BASELINE_DIRS"
 
 if [[ "${CHECK_LOCAL_INPUTS:-1}" == "1" ]]; then
-    for required_path in "$MODEL_PATH" "$DISTCP_PATH" "$TRAIN_FILE_ORIG" "$TEST_FILE" "$BASELINE_DIR"; do
+    for required_path in "$MODEL_PATH" "$DISTCP_PATH" "$TRAIN_FILE_ORIG" "$TEST_FILE"; do
         if [[ ! -e "$required_path" ]]; then
             echo "missing local input path: $required_path" >&2
+            exit 2
+        fi
+    done
+    for required_path in "${BASELINE_DIR_ARRAY[@]}"; do
+        if [[ -n "$required_path" && ! -e "$required_path" ]]; then
+            echo "missing baseline input path: $required_path" >&2
             exit 2
         fi
     done
@@ -49,8 +58,10 @@ export VLLM_ASCEND_SHRINK_AWARE_ENABLE=1
 export VLLM_ASCEND_REGISTER_CUSTOM_MODELS="${VLLM_ASCEND_REGISTER_CUSTOM_MODELS:-1}"
 export VLLM_ASCEND_USE_NATIVE_QWEN3_MOE=0
 export VLLM_ASCEND_SHRINK_AWARE_MODE=staged
-export VLLM_ASCEND_SHRINK_AWARE_STAGES=8,4
+export VLLM_ASCEND_SHRINK_AWARE_STAGES=8,4,2
 export VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY=manual
+export VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY="${VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY:-natural}"
+export VLLM_ASCEND_MODE1_PARITY_FIXED_TOPOLOGY_REUSE="${VLLM_ASCEND_MODE1_PARITY_FIXED_TOPOLOGY_REUSE:-$([[ "${VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY}" =~ ^(planned|fixed|plan)$ ]] && echo 1 || echo 0)}"
 export VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS=8,9,10,11,12,13,14,15
 export VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS=12,13,14,15
 export VLLM_EAGER_BASELINE_NO_RESAMPLE=0
@@ -95,18 +106,26 @@ export VLLM_ASCEND_MODE1_PARITY_PRE_MOE_WARMUP_EMPTY_CACHE="${VLLM_ASCEND_MODE1_
 export VLLM_ASCEND_MODE1_PARITY_POST_SHRINK_WARMUP="${VLLM_ASCEND_MODE1_PARITY_POST_SHRINK_WARMUP:-1}"
 export VLLM_ASCEND_MODE1_PARITY_POST_SHRINK_WARMUP_KIND="${VLLM_ASCEND_MODE1_PARITY_POST_SHRINK_WARMUP_KIND:-mc2_dispatcher_only}"
 export VLLM_ASCEND_REPEAT_POST_SHRINK_MOE_DISPATCH_WARMUP="${VLLM_ASCEND_REPEAT_POST_SHRINK_MOE_DISPATCH_WARMUP:-0}"
-export VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG="${VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG:-1}"
+export VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG="${VLLM_ASCEND_MODE1_PARITY_MC2_MEM_LOG:-0}"
+export VLLM_ASCEND_MODE1_FULLWORLD_RESTORE_DIAG="${VLLM_ASCEND_MODE1_FULLWORLD_RESTORE_DIAG:-1}"
+export VLLM_ASCEND_MODE1_FULLWORLD_RESTORE_DIAG_DISPATCH_BUDGET="${VLLM_ASCEND_MODE1_FULLWORLD_RESTORE_DIAG_DISPATCH_BUDGET:-4}"
+export VLLM_ASCEND_MODE1_STEP_TIMELINE_LOG="${VLLM_ASCEND_MODE1_STEP_TIMELINE_LOG:-1}"
+export VLLM_ASCEND_MODE1_COMM_CACHE_STATE_DETAILED="${VLLM_ASCEND_MODE1_COMM_CACHE_STATE_DETAILED:-0}"
+export VLLM_ASCEND_MODE1_SKIP_SAME_BLOCK_KV_RESIZE="${VLLM_ASCEND_MODE1_SKIP_SAME_BLOCK_KV_RESIZE:-1}"
 export VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_CACHE="${VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_CACHE:-0}"
 export VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_KINDS="${VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_KINDS:-dp,ep}"
 export VLLM_ASCEND_MODE1_PARITY_DROP_OLD_FLOOR_BEFORE_REBUILD="${VLLM_ASCEND_MODE1_PARITY_DROP_OLD_FLOOR_BEFORE_REBUILD:-1}"
 export VLLM_ASCEND_MODE1_PARITY_RELEASE_LIVE_OLD_FLOOR_ON_REBUILD="${VLLM_ASCEND_MODE1_PARITY_RELEASE_LIVE_OLD_FLOOR_ON_REBUILD:-1}"
-export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY:-1}"
+export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY:-0}"
 export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_FULL_RESTORE:-0}"
 export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_PRE_REBUILD:-0}"
 export VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH="${VLLM_ASCEND_MODE1_PARITY_DEFER_GROUP_DESTROY_ON_STASH:-0}"
 export VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES="${VLLM_ASCEND_MODE1_PARITY_DEFER_DESTROY_FLOOR_GROUP_SIZES:-1,2,4,8}"
 export VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE="${VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE:-1}"
 export VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE="${VLLM_ASCEND_MODE1_PARITY_DESTROY_DEVICE_PG_ON_RETIRE:-1}"
+export VLLM_ASCEND_MODE1_PARITY_PRESERVE_DEVICE_PG_ON_FULL_RESTORE="${VLLM_ASCEND_MODE1_PARITY_PRESERVE_DEVICE_PG_ON_FULL_RESTORE:-0}"
+export VLLM_ASCEND_MODE1_PARITY_PRESERVE_GROUP_REFS_ON_FULL_RESTORE="${VLLM_ASCEND_MODE1_PARITY_PRESERVE_GROUP_REFS_ON_FULL_RESTORE:-0}"
+export VLLM_ASCEND_MODE1_PARITY_SKIP_CLEANUP_ON_PRESERVED_FULL_RESTORE="${VLLM_ASCEND_MODE1_PARITY_SKIP_CLEANUP_ON_PRESERVED_FULL_RESTORE:-0}"
 export VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE="${VLLM_ASCEND_MODE1_PARITY_DESTROY_CPU_PG_ON_RETIRE:-1}"
 export VLLM_ASCEND_CUSTOM_MODE1_DEBUG=0
 export VLLM_ASCEND_CUSTOM_MODE1_TIMING_EVENTS=0
@@ -138,6 +157,7 @@ ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-32}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.9}"
 TRAINER_TOTAL_EPOCHS="${TRAINER_TOTAL_EPOCHS:-1}"
+PLAN_STEPS="${PLAN_STEPS:-5}"
 DATASET_FRACTION_FOR_ORACLE="${DATASET_FRACTION_FOR_ORACLE:-0.005}"
 SHRINK_AWARE_LOGGING="${SHRINK_AWARE_LOGGING:-false}"
 MAX_RANK_PEAK_TOKENS="${MAX_RANK_PEAK_TOKENS:-$VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS}"
@@ -147,6 +167,13 @@ ACTIVE_PEAK_SAFETY_FACTOR="${ACTIVE_PEAK_SAFETY_FACTOR:-1.16}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-16384}"
 MAX_CROSS_STEP_REPAIR_SWAPS="${MAX_CROSS_STEP_REPAIR_SWAPS:-8}"
 REPAIR_CANDIDATE_LIMIT="${REPAIR_CANDIDATE_LIMIT:-8}"
+FORCE_SELECTED_FLOORS="${FORCE_SELECTED_FLOORS:-}"
+if [[ -z "$FORCE_SELECTED_FLOORS" ]]; then
+    FORCE_SELECTED_FLOOR="${FORCE_SELECTED_FLOOR:-2}"
+else
+    FORCE_SELECTED_FLOOR="${FORCE_SELECTED_FLOOR:-}"
+fi
+IGNORE_TAIL_TIES_AT_RESPONSE_CAP="${IGNORE_TAIL_TIES_AT_RESPONSE_CAP:-1}"
 
 PLAN_DIR="${PLAN_DIR:-$REPO_ROOT/mode1_length_sorted_e2e_adaptive_floor2/oracle}"
 OPT_TRAIN_FILE="${OPT_TRAIN_FILE:-$PLAN_DIR/length_sorted_train.parquet}"
@@ -155,14 +182,32 @@ OPT_SUMMARY="${OPT_SUMMARY:-$PLAN_DIR/length_sorted_rank_plan_summary.json}"
 OPT_ORACLE="${OPT_ORACLE:-$PLAN_DIR/length_sorted_length_oracle.json}"
 mkdir -p "$PLAN_DIR"
 
+baseline_args=()
+for baseline_dir_item in "${BASELINE_DIR_ARRAY[@]}"; do
+    if [[ -n "$baseline_dir_item" ]]; then
+        baseline_args+=(--baseline-dir "$baseline_dir_item")
+    fi
+done
+
+PLAN_EXTRA_ARGS=()
+if [[ -n "${FORCE_SELECTED_FLOOR:-}" && "${FORCE_SELECTED_FLOOR:-0}" != "0" ]]; then
+    PLAN_EXTRA_ARGS+=(--force-selected-floor "$FORCE_SELECTED_FLOOR")
+fi
+if [[ -n "${FORCE_SELECTED_FLOORS:-}" ]]; then
+    PLAN_EXTRA_ARGS+=(--force-selected-floors "$FORCE_SELECTED_FLOORS")
+fi
+if [[ "${IGNORE_TAIL_TIES_AT_RESPONSE_CAP,,}" =~ ^(1|true|yes|on)$ ]]; then
+    PLAN_EXTRA_ARGS+=(--ignore-tail-ties-at-response-cap)
+fi
+
 python3 "$PATCH_TREE/tools/build_mode1_length_sorted_e2e_plan.py" \
-    --baseline-dir "$BASELINE_DIR" \
+    "${baseline_args[@]}" \
     --train-file "$TRAIN_FILE_ORIG" \
     --output-train "$OPT_TRAIN_FILE" \
     --output-plan "$OPT_RANK_PLAN" \
     --output-summary "$OPT_SUMMARY" \
     --output-oracle "$OPT_ORACLE" \
-    --steps 5 \
+    --steps "$PLAN_STEPS" \
     --batch-size "$TRAIN_BATCH_SIZE" \
     --responses-per-prompt "$ROLLOUT_N" \
     --dataset-fraction "$DATASET_FRACTION_FOR_ORACLE" \
@@ -173,7 +218,8 @@ python3 "$PATCH_TREE/tools/build_mode1_length_sorted_e2e_plan.py" \
     --active-peak-safety-factor "$ACTIVE_PEAK_SAFETY_FACTOR" \
     --max-response-len "$MAX_RESPONSE_LEN" \
     --max-cross-step-repair-swaps "$MAX_CROSS_STEP_REPAIR_SWAPS" \
-    --repair-candidate-limit "$REPAIR_CANDIDATE_LIMIT"
+    --repair-candidate-limit "$REPAIR_CANDIDATE_LIMIT" \
+    "${PLAN_EXTRA_ARGS[@]}"
 
 TRAIN_FILE="$OPT_TRAIN_FILE"
 export TRAIN_FILE
@@ -185,15 +231,24 @@ tee_log="$REPO_ROOT/mode1_local_length_sorted_e2e_adaptive_floor2_${stamp}.log"
 printf '[mode1 length-sorted e2e] runtime_cwd=%s\n' "$PATCH_TREE"
 printf '[mode1 length-sorted e2e] launcher=%s tee_log=%s\n' "$LAUNCHER" "$tee_log"
 printf '[mode1 length-sorted e2e] train=%s plan=%s summary=%s oracle=%s baseline=%s\n' \
-    "$TRAIN_FILE" "$OPT_RANK_PLAN" "$OPT_SUMMARY" "$OPT_ORACLE" "$BASELINE_DIR"
+    "$TRAIN_FILE" "$OPT_RANK_PLAN" "$OPT_SUMMARY" "$OPT_ORACLE" "$BASELINE_DIRS"
 printf '[mode1 length-sorted e2e] model=%s distcp=%s test=%s\n' \
     "$MODEL_PATH" "$DISTCP_PATH" "$TEST_FILE"
 printf '[mode1 length-sorted e2e adaptive] mode=1 global_floor=2 util=%s kv_caps=%s total_epochs=%s\n' \
     "$ROLLOUT_GPU_MEMORY_UTILIZATION" \
     "$FLOOR_KV_CAPS" \
     "$TRAINER_TOTAL_EPOCHS"
+printf '[mode1 length-sorted e2e adaptive] target_policy=%s fixed_topology_reuse=%s cache_floor_groups=%s keep_mc2_group_cache=%s\n' \
+    "$VLLM_ASCEND_SHRINK_AWARE_TARGET_POLICY" \
+    "$VLLM_ASCEND_MODE1_PARITY_FIXED_TOPOLOGY_REUSE" \
+    "$VLLM_ASCEND_MODE1_PARITY_CACHE_FLOOR_GROUPS" \
+    "$VLLM_ASCEND_MODE1_PARITY_KEEP_MC2_GROUP_CACHE"
 printf '[mode1 length-sorted e2e adaptive] max_rank_peak_tokens=%s min_adaptive_floor=%s active_peak_safety_factor=%s max_response_len=%s shrink_not_required=true\n' \
     "$MAX_RANK_PEAK_TOKENS" "$MIN_ADAPTIVE_FLOOR" "$ACTIVE_PEAK_SAFETY_FACTOR" "$MAX_RESPONSE_LEN"
+printf '[mode1 length-sorted e2e adaptive] force_selected_floor=%s ignore_tail_ties_at_response_cap=%s\n' \
+    "$FORCE_SELECTED_FLOOR" "$IGNORE_TAIL_TIES_AT_RESPONSE_CAP"
+printf '[mode1 length-sorted e2e adaptive] force_selected_floors=%s plan_steps=%s history_dirs=%s\n' \
+    "${FORCE_SELECTED_FLOORS:-}" "$PLAN_STEPS" "${#BASELINE_DIR_ARRAY[@]}"
 printf '[mode1 length-sorted e2e] max_cross_step_repair_swaps=%s repair_candidate_limit=%s\n' \
     "$MAX_CROSS_STEP_REPAIR_SWAPS" "$REPAIR_CANDIDATE_LIMIT"
 
@@ -214,7 +269,7 @@ bash "$LAUNCHER" \
     actor_rollout_ref.rollout.gpu_memory_utilization="$ROLLOUT_GPU_MEMORY_UTILIZATION" \
     actor_rollout_ref.rollout.shrink_aware.enable_shrink_aware_scheduling=true \
     actor_rollout_ref.rollout.shrink_aware.shrink_aware_mode=staged \
-    actor_rollout_ref.rollout.shrink_aware.shrink_stages='[8,4]' \
+    actor_rollout_ref.rollout.shrink_aware.shrink_stages='[8,4,2]' \
     actor_rollout_ref.rollout.shrink_aware.survivor_selection_policy=manual \
     actor_rollout_ref.rollout.shrink_aware.intermediate_survivor_ranks='[8,9,10,11,12,13,14,15]' \
     actor_rollout_ref.rollout.shrink_aware.final_survivor_ranks='[12,13,14,15]' \

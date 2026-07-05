@@ -108,10 +108,31 @@ def _preserve_topology_cache() -> bool:
 def _group_key(group: Any) -> tuple[Any, ...]:
     if group is None:
         return ()
+    identity_parts: list[Any] = []
+    unique_name = getattr(group, "unique_name", None)
+    if unique_name:
+        identity_parts.extend(("uid", str(unique_name)))
+    device_group = getattr(group, "device_group", None)
+    if device_group is not None:
+        for attr_name in ("group_name", "name"):
+            value = getattr(device_group, attr_name, None)
+            if value:
+                identity_parts.extend((f"device_{attr_name}", str(value)))
+                break
+        try:
+            if torch.distributed.is_initialized():
+                local_rank = torch.distributed.get_rank(group=device_group)
+                backend = device_group._get_backend(torch.device("npu"))
+                hcomm_name = backend.get_hccl_comm_name(local_rank)
+                if hcomm_name:
+                    identity_parts.extend(("hcomm", str(hcomm_name)))
+        except Exception:
+            pass
     ranks = getattr(group, "ranks", None)
     if ranks is not None:
         try:
-            return tuple(int(rank) for rank in ranks)
+            return ("ranks", *tuple(int(rank) for rank in ranks),
+                    *identity_parts)
         except TypeError:
             pass
     return (
@@ -119,6 +140,7 @@ def _group_key(group: Any) -> tuple[Any, ...]:
         int(getattr(group, "world_size", 0) or 0),
         "rank",
         int(getattr(group, "rank_in_group", -1) or -1),
+        *identity_parts,
     )
 
 
@@ -207,6 +229,15 @@ def prune_moe_comm_method_topology_cache(
             return True
         if not component:
             return True
+        if component[0] == "ranks":
+            ranks: list[int] = []
+            for item in component[1:]:
+                if not isinstance(item, int):
+                    break
+                ranks.append(int(item))
+            if not ranks:
+                return True
+            return tuple(ranks) in allowed
         if len(component) >= 2 and component[0] == "size":
             try:
                 group_size = int(component[1])

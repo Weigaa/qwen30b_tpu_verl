@@ -34,13 +34,14 @@ import json
 import logging
 import os
 import pickle
+import re
 import socket
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from types import MethodType
-from typing import Any, Generator
+from typing import Any, Generator, Iterable
 
 import numpy as np
 import ray
@@ -539,19 +540,242 @@ def _log_custom_mode1_rollout_state(owner: Any, tag: str) -> None:
         )
 
 
+def _stream_rollout_weight_staging_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_STREAM_ROLLOUT_WEIGHT_STAGING",
+                     "1").lower() in ("1", "true", "yes", "on")
+
+
 def _materialize_rollout_weight_staging(
-        weights: list[tuple[str, torch.Tensor]]
-) -> list[tuple[str, torch.Tensor]]:
+        weights: Iterable[tuple[str, torch.Tensor]]
+) -> Iterable[tuple[str, torch.Tensor]]:
     """Create rollout-owned tensors for weight reload.
 
     Mode=1 repeatedly reloads rollout weights while elastic groups and runtime
     views are being rebuilt. Cloning cuts loader-side aliases to caller-owned
     tensors so the rollout can release temporary NPU allocations promptly.
+
+    The old path cloned every tensor into a list before calling load_weights,
+    which can create a large transient NPU peak.  AutoWeightsLoader consumes an
+    iterable once, so the default path clones lazily and lets each temporary
+    tensor die as soon as its parameter has been loaded.  Keep the list path
+    available for debugging via VLLM_ASCEND_STREAM_ROLLOUT_WEIGHT_STAGING=0.
     """
-    staged: list[tuple[str, torch.Tensor]] = []
+    if _stream_rollout_weight_staging_enabled():
+        return ((name, weight.detach().clone()) for name, weight in weights)
+    return [(name, weight.detach().clone()) for name, weight in weights]
+
+
+_MODE1_EXPERT_WEIGHT_RE = re.compile(
+    r"(?:^|\.)layers\.(\d+)\.mlp\.experts\.(\d+)\."
+    r"(gate_proj|up_proj|down_proj)\.weight$")
+
+
+def _mode1_update_weights_diag_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_MODE1_UPDATE_WEIGHTS_DIAG",
+                     "0").lower() in ("1", "true", "yes", "on")
+
+
+def _mode1_update_weights_diag(message: str, *args) -> None:
+    if not _mode1_update_weights_diag_enabled():
+        return
+    text = message % args if args else message
+    logger.info("Mode1 update_weights diag: %s", text)
+    print(f"[mode1_update_weights] {text}", flush=True)
+
+
+def _mode1_dist_rank() -> int:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return int(os.getenv("RANK", "-1") or "-1")
+
+
+def _mode1_safe_int(value: Any, default: int = -1) -> int:
+    try:
+        if isinstance(value, torch.Tensor):
+            return int(value.item())
+        return int(value)
+    except Exception:
+        return default
+
+
+def _mode1_weight_tensor_summary(
+        weights: Iterable[tuple[str, torch.Tensor]]) -> dict[str, Any]:
+    total = 0
+    tensor_count = 0
+    tensor_bytes = 0
+    expert_tensor_count = 0
+    layer_experts: dict[int, set[int]] = {}
+    projection_counts: dict[str, int] = {}
+    non_expert_count = 0
     for name, weight in weights:
-        staged.append((name, weight.detach().clone()))
-    return staged
+        total += 1
+        if isinstance(weight, torch.Tensor):
+            tensor_count += 1
+            try:
+                tensor_bytes += int(weight.numel()) * int(weight.element_size())
+            except Exception:
+                pass
+        match = _MODE1_EXPERT_WEIGHT_RE.search(name)
+        if match:
+            layer_idx = int(match.group(1))
+            expert_id = int(match.group(2))
+            projection = match.group(3)
+            expert_tensor_count += 1
+            layer_experts.setdefault(layer_idx, set()).add(expert_id)
+            projection_counts[projection] = (
+                int(projection_counts.get(projection, 0)) + 1)
+        else:
+            non_expert_count += 1
+    per_layer_counts = {layer: len(experts)
+                        for layer, experts in layer_experts.items()}
+    sample_layers = ",".join(
+        f"{layer}:{count}" for layer, count in
+        sorted(per_layer_counts.items())[:8])
+    return {
+        "total": total,
+        "tensor_count": tensor_count,
+        "tensor_bytes": tensor_bytes,
+        "expert_tensor_count": expert_tensor_count,
+        "non_expert_count": non_expert_count,
+        "expert_layers": len(layer_experts),
+        "max_experts_per_layer":
+            max(per_layer_counts.values()) if per_layer_counts else 0,
+        "min_experts_per_layer":
+            min(per_layer_counts.values()) if per_layer_counts else 0,
+        "sample_layers": sample_layers,
+        "projection_counts": projection_counts,
+    }
+
+
+def _mode1_count_nonnegative_map_slots(value: Any) -> tuple[int, int]:
+    if value is None:
+        return -1, -1
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                cpu_values = value.detach().cpu()
+            else:
+                cpu_values = value.detach()
+            return int((cpu_values >= 0).sum().item()), int(cpu_values.numel())
+        values = list(value)
+        return sum(1 for item in values if int(item) >= 0), len(values)
+    except Exception:
+        return -1, -1
+
+
+def _mode1_model_moe_state_summary(model: Any) -> dict[str, Any]:
+    modules = 0
+    local_counts: dict[int, int] = {}
+    active_counts: dict[int, int] = {}
+    loaded_counts: dict[int, int] = {}
+    capacity_counts: dict[int, int] = {}
+    redundant_counts: dict[int, int] = {}
+    expert_map_counts: dict[str, int] = {}
+    loaded_map_counts: dict[str, int] = {}
+    runtime_weight_modules = 0
+    runtime_buffer_modules = 0
+    samples: list[str] = []
+    for module in model.modules():
+        if not (hasattr(module, "expert_map")
+                or hasattr(module, "loaded_expert_map")
+                or hasattr(module, "local_num_experts")):
+            continue
+        modules += 1
+        layer_idx = _mode1_safe_int(getattr(module, "layer_idx", -1))
+        local_num = _mode1_safe_int(getattr(module, "local_num_experts", -1))
+        active_num = _mode1_safe_int(
+            getattr(module, "active_local_num_experts", -1))
+        loaded_num = _mode1_safe_int(
+            getattr(module, "loaded_local_num_experts", -1))
+        capacity = _mode1_safe_int(
+            getattr(module, "loaded_weight_capacity", -1))
+        redundant = _mode1_safe_int(
+            getattr(module, "global_redundant_expert_num", -1))
+        for store, value in ((local_counts, local_num),
+                             (active_counts, active_num),
+                             (loaded_counts, loaded_num),
+                             (capacity_counts, capacity),
+                             (redundant_counts, redundant)):
+            store[value] = int(store.get(value, 0)) + 1
+        expert_nonneg, expert_len = _mode1_count_nonnegative_map_slots(
+            getattr(module, "expert_map", None))
+        loaded_nonneg, loaded_len = _mode1_count_nonnegative_map_slots(
+            getattr(module, "loaded_expert_map", None))
+        expert_key = f"{expert_nonneg}/{expert_len}"
+        loaded_key = f"{loaded_nonneg}/{loaded_len}"
+        expert_map_counts[expert_key] = int(
+            expert_map_counts.get(expert_key, 0)) + 1
+        loaded_map_counts[loaded_key] = int(
+            loaded_map_counts.get(loaded_key, 0)) + 1
+        if getattr(module, "runtime_w13_weight", None) is not None:
+            runtime_weight_modules += 1
+        if getattr(module, "runtime_w13_buffer", None) is not None:
+            runtime_buffer_modules += 1
+        if len(samples) < 4:
+            samples.append(
+                f"layer={layer_idx} local={local_num} active={active_num} "
+                f"loaded={loaded_num} cap={capacity} redundant={redundant} "
+                f"map={expert_key} loaded_map={loaded_key}")
+    return {
+        "modules": modules,
+        "local_counts": local_counts,
+        "active_counts": active_counts,
+        "loaded_counts": loaded_counts,
+        "capacity_counts": capacity_counts,
+        "redundant_counts": redundant_counts,
+        "expert_map_counts": expert_map_counts,
+        "loaded_map_counts": loaded_map_counts,
+        "runtime_weight_modules": runtime_weight_modules,
+        "runtime_buffer_modules": runtime_buffer_modules,
+        "samples": "; ".join(samples),
+    }
+
+
+def _mode1_expert_loader_stats_summary(model: Any) -> dict[str, Any]:
+    modules = 0
+    calls = 0
+    total_s = 0.0
+    max_s = 0.0
+    errors = 0
+    loaded_bytes = 0
+    shard_counts: dict[str, int] = {}
+    samples: list[str] = []
+    for module in model.modules():
+        stats = getattr(module, "_mode1_weight_loader_stats", None)
+        if not isinstance(stats, dict):
+            continue
+        modules += 1
+        module_calls = int(stats.get("calls", 0))
+        module_total_s = float(stats.get("total_s", 0.0))
+        module_max_s = float(stats.get("max_s", 0.0))
+        calls += module_calls
+        total_s += module_total_s
+        max_s = max(max_s, module_max_s)
+        errors += int(stats.get("errors", 0))
+        loaded_bytes += int(stats.get("loaded_bytes", 0))
+        if os.getenv("VLLM_ASCEND_MODE1_UPDATE_WEIGHTS_SHARD_COUNTS",
+                     "0").lower() in ("1", "true", "yes", "on"):
+            for shard, count in dict(stats.get("shard_counts", {})).items():
+                shard_counts[str(shard)] = (
+                    int(shard_counts.get(str(shard), 0)) + int(count))
+        if len(samples) < 4 and module_calls > 0:
+            layer_idx = _mode1_safe_int(getattr(module, "layer_idx", -1))
+            samples.append(
+                f"layer={layer_idx} calls={module_calls} "
+                f"total_s={module_total_s:.3f} max_s={module_max_s:.3f}")
+    return {
+        "modules": modules,
+        "calls": calls,
+        "total_s": total_s,
+        "max_s": max_s,
+        "errors": errors,
+        "loaded_bytes": loaded_bytes,
+        "shard_counts": shard_counts,
+        "samples": "; ".join(samples),
+    }
 
 
 def _load_model_num_experts(model_path: str) -> int:
@@ -852,11 +1076,6 @@ class vLLMRollout(BaseRollout):
         if target_tokens is None:
             return
         target_floor = self._target_mode1_floor_from_meta(meta_info)
-        os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_KV_TOKENS"] = str(
-            target_tokens)
-        if target_floor is not None:
-            os.environ["VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR"] = str(
-                target_floor)
         engine_core = self.inference_engine.llm_engine.engine_core.engine_core
         resize_fn = getattr(engine_core, "resize_kv_cache_for_mode1_step",
                             None)
@@ -1137,7 +1356,35 @@ class vLLMRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        step_timeline_log = (
+            os.environ.get("VLLM_ASCEND_MODE1_STEP_TIMELINE_LOG", "1").lower()
+            in ("1", "true", "yes", "on"))
+
+        def _timeline(message: str, *args) -> None:
+            if not step_timeline_log:
+                return
+            text = message % args if args else message
+            logger.info("Mode1 step timeline: %s", text)
+            print(f"[mode1_timeline] {text}", flush=True)
+
+        worker_generate_start = time.perf_counter()
+        worker_rank = -1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            worker_rank = int(torch.distributed.get_rank())
+        _timeline(
+            "rollout_worker_generate_entry rank=%s step=%s epoch=%s",
+            worker_rank,
+            prompts.meta_info.get("global_steps", -1),
+            prompts.meta_info.get("epoch", -1),
+        )
         _sync_shrink_aware_env_from_meta(prompts.meta_info)
+        _timeline(
+            "rollout_worker_after_env_sync rank=%s step=%s epoch=%s total_s=%.3f",
+            worker_rank,
+            prompts.meta_info.get("global_steps", -1),
+            prompts.meta_info.get("epoch", -1),
+            time.perf_counter() - worker_generate_start,
+        )
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch["attention_mask"]
@@ -1150,8 +1397,18 @@ class vLLMRollout(BaseRollout):
 
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
+            preprocess_start = time.perf_counter()
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
+            )
+            _timeline(
+                "rollout_worker_raw_prompt_preprocess_done rank=%s step=%s "
+                "epoch=%s elapsed_s=%.3f total_s=%.3f",
+                worker_rank,
+                prompts.meta_info.get("global_steps", -1),
+                prompts.meta_info.get("epoch", -1),
+                time.perf_counter() - preprocess_start,
+                time.perf_counter() - worker_generate_start,
             )
 
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
@@ -1169,9 +1426,20 @@ class vLLMRollout(BaseRollout):
             ):
                 vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
         else:
+            vllm_input_start = time.perf_counter()
             vllm_inputs = [
                 {"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")
             ]
+            _timeline(
+                "rollout_worker_vllm_inputs_built rank=%s step=%s epoch=%s "
+                "batch_size=%s elapsed_s=%.3f total_s=%.3f",
+                worker_rank,
+                prompts.meta_info.get("global_steps", -1),
+                prompts.meta_info.get("epoch", -1),
+                batch_size,
+                time.perf_counter() - vllm_input_start,
+                time.perf_counter() - worker_generate_start,
+            )
 
         for input_data in vllm_inputs:
             # Ensure token IDs are lists or numpy arrays
@@ -1214,6 +1482,20 @@ class vLLMRollout(BaseRollout):
                 logger.warning("Ignore invalid response_max_tokens_cap=%s", response_cap)
 
         tail_validate_caps = os.environ.get("VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS")
+        step_tail_validate_caps = os.environ.get(
+            "VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP")
+        if step_tail_validate_caps:
+            try:
+                current_step = int(prompts.meta_info.get("global_steps", -1))
+            except (TypeError, ValueError):
+                current_step = -1
+            step_caps = [
+                item.strip() for item in step_tail_validate_caps.split(";")
+            ]
+            if current_step >= 1 and current_step <= len(step_caps):
+                tail_validate_caps = step_caps[current_step - 1]
+            elif step_caps:
+                tail_validate_caps = step_caps[-1]
         if tail_validate_caps:
             try:
                 level_caps = [int(x.strip()) for x in tail_validate_caps.split(",") if x.strip()]
@@ -1273,14 +1555,55 @@ class vLLMRollout(BaseRollout):
         # users can customize different sampling_params at different run
         # 核心运行引擎调用
         self._maybe_log_mode1_comm_cache_state("rollout_step_start")
+        resize_start = time.perf_counter()
+        _timeline(
+            "rollout_worker_resize_start rank=%s step=%s epoch=%s "
+            "target_floor=%s target_kv=%s total_s=%.3f",
+            worker_rank,
+            prompts.meta_info.get("global_steps", -1),
+            prompts.meta_info.get("epoch", -1),
+            self._target_mode1_floor_from_meta(prompts.meta_info),
+            self._target_mode1_kv_tokens_from_meta(prompts.meta_info),
+            time.perf_counter() - worker_generate_start,
+        )
         self._maybe_resize_mode1_kv_cache_from_meta(prompts.meta_info)
+        _timeline(
+            "rollout_worker_resize_done rank=%s step=%s epoch=%s "
+            "elapsed_s=%.3f total_s=%.3f",
+            worker_rank,
+            prompts.meta_info.get("global_steps", -1),
+            prompts.meta_info.get("epoch", -1),
+            time.perf_counter() - resize_start,
+            time.perf_counter() - worker_generate_start,
+        )
         self._maybe_log_mode1_comm_cache_state("rollout_step_after_resize")
         with self.update_sampling_params(**kwargs):
+            infer_start = time.perf_counter()
+            _timeline(
+                "rollout_worker_infer_start rank=%s step=%s epoch=%s "
+                "batch_size=%s max_tokens=%s total_s=%.3f",
+                worker_rank,
+                prompts.meta_info.get("global_steps", -1),
+                prompts.meta_info.get("epoch", -1),
+                batch_size,
+                getattr(self.sampling_params, "max_tokens", None),
+                time.perf_counter() - worker_generate_start,
+            )
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=True,
+            )
+            _timeline(
+                "rollout_worker_infer_done rank=%s step=%s epoch=%s "
+                "elapsed_s=%.3f outputs=%s total_s=%.3f",
+                worker_rank,
+                prompts.meta_info.get("global_steps", -1),
+                prompts.meta_info.get("epoch", -1),
+                time.perf_counter() - infer_start,
+                len(outputs),
+                time.perf_counter() - worker_generate_start,
             )
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
@@ -1329,6 +1652,13 @@ class vLLMRollout(BaseRollout):
                 )
 
         self._maybe_log_mode1_comm_cache_state("rollout_step_end")
+        _timeline(
+            "rollout_worker_generate_done rank=%s step=%s epoch=%s elapsed_s=%.3f",
+            worker_rank,
+            prompts.meta_info.get("global_steps", -1),
+            prompts.meta_info.get("epoch", -1),
+            time.perf_counter() - worker_generate_start,
+        )
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
@@ -1391,6 +1721,11 @@ class vLLMRollout(BaseRollout):
         Args:
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
+        update_total_start_t = time.perf_counter()
+        rank = _mode1_dist_rank()
+        step_id = os.getenv("VLLM_ASCEND_MODE1_CURRENT_UPDATE_STEP", "-1")
+        epoch_id = os.getenv("VLLM_ASCEND_MODE1_CURRENT_UPDATE_EPOCH", "-1")
+        filter_start_t = time.perf_counter()
         filtered_weights: list[tuple[str, torch.Tensor]] = []
         skipped = 0
         skipped_names: list[str] = []
@@ -1401,6 +1736,7 @@ class vLLMRollout(BaseRollout):
                     skipped_names.append(name)
                 continue
             filtered_weights.append((name, weight))
+        filter_elapsed_s = time.perf_counter() - filter_start_t
         if skipped > 0 and not getattr(self, "_empty_weight_update_warned",
                                        False):
             logger.warning(
@@ -1411,6 +1747,9 @@ class vLLMRollout(BaseRollout):
             self._empty_weight_update_warned = True
 
         weights = filtered_weights
+        input_summary = (
+            _mode1_weight_tensor_summary(weights)
+            if _mode1_update_weights_diag_enabled() else {})
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
             lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
@@ -1427,7 +1766,12 @@ class vLLMRollout(BaseRollout):
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
+            patch_start_t = time.perf_counter()
             patch_vllm_moe_model_weight_loader(model)
+            patch_elapsed_s = time.perf_counter() - patch_start_t
+        if peft_config and base_sync_done:
+            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
+            patch_elapsed_s = 0.0
         if (self.elastic_execution_mode in (1, 2)
                 and self.elastic_init_redundancy_expert > 0
                 and not getattr(self, "_lossless_weight_update_sync_logged", False)):
@@ -1437,30 +1781,137 @@ class vLLMRollout(BaseRollout):
             self._lossless_weight_update_sync_logged = True
         _log_custom_mode1_rollout_memory("before_update_weights_load")
         _log_custom_mode1_rollout_state(self, "before_update_weights_load")
+        trim_elapsed_s = 0.0
         if (self.elastic_execution_mode == 1
                 and int(os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE",
                                   "0") or "0") <= 2):
+            trim_start_t = time.perf_counter()
             try:
                 torch.npu.synchronize()
                 gc.collect()
                 torch.npu.empty_cache()
             except Exception:
                 pass
+            trim_elapsed_s = time.perf_counter() - trim_start_t
             _log_custom_mode1_rollout_memory(
                 "before_update_weights_load_after_trim")
+        if _mode1_update_weights_diag_enabled():
+            model_summary = _mode1_model_moe_state_summary(model)
+            _mode1_update_weights_diag(
+                "before_load rank=%s step=%s epoch=%s total_weights=%s "
+                "tensor_weights=%s skipped_empty=%s tensor_bytes=%s "
+                "expert_tensors=%s non_expert_tensors=%s expert_layers=%s "
+                "experts_per_layer_minmax=%s/%s sample_layers=%s "
+                "projection_counts=%s filter_s=%.3f patch_s=%.3f trim_s=%.3f "
+                "moe_modules=%s local_counts=%s active_counts=%s "
+                "loaded_counts=%s capacity_counts=%s redundant_counts=%s "
+                "expert_map_counts=%s loaded_map_counts=%s runtime_weight_modules=%s "
+                "runtime_buffer_modules=%s samples=%s",
+                rank,
+                step_id,
+                epoch_id,
+                input_summary.get("total"),
+                input_summary.get("tensor_count"),
+                skipped,
+                input_summary.get("tensor_bytes"),
+                input_summary.get("expert_tensor_count"),
+                input_summary.get("non_expert_count"),
+                input_summary.get("expert_layers"),
+                input_summary.get("min_experts_per_layer"),
+                input_summary.get("max_experts_per_layer"),
+                input_summary.get("sample_layers"),
+                input_summary.get("projection_counts"),
+                filter_elapsed_s,
+                patch_elapsed_s,
+                trim_elapsed_s,
+                model_summary.get("modules"),
+                model_summary.get("local_counts"),
+                model_summary.get("active_counts"),
+                model_summary.get("loaded_counts"),
+                model_summary.get("capacity_counts"),
+                model_summary.get("redundant_counts"),
+                model_summary.get("expert_map_counts"),
+                model_summary.get("loaded_map_counts"),
+                model_summary.get("runtime_weight_modules"),
+                model_summary.get("runtime_buffer_modules"),
+                model_summary.get("samples"),
+            )
+        materialize_start_t = time.perf_counter()
         staged_weights = _materialize_rollout_weight_staging(weights)
+        materialize_elapsed_s = time.perf_counter() - materialize_start_t
+        load_start_t = time.perf_counter()
+        load_call_start_t = time.perf_counter()
         model.load_weights(staged_weights)
+        load_call_elapsed_s = time.perf_counter() - load_call_start_t
+        load_sync_start_t = time.perf_counter()
+        load_sync_elapsed_s = 0.0
+        try:
+            torch.npu.synchronize()
+            load_sync_elapsed_s = time.perf_counter() - load_sync_start_t
+        except Exception:
+            pass
+        load_elapsed_s = time.perf_counter() - load_start_t
+        if _mode1_update_weights_diag_enabled():
+            loader_stats = _mode1_expert_loader_stats_summary(model)
+            _mode1_update_weights_diag(
+                "after_load rank=%s step=%s epoch=%s materialize_s=%.3f "
+                "model_load_s=%.3f model_load_call_s=%.3f "
+                "model_load_sync_s=%.3f expert_loader_modules=%s "
+                "expert_loader_calls=%s expert_loader_total_s=%.3f "
+                "expert_loader_max_s=%.3f expert_loader_errors=%s "
+                "expert_loader_loaded_bytes=%s shard_counts=%s samples=%s",
+                rank,
+                step_id,
+                epoch_id,
+                materialize_elapsed_s,
+                load_elapsed_s,
+                load_call_elapsed_s,
+                load_sync_elapsed_s,
+                loader_stats.get("modules"),
+                loader_stats.get("calls"),
+                loader_stats.get("total_s"),
+                loader_stats.get("max_s"),
+                loader_stats.get("errors"),
+                loader_stats.get("loaded_bytes"),
+                loader_stats.get("shard_counts"),
+                loader_stats.get("samples"),
+            )
         refresh_gpu_buffer_aliases = getattr(self, "_refresh_gpu_buffer_aliases",
                                              None)
+        refresh_start_t = time.perf_counter()
         if callable(refresh_gpu_buffer_aliases):
             refresh_gpu_buffer_aliases()
-        staged_weights = []
+        refresh_elapsed_s = time.perf_counter() - refresh_start_t
+        staged_weights = None
         weights = []
         filtered_weights = []
+        cleanup_start_t = time.perf_counter()
         gc.collect()
         torch.npu.empty_cache()
+        cleanup_elapsed_s = time.perf_counter() - cleanup_start_t
         _log_custom_mode1_rollout_state(self, "after_update_weights_load")
         _log_custom_mode1_rollout_memory("after_update_weights_load")
+        if _mode1_update_weights_diag_enabled():
+            after_summary = _mode1_model_moe_state_summary(model)
+            _mode1_update_weights_diag(
+                "done rank=%s step=%s epoch=%s total_s=%.3f refresh_s=%.3f "
+                "cleanup_s=%.3f local_counts=%s active_counts=%s "
+                "loaded_counts=%s capacity_counts=%s runtime_weight_modules=%s "
+                "runtime_buffer_modules=%s samples=%s",
+                rank,
+                step_id,
+                epoch_id,
+                time.perf_counter() - update_total_start_t,
+                refresh_elapsed_s,
+                cleanup_elapsed_s,
+                after_summary.get("local_counts"),
+                after_summary.get("active_counts"),
+                after_summary.get("loaded_counts"),
+                after_summary.get("capacity_counts"),
+                after_summary.get("runtime_weight_modules"),
+                after_summary.get("runtime_buffer_modules"),
+                after_summary.get("samples"),
+            )
         ###new wj
     def get_record(self):
         return moe_stats.snapshot_pattern()
@@ -1619,9 +2070,9 @@ class vLLMAsyncRollout(BaseRollout):
 
             model = self.inference_engine.worker.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            staged_weights = _materialize_rollout_weight_staging(list(weights))
+            staged_weights = _materialize_rollout_weight_staging(weights)
             model.load_weights(staged_weights)
-            staged_weights = []
+            staged_weights = None
             gc.collect()
             torch.npu.empty_cache()
 

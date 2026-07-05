@@ -331,13 +331,19 @@ class TaskRunner:
             f"[TaskRunnerTiming] tokenizer_processor_done elapsed_s={time.perf_counter() - tokenizer_start:.3f} total_s={time.perf_counter() - run_start:.3f}",
             flush=True)
 
-        # Load the reward manager for training and validation.
-        reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
-        )
-        val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
-        )
+        benchmark_only = _env_enabled("VERL_ROLLOUT_BENCHMARK_ONLY", "0")
+        if benchmark_only:
+            print("[TaskRunnerTiming] rollout benchmark only: skip reward managers", flush=True)
+            reward_fn = None
+            val_reward_fn = None
+        else:
+            # Load the reward manager for training and validation.
+            reward_fn = load_reward_manager(
+                config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            )
+            val_reward_fn = load_reward_manager(
+                config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
@@ -345,7 +351,11 @@ class TaskRunner:
 
         # Create training and validation datasets.
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
+        if benchmark_only:
+            print("[TaskRunnerTiming] rollout benchmark only: reuse train dataset as val placeholder", flush=True)
+            val_dataset = train_dataset
+        else:
+            val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
         print(
             f"[TaskRunnerTiming] dataset_done total_s={time.perf_counter() - run_start:.3f}",

@@ -65,6 +65,18 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
         return max(minimum, default)
 
 
+def _npu_sync_if_available() -> None:
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        return
+    try:
+        if not npu.is_available():
+            return
+    except Exception:
+        return
+    npu.synchronize()
+
+
 def _parse_int_set(value: str) -> Optional[set[int]]:
     value = value.strip().lower()
     if value in ("", "all", "*"):
@@ -307,9 +319,6 @@ class LLMEngine:
     def _get_shrink_aware_role_plan(self, dp_world_size: int):
         if not envs_ascend.VLLM_ASCEND_SHRINK_AWARE_ENABLE:
             return None
-        cached = getattr(self, "_shrink_aware_role_plan", None)
-        if cached is not None:
-            return cached
         original_dp_world_size = getattr(self, "elastic_original_dp_world_size",
                                          None)
         plan_world_size = (
@@ -317,6 +326,22 @@ class LLMEngine:
             if isinstance(original_dp_world_size, int)
             and original_dp_world_size > 0
             else dp_world_size)
+        raw_stage_ranks = getattr(
+            envs_ascend, "VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS", "")
+        cache_signature = (
+            int(plan_world_size),
+            str(envs_ascend.VLLM_ASCEND_SHRINK_AWARE_STAGES),
+            str(envs_ascend.VLLM_ASCEND_SHRINK_AWARE_SURVIVOR_POLICY),
+            str(envs_ascend.VLLM_ASCEND_SHRINK_AWARE_PACKAGE_TOPOLOGY),
+            str(envs_ascend.VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS),
+            str(envs_ascend.VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS),
+            str(raw_stage_ranks),
+        )
+        cached = getattr(self, "_shrink_aware_role_plan", None)
+        cached_signature = getattr(self, "_shrink_aware_role_plan_signature",
+                                   None)
+        if cached is not None and cached_signature == cache_signature:
+            return cached
         stages = [
             int(item.strip())
             for item in str(envs_ascend.VLLM_ASCEND_SHRINK_AWARE_STAGES).split(",")
@@ -326,8 +351,6 @@ class LLMEngine:
             envs_ascend.VLLM_ASCEND_SHRINK_AWARE_INTERMEDIATE_RANKS)
         final = parse_rank_list(envs_ascend.VLLM_ASCEND_SHRINK_AWARE_FINAL_RANKS)
         stage_ranks = None
-        raw_stage_ranks = getattr(
-            envs_ascend, "VLLM_ASCEND_SHRINK_AWARE_STAGE_RANKS", "")
         if raw_stage_ranks:
             parsed_stage_ranks = parse_stage_survivor_ranks(
                 raw_stage_ranks, world_size=plan_world_size)
@@ -348,12 +371,14 @@ class LLMEngine:
             stage_survivor_ranks=stage_ranks,
         )
         self._shrink_aware_role_plan = plan
+        self._shrink_aware_role_plan_signature = cache_signature
         logger.info(
-            "Shrink-aware role plan loaded: donor=%s wave2=%s stages=%s intermediate=%s final=%s locality=%.4f fallback=%s",
+            "Shrink-aware role plan loaded: donor=%s wave2=%s stages=%s intermediate=%s final=%s locality=%.4f fallback=%s signature=%s",
             plan.donor_ranks, plan.wave2_ranks,
             plan.stage_survivor_ranks,
             plan.intermediate_survivor_ranks, plan.final_survivor_ranks,
-            plan.package_locality_score, plan.fallback_reason)
+            plan.package_locality_score, plan.fallback_reason,
+            cache_signature)
         return plan
 
     def _staged_shrink_target(self, natural_active_ranks: list[int],
@@ -809,11 +834,36 @@ class LLMEngine:
                             current_global_rank, active_global_ranks)
 
                     prev_elastic_ep_active_ranks = self.elastic_ep_active_ranks
-                    self.elastic_ep_active_ranks = active_ranks_tuple
-                    self.elastic_ep_scaled_once = True
-                    self._logged_followup_shrink_skip = None
+                    mode1_rpc_pre_sync = (
+                        envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
+                        and _env_flag("VLLM_ASCEND_MODE1_RPC_PRE_NPU_SYNC",
+                                      "1"))
+                    if mode1_rpc_pre_sync:
+                        sync_start_t = time.perf_counter()
+                        try:
+                            _npu_sync_if_available()
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "Elastic mode1 shrink RPC pre-NPU-sync failed; "
+                                "outstanding full-world runtime work surfaced an "
+                                "error before communication group transition. "
+                                f"global_rank={current_global_rank} "
+                                f"active_ranks={active_global_ranks} "
+                                f"prev_active_ranks={prev_elastic_ep_active_ranks} "
+                                f"dp_world_size={dp_world_size} "
+                                f"local_has_unfinished={has_unfinished}") from exc
+                        logger.info(
+                            "Elastic mode1 shrink rpc pre-NPU-sync done: global_rank=%s active_ranks=%s prev_active_ranks=%s dp_world_size=%s total_ms=%.2f",
+                            current_global_rank, active_global_ranks,
+                            prev_elastic_ep_active_ranks, dp_world_size,
+                            (time.perf_counter() - sync_start_t) * 1000.0)
                     rebuild_start_t = time.perf_counter()
-                    if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (2, 3, 4):
+                    mode1_rpc_pre_barrier = (
+                        envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
+                        and _env_flag("VLLM_ASCEND_MODE1_RPC_PRE_BARRIER",
+                                      "0"))
+                    if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in
+                            (2, 3, 4) or mode1_rpc_pre_barrier):
                         try:
                             torch.distributed.monitored_barrier(
                                 group=self.dp_group,
@@ -823,7 +873,7 @@ class LLMEngine:
                             raise RuntimeError(
                                 "Elastic EP shrink RPC pre-barrier failed; "
                                 "not all current DP ranks reached the same "
-                                "shrink boundary. "
+                            "shrink boundary. "
                                 f"global_rank={current_global_rank} "
                                 f"active_ranks={active_global_ranks} "
                                 f"prev_active_ranks={prev_elastic_ep_active_ranks} "
@@ -831,6 +881,9 @@ class LLMEngine:
                                 f"local_has_unfinished={has_unfinished}") from exc
                     self.engine_core.collective_rpc(
                         "rebuild_elastic_ep_group", args=(active_global_ranks, ))
+                    self.elastic_ep_active_ranks = active_ranks_tuple
+                    self.elastic_ep_scaled_once = True
+                    self._logged_followup_shrink_skip = None
                     if self.external_launcher_dp:
                         if current_global_rank in active_global_ranks:
                             self.dp_group = get_dp_group().cpu_group
@@ -875,6 +928,20 @@ class LLMEngine:
             return
         restore_start_t = time.perf_counter()
         self.engine_core.collective_rpc("restore_elastic_parallel_groups")
+        if (envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
+                and _env_flag("VLLM_ASCEND_MODE1_RESTORE_POST_NPU_SYNC", "1")):
+            sync_start_t = time.perf_counter()
+            try:
+                _npu_sync_if_available()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Elastic mode1 restore post-NPU-sync failed; "
+                    "full-world restore left outstanding runtime work in an "
+                    "error state.") from exc
+            logger.info(
+                "Elastic mode1 restore post-NPU-sync done: global_rank=%s total_ms=%.2f",
+                torch.distributed.get_rank(),
+                (time.perf_counter() - sync_start_t) * 1000.0)
         if self.external_launcher_dp:
             self.dp_group = get_dp_group().cpu_group
         self.elastic_ep_scaled_once = False

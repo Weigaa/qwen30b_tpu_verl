@@ -14,6 +14,9 @@
 
 # To support different vLLM versions, we add the model into SUPPORTED_MOE_MODELS separately to avoid triggering
 # unsupported issues.
+import os
+import time
+
 SUPPORTED_MOE_MODELS = []
 
 try:
@@ -51,6 +54,61 @@ try:
     SUPPORTED_MOE_MODELS.append(KimiVLForConditionalGeneration)
 except ImportError:
     pass
+
+
+def _mode1_update_weight_diag_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_MODE1_UPDATE_WEIGHTS_DIAG",
+                     "0").lower() in ("1", "true", "yes", "on")
+
+
+def _wrap_mode1_expert_weight_loader_for_diag(experts):
+    if not _mode1_update_weight_diag_enabled():
+        return
+    if getattr(experts, "_mode1_weight_loader_diag_wrapped", False):
+        stats = getattr(experts, "_mode1_weight_loader_stats", None)
+        if isinstance(stats, dict):
+            stats.clear()
+        return
+    original_loader = experts.weight_loader
+    stats = {}
+    experts._mode1_weight_loader_stats = stats
+
+    def timed_weight_loader(*args, **kwargs):
+        start_t = time.perf_counter()
+        status = "ok"
+        try:
+            return original_loader(*args, **kwargs)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            elapsed_s = time.perf_counter() - start_t
+            stats["calls"] = int(stats.get("calls", 0)) + 1
+            stats["total_s"] = float(stats.get("total_s", 0.0)) + elapsed_s
+            stats["max_s"] = max(float(stats.get("max_s", 0.0)), elapsed_s)
+            if status != "ok":
+                stats["errors"] = int(stats.get("errors", 0)) + 1
+            loaded_weight = args[1] if len(args) > 1 else kwargs.get(
+                "loaded_weight")
+            if hasattr(loaded_weight, "numel"):
+                stats["loaded_numel"] = (
+                    int(stats.get("loaded_numel", 0)) +
+                    int(loaded_weight.numel()))
+                try:
+                    stats["loaded_bytes"] = (
+                        int(stats.get("loaded_bytes", 0)) +
+                        int(loaded_weight.numel()) *
+                        int(loaded_weight.element_size()))
+                except Exception:
+                    pass
+            shard_id = (args[2] if len(args) > 2 else kwargs.get(
+                "shard_id", kwargs.get("loaded_shard_id", "unknown")))
+            shard_key = str(shard_id)
+            shard_counts = stats.setdefault("shard_counts", {})
+            shard_counts[shard_key] = int(shard_counts.get(shard_key, 0)) + 1
+
+    experts.weight_loader = timed_weight_loader
+    experts._mode1_weight_loader_diag_wrapped = True
 
 
 def patch_vllm_moe_model_weight_loader(model):
@@ -106,6 +164,7 @@ def patch_vllm_moe_model_weight_loader(model):
         experts = getattr(mlp, "experts", None)
         if not experts or not hasattr(experts, "weight_loader"):
             continue
+        _wrap_mode1_expert_weight_loader_for_diag(experts)
 
         # Patch the weight loaders
         for name, param in mlp.named_parameters():
