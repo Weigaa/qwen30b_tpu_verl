@@ -1,0 +1,70 @@
+{
+  "model_config": "/home/data/Qwen3-30B-A3B/config.json",
+  "tokens": 17408,
+  "rows_per_expert": [
+    128
+  ],
+  "active_experts": [
+    32
+  ],
+  "ep_size": 16,
+  "dtype": "bfloat16",
+  "cpu": "Kunpeng 920 7285Z To be filled by O.E.M. CPU @ 3.0GHz",
+  "torch": null,
+  "torch_npu": null,
+  "cases": [
+    {
+      "scope": "ep-local",
+      "hidden_size": 2048,
+      "intermediate_size": 768,
+      "num_experts": 128,
+      "top_k": 8,
+      "ep_size": 16,
+      "num_tokens": 512,
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128
+    }
+  ],
+  "results": [
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e32/rpe128",
+      "device": "cpu-kml-sbgemm-numa-bf16-fp32",
+      "workers": "8x10,10,10,10,10,10,10,10",
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128,
+      "median_ms": 11.74898847239092,
+      "min_ms": 11.61931303795427,
+      "p90_ms": 11.865012987982482,
+      "tflops": 3.2900454158104866
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e32/rpe128",
+      "device": "cpu-kml-sbgemm-numa-bf16-fp32",
+      "workers": "8x20,20,20,20,20,20,20,20",
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128,
+      "median_ms": 9.025770996231586,
+      "min_ms": 8.935510995797813,
+      "p90_ms": 9.184357000049204,
+      "tflops": 4.282704012780626
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e32/rpe128",
+      "device": "cpu-kml-sbgemm-numa-bf16-fp32",
+      "workers": "8x40,40,40,40,40,40,40,40",
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128,
+      "median_ms": 138.0253235111013,
+      "min_ms": 92.03195897862315,
+      "p90_ms": 289.0278219128959,
+      "tflops": 0.2800551716213947
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+--- a/vllm_ascend/worker/worker_v1.py
++++ b/vllm_ascend/worker/worker_v1.py
+@@ -7321,7 +7321,7 @@
+             return False
+         raw_sizes = os.getenv(
+             "VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES",
+-            "4,8",
++            "1,2,4,8",
+         )
+         defer_sizes: set[int] = set()
+         for raw_size in raw_sizes.split(","):
+--- a/internal/wj_train_grpo_qwen30b_a3b_16die_true_weight_eager.sh
++++ b/internal/wj_train_grpo_qwen30b_a3b_16die_true_weight_eager.sh
+@@ -288,9 +288,9 @@
+ # old MC2 wrappers instead of direct hot-path destruction.
+ export VLLM_ASCEND_MODE3_DROP_STALE_GROUP_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE3_DROP_STALE_GROUP_CACHE_AFTER_SHRINK:-1}
+ export VLLM_ASCEND_MODE3_DROP_STALE_MC2_GROUP_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE3_DROP_STALE_MC2_GROUP_CACHE_AFTER_SHRINK:-1}
+-export VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS=${VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS:-1}
++export VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS=${VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS:-0}
+ export VLLM_ASCEND_MODE3_DEFER_GROUP_DESTROY=${VLLM_ASCEND_MODE3_DEFER_GROUP_DESTROY:-1}
+-export VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES=${VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES:-4,8}
++export VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES=${VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES:-1,2,4,8}
+ # mode=3 dispatcher-only warmup is diagnostic only. On this CANN/HCCL stack the
+ # synthetic MC2 DispatchV2 warmup can hit a 300s-class runtime timeout at 8->4.
+ export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP:-0}
+--- a/run_mode3_perf_clean_test.sh
++++ b/run_mode3_perf_clean_test.sh
+@@ -87,9 +87,9 @@
+ # groups from cache and retire stale MC2 wrappers instead of keeping them.
+ export VLLM_ASCEND_MODE3_DROP_STALE_GROUP_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE3_DROP_STALE_GROUP_CACHE_AFTER_SHRINK:-1}
+ export VLLM_ASCEND_MODE3_DROP_STALE_MC2_GROUP_CACHE_AFTER_SHRINK=${VLLM_ASCEND_MODE3_DROP_STALE_MC2_GROUP_CACHE_AFTER_SHRINK:-1}
+-export VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS=${VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS:-1}
++export VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS=${VLLM_ASCEND_MODE3_KEEP_STALE_MC2_ON_ACTIVE_RANKS:-0}
+ export VLLM_ASCEND_MODE3_DEFER_GROUP_DESTROY=${VLLM_ASCEND_MODE3_DEFER_GROUP_DESTROY:-1}
+-export VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES=${VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES:-4,8}
++export VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES=${VLLM_ASCEND_MODE3_DEFER_DESTROY_FLOOR_GROUP_SIZES:-1,2,4,8}
+ # Diagnostic only. The synthetic MC2 dispatcher warmup can expose a 300s HCCL
+ # timeout on floor=4; keep it off unless explicitly bisecting that path.
+ export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP=${VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP:-0}

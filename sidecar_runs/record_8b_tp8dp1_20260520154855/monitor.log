@@ -1,0 +1,224 @@
+watch_start_time=1779263335.434910331
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/record_8b_tp8dp1_20260520154855_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+watch_start_trigger=shrink_done
+watch_graceful_kill_seconds=3
+watch_max_shrink_total_ms=0
+watch_sidecar_stop_file=sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl.stop_requested
+shrink_window_detected_time=1779264307.960886461 active_count=8
+shrink_window_line=[36m(WorkerDict pid=3801073)[0m INFO 05-20 16:05:07 [worker_v1.py:2992] Elastic parallel shrink done: rank=0 active_ranks=[0, 1, 5, 7, 9, 11, 12, 14] dp_size=8 ep_size=8 no_ep_tail=False rebuild_ms=2325.22 refresh_ms=383.91 warmup_ms=1124.49 total_ms=5070.03
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1779264307.995639060
+sidecar_active_ranks=0,1,5,7,9,11,12,14
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_pid=3825042
+sidecar_start_time=1779264308.204278989
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_device_count=8
+sidecar_replica_count=1
+sidecar_parallel_mode=hybrid
+sidecar_tensor_parallel_size=8
+sidecar_data_parallel_size=1
+sidecar_device_groups=2,3,4,6,8,10,13,15
+sidecar_unused_devices=
+sidecar_master_addr=192.168.0.163
+sidecar_force_host_ip_for_tp=1
+sidecar_vllm_host_ip=192.168.0.163
+sidecar_vllm_multiproc_host_ip=192.168.0.163
+sidecar_vllm_reuse_world_group=1
+sidecar_master_port_base=24300
+sidecar_master_ports=24300
+sidecar_master_port_stride=32
+sidecar_data_parallel_rpc_ports=
+sidecar_hccl_if_base_port=52673
+sidecar_hccl_if_base_ports=52673
+sidecar_hccl_host_socket_port_range=52673-52736
+sidecar_hccl_npu_socket_port_range=52737-52800
+sidecar_hccl_if_base_port_fixed=0
+sidecar_hccl_port_stride=2048
+sidecar_hccl_port_window=64
+sidecar_vllm_set_worker_rank_envs=1
+sidecar_ep_allowed=0
+sidecar_model_is_moe=0
+sidecar_model_is_moe_reason=dense_or_unknown
+sidecar_ep_effective=0
+sidecar_model=/home/data/Qwen3-8B
+sidecar_output=sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl
+sidecar_state_dir=sidecar_runs/state/qwen3_8b_gsm8k_train
+sidecar_generate_chunk_size=556
+sidecar_stream_checkpoint=1
+sidecar_partial_sync_every_steps=0
+sidecar_stop_file=sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl.stop_requested
+sidecar_shard_start_time=1779264308.206114257 shard=0 device_group=2,3,4,6,8,10,13,15 tp=8 dp=1 master_port=24300 data_parallel_rpc_port= hccl_if_base_port=52673 hccl_host_socket_port_range=52673-52736 hccl_npu_socket_port_range=52737-52800 output=sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl
+INFO 05-20 16:05:12 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 05-20 16:05:12 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 05-20 16:05:12 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 05-20 16:05:12 [__init__.py:207] Platform plugin ascend is activated
+INFO 05-20 16:05:16 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 05-20 16:05:16 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 05-20 16:05:16 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen3-8B", "devices": "2,3,4,6,8,10,13,15", "master_port": "24300", "master_addr": "192.168.0.163", "hccl_if_base_port": "52673", "hccl_host_socket_port_range": "52673-52736", "hccl_npu_socket_port_range": "52737-52800", "sidecar_hccl_if_base_port_fixed": "0", "sidecar_hccl_port_stride": "2048", "sidecar_hccl_port_window": "64", "vllm_host_ip": "192.168.0.163", "vllm_multiproc_distributed_host_ip": "192.168.0.163", "vllm_multiproc_use_host_ip": "1", "vllm_multiproc_set_worker_rank_envs": "1", "vllm_reuse_world_group_for_full_model_parallel": "1", "num_prompts": 556, "total_prompts": 7473, "completed_prompts": 1511, "inflight_prompts": 0, "resume_prompts": 90, "sidecar_epoch": 0, "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "repeat_until_killed": true, "max_iterations": 0, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "data_split": "train", "use_short_data": "0", "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "partials_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/partials.shard0.jsonl", "stop_file": "sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl.stop_requested", "expert_parallel_allowed": "0", "expert_parallel_effective": "0", "model_is_moe": "0", "model_is_moe_reason": "dense_or_unknown", "vllm_enable_expert_parallel": "0", "max_prompts": 556, "max_prompts_per_device": 556, "max_records_per_iteration": 556, "generate_chunk_size": 556, "engine_kwargs": {"tensor_parallel_size": 8, "enable_expert_parallel": false, "gpu_memory_utilization": 0.9, "max_num_seqs": 278, "max_num_batched_tokens": 65536, "trust_remote_code": true, "enforce_eager": true, "max_model_len": 6144}}
+INFO 05-20 16:05:16 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 05-20 16:05:16 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 05-20 16:05:16 [utils.py:233] non-default args: {'trust_remote_code': True, 'max_model_len': 6144, 'tensor_parallel_size': 8, 'max_num_batched_tokens': 65536, 'max_num_seqs': 278, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen3-8B'}
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 05-20 16:05:16 [model.py:547] Resolved architecture: Qwen3ForCausalLM
+INFO 05-20 16:05:16 [model.py:1510] Using max model len 6144
+INFO 05-20 16:05:17 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=65536.
+INFO 05-20 16:05:17 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 05-20 16:05:17 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 05-20 16:05:17 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [core.py:667] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen3-8B', speculative_config=None, tokenizer='/home/data/Qwen3-8B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=6144, download_dir=None, load_format=auto, tensor_parallel_size=8, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen3-8B, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m WARNING 05-20 16:05:17 [multiproc_executor.py:775] Reducing Torch parallelism from 320 threads to 1 to avoid unnecessary CPU contention. Set OMP_NUM_THREADS in the external environment to tune this value as needed.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:123] Multiproc executor distributed init host=192.168.0.163
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0, 1, 2, 3, 4, 5, 6, 7], buffer_handle=(8, 16777216, 10, 'psm_21bbc78a'), local_subscribe_addr='ipc:///tmp/4e2504b4-ea09-430f-a294-5660b4025cbd', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=0 local_rank=0 world_size=8
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=1 local_rank=1 world_size=8
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=2 local_rank=2 world_size=8
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=3 local_rank=3 world_size=8
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=4 local_rank=4 world_size=8
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=5 local_rank=5 world_size=8
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=6 local_rank=6 world_size=8
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:17 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=7 local_rank=7 world_size=8
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:24 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_e8d11fab'), local_subscribe_addr='ipc:///tmp/3f59d5fb-004a-4247-9559-abc8707cc2c6', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:26 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_c5fa772e'), local_subscribe_addr='ipc:///tmp/1577965c-7c93-4080-bcf3-75ddc18f5dcd', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:26 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_0e756ec2'), local_subscribe_addr='ipc:///tmp/e5a818a4-dca6-4438-806f-6bc7ce3dc4e9', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:27 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_184ba412'), local_subscribe_addr='ipc:///tmp/f9f114da-4b34-4e95-bae0-7a1011eec9ae', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:28 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_05fc77d3'), local_subscribe_addr='ipc:///tmp/f670e6f4-b74a-4961-9c67-28ca86e4d467', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:28 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_52ffe11d'), local_subscribe_addr='ipc:///tmp/c1637182-53e4-48b2-a219-8605c014f5e2', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:28 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_f4460e42'), local_subscribe_addr='ipc:///tmp/ed3e2bcf-37b8-40f3-8cc2-6b0940fbf434', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:29 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_4a3854e6'), local_subscribe_addr='ipc:///tmp/67e30f16-e500-434d-80ab-677b306afe96', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:31 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[1, 2, 3, 4, 5, 6, 7], buffer_handle=(7, 4194304, 6, 'psm_e9a76e08'), local_subscribe_addr='ipc:///tmp/6f574087-7627-4096-aeb9-1a0b7758cb3a', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:1232] rank 7 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 7, EP rank 7
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:1232] rank 1 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 1, EP rank 1
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:1232] rank 3 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 3, EP rank 3
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:1232] rank 0 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:1232] rank 2 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 2, EP rank 2
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:1232] rank 5 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 5, EP rank 5
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:1232] rank 4 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 4, EP rank 4
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:1232] rank 6 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 6, EP rank 6
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:32 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP3 pid=3825382)[0;0m INFO 05-20 16:05:33 [model_runner_v1.py:3087] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m INFO 05-20 16:05:33 [model_runner_v1.py:3087] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP1 pid=3825376)[0;0m INFO 05-20 16:05:33 [model_runner_v1.py:3087] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP5 pid=3825392)[0;0m INFO 05-20 16:05:33 [model_runner_v1.py:3087] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP4 pid=3825387)[0;0m INFO 05-20 16:05:33 [model_runner_v1.py:3087] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP6 pid=3825407)[0;0m INFO 05-20 16:05:33 [model_runner_v1.py:3087] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP2 pid=3825379)[0;0m INFO 05-20 16:05:33 [model_runner_v1.py:3087] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP7 pid=3825410)[0;0m INFO 05-20 16:05:33 [model_runner_v1.py:3087] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/5 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m Loading safetensors checkpoint shards:  20% Completed | 1/5 [00:00<00:00,  7.19it/s]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m Loading safetensors checkpoint shards:  40% Completed | 2/5 [00:00<00:00,  5.36it/s]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m Loading safetensors checkpoint shards:  60% Completed | 3/5 [00:00<00:00,  5.25it/s]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m Loading safetensors checkpoint shards:  80% Completed | 4/5 [00:00<00:00,  4.87it/s]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP2 pid=3825379)[0;0m INFO 05-20 16:05:38 [default_loader.py:267] Loading weights took 0.94 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP5 pid=3825392)[0;0m INFO 05-20 16:05:38 [default_loader.py:267] Loading weights took 0.75 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m Loading safetensors checkpoint shards: 100% Completed | 5/5 [00:00<00:00,  5.82it/s]
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m 
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m INFO 05-20 16:05:38 [default_loader.py:267] Loading weights took 0.87 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP6 pid=3825407)[0;0m INFO 05-20 16:05:38 [default_loader.py:267] Loading weights took 0.89 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP1 pid=3825376)[0;0m INFO 05-20 16:05:38 [default_loader.py:267] Loading weights took 0.94 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP4 pid=3825387)[0;0m INFO 05-20 16:05:38 [default_loader.py:267] Loading weights took 0.79 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP3 pid=3825382)[0;0m INFO 05-20 16:05:38 [default_loader.py:267] Loading weights took 0.96 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP7 pid=3825410)[0;0m INFO 05-20 16:05:38 [default_loader.py:267] Loading weights took 0.92 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP2 pid=3825379)[0;0m INFO 05-20 16:05:38 [model_runner_v1.py:3121] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m INFO 05-20 16:05:38 [model_runner_v1.py:3121] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP6 pid=3825407)[0;0m INFO 05-20 16:05:39 [model_runner_v1.py:3121] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP1 pid=3825376)[0;0m INFO 05-20 16:05:39 [model_runner_v1.py:3121] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP5 pid=3825392)[0;0m INFO 05-20 16:05:39 [model_runner_v1.py:3121] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP3 pid=3825382)[0;0m INFO 05-20 16:05:39 [model_runner_v1.py:3121] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP7 pid=3825410)[0;0m INFO 05-20 16:05:39 [model_runner_v1.py:3121] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP4 pid=3825387)[0;0m INFO 05-20 16:05:39 [model_runner_v1.py:3121] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP6 pid=3825407)[0;0m INFO 05-20 16:05:44 [worker_v1.py:344] Available memory: 31796507955, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP1 pid=3825376)[0;0m INFO 05-20 16:05:44 [worker_v1.py:344] Available memory: 31811937587, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP3 pid=3825382)[0;0m INFO 05-20 16:05:45 [worker_v1.py:344] Available memory: 31498813952, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP5 pid=3825392)[0;0m INFO 05-20 16:05:45 [worker_v1.py:344] Available memory: 31521812992, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP2 pid=3825379)[0;0m INFO 05-20 16:05:45 [worker_v1.py:344] Available memory: 31507673600, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m INFO 05-20 16:05:45 [worker_v1.py:344] Available memory: 31080194560, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP4 pid=3825387)[0;0m INFO 05-20 16:05:45 [worker_v1.py:344] Available memory: 31526158848, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP7 pid=3825410)[0;0m INFO 05-20 16:05:45 [worker_v1.py:344] Available memory: 31803565363, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1087] GPU KV cache size: 1,686,144 tokens
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1091] Maximum concurrency for 6,144 tokens per request: 274.44x
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1087] GPU KV cache size: 1,725,824 tokens
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1091] Maximum concurrency for 6,144 tokens per request: 280.90x
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1087] GPU KV cache size: 1,709,312 tokens
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1091] Maximum concurrency for 6,144 tokens per request: 278.21x
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1087] GPU KV cache size: 1,708,800 tokens
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1091] Maximum concurrency for 6,144 tokens per request: 278.12x
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1087] GPU KV cache size: 1,710,336 tokens
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1091] Maximum concurrency for 6,144 tokens per request: 278.38x
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1087] GPU KV cache size: 1,710,080 tokens
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1091] Maximum concurrency for 6,144 tokens per request: 278.33x
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1087] GPU KV cache size: 1,725,056 tokens
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1091] Maximum concurrency for 6,144 tokens per request: 280.77x
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1087] GPU KV cache size: 1,725,440 tokens
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [kv_cache_utils.py:1091] Maximum concurrency for 6,144 tokens per request: 280.83x
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [core.py:217] init engine (profile, create kv cache, warmup model) took 5.98 seconds
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m WARNING 05-20 16:05:45 [core.py:119] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m max_num_running_reqs: 278 max_num_scheduled_tokens: 65536 max_model_len: 6144
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:45 [platform.py:179] Compilation disabled, using eager mode by default
+INFO 05-20 16:05:46 [llm.py:313] Supported_tasks: ['generate']
+{"event": "sidecar_sampling_params", "n": 1, "temperature": 0.0, "top_p": 1.0, "max_tokens": 4096, "max_model_len": 6144, "max_num_seqs": 278, "max_num_batched_tokens": 65536, "shard_index": 0, "num_shards": 1}
+{"event": "sidecar_chunk_start", "iteration": 0, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 556, "prompt_ids_first": [629, 631, 633, 635, 637, 639, 641, 643], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:46 [core.py:269] Elastic first model exec: entering model_fn scheduled_tokens=275 num_reqs=1
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP0 pid=3825373)[0;0m [1;36m(Worker_TP1 pid=3825376)[0;0m [1;36m(Worker_TP6 pid=3825407)[0;0m WARNING 05-20 16:05:46 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+WARNING 05-20 16:05:46 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+WARNING 05-20 16:05:46 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP5 pid=3825392)[0;0m WARNING 05-20 16:05:46 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP4 pid=3825387)[0;0m WARNING 05-20 16:05:46 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP2 pid=3825379)[0;0m WARNING 05-20 16:05:46 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP3 pid=3825382)[0;0m WARNING 05-20 16:05:46 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m [1;36m(Worker_TP7 pid=3825410)[0;0m WARNING 05-20 16:05:46 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3825366)[0;0m INFO 05-20 16:05:46 [core.py:282] Elastic first model exec: model_fn returned
+INFO 05-20 16:05:47 [llm_engine.py:707] Elastic first live step: entering engine_core.get_output
+{"event": "sidecar_chunk_done", "iteration": 0, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 246.71822787699057, "num_requests": 556, "submitted_requests": 556, "prompt_ids_first": [629, 631, 633, 635, 637, 639, 641, 643], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 1253606, "tokens_per_s": 5081.124369233984, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 0, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 246.71822787699057, "num_requests": 556, "total_prompts": 7473, "completed_prompts": 2067, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 1253606, "tokens_per_s": 5081.124369233984, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 1, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 556, "prompt_ids_first": [1689, 1691, 1693, 1695, 1697, 1699, 1701, 1703], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+sidecar_deadline_signal_time=1779264743.321343155
+sidecar_deadline_signal_line=[36m(TaskRunner pid=3798563)[0m [Rank 0 | Local Rank 0] 2026-05-20 16:12:22,941 INFO [verl.trainer.ppo.ray_trainer:373] => Elastic parallel restore requested before rollout restore rpc
+sidecar_stop_request_time=1779264743.324903351 reason=training_rollout_done_or_restore pid=3825042 stop_file=sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl.stop_requested
+{"event": "sidecar_soft_stop_observed", "time": 1779264743.3330798, "stop_file": "sidecar_runs/record_8b_tp8dp1_20260520154855/outputs.jsonl.stop_requested", "shard_index": 0, "num_shards": 1}
+{"event": "sidecar_soft_stop_checkpointed", "time": 1779264743.3948596, "iteration": 1, "chunk_start": 0, "sidecar_epoch": 0, "active_requests": 290, "checkpointed_requests": 278, "resume_prompts": 278, "shard_index": 0, "num_shards": 1, "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "partials_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/partials.shard0.jsonl"}
+sidecar_kill_time=1779264746.145386285 reason=training_rollout_done_or_restore pid=3825042 after_soft_stop=1
+Terminated
+watch_end_time=1779264746.361695900

@@ -26,7 +26,7 @@ from torch.nn import Parameter
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (divide, get_pp_group,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
@@ -340,6 +340,25 @@ class PanguProMoEMLP(nn.Module):
 
 def topk_wrapper(num_voted_experts):
 
+    def _effective_ep_layout(global_num_experts: int) -> tuple[int, int]:
+        """Return the EP layout that Pangu routing should actually use.
+
+        Pangu's grouped routing emits local expert ids.  In pure TP mode vLLM's
+        EP group can still have TP ranks in it, but FusedMoE owns all experts on
+        each rank (use_ep=False).  Using get_ep_group() directly would shrink
+        64 experts to 16 for TP=4 and make group_list disagree with the full
+        expert weights.
+        """
+        vllm_config = get_current_vllm_config()
+        enable_ep = bool(vllm_config.parallel_config.enable_expert_parallel)
+        ep_size = get_ep_group().world_size if enable_ep else 1
+        ep_rank = get_ep_group().rank_in_group if enable_ep else 0
+        if ep_size <= 0 or global_num_experts % ep_size != 0:
+            raise RuntimeError(
+                "Invalid Pangu MoE EP layout: "
+                f"global_num_experts={global_num_experts}, ep_size={ep_size}")
+        return ep_size, ep_rank
+
     def pangu_group8_topk(
         hidden_states: torch.Tensor,
         gating_output: torch.Tensor,
@@ -353,14 +372,16 @@ def topk_wrapper(num_voted_experts):
         num_tokens = scores.shape[0]
         router_scale = _ROUTER_SCALE.squeeze(  # type: ignore
         )
-        # TODO: support disable expert parallel
-        ep_size = get_ep_group().world_size
+        ep_size, ep_rank = _effective_ep_layout(global_num_experts)
         local_num_experts = global_num_experts // ep_size
         local_num_group = topk // ep_size
         experts_per_group = global_num_experts // topk
-        local_group_start = get_ep_group().rank_in_group * local_num_experts
-        local_group_end = (get_ep_group().rank_in_group +
-                           1) * local_num_experts
+        if topk % ep_size != 0:
+            raise RuntimeError(
+                "Invalid Pangu MoE routing layout: "
+                f"topk={topk}, ep_size={ep_size}")
+        local_group_start = ep_rank * local_num_experts
+        local_group_end = (ep_rank + 1) * local_num_experts
         scores = F.softmax(gating_output, dim=1)
         scores = scores[..., local_group_start:local_group_end]
 

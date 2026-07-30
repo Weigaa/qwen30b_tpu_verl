@@ -47,6 +47,33 @@ logger = init_logger(__name__)
 _R = TypeVar("_R", default=Any)
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+def _parse_int_set(value: str) -> Optional[set[int]]:
+    value = value.strip().lower()
+    if value in ("", "all", "*"):
+        return None
+    result: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.add(int(item))
+        except ValueError:
+            logger.warning("Ignoring invalid integer in env list: %s", item)
+    return result
+
+
 class LLMEngine:
     """Legacy LLMEngine for backwards compatibility."""
 
@@ -165,6 +192,9 @@ class LLMEngine:
         self.elastic_ep_active_ranks: Optional[tuple[int, ...]] = None
         self.elastic_ep_runtime_active_ranks: Optional[tuple[int, ...]] = None
         self._logged_followup_shrink_skip: Optional[tuple[int, ...]] = None
+        self._elastic_last_dummy_boundary_ranks: Optional[tuple[int, ...]] = None
+        self._logged_mode1_dummy_boundary_delay: Optional[tuple[int, ...]] = None
+        self._elastic_mode1_dummy_boundary_needs_sync = False
         
         #new code here
         self.dummy_times = 0
@@ -198,6 +228,13 @@ class LLMEngine:
             }
         else:
             self._elastic_op_profile_buckets = None
+        self._elastic_op_profile_by_stage = _env_flag(
+            "VLLM_ASCEND_BUCKET_OP_PROFILE_BY_STAGE", "0")
+        self._elastic_op_profile_stage_samples = _env_int(
+            "VLLM_ASCEND_BUCKET_OP_PROFILE_STAGE_SAMPLES", 5, minimum=1)
+        self._elastic_op_profile_stage_targets = _parse_int_set(
+            os.getenv("VLLM_ASCEND_BUCKET_OP_PROFILE_STAGES", "8,4,2,1"))
+        self._elastic_op_profile_stage_seen: dict[int, int] = {}
         # Don't keep the dummy data in memory
         self.reset_mm_cache()
         self._logged_mc2_delay = False
@@ -251,6 +288,89 @@ class LLMEngine:
         if self.dp_group is None:
             return has_unfinished or self.engine_core.dp_engines_running()
         return self.has_unfinished_requests_dp(has_unfinished)
+
+    def _should_include_engine_running_in_elastic_active_ranks(self) -> bool:
+        return (
+            self.elastic_ep_no_dummy
+            and envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE == 1
+            and _env_flag(
+                "VLLM_ASCEND_ELASTIC_INCLUDE_ENGINE_RUNNING_IN_ACTIVE_RANKS",
+                "0"))
+
+    def _local_engine_core_running(self) -> bool:
+        try:
+            return bool(self.engine_core.dp_engines_running())
+        except Exception:
+            return False
+
+    def _should_wait_mode1_dummy_boundary_before_shrink(
+            self, active_ranks_tuple: tuple[int, ...],
+            current_global_rank: int, dp_world_size: int) -> bool:
+        if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE != 1:
+            return False
+        if not self.elastic_ep_no_dummy:
+            return False
+        if not _env_flag("VLLM_ASCEND_MODE1_WAIT_DUMMY_BOUNDARY_BEFORE_SHRINK",
+                         "0"):
+            return False
+        prev_active_ranks = self.elastic_ep_active_ranks
+        if prev_active_ranks is None or prev_active_ranks == active_ranks_tuple:
+            return False
+
+        prev_active_set = set(prev_active_ranks)
+        active_set = set(active_ranks_tuple)
+        if (not active_set or not active_set.issubset(prev_active_set)
+                or len(active_set) >= len(prev_active_set)):
+            return False
+
+        max_group_size = _env_int(
+            "VLLM_ASCEND_MODE1_WAIT_DUMMY_BOUNDARY_MAX_GROUP_SIZE",
+            4,
+            minimum=1)
+        if dp_world_size > max_group_size:
+            return False
+
+        is_exiting_rank = (current_global_rank in prev_active_set
+                           and current_global_rank not in active_set)
+        local_boundary_ready = (
+            not is_exiting_rank
+            or self._elastic_last_dummy_boundary_ranks == prev_active_ranks)
+        not_ready_marker = (
+            current_global_rank if not local_boundary_ready else -1)
+        not_ready_tensor = torch.tensor([not_ready_marker],
+                                        dtype=torch.int64,
+                                        device="cpu")
+        gathered = [torch.empty_like(not_ready_tensor) for _ in range(
+            torch.distributed.get_world_size(group=self.dp_group))]
+        torch.distributed.all_gather(gathered,
+                                     not_ready_tensor,
+                                     group=self.dp_group)
+        not_ready_exit_ranks = [
+            int(t.item()) for t in gathered if int(t.item()) >= 0
+        ]
+        if not not_ready_exit_ranks:
+            return False
+
+        # The shrink is deferred, so the next dummy/live step must still run
+        # under the currently installed group, not the candidate smaller group.
+        self.elastic_ep_runtime_active_ranks = prev_active_ranks
+        if is_exiting_rank:
+            self.should_execute_dummy_batch = True
+            self._elastic_mode1_dummy_boundary_needs_sync = True
+        if self._logged_mode1_dummy_boundary_delay != active_ranks_tuple:
+            logger.info(
+                "Elastic mode1 shrink deferred for dummy boundary: global_rank=%s active_ranks=%s prev_active_ranks=%s current_group_size=%s not_ready_exit_ranks=%s local_is_exiting=%s local_boundary_ready=%s last_dummy_boundary=%s",
+                current_global_rank,
+                list(active_ranks_tuple),
+                prev_active_ranks,
+                dp_world_size,
+                not_ready_exit_ranks,
+                is_exiting_rank,
+                local_boundary_ready,
+                self._elastic_last_dummy_boundary_ranks,
+            )
+            self._logged_mode1_dummy_boundary_delay = active_ranks_tuple
+        return True
 
     def _get_active_dp_global_ranks(self, has_unfinished: bool) -> list[int]:
         assert self.dp_group is not None
@@ -467,24 +587,44 @@ class LLMEngine:
     def _maybe_arm_elastic_op_profile(self, kind: str) -> None:
         if not getattr(self, "_elastic_op_profile_enabled", False):
             return
-        step = int(getattr(self, "total_step_times", 0))
-        buckets = getattr(self, "_elastic_op_profile_buckets", None)
-        if buckets is not None:
-            if step not in buckets:
-                return
-            bucket = step
-        else:
-            start = int(getattr(self, "_elastic_op_profile_start", 0))
-            end = int(getattr(self, "_elastic_op_profile_end", 0))
-            interval = int(getattr(self, "_elastic_op_profile_interval", 500))
-            if step <= 0 or (start and step < start) or (end and step > end):
-                return
-            if step % interval != 0:
-                return
-            bucket = step
-
         active_count, compute_world_size, active_ranks = (
             self._active_rank_context())
+        step = int(getattr(self, "total_step_times", 0))
+
+        if getattr(self, "_elastic_op_profile_by_stage", False):
+            if kind != "live":
+                return
+            targets = getattr(self, "_elastic_op_profile_stage_targets", None)
+            if targets is not None and active_count not in targets:
+                return
+            seen = getattr(self, "_elastic_op_profile_stage_seen", {})
+            sample_idx = int(seen.get(active_count, 0))
+            max_samples = int(getattr(self,
+                                      "_elastic_op_profile_stage_samples", 5))
+            if sample_idx >= max_samples:
+                return
+            sample_idx += 1
+            seen[active_count] = sample_idx
+            self._elastic_op_profile_stage_seen = seen
+            bucket = f"stage{active_count}_sample{sample_idx}_step{step}"
+        else:
+            buckets = getattr(self, "_elastic_op_profile_buckets", None)
+            if buckets is not None:
+                if step not in buckets:
+                    return
+                bucket = step
+            else:
+                start = int(getattr(self, "_elastic_op_profile_start", 0))
+                end = int(getattr(self, "_elastic_op_profile_end", 0))
+                interval = int(
+                    getattr(self, "_elastic_op_profile_interval", 500))
+                if step <= 0 or (start and step < start) or (end
+                                                            and step > end):
+                    return
+                if step % interval != 0:
+                    return
+                bucket = step
+
         context = {
             "bucket": bucket,
             "step": step,
@@ -492,6 +632,10 @@ class LLMEngine:
             "active_count": active_count,
             "compute_world_size": compute_world_size,
             "active_ranks": active_ranks,
+            "stage_profile_sample": (
+                getattr(self, "_elastic_op_profile_stage_seen", {}).get(
+                    active_count, 0)
+                if getattr(self, "_elastic_op_profile_by_stage", False) else 0),
         }
         self.engine_core.collective_rpc("set_elastic_op_profile_context",
                                         args=(context, ))
@@ -500,7 +644,13 @@ class LLMEngine:
             bucket, step, kind, active_count, compute_world_size, active_ranks)
 
     def has_unfinished_requests_dp(self, has_unfinished: bool) -> bool:
-        active_global_ranks = self._get_active_dp_global_ranks(has_unfinished)
+        local_has_unfinished = bool(has_unfinished)
+        local_engine_running = False
+        if self._should_include_engine_running_in_elastic_active_ranks():
+            local_engine_running = self._local_engine_core_running()
+        local_active_marker = local_has_unfinished or local_engine_running
+        active_global_ranks = self._get_active_dp_global_ranks(
+            local_active_marker)
         self.elastic_ep_runtime_active_ranks = (
             tuple(active_global_ranks) if active_global_ranks else None)
 
@@ -535,18 +685,20 @@ class LLMEngine:
                 if (self._should_delay_elastic_shrink_for_mc2(
                         num_active_ranks, dp_world_size)
                         and not allow_single_rank_no_ep_tail):
-                    if not has_unfinished:
+                    if not local_active_marker:
                         if not self._logged_mc2_delay:
                             self._logged_mc2_delay = True
                             logger.info(
-                                "Elastic shrink delayed for MC2 compatibility: global_rank=%s active_ranks=%s active_count=%s dp_world_size=%s delay_for_min_ep=%s delay_for_divisibility=%s local_has_unfinished=%s scaled_once=%s prev_active_ranks=%s",
+                                "Elastic shrink delayed for MC2 compatibility: global_rank=%s active_ranks=%s active_count=%s dp_world_size=%s delay_for_min_ep=%s delay_for_divisibility=%s local_has_unfinished=%s local_engine_running=%s local_active_marker=%s scaled_once=%s prev_active_ranks=%s",
                                 current_global_rank,
                                 active_global_ranks,
                                 num_active_ranks,
                                 dp_world_size,
                                 delay_for_min_ep,
                                 delay_for_divisibility,
-                                has_unfinished,
+                                local_has_unfinished,
+                                local_engine_running,
+                                local_active_marker,
                                 self.elastic_ep_scaled_once,
                                 self.elastic_ep_active_ranks)
                             if delay_for_min_ep and num_active_ranks == 1:
@@ -588,22 +740,29 @@ class LLMEngine:
                     if skip_reason is not None:
                         if self._logged_followup_shrink_skip != active_ranks_tuple:
                             logger.info(
-                                "Elastic follow-up shrink skipped: global_rank=%s unfinished_active_ranks=%s prev_active_ranks=%s current_group_size=%s min_compute_group_size=%s reason=%s local_has_unfinished=%s",
+                                "Elastic follow-up shrink skipped: global_rank=%s unfinished_active_ranks=%s prev_active_ranks=%s current_group_size=%s min_compute_group_size=%s reason=%s local_has_unfinished=%s local_engine_running=%s local_active_marker=%s",
                                 current_global_rank, active_global_ranks,
                                 self.elastic_ep_active_ranks, dp_world_size,
                                 min_compute_group_size, skip_reason,
-                                has_unfinished)
+                                local_has_unfinished, local_engine_running,
+                                local_active_marker)
                             self._logged_followup_shrink_skip = active_ranks_tuple
                         if current_global_rank not in active_global_ranks:
                             self.should_execute_dummy_batch = True
                         return True
 
+                    if self._should_wait_mode1_dummy_boundary_before_shrink(
+                            active_ranks_tuple, current_global_rank,
+                            dp_world_size):
+                        return True
+
                     logger.info(
-                        "Elastic EP shrink rpc enter: global_rank=%s active_ranks=%s prev_active_ranks=%s dp_world_size=%s local_has_unfinished=%s",
+                        "Elastic EP shrink rpc enter: global_rank=%s active_ranks=%s prev_active_ranks=%s dp_world_size=%s local_has_unfinished=%s local_engine_running=%s local_active_marker=%s",
                         current_global_rank, active_global_ranks,
                         self.elastic_ep_active_ranks, dp_world_size,
-                        has_unfinished)
-                    if not has_unfinished:
+                        local_has_unfinished, local_engine_running,
+                        local_active_marker)
+                    if not local_active_marker:
                         if allow_single_rank_no_ep_tail:
                             logger.info(
                                 "Elastic single-rank tail allowed: global_rank=%s surviving_rank=%s prev_active_ranks=%s current_group_size=%s configured_min_compute_group_size=%s tail_mode=no_ep",
@@ -622,6 +781,8 @@ class LLMEngine:
                     self.elastic_ep_active_ranks = active_ranks_tuple
                     self.elastic_ep_scaled_once = True
                     self._logged_followup_shrink_skip = None
+                    self._logged_mode1_dummy_boundary_delay = None
+                    self._elastic_last_dummy_boundary_ranks = None
                     rebuild_start_t = time.perf_counter()
                     if envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE in (2, 3, 4):
                         try:
@@ -638,7 +799,9 @@ class LLMEngine:
                                 f"active_ranks={active_global_ranks} "
                                 f"prev_active_ranks={prev_elastic_ep_active_ranks} "
                                 f"dp_world_size={dp_world_size} "
-                                f"local_has_unfinished={has_unfinished}") from exc
+                                f"local_has_unfinished={local_has_unfinished} "
+                                f"local_engine_running={local_engine_running} "
+                                f"local_active_marker={local_active_marker}") from exc
                     self.engine_core.collective_rpc(
                         "rebuild_elastic_ep_group", args=(active_global_ranks, ))
                     if self.external_launcher_dp:
@@ -650,10 +813,10 @@ class LLMEngine:
                         "Elastic parallel shrink rpc done: global_rank=%s active_ranks=%s total_ms=%.2f",
                         current_global_rank, active_global_ranks,
                         (time.perf_counter() - rebuild_start_t) * 1000.0)
-            return has_unfinished
+            return local_active_marker
 
         aggregated_has_unfinished = len(active_global_ranks) > 0
-        if not has_unfinished and aggregated_has_unfinished:
+        if not local_active_marker and aggregated_has_unfinished:
             self.should_execute_dummy_batch = True
         return aggregated_has_unfinished
 
@@ -683,6 +846,9 @@ class LLMEngine:
         self.elastic_ep_runtime_active_ranks = None
         self._logged_followup_shrink_skip = None
         self._logged_mc2_delay = False
+        self._logged_mode1_dummy_boundary_delay = None
+        self._elastic_last_dummy_boundary_ranks = None
+        self._elastic_mode1_dummy_boundary_needs_sync = False
         logger.info(
             "Elastic parallel groups restored: global_rank=%s total_ms=%.2f",
             torch.distributed.get_rank(),
@@ -764,12 +930,35 @@ class LLMEngine:
 
         if self.should_execute_dummy_batch:
             self.should_execute_dummy_batch = False
+            dummy_boundary_ranks = self.elastic_ep_active_ranks
+            sync_dummy_boundary = self._elastic_mode1_dummy_boundary_needs_sync
+            self._elastic_mode1_dummy_boundary_needs_sync = False
             #do something replace execute dummy batch
             #record dummy_run time
             # print("rank", torch.distributed.get_rank(group=self.dp_group), "executed dummy batch")
             # begin_time = time.time()
             self._maybe_arm_elastic_op_profile("dummy")
             self.engine_core.execute_dummy_batch()
+            if (sync_dummy_boundary and torch.npu.is_available()
+                    and _env_flag(
+                        "VLLM_ASCEND_MODE1_SYNC_DUMMY_BOUNDARY_BEFORE_SHRINK",
+                        "0")):
+                sync_start_t = time.perf_counter()
+                torch.npu.synchronize()
+                sync_ms = (time.perf_counter() - sync_start_t) * 1000.0
+                slow_ms = _env_int(
+                    "VLLM_ASCEND_MODE1_DUMMY_BOUNDARY_SYNC_SLOW_MS",
+                    1000,
+                    minimum=0)
+                if sync_ms >= slow_ms:
+                    logger.info(
+                        "Elastic mode1 dummy boundary sync done: global_rank=%s boundary_ranks=%s sync_ms=%.2f",
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_initialized() else -1,
+                        dummy_boundary_ranks,
+                        sync_ms,
+                    )
+            self._elastic_last_dummy_boundary_ranks = dummy_boundary_ranks
             self._maybe_log_elastic_util_bucket(local_new_tokens=0)
             # end=time.time()
             # self.dummy_times += 1

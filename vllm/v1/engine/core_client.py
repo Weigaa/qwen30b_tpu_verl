@@ -311,6 +311,10 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
 
     def dp_engines_running(self) -> bool:
+        # In-process execution is synchronous with LLMEngine.step(). The
+        # scheduler may still have requests while the current model call is not
+        # running; treating that as "engine running" prevents elastic shrink
+        # entirely in mode=1.
         return False
 
 

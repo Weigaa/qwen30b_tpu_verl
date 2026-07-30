@@ -1,0 +1,175 @@
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py	2026-06-24 14:40:43.000158063 +0800
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py	2026-06-24 16:09:30.312399453 +0800
+@@ -160,6 +160,49 @@
+         logger.exception("Failed to log custom mode=1 rollout memory at %s", tag)
+ 
+ 
++def _mode1_reload_floor() -> int:
++    try:
++        return int(os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", "0") or "0")
++    except ValueError:
++        return 0
++
++
++def _maybe_trim_before_update_weights_load(obj, tag: str) -> None:
++    """Trim NPU allocator before rollout weight reload on all rollout paths."""
++    floor = _mode1_reload_floor()
++    try:
++        mode = int(getattr(obj, "elastic_execution_mode", 0) or 0)
++    except Exception:
++        mode = 0
++    if mode == 0:
++        try:
++            mode = int(os.getenv("VLLM_ASCEND_ELASTIC_EXECUTION_MODE", "0") or "0")
++        except ValueError:
++            mode = 0
++    default = "1" if mode == 1 and 0 < floor <= 4 else "0"
++    if not _env_flag("VLLM_ASCEND_MODE1_TRIM_BEFORE_UPDATE_WEIGHTS_LOAD", default):
++        logger.info(
++            "Mode1 rollout update_weights allocator trim skipped: tag=%s mode=%s floor=%s",
++            tag, mode, floor)
++        return
++    _log_custom_mode1_rollout_memory(f"{tag}_before_trim")
++    try:
++        if hasattr(torch, "npu") and torch.npu.is_available():
++            if _env_flag("VLLM_ASCEND_MODE1_RELOAD_SYNC_ON_TRIM", "1"):
++                torch.npu.synchronize()
++            gc.collect()
++            torch.npu.empty_cache()
++    except Exception:
++        logger.exception(
++            "Mode1 rollout update_weights allocator trim failed: tag=%s mode=%s floor=%s",
++            tag, mode, floor)
++        return
++    _log_custom_mode1_rollout_memory(f"{tag}_after_trim")
++    logger.info(
++        "Mode1 rollout update_weights allocator trim applied: tag=%s mode=%s floor=%s",
++        tag, mode, floor)
++
++
+ def _tensor_nbytes(tensor: Any) -> int:
+     if not isinstance(tensor, torch.Tensor):
+         return 0
+@@ -1313,31 +1356,7 @@
+             self._lossless_weight_update_sync_logged = True
+         _log_custom_mode1_rollout_memory("before_update_weights_load")
+         _log_custom_mode1_rollout_state(self, "before_update_weights_load")
+-        try:
+-            mode1_reload_floor = int(
+-                os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", "0")
+-                or "0")
+-        except ValueError:
+-            mode1_reload_floor = 0
+-        trim_before_update_default = "1" if (
+-            self.elastic_execution_mode == 1 and 0 < mode1_reload_floor <= 4
+-        ) else "0"
+-        trim_before_update = str(
+-            os.getenv("VLLM_ASCEND_MODE1_TRIM_BEFORE_UPDATE_WEIGHTS_LOAD",
+-                      trim_before_update_default)).strip().lower() in (
+-                          "1", "true", "yes", "on")
+-        if trim_before_update:
+-            try:
+-                torch.npu.synchronize()
+-                gc.collect()
+-                torch.npu.empty_cache()
+-            except Exception:
+-                pass
+-            _log_custom_mode1_rollout_memory(
+-                "before_update_weights_load_after_trim")
+-            logger.info(
+-                "Mode1 rollout update_weights allocator trim applied: floor=%s",
+-                mode1_reload_floor)
++        _maybe_trim_before_update_weights_load(self, "before_update_weights_load")
+         staged_weights = _materialize_rollout_weight_staging(weights)
+         model.load_weights(staged_weights)
+         refresh_gpu_buffer_aliases = getattr(self, "_refresh_gpu_buffer_aliases",
+@@ -1509,11 +1528,15 @@
+ 
+             model = self.inference_engine.worker.model_runner.model
+             patch_vllm_moe_model_weight_loader(model)
++            _log_custom_mode1_rollout_memory("before_update_weights_load")
++            _log_custom_mode1_rollout_state(self, "before_update_weights_load")
++            _maybe_trim_before_update_weights_load(self, "before_update_weights_load")
+             staged_weights = _materialize_rollout_weight_staging(list(weights))
+             model.load_weights(staged_weights)
+             staged_weights = []
+             gc.collect()
+             torch.npu.empty_cache()
++            _log_custom_mode1_rollout_memory("after_update_weights_load")
+ 
+     def generate_sequences(self, prompts: DataProto) -> DataProto:
+         """Batch generate sequences in sync mode."""
+--- a/vllm_ascend/worker/worker_v1.py	2026-06-24 12:04:02.685382889 +0800
++++ b/vllm_ascend/worker/worker_v1.py	2026-06-24 16:09:30.316399472 +0800
+@@ -7273,6 +7273,7 @@
+             "group_ranks": group_ranks,
+             "reason": reason,
+         })
++        self._maybe_async_destroy_fast_retired_mc2_device_pgs(deferred)
+         logger.info(
+             "Elastic parallel group destroy deferred: rank=%s "
+             "group_kind=%s group_ranks=%s reason=%s deferred_count=%s "
+@@ -7295,6 +7296,63 @@
+         )
+         return True
+ 
++    def _maybe_async_destroy_fast_retired_mc2_device_pgs(self, deferred) -> None:
++        """Bound HCCL resources kept by full-restore MC2 fast retire."""
++        if not _env_flag(
++                "VLLM_ASCEND_MODE1_PARITY_ASYNC_DESTROY_FAST_RETIRED_MC2", "1"):
++            return
++        try:
++            keep_limit = int(os.getenv(
++                "VLLM_ASCEND_MODE1_PARITY_MAX_FAST_RETIRED_MC2_DEVICE_PGS", "1") or "1")
++        except ValueError:
++            keep_limit = 1
++        keep_limit = max(0, keep_limit)
++        candidates = [
++            item for item in deferred
++            if item.get("group_kind") == "mc2"
++            and item.get("reason") == "mode1_full_restore"
++            and item.get("device_pgs")
++        ]
++        overflow = len(candidates) - keep_limit
++        if overflow <= 0:
++            return
++        to_destroy = []
++        for item in candidates[:overflow]:
++            device_pgs = item.get("device_pgs") or []
++            if device_pgs:
++                to_destroy.extend(device_pgs)
++                item["device_pgs"] = []
++        if not to_destroy:
++            return
++
++        def _destroy(rank: int, pgs: list[object]) -> None:
++            start_t = time.perf_counter()
++            destroyed = 0
++            for pg in pgs:
++                try:
++                    torch.distributed.destroy_process_group(pg)
++                    destroyed += 1
++                except Exception:
++                    logger.exception(
++                        "Elastic async fast-retired MC2 device PG destroy failed: rank=%s",
++                        rank)
++            logger.info(
++                "Elastic async fast-retired MC2 device PG destroy done: rank=%s destroyed=%s elapsed_ms=%.2f",
++                rank, destroyed, (time.perf_counter() - start_t) * 1000.0)
++
++        logger.info(
++            "Elastic async fast-retired MC2 device PG destroy queued: rank=%s queued=%s keep_limit=%s deferred_count=%s",
++            self.rank, len(to_destroy), keep_limit, len(deferred))
++        thread = threading.Thread(
++            target=_destroy, args=(self.rank, to_destroy), daemon=True)
++        thread.start()
++        threads = getattr(self, "_elastic_async_destroy_threads", None)
++        if threads is None:
++            threads = []
++            self._elastic_async_destroy_threads = threads
++        threads.append(thread)
++        self._elastic_async_destroy_threads = [t for t in threads if t.is_alive()]
++
+     def _should_defer_mode1_group_destroy(
+             self, group_kind: str, group_ranks: tuple[int, ...],
+             keep_group_ranks: tuple[int, ...], reason: str) -> bool:

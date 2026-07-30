@@ -1,0 +1,118 @@
+sidecar_start_time=1778728140.047567747
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_device_count=8
+sidecar_replica_count=1
+sidecar_parallel_mode=hybrid
+sidecar_tensor_parallel_size=1
+sidecar_data_parallel_size=8
+sidecar_device_groups=2,3,4,6,8,10,13,15
+sidecar_unused_devices=
+sidecar_master_addr=192.168.0.163
+sidecar_force_host_ip_for_tp=1
+sidecar_vllm_host_ip=192.168.0.163
+sidecar_vllm_multiproc_host_ip=192.168.0.163
+sidecar_vllm_reuse_world_group=1
+sidecar_master_port_base=45000
+sidecar_master_port_stride=32
+sidecar_hccl_if_base_port=30000
+sidecar_hccl_host_socket_port_range=30000-30063
+sidecar_hccl_npu_socket_port_range=30064-30127
+sidecar_hccl_if_base_port_fixed=0
+sidecar_hccl_port_stride=2048
+sidecar_hccl_port_window=64
+sidecar_vllm_set_worker_rank_envs=1
+sidecar_ep_allowed=0
+sidecar_model_is_moe=1
+sidecar_model_is_moe_reason=override
+sidecar_ep_effective=0
+sidecar_model=/home/sharedata/models/pangu-pro-moe-model
+sidecar_output=sidecar_runs/20260514105114/outputs.jsonl
+sidecar_state_dir=sidecar_runs/state/00_PanguProMoE-72B-A16B_dp8_tp1_ep0_gsm8k_train
+sidecar_generate_chunk_size=4
+sidecar_stream_checkpoint=1
+sidecar_partial_sync_every_steps=0
+sidecar_stop_file=sidecar_runs/20260514105114/outputs.jsonl.stop_requested
+sidecar_shard_start_time=1778728140.049454576 shard=0 device_group=2,3,4,6,8,10,13,15 tp=1 dp=8 master_port=45000 hccl_if_base_port=30000 hccl_host_socket_port_range=30000-30063 hccl_npu_socket_port_range=30064-30127 output=sidecar_runs/20260514105114/outputs.jsonl
+INFO 05-14 11:09:05 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 05-14 11:09:05 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 05-14 11:09:05 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 05-14 11:09:05 [__init__.py:207] Platform plugin ascend is activated
+INFO 05-14 11:09:08 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 05-14 11:09:08 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 05-14 11:09:08 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+{"event": "sidecar_load_start", "model_path": "/home/sharedata/models/pangu-pro-moe-model", "devices": "2,3,4,6,8,10,13,15", "master_port": "45000", "master_addr": "192.168.0.163", "hccl_if_base_port": "30000", "hccl_host_socket_port_range": "30000-30063", "hccl_npu_socket_port_range": "30064-30127", "sidecar_hccl_if_base_port_fixed": "0", "sidecar_hccl_port_stride": "2048", "sidecar_hccl_port_window": "64", "vllm_host_ip": "192.168.0.163", "vllm_multiproc_distributed_host_ip": "192.168.0.163", "vllm_multiproc_use_host_ip": "1", "vllm_multiproc_set_worker_rank_envs": "1", "vllm_reuse_world_group_for_full_model_parallel": "1", "num_prompts": 4, "total_prompts": 7473, "completed_prompts": 0, "inflight_prompts": 0, "resume_prompts": 0, "sidecar_epoch": 0, "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "repeat_until_killed": true, "max_iterations": 0, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "data_split": "train", "use_short_data": "0", "state_dir": "sidecar_runs/state/00_PanguProMoE-72B-A16B_dp8_tp1_ep0_gsm8k_train", "resume_file": "sidecar_runs/state/00_PanguProMoE-72B-A16B_dp8_tp1_ep0_gsm8k_train/resume.shard0.jsonl", "partials_file": "sidecar_runs/state/00_PanguProMoE-72B-A16B_dp8_tp1_ep0_gsm8k_train/partials.shard0.jsonl", "stop_file": "sidecar_runs/20260514105114/outputs.jsonl.stop_requested", "expert_parallel_allowed": "0", "expert_parallel_effective": "0", "model_is_moe": "1", "model_is_moe_reason": "override", "vllm_enable_expert_parallel": "0", "max_prompts": 4, "max_prompts_per_device": 4, "max_records_per_iteration": 4, "generate_chunk_size": 4, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.9, "max_num_seqs": 6, "max_num_batched_tokens": 98304, "trust_remote_code": true, "enforce_eager": true, "max_model_len": 16384, "data_parallel_size": 8, "data_parallel_backend": "mp"}}
+INFO 05-14 11:09:09 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 05-14 11:09:09 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 05-14 11:09:09 [utils.py:233] non-default args: {'trust_remote_code': True, 'max_model_len': 16384, 'data_parallel_size': 8, 'max_num_batched_tokens': 98304, 'max_num_seqs': 6, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/sharedata/models/pangu-pro-moe-model'}
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+Traceback (most recent call last):
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+    hf_hub_download(
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 106, in _inner_fn
+    validate_repo_id(arg_value)
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 154, in validate_repo_id
+    raise HFValidationError(
+huggingface_hub.errors.HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/home/sharedata/models/pangu-pro-moe-model'. Use `repo_type` argument if needed.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/transformers/configuration_utils.py", line 708, in _get_config_dict
+    resolved_config_file = cached_file(
+                           ^^^^^^^^^^^^
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/transformers/utils/hub.py", line 321, in cached_file
+    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/transformers/utils/hub.py", line 531, in cached_files
+    resolved_files = [
+                     ^
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/transformers/utils/hub.py", line 532, in <listcomp>
+    _get_cache_file_to_return(path_or_repo_id, filename, cache_dir, revision, repo_type)
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/transformers/utils/hub.py", line 144, in _get_cache_file_to_return
+    resolved_file = try_to_load_from_cache(
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 106, in _inner_fn
+    validate_repo_id(arg_value)
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 154, in validate_repo_id
+    raise HFValidationError(
+huggingface_hub.errors.HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/home/sharedata/models/pangu-pro-moe-model'. Use `repo_type` argument if needed.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/tmp/elastic_sidecar_infer.ugIkIA.py", line 786, in <module>
+    llm = LLM(**engine_kwargs)
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 200, in from_engine_args
+    vllm_config = engine_args.create_engine_config(usage_context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/engine/arg_utils.py", line 1135, in create_engine_config
+    self.speculative_config) = maybe_override_with_speculators(
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/transformers_utils/config.py", line 501, in maybe_override_with_speculators
+    config_dict, _ = PretrainedConfig.get_config_dict(
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/transformers/configuration_utils.py", line 649, in get_config_dict
+    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.13/lib/python3.11/site-packages/transformers/configuration_utils.py", line 731, in _get_config_dict
+    raise OSError(
+OSError: Can't load the configuration of '/home/sharedata/models/pangu-pro-moe-model'. If you were trying to load it from 'https://huggingface.co/models', make sure you don't have a local directory with the same name. Otherwise, make sure '/home/sharedata/models/pangu-pro-moe-model' is the correct path to a directory containing a config.json file
+[ERROR] 2026-05-14-11:09:09 (PID:3165445, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+sidecar_end_time=1778728150.990659756
+sidecar_exit_code=1
+sidecar_killed_by_deadline=0

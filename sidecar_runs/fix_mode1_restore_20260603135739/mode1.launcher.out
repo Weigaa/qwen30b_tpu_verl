@@ -1,0 +1,430 @@
++ export CUDA_DEVICE_MAX_CONNECTIONS=1
++ CUDA_DEVICE_MAX_CONNECTIONS=1
++ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
++ PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
++ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
++ ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
++ source /usr/local/Ascend/ascend-toolkit/set_env.sh
+++ export ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
+++ ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
++++ arch
+++ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/:
+++ LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/:
+++ export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/:
+++ LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/:
+++ export PYTHONPATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:
+++ PYTHONPATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe:
+++ export PATH=/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/root/.nvm/versions/node/v20.20.0/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/root/.codex/tmp/arg0/codex-arg0cBrVde:/root/.vscode-server/bin/8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e/bin/remote-cli:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.11.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.vscode-server/extensions/openai.chatgpt-26.601.21317-linux-arm64/bin/linux-aarch64:/root/bin
+++ PATH=/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/root/.nvm/versions/node/v20.20.0/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/root/.codex/tmp/arg0/codex-arg0cBrVde:/root/.vscode-server/bin/8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e/bin/remote-cli:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.11.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.vscode-server/extensions/openai.chatgpt-26.601.21317-linux-arm64/bin/linux-aarch64:/root/bin
+++ export ASCEND_AICPU_PATH=/usr/local/Ascend/ascend-toolkit/latest
+++ ASCEND_AICPU_PATH=/usr/local/Ascend/ascend-toolkit/latest
+++ export ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp
+++ ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp
+++ export TOOLCHAIN_HOME=/usr/local/Ascend/ascend-toolkit/latest/toolkit
+++ TOOLCHAIN_HOME=/usr/local/Ascend/ascend-toolkit/latest/toolkit
+++ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+++ ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
++ source /usr/local/Ascend/nnal/asdsip/set_env.sh
+++ path=/usr/local/Ascend/nnal/asdsip/set_env.sh
+++ [[ -f /usr/local/Ascend/nnal/asdsip/set_env.sh ]]
+++ [[ /usr/local/Ascend/nnal/asdsip/set_env.sh =~ set_env\.sh ]]
+++++ dirname /usr/local/Ascend/nnal/asdsip/set_env.sh
++++ cd /usr/local/Ascend/nnal/asdsip
++++ pwd
+++ asdsip_dir_path=/usr/local/Ascend/nnal/asdsip
+++ export ASDSIP_HOME_PATH=/usr/local/Ascend/nnal/asdsip/latest/
+++ ASDSIP_HOME_PATH=/usr/local/Ascend/nnal/asdsip/latest/
+++ export LD_LIBRARY_PATH=/usr/local/Ascend/nnal/asdsip/latest//lib:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/:
+++ LD_LIBRARY_PATH=/usr/local/Ascend/nnal/asdsip/latest//lib:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/:
++ source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+++ set_env_path=/usr/local/Ascend/nnal/atb/set_env.sh
+++ [[ -n '' ]]
+++ [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]
+++ [[ /usr/local/Ascend/nnal/atb/set_env.sh =~ (^|/)set_env\.sh$ ]]
+++++ dirname /usr/local/Ascend/nnal/atb/set_env.sh
++++ cd /usr/local/Ascend/nnal/atb
++++ pwd
+++ atb_path=/usr/local/Ascend/nnal/atb
+++ get_cxx_abi_option --cxx_abi=1
+++ cxx_abi=
+++ [[ -z --cxx_abi=1 ]]
+++ case "$1" in
+++ cxx_abi=1
+++ shift
+++ [[ -z '' ]]
+++ [[ 1 == '' ]]
+++ export ATB_HOME_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1
+++ ATB_HOME_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1
+++ export LD_LIBRARY_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/nnal/asdsip/latest//lib:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/:
+++ LD_LIBRARY_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/nnal/asdsip/latest//lib:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/Ascend/driver/lib64/common/:/usr/local/Ascend/driver/lib64/driver/:
+++ export PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/root/.nvm/versions/node/v20.20.0/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/root/.codex/tmp/arg0/codex-arg0cBrVde:/root/.vscode-server/bin/8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e/bin/remote-cli:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.11.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.vscode-server/extensions/openai.chatgpt-26.601.21317-linux-arm64/bin/linux-aarch64:/root/bin
+++ PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/root/.nvm/versions/node/v20.20.0/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/root/.codex/tmp/arg0/codex-arg0cBrVde:/root/.vscode-server/bin/8761a5560cfd65fdd19ce7e2bd18dab5c0a4d84e/bin/remote-cli:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_0/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.11.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.vscode-server/extensions/openai.chatgpt-26.601.21317-linux-arm64/bin/linux-aarch64:/root/bin
+++ export ATB_STREAM_SYNC_EVERY_KERNEL_ENABLE=0
+++ ATB_STREAM_SYNC_EVERY_KERNEL_ENABLE=0
+++ export ATB_STREAM_SYNC_EVERY_RUNNER_ENABLE=0
+++ ATB_STREAM_SYNC_EVERY_RUNNER_ENABLE=0
+++ export ATB_STREAM_SYNC_EVERY_OPERATION_ENABLE=0
+++ ATB_STREAM_SYNC_EVERY_OPERATION_ENABLE=0
+++ export ATB_OPSRUNNER_SETUP_CACHE_ENABLE=1
+++ ATB_OPSRUNNER_SETUP_CACHE_ENABLE=1
+++ export ATB_OPSRUNNER_KERNEL_CACHE_LOCAL_COUNT=1
+++ ATB_OPSRUNNER_KERNEL_CACHE_LOCAL_COUNT=1
+++ export ATB_OPSRUNNER_KERNEL_CACHE_GLOABL_COUNT=5
+++ ATB_OPSRUNNER_KERNEL_CACHE_GLOABL_COUNT=5
+++ export ATB_WORKSPACE_MEM_ALLOC_ALG_TYPE=1
+++ ATB_WORKSPACE_MEM_ALLOC_ALG_TYPE=1
+++ export ATB_WORKSPACE_MEM_ALLOC_GLOBAL=1
+++ ATB_WORKSPACE_MEM_ALLOC_GLOBAL=1
+++ export ATB_COMPARE_TILING_EVERY_KERNEL=0
+++ ATB_COMPARE_TILING_EVERY_KERNEL=0
+++ export ATB_HOST_TILING_BUFFER_BLOCK_NUM=128
+++ ATB_HOST_TILING_BUFFER_BLOCK_NUM=128
+++ export ATB_DEVICE_TILING_BUFFER_BLOCK_NUM=32
+++ ATB_DEVICE_TILING_BUFFER_BLOCK_NUM=32
+++ export ATB_SHARE_MEMORY_NAME_SUFFIX=
+++ ATB_SHARE_MEMORY_NAME_SUFFIX=
+++ export ATB_MATMUL_SHUFFLE_K_ENABLE=1
+++ ATB_MATMUL_SHUFFLE_K_ENABLE=1
+++ export LCCL_DETERMINISTIC=0
+++ LCCL_DETERMINISTIC=0
+++ export LCCL_PARALLEL=0
+++ LCCL_PARALLEL=0
++ export HYDRA_FULL_ERROR=1
++ HYDRA_FULL_ERROR=1
++ export RAY_DEDUP_LOGS=0
++ RAY_DEDUP_LOGS=0
++ export ASCEND_GLOBAL_EVENT_ENABLE=0
++ ASCEND_GLOBAL_EVENT_ENABLE=0
++ export ASCEND_SLOG_PRINT_TO_STDOUT=0
++ ASCEND_SLOG_PRINT_TO_STDOUT=0
++ export ASCEND_GLOBAL_LOG_LEVEL=3
++ ASCEND_GLOBAL_LOG_LEVEL=3
++ export HCCL_CONNECT_TIMEOUT=360
++ HCCL_CONNECT_TIMEOUT=360
++ export HCCL_IF_BASE_PORT=64021
++ HCCL_IF_BASE_PORT=64021
++ export HCCL_EXEC_TIMEOUT=360
++ HCCL_EXEC_TIMEOUT=360
++ export CUDA_DEVICE_MAX_CONNECTIONS=1
++ CUDA_DEVICE_MAX_CONNECTIONS=1
++ export MASTER_PORT=23300
++ MASTER_PORT=23300
++ export D2D_DATA_TRANSFER=1
++ D2D_DATA_TRANSFER=1
++ export VLLM_USE_V1=1
++ VLLM_USE_V1=1
++ export PRINT_MEMORY=1
++ PRINT_MEMORY=1
++ export USE_ALLTOALL_OVERLAP=1
++ USE_ALLTOALL_OVERLAP=1
++ export HCCL_OP_EXPANSION_MODE=AIV
++ HCCL_OP_EXPANSION_MODE=AIV
++ export VLLM_LOGGING_LEVEL=INFO
++ VLLM_LOGGING_LEVEL=INFO
++ export VLLM_ASCEND_FORCE_ALLTOALL_MOE=0
++ VLLM_ASCEND_FORCE_ALLTOALL_MOE=0
++ [[ 0 == \1 ]]
++ export VLLM_ENABLE_MC2=1
++ VLLM_ENABLE_MC2=1
++ export VLLM_DP_SIZE=16
++ VLLM_DP_SIZE=16
++ export HCCL_BUFFSIZE=800
++ HCCL_BUFFSIZE=800
++ export TASK_QUEUE_ENABLE=2
++ TASK_QUEUE_ENABLE=2
++ export VLLM_ENABLE_FIX_ROUTE=0
++ VLLM_ENABLE_FIX_ROUTE=0
++ export VLLM_MODEL_EXECUTE_TIME_OBSERVE=0
++ VLLM_MODEL_EXECUTE_TIME_OBSERVE=0
++ export VLLM_ENABLE_GRAPH_MODE=0
++ VLLM_ENABLE_GRAPH_MODE=0
++ export VLLM_ENABLE_EXPERT_PARALLEL=1
++ VLLM_ENABLE_EXPERT_PARALLEL=1
++ export VLLM_CHUNK_MOE_SIZE=512
++ VLLM_CHUNK_MOE_SIZE=512
++ export ALL_TO_ALL_RESHARD=1
++ ALL_TO_ALL_RESHARD=1
++ export USE_ALLTOALL_OVERLAP=1
++ USE_ALLTOALL_OVERLAP=1
++ export VLLM_ENABLE_EPLB=0
++ VLLM_ENABLE_EPLB=0
++ export USE_HDP=0
++ USE_HDP=0
++ export ROLLOUT_REBALANCE_ENABLE=0
++ ROLLOUT_REBALANCE_ENABLE=0
++ export HCCL_ASYNC_ERROR_HANDLING=1
++ HCCL_ASYNC_ERROR_HANDLING=1
++ export VLLM_ASCEND_ENABLE_DRAFT_TRAIN=0
++ VLLM_ASCEND_ENABLE_DRAFT_TRAIN=0
++ export VLLM_ASCEND_DRAFT_WARMUP_ON_INIT=1
++ VLLM_ASCEND_DRAFT_WARMUP_ON_INIT=1
++ export VLLM_ASCEND_DRAFT_LR=1e-4
++ VLLM_ASCEND_DRAFT_LR=1e-4
++ export VLLM_ASCEND_DRAFT_REUSE_TARGET_EMB_LM=1
++ VLLM_ASCEND_DRAFT_REUSE_TARGET_EMB_LM=1
++ export VLLM_ASCEND_DRAFT_VOCAB_SIZE=4096
++ VLLM_ASCEND_DRAFT_VOCAB_SIZE=4096
++ export VLLM_ASCEND_DRAFT_QUEUE_SIZE=4
++ VLLM_ASCEND_DRAFT_QUEUE_SIZE=4
++ export VLLM_ASCEND_DRAFT_MAX_SEQ_LEN=16384
++ VLLM_ASCEND_DRAFT_MAX_SEQ_LEN=16384
++ export VLLM_ASCEND_DRAFT_TRAIN_DTYPE=bf16
++ VLLM_ASCEND_DRAFT_TRAIN_DTYPE=bf16
++ export VLLM_ASCEND_DRAFT_ATTN_IMPL=sdpa
++ VLLM_ASCEND_DRAFT_ATTN_IMPL=sdpa
++ export VLLM_ASCEND_DRAFT_ATTN_CHUNK_SIZE=1024
++ VLLM_ASCEND_DRAFT_ATTN_CHUNK_SIZE=1024
++ export VLLM_ASCEND_DRAFT_LORA_ENABLE=0
++ VLLM_ASCEND_DRAFT_LORA_ENABLE=0
++ export VLLM_ASCEND_DRAFT_LORA_BACKEND=custom
++ VLLM_ASCEND_DRAFT_LORA_BACKEND=custom
++ export VLLM_ASCEND_DRAFT_LORA_RANK=8
++ VLLM_ASCEND_DRAFT_LORA_RANK=8
++ export VLLM_ASCEND_DRAFT_LORA_ALPHA=16
++ VLLM_ASCEND_DRAFT_LORA_ALPHA=16
++ export VLLM_ASCEND_DRAFT_LORA_DROPOUT=0.0
++ VLLM_ASCEND_DRAFT_LORA_DROPOUT=0.0
++ export VLLM_ASCEND_DRAFT_LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,fc
++ VLLM_ASCEND_DRAFT_LORA_TARGET_MODULES=q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,fc
++ export VLLM_ASCEND_DRAFT_SPARSE_KL_ENABLE=1
++ VLLM_ASCEND_DRAFT_SPARSE_KL_ENABLE=1
++ export VLLM_ASCEND_DRAFT_SPARSE_KL_TOPK=64
++ VLLM_ASCEND_DRAFT_SPARSE_KL_TOPK=64
++ export VLLM_ASCEND_DRAFT_COMPUTE_ACCURACY=0
++ VLLM_ASCEND_DRAFT_COMPUTE_ACCURACY=0
++ export VLLM_ASCEND_DRAFT_MICRO_SEQ_LEN=1
++ VLLM_ASCEND_DRAFT_MICRO_SEQ_LEN=1
++ export VLLM_ASCEND_DRAFT_GRAD_ACCUM_STEPS=4096
++ VLLM_ASCEND_DRAFT_GRAD_ACCUM_STEPS=4096
++ export DRAFT_PROFILE_MODE=breakdown
++ DRAFT_PROFILE_MODE=breakdown
++ export VLLM_ASCEND_DRAFT_PROFILE_ONLY=0
++ VLLM_ASCEND_DRAFT_PROFILE_ONLY=0
++ export VLLM_ASCEND_DRAFT_NPU_PROFILE=0
++ VLLM_ASCEND_DRAFT_NPU_PROFILE=0
++ export VLLM_ASCEND_DRAFT_NPU_PROFILE_DIR=./result/profiler/draft_breakdown
++ VLLM_ASCEND_DRAFT_NPU_PROFILE_DIR=./result/profiler/draft_breakdown
++ export VLLM_ASCEND_DRAFT_STARTUP_WARMUP_STEPS=5
++ VLLM_ASCEND_DRAFT_STARTUP_WARMUP_STEPS=5
++ export VLLM_ASCEND_DRAFT_WARMUP_STEPS=5
++ VLLM_ASCEND_DRAFT_WARMUP_STEPS=5
++ export VLLM_ASCEND_DRAFT_PROFILE_BREAKDOWN=1
++ VLLM_ASCEND_DRAFT_PROFILE_BREAKDOWN=1
++ export VLLM_ASCEND_DRAFT_PROFILE_SYNC=0
++ VLLM_ASCEND_DRAFT_PROFILE_SYNC=0
++ export VLLM_ASCEND_DRAFT_ASYNC_TRAIN=0
++ VLLM_ASCEND_DRAFT_ASYNC_TRAIN=0
++ export VLLM_ASCEND_REGISTER_CUSTOM_MODELS=1
++ VLLM_ASCEND_REGISTER_CUSTOM_MODELS=1
++ export VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES=0
++ VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES=0
++ export VLLM_ASCEND_CUSTOM_MODE1_DEBUG=0
++ VLLM_ASCEND_CUSTOM_MODE1_DEBUG=0
++ export VLLM_ASCEND_CUSTOM_MODE1_TIMING_EVENTS=0
++ VLLM_ASCEND_CUSTOM_MODE1_TIMING_EVENTS=0
++ export VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG=1
++ VLLM_ASCEND_CUSTOM_MODE1_KV_DIAG=1
++ export VLLM_ASCEND_ELASTIC_EXECUTION_MODE=1
++ VLLM_ASCEND_ELASTIC_EXECUTION_MODE=1
++ VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE_WAS_SET=0
++ [[ -n x ]]
++ VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE_WAS_SET=1
++ export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=8
++ VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=8
++ export VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS=8
++ VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS=8
++ export VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH=1
++ VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH=1
++ export VLLM_ASCEND_MODE3_ALLOW_BELOW_FLOOR_TAIL=0
++ VLLM_ASCEND_MODE3_ALLOW_BELOW_FLOOR_TAIL=0
++ export VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE=1
++ VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE=1
++ export VLLM_ASCEND_MODE3_ASYNC_CPU_PACK=1
++ VLLM_ASCEND_MODE3_ASYNC_CPU_PACK=1
++ export VLLM_ASCEND_MODE3_DEVICE_READY_WAIT=1
++ VLLM_ASCEND_MODE3_DEVICE_READY_WAIT=1
++ export VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT=1
++ VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT=1
++ export VLLM_ASCEND_MODE3_BULK_NPU_COPY=1
++ VLLM_ASCEND_MODE3_BULK_NPU_COPY=1
++ export VLLM_ASCEND_MODE3_BULK_CPU_STAGE=1
++ VLLM_ASCEND_MODE3_BULK_CPU_STAGE=1
++ export VLLM_ASCEND_MODE3_BULK_CPU_DIRECT=1
++ VLLM_ASCEND_MODE3_BULK_CPU_DIRECT=1
++ export VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER=0
++ VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER=0
++ export VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH=1
++ VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH=1
++ export VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE=0
++ VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE=0
++ export VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC=0
++ VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC=0
++ export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP=1
++ VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP=1
++ export VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS=32
++ VLLM_ASCEND_MODE3_POST_SHRINK_MOE_WARMUP_TOKENS=32
++ export VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=5368709120
++ VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES=5368709120
++ export VLLM_ASCEND_MODE3_TRANSFER_LOG=0
++ VLLM_ASCEND_MODE3_TRANSFER_LOG=0
++ export VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG=0
++ VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG=0
++ export VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N=4
++ VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N=4
++ export VLLM_ASCEND_MODE3_TIMING_LOG=0
++ VLLM_ASCEND_MODE3_TIMING_LOG=0
++ export VLLM_ASCEND_MODE3_TIMING_SYNC=0
++ VLLM_ASCEND_MODE3_TIMING_SYNC=0
++ export VLLM_ASCEND_MODE3_TIMING_EVERY=1024
++ VLLM_ASCEND_MODE3_TIMING_EVERY=1024
++ export VLLM_ASCEND_MODE3_TIMING_FIRST_N=1
++ VLLM_ASCEND_MODE3_TIMING_FIRST_N=1
++ export VLLM_ASCEND_MODE3_TIMING_LAYERS=all
++ VLLM_ASCEND_MODE3_TIMING_LAYERS=all
++ export VLLM_MOE_PATTERN_STATS=0
++ VLLM_MOE_PATTERN_STATS=0
++ export VLLM_MOE_STATS=0
++ VLLM_MOE_STATS=0
++ export VLLM_MOE_STATS_DIR=./moe_stats
++ VLLM_MOE_STATS_DIR=./moe_stats
++ export VLLM_ASCEND_DUMMY_WASTE_TIMING=0
++ VLLM_ASCEND_DUMMY_WASTE_TIMING=0
++ export VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC=0
++ VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC=0
++ export VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE=0
++ VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE=0
++ export VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS=0
++ VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS=0
++ export VLLM_ASCEND_ELASTIC_UTIL_LOG=0
++ VLLM_ASCEND_ELASTIC_UTIL_LOG=0
++ export VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS=500
++ VLLM_ASCEND_ELASTIC_UTIL_BUCKET_STEPS=500
++ export VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG=0
++ VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG=0
++ export VLLM_ASCEND_MODE4_STABILITY_PROFILE=1
++ VLLM_ASCEND_MODE4_STABILITY_PROFILE=1
++ [[ 1 == \4 ]]
++ [[ 1 == \5 ]]
++ [[ 1 == \3 ]]
++ export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=0
++ VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=0
++ export VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES=2147483648
++ VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES=2147483648
++ echo '[moe pattern stats] enabled=0 dir=./moe_stats mode=1 floor=8 hybrid_slots=8 mode3_async_npu_prefetch=1 mode3_async_cpu_stage=1 mode3_async_cpu_pack=1 mode3_direct_cpu_slot=1 mode3_bulk_npu_copy=1 mode3_bulk_cpu_stage=1 mode3_bulk_cpu_direct=1 mode3_layer_local_buffer=0 mode3_use_fused_experts_path=1 mode3_expert_token_nums_type=0 mode3_active_rows_sync=0 mode3_device_ready_wait=1 mode3_post_shrink_warmup=1 mode3_post_shrink_warmup_tokens=32 mode3_low_floor_mc2_workspace=5368709120 mode3_transfer_log=0 mode3_transfer_plan_log=0 mode3_transfer_plan_first_n=4 mode3_timing_log=0 mode3_timing_sync=0 mode3_timing_every=1024 mode3_timing_first_n=1 mode3_timing_layers=all dummy_waste_timing=0 dummy_waste_sync=0 dummy_waste_profile=0 dummy_waste_markers=0 elastic_util_log=0 elastic_util_bucket_steps=500 custom_mode1_kv_headroom=0 kv_cache_init_headroom=0 mode4_stability=1 mode4_force_floor= mode4_runtime_floor= mode5_runtime_floor= mode5_remote_fraction= mode5_fraction_policy= mode5_balance_remote_source_fanout= mode4_generic_headroom=0 mode4_moe_dispatch_headroom=2147483648 mode4_low_floor_mc2_headroom= mode5_low_floor_mc2_headroom= mode4_block_prefetch_layers=1'
+[moe pattern stats] enabled=0 dir=./moe_stats mode=1 floor=8 hybrid_slots=8 mode3_async_npu_prefetch=1 mode3_async_cpu_stage=1 mode3_async_cpu_pack=1 mode3_direct_cpu_slot=1 mode3_bulk_npu_copy=1 mode3_bulk_cpu_stage=1 mode3_bulk_cpu_direct=1 mode3_layer_local_buffer=0 mode3_use_fused_experts_path=1 mode3_expert_token_nums_type=0 mode3_active_rows_sync=0 mode3_device_ready_wait=1 mode3_post_shrink_warmup=1 mode3_post_shrink_warmup_tokens=32 mode3_low_floor_mc2_workspace=5368709120 mode3_transfer_log=0 mode3_transfer_plan_log=0 mode3_transfer_plan_first_n=4 mode3_timing_log=0 mode3_timing_sync=0 mode3_timing_every=1024 mode3_timing_first_n=1 mode3_timing_layers=all dummy_waste_timing=0 dummy_waste_sync=0 dummy_waste_profile=0 dummy_waste_markers=0 elastic_util_log=0 elastic_util_bucket_steps=500 custom_mode1_kv_headroom=0 kv_cache_init_headroom=0 mode4_stability=1 mode4_force_floor= mode4_runtime_floor= mode5_runtime_floor= mode5_remote_fraction= mode5_fraction_policy= mode5_balance_remote_source_fanout= mode4_generic_headroom=0 mode4_moe_dispatch_headroom=2147483648 mode4_low_floor_mc2_headroom= mode5_low_floor_mc2_headroom= mode4_block_prefetch_layers=1
++ export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
++ VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
++ echo '[elastic tail validate] VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896'
+[elastic tail validate] VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
++ '[' breakdown = profile_only ']'
++ export ACL_MDL_STREAM_SYNC_TIMEOUT=-1
++ ACL_MDL_STREAM_SYNC_TIMEOUT=-1
++ export ACL_MDL_EVENT_SYNC_TIMEOUT=-1
++ ACL_MDL_EVENT_SYNC_TIMEOUT=-1
+++ pwd
++ HOME=/workspace/cann-recipes-train/llm_rl/qwen3
++ MODEL_PATH=/home/data/Qwen3-30B-A3B
++ CONFIG_DIR=/workspace/cann-recipes-train/llm_rl/qwen3/verl/trainer/config
++ DISTCP_PATH=/home/data/Qwen3-30B-A3B_megatron
++ TRAIN_FILE=/workspace/data/deepscaler/train.parquet
++ TEST_FILE=/workspace/data/deepscaler/test.parquet
++ RECORD_DIR=/workspace/cann-recipes-train/llm_rl/qwen3/record
++ TRAIN_BATCH_SIZE=32
++ MAX_PROMPT_LENGTH=1024
++ MAX_RESPONSE_LENGTH=16384
++ ROLLOUT_N=16
++ ROLLOUT_MAX_NUM_SEQS=32
++ ROLLOUT_MAX_MODEL_LEN=17408
++ ROLLOUT_MAX_NUM_BATCHED_TOKENS=17408
++ ROLLOUT_GPU_MEMORY_UTILIZATION=0.85
++ ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=4
++ REF_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=8
++ TRAINER_TOTAL_EPOCHS=1
++ ((  ROLLOUT_MAX_NUM_BATCHED_TOKENS < ROLLOUT_MAX_MODEL_LEN  ))
++ mkdir -p /workspace/cann-recipes-train/llm_rl/qwen3/record
+++ date +%Y%m%d%H%M%S
++ time=20260603215739
++ elastic_suffix=
++ '[' 1 '!=' 0 ']'
++ elastic_suffix=_elastic
++ logfile=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt
++ export VERL_SIDECAR_ENABLE=1
++ VERL_SIDECAR_ENABLE=1
++ export VERL_SIDECAR_MODEL_PATH=/home/data/Qwen2.5-1.5B-Instruct
++ VERL_SIDECAR_MODEL_PATH=/home/data/Qwen2.5-1.5B-Instruct
++ export VERL_SIDECAR_PROMPTS_FILE=/home/qiuzy/verl_dev/data/gsm8k
++ VERL_SIDECAR_PROMPTS_FILE=/home/qiuzy/verl_dev/data/gsm8k
++ export VERL_SIDECAR_DATA_SPLIT=train
++ VERL_SIDECAR_DATA_SPLIT=train
++ export VERL_SIDECAR_USE_SHORT_DATA=0
++ VERL_SIDECAR_USE_SHORT_DATA=0
++ export VERL_SIDECAR_GPU_MEMORY_UTILIZATION=0.90
++ VERL_SIDECAR_GPU_MEMORY_UTILIZATION=0.90
++ export VERL_SIDECAR_MAX_MODEL_LEN=2048
++ VERL_SIDECAR_MAX_MODEL_LEN=2048
++ export VERL_SIDECAR_MAX_NUM_SEQS=128
++ VERL_SIDECAR_MAX_NUM_SEQS=128
++ export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=65536
++ VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=65536
++ export VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE=128
++ VERL_SIDECAR_MAX_PROMPTS_PER_DEVICE=128
++ export VERL_SIDECAR_MAX_PROMPTS=1024
++ VERL_SIDECAR_MAX_PROMPTS=1024
++ export VERL_SIDECAR_MAX_TOKENS=1024
++ VERL_SIDECAR_MAX_TOKENS=1024
++ export VERL_SIDECAR_REPEAT_UNTIL_KILLED=1
++ VERL_SIDECAR_REPEAT_UNTIL_KILLED=1
++ export VERL_SIDECAR_MAX_ITERATIONS=0
++ VERL_SIDECAR_MAX_ITERATIONS=0
++ export VERL_SIDECAR_GENERATE_CHUNK_SIZE=32
++ VERL_SIDECAR_GENERATE_CHUNK_SIZE=32
++ export VERL_SIDECAR_STREAM_CHECKPOINT=1
++ VERL_SIDECAR_STREAM_CHECKPOINT=1
++ export VERL_SIDECAR_PARTIAL_SYNC_EVERY_STEPS=0
++ VERL_SIDECAR_PARTIAL_SYNC_EVERY_STEPS=0
++ export VERL_SIDECAR_GRACEFUL_KILL_SECONDS=3
++ VERL_SIDECAR_GRACEFUL_KILL_SECONDS=3
++ export VERL_SIDECAR_STATE_DIR=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/state_mode1
++ VERL_SIDECAR_STATE_DIR=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/state_mode1
++ export VERL_SIDECAR_PARALLEL_MODE=dp
++ VERL_SIDECAR_PARALLEL_MODE=dp
++ export VERL_SIDECAR_LOG_DIR=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1
++ VERL_SIDECAR_LOG_DIR=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1
++ sidecar_monitor_pid=
++ [[ 1 == \1 ]]
++ mkdir -p /workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1
++ :
++ export VERL_SIDECAR_TRAIN_LOG=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt
++ VERL_SIDECAR_TRAIN_LOG=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt
++ export VERL_SIDECAR_LEASE_LOG=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/lease.log
++ VERL_SIDECAR_LEASE_LOG=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/lease.log
++ export VERL_SIDECAR_LOG_FILE=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/infer.log
++ VERL_SIDECAR_LOG_FILE=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/infer.log
++ export VERL_SIDECAR_OUTPUT_FILE=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/outputs.jsonl
++ VERL_SIDECAR_OUTPUT_FILE=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/outputs.jsonl
++ sidecar_monitor_log=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/monitor.log
++ echo '[elastic sidecar] enabled=1 train_log=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt log_dir=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1 lease_log=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/lease.log sidecar_log=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/infer.log sidecar_output=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/outputs.jsonl monitor_log=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/monitor.log devices=auto_from_inactive_ranks parallel_mode=dp model=/home/data/Qwen2.5-1.5B-Instruct prompts=/home/qiuzy/verl_dev/data/gsm8k data_split=train use_short_data=0 state_dir=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/state_mode1 max_prompts=1024 max_prompts_per_device=128 generate_chunk_size=32 stream_checkpoint=1 partial_sync_every_steps=0 graceful_kill_seconds=3 max_tokens=1024 max_num_seqs=128 max_num_batched_tokens=65536 max_model_len=2048 gpu_memory_utilization=0.90 repeat_until_killed=1 max_iterations=0'
+[elastic sidecar] enabled=1 train_log=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt log_dir=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1 lease_log=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/lease.log sidecar_log=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/infer.log sidecar_output=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/outputs.jsonl monitor_log=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/monitor.log devices=auto_from_inactive_ranks parallel_mode=dp model=/home/data/Qwen2.5-1.5B-Instruct prompts=/home/qiuzy/verl_dev/data/gsm8k data_split=train use_short_data=0 state_dir=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/state_mode1 max_prompts=1024 max_prompts_per_device=128 generate_chunk_size=32 stream_checkpoint=1 partial_sync_every_steps=0 graceful_kill_seconds=3 max_tokens=1024 max_num_seqs=128 max_num_batched_tokens=65536 max_model_len=2048 gpu_memory_utilization=0.90 repeat_until_killed=1 max_iterations=0
++ sidecar_monitor_pid=1173279
++ trap cleanup_sidecar_monitor EXIT
++ internal/watch_elastic_shrink_and_run_sidecar.sh /workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt
++ tee -a /workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt
+++ date +%Y-%m-%dT%H:%M:%S%z
++ echo '[run] start_time=2026-06-03T21:57:39+0800 logfile=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt'
+[run] start_time=2026-06-03T21:57:39+0800 logfile=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt
++ echo '[full redundancy experiment] enabled=0 sidecar=1 mode=1 floor=8 mode4_runtime_floor= dp_size=16 draft_profile_mode=breakdown model_path=/home/data/Qwen3-30B-A3B train_file=/workspace/data/deepscaler/train.parquet test_file=/workspace/data/deepscaler/test.parquet train_batch_size=32 max_num_seqs=32 max_num_batched_tokens=17408 max_prompt_length=1024 max_response_length=16384 rollout_n=16 gpu_memory_utilization=0.85 total_epochs=1 custom_mode1_kv_headroom=0 kv_cache_init_headroom=0'
+[full redundancy experiment] enabled=0 sidecar=1 mode=1 floor=8 mode4_runtime_floor= dp_size=16 draft_profile_mode=breakdown model_path=/home/data/Qwen3-30B-A3B train_file=/workspace/data/deepscaler/train.parquet test_file=/workspace/data/deepscaler/test.parquet train_batch_size=32 max_num_seqs=32 max_num_batched_tokens=17408 max_prompt_length=1024 max_response_length=16384 rollout_n=16 gpu_memory_utilization=0.85 total_epochs=1 custom_mode1_kv_headroom=0 kv_cache_init_headroom=0
++ set -x
++ set +e
++ python3 -m verl.trainer.main_ppo --config-path=/workspace/cann-recipes-train/llm_rl/qwen3/verl/trainer/config --config-name=ppo_megatron_trainer.yaml algorithm.adv_estimator=grpo data.train_files=/workspace/data/deepscaler/train.parquet data.val_files=/workspace/data/deepscaler/test.parquet data.train_batch_size=32 data.max_prompt_length=1024 data.max_response_length=16384 data.filter_overlong_prompts=True data.truncation=error data.shuffle=False +data.dataset_fraction=0.003 custom_reward_function.path=deepscaler.py custom_reward_function.name=compute_score actor_rollout_ref.model.path=/home/data/Qwen3-30B-A3B actor_rollout_ref.actor.optim.lr=1e-6 actor_rollout_ref.actor.optim.clip_grad=10000 actor_rollout_ref.actor.ppo_mini_batch_size=32 actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 actor_rollout_ref.actor.megatron.sequence_parallel=True actor_rollout_ref.actor.megatron.expert_model_parallel_size=4 actor_rollout_ref.actor.megatron.tensor_model_parallel_size=4 actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=4 actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=1 actor_rollout_ref.actor.megatron.param_offload=True actor_rollout_ref.actor.megatron.grad_offload=True actor_rollout_ref.actor.megatron.optimizer_offload=False actor_rollout_ref.actor.megatron.use_dist_checkpointing=True actor_rollout_ref.actor.megatron.dist_checkpointing_path=/home/data/Qwen3-30B-A3B_megatron actor_rollout_ref.actor.use_kl_loss=True actor_rollout_ref.actor.kl_loss_coef=0.001 actor_rollout_ref.actor.kl_loss_type=low_var_kl actor_rollout_ref.actor.load_weight=True actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=block actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 actor_rollout_ref.rollout.tensor_model_parallel_size=1 actor_rollout_ref.rollout.name=vllm actor_rollout_ref.rollout.gpu_memory_utilization=0.85 actor_rollout_ref.rollout.max_num_batched_tokens=17408 actor_rollout_ref.rollout.enforce_eager=True actor_rollout_ref.rollout.max_num_seqs=32 actor_rollout_ref.rollout.n=16 actor_rollout_ref.rollout.temperature=0.9 actor_rollout_ref.rollout.top_k=50 actor_rollout_ref.rollout.top_p=0.9 actor_rollout_ref.rollout.ignore_eos=False actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 actor_rollout_ref.ref.megatron.param_offload=True actor_rollout_ref.ref.load_weight=True actor_rollout_ref.ref.megatron.use_dist_checkpointing=True actor_rollout_ref.ref.megatron.dist_checkpointing_path=/home/data/Qwen3-30B-A3B_megatron algorithm.kl_ctrl.kl_coef=0.001 trainer.balance_batch=False trainer.device=npu trainer.val_before_train=False trainer.critic_warmup=0 'trainer.logger=[console,tensorboard]' trainer.project_name=verl_grpo_example trainer.experiment_name=qwen3_30_verl_mindspeedllm_vllm trainer.n_gpus_per_node=16 trainer.nnodes=1 trainer.save_freq=-1 trainer.test_freq=-1 trainer.total_epochs=1 +trainer.rollout_data_dir=/workspace/cann-recipes-train/llm_rl/qwen3/record +trainer.rollout_length_dir=/workspace/cann-recipes-train/llm_rl/qwen3/record +actor_rollout_ref.actor.megatron.override_transformer_config.use_flash_attn=True '+actor_rollout_ref.actor.megatron.override_transformer_config.pipeline_num_transformer_layers=[[11],[13],[13],[11]]' +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=alltoall +actor_rollout_ref.actor.megatron.override_transformer_config.moe_alltoall_overlap_comm=True +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_rotary_pos_emb=True +actor_rollout_ref.actor.megatron.override_transformer_config.use_fused_swiglu=True +actor_rollout_ref.actor.megatron.override_transformer_config.seq_length=2048 +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=11 +actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=11 +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True
++ ide_transformer_config.num_layers_in_last_pipeline_stage=11 +actor_rollout_ref.actor.megatron.override_transformer_config.swap_optimizer=True
++ run_exit_code=127
++ set -e
++ tee -a /workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt
+++ date +%Y-%m-%dT%H:%M:%S%z
++ echo '[run] end_time=2026-06-03T22:10:26+0800 exit_code=127'
+[run] end_time=2026-06-03T22:10:26+0800 exit_code=127
++ exit 127
++ cleanup_sidecar_monitor
++ [[ -n 1173279 ]]
++ kill -0 1173279

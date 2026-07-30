@@ -1,0 +1,55 @@
+{
+  "model_config": "/home/data/Qwen3-30B-A3B/config.json",
+  "tokens": 17408,
+  "rows_per_expert": [
+    16
+  ],
+  "active_experts": null,
+  "ep_size": 16,
+  "dtype": "bfloat16",
+  "cpu": "Kunpeng 920 7285Z To be filled by O.E.M. CPU @ 3.0GHz",
+  "torch": "2.7.1+cpu",
+  "torch_npu": "2.7.1.dev20250724",
+  "cases": [
+    {
+      "scope": "ep-local",
+      "hidden_size": 2048,
+      "intermediate_size": 768,
+      "num_experts": 128,
+      "top_k": 8,
+      "ep_size": 16,
+      "num_tokens": 256,
+      "active_experts": 8,
+      "expanded_rows": 128,
+      "rows_per_expert": 16
+    }
+  ],
+  "results": [
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe16",
+      "device": "npu:0",
+      "workers": "1",
+      "active_experts": 8,
+      "expanded_rows": 128,
+      "rows_per_expert": 16,
+      "median_ms": 0.41812001168727875,
+      "min_ms": 0.32346001267433167,
+      "p90_ms": 0.4938480108976364,
+      "tflops": 2.8890259213506857
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe16",
+      "device": "cpu-openblas-numa-fp32",
+      "workers": "8x5,5,5,5,5,5,5,5",
+      "active_experts": 8,
+      "expanded_rows": 128,
+      "rows_per_expert": 16,
+      "median_ms": 201.30219595739618,
+      "min_ms": 142.74229994043708,
+      "p90_ms": 248.15011277096346,
+      "tflops": 0.006000727146839739
+    }
+  ]
+}

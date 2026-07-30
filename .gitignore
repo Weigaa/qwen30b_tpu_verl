@@ -33,3 +33,36 @@ resample_result_*/
 save4eagle3resampler/
 outputs/
 tensorboard_log/
+
+# Local runtime logs and diagnostics
+*.log
+*.out
+.last_*
+.tmp_*
+.probe.png
+
+# Local CANN/NNAL builds, installers, and downloaded wheels
+Ascend_nnal_9.1.0_beta3/
+nnal_9.1.0_beta3_a3/
+cann_master_9.1/
+cann_master_9.1_a3/
+cann_master_downloads/
+downloads/
+hccl_master_build/
+hccl_local_backups/
+torch_npu_wheel_probe/
+third_party/
+*.whl
+
+# Generated communication, profiling, and sidecar state
+hccl_*_runs/
+hccl_stage2_p2p_bench/
+moe_stats/
+moe_stats_layer_wise/
+stage_decode_profiles/
+mode3_stage_decode_profiles/
+mode5_stage_decode_profiles/
+sidecar_runs/**/outputs.jsonl*
+sidecar_runs/**/state/
+sidecar_runs/**/state_*/
+sidecar_runs/state/

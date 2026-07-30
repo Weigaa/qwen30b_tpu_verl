@@ -1,0 +1,158 @@
+watch_start_time=1779196609.595800098
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/record_72b_tp4dp2_20260519211649_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+watch_start_trigger=shrink_done
+watch_graceful_kill_seconds=3
+watch_sidecar_stop_file=sidecar_runs/record_72b_tp4dp2_20260519211649/outputs.jsonl.stop_requested
+shrink_window_detected_time=1779199108.863696296 active_count=8
+shrink_window_line=[36m(WorkerDict pid=2366059)[0m INFO 05-19 21:58:28 [worker_v1.py:2983] Elastic parallel shrink done: rank=0 active_ranks=[0, 1, 5, 7, 9, 11, 12, 14] dp_size=8 ep_size=8 no_ep_tail=False rebuild_ms=241196.56 refresh_ms=383.74 warmup_ms=1187.67 total_ms=244215.17
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1779199108.900093912
+sidecar_active_ranks=0,1,5,7,9,11,12,14
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_pid=2406165
+sidecar_start_time=1779199109.428396671
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_device_count=8
+sidecar_replica_count=2
+sidecar_parallel_mode=hybrid
+sidecar_tensor_parallel_size=4
+sidecar_data_parallel_size=1
+sidecar_device_groups=2,3,4,6;8,10,13,15
+sidecar_unused_devices=
+sidecar_master_addr=192.168.0.163
+sidecar_force_host_ip_for_tp=1
+sidecar_vllm_host_ip=192.168.0.163
+sidecar_vllm_multiproc_host_ip=192.168.0.163
+sidecar_vllm_reuse_world_group=1
+sidecar_master_port_base=24300
+sidecar_master_ports=24300,24332
+sidecar_master_port_stride=32
+sidecar_data_parallel_rpc_ports=
+sidecar_hccl_if_base_port=55105
+sidecar_hccl_if_base_ports=55105,55401
+sidecar_hccl_host_socket_port_range=55105-55168
+sidecar_hccl_npu_socket_port_range=55169-55232
+sidecar_hccl_if_base_port_fixed=0
+sidecar_hccl_port_stride=2048
+sidecar_hccl_port_window=64
+sidecar_vllm_set_worker_rank_envs=1
+sidecar_ep_allowed=0
+sidecar_model_is_moe=1
+sidecar_model_is_moe_reason=override
+sidecar_ep_effective=0
+sidecar_model=/home/sharedata/models/pangu-pro-moe-model
+sidecar_output=sidecar_runs/record_72b_tp4dp2_20260519211649/outputs.jsonl
+sidecar_state_dir=sidecar_runs/state/pangu_pro_moe_gsm8k_train
+sidecar_generate_chunk_size=4
+sidecar_stream_checkpoint=1
+sidecar_partial_sync_every_steps=0
+sidecar_stop_file=sidecar_runs/record_72b_tp4dp2_20260519211649/outputs.jsonl.stop_requested
+sidecar_shard_start_time=1779199109.435756975 shard=0 device_group=2,3,4,6 tp=4 dp=1 master_port=24300 data_parallel_rpc_port= hccl_if_base_port=55105 hccl_host_socket_port_range=55105-55168 hccl_npu_socket_port_range=55169-55232 output=sidecar_runs/record_72b_tp4dp2_20260519211649/outputs.jsonl.shard0
+sidecar_shard_start_time=1779199109.439979744 shard=1 device_group=8,10,13,15 tp=4 dp=1 master_port=24332 data_parallel_rpc_port= hccl_if_base_port=55401 hccl_host_socket_port_range=55401-55464 hccl_npu_socket_port_range=55465-55528 output=sidecar_runs/record_72b_tp4dp2_20260519211649/outputs.jsonl.shard1
+INFO 05-19 21:58:34 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 05-19 21:58:34 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 05-19 21:58:34 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 05-19 21:58:34 [__init__.py:207] Platform plugin ascend is activated
+INFO 05-19 21:58:34 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 05-19 21:58:34 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 05-19 21:58:34 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 05-19 21:58:34 [__init__.py:207] Platform plugin ascend is activated
+INFO 05-19 21:58:38 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 05-19 21:58:38 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 05-19 21:58:38 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+INFO 05-19 21:58:38 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 05-19 21:58:38 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 05-19 21:58:38 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+{"event": "sidecar_load_start", "model_path": "/home/sharedata/models/pangu-pro-moe-model", "devices": "8,10,13,15", "master_port": "24332", "master_addr": "192.168.0.163", "hccl_if_base_port": "55401", "hccl_host_socket_port_range": "55401-55464", "hccl_npu_socket_port_range": "55465-55528", "sidecar_hccl_if_base_port_fixed": "0", "sidecar_hccl_port_stride": "2048", "sidecar_hccl_port_window": "64", "vllm_host_ip": "192.168.0.163", "vllm_multiproc_distributed_host_ip": "192.168.0.163", "vllm_multiproc_use_host_ip": "1", "vllm_multiproc_set_worker_rank_envs": "1", "vllm_reuse_world_group_for_full_model_parallel": "1", "num_prompts": 4, "total_prompts": 7473, "completed_prompts": 0, "inflight_prompts": 0, "resume_prompts": 0, "sidecar_epoch": 0, "stream_checkpoint": true, "shard_index": 1, "num_shards": 2, "repeat_until_killed": true, "max_iterations": 0, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "data_split": "train", "use_short_data": "0", "state_dir": "sidecar_runs/state/pangu_pro_moe_gsm8k_train", "resume_file": "sidecar_runs/state/pangu_pro_moe_gsm8k_train/resume.shard1.jsonl", "partials_file": "sidecar_runs/state/pangu_pro_moe_gsm8k_train/partials.shard1.jsonl", "stop_file": "sidecar_runs/record_72b_tp4dp2_20260519211649/outputs.jsonl.stop_requested", "expert_parallel_allowed": "0", "expert_parallel_effective": "0", "model_is_moe": "1", "model_is_moe_reason": "override", "vllm_enable_expert_parallel": "0", "max_prompts": 8, "max_prompts_per_device": 4, "max_records_per_iteration": 4, "generate_chunk_size": 4, "engine_kwargs": {"tensor_parallel_size": 4, "gpu_memory_utilization": 0.98, "max_num_seqs": 2, "max_num_batched_tokens": 8192, "trust_remote_code": true, "enforce_eager": true, "max_model_len": 6144}}
+INFO 05-19 21:58:38 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 05-19 21:58:38 [utils.py:233] non-default args: {'trust_remote_code': True, 'max_model_len': 6144, 'tensor_parallel_size': 4, 'gpu_memory_utilization': 0.98, 'max_num_batched_tokens': 8192, 'max_num_seqs': 2, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/sharedata/models/pangu-pro-moe-model'}
+{"event": "sidecar_load_start", "model_path": "/home/sharedata/models/pangu-pro-moe-model", "devices": "2,3,4,6", "master_port": "24300", "master_addr": "192.168.0.163", "hccl_if_base_port": "55105", "hccl_host_socket_port_range": "55105-55168", "hccl_npu_socket_port_range": "55169-55232", "sidecar_hccl_if_base_port_fixed": "0", "sidecar_hccl_port_stride": "2048", "sidecar_hccl_port_window": "64", "vllm_host_ip": "192.168.0.163", "vllm_multiproc_distributed_host_ip": "192.168.0.163", "vllm_multiproc_use_host_ip": "1", "vllm_multiproc_set_worker_rank_envs": "1", "vllm_reuse_world_group_for_full_model_parallel": "1", "num_prompts": 4, "total_prompts": 7473, "completed_prompts": 0, "inflight_prompts": 0, "resume_prompts": 0, "sidecar_epoch": 0, "stream_checkpoint": true, "shard_index": 0, "num_shards": 2, "repeat_until_killed": true, "max_iterations": 0, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "data_split": "train", "use_short_data": "0", "state_dir": "sidecar_runs/state/pangu_pro_moe_gsm8k_train", "resume_file": "sidecar_runs/state/pangu_pro_moe_gsm8k_train/resume.shard0.jsonl", "partials_file": "sidecar_runs/state/pangu_pro_moe_gsm8k_train/partials.shard0.jsonl", "stop_file": "sidecar_runs/record_72b_tp4dp2_20260519211649/outputs.jsonl.stop_requested", "expert_parallel_allowed": "0", "expert_parallel_effective": "0", "model_is_moe": "1", "model_is_moe_reason": "override", "vllm_enable_expert_parallel": "0", "max_prompts": 8, "max_prompts_per_device": 4, "max_records_per_iteration": 4, "generate_chunk_size": 4, "engine_kwargs": {"tensor_parallel_size": 4, "gpu_memory_utilization": 0.98, "max_num_seqs": 2, "max_num_batched_tokens": 8192, "trust_remote_code": true, "enforce_eager": true, "max_model_len": 6144}}
+INFO 05-19 21:58:38 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 05-19 21:58:38 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 05-19 21:58:38 [utils.py:233] non-default args: {'trust_remote_code': True, 'max_model_len': 6144, 'tensor_parallel_size': 4, 'gpu_memory_utilization': 0.98, 'max_num_batched_tokens': 8192, 'max_num_seqs': 2, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/sharedata/models/pangu-pro-moe-model'}
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 05-19 21:58:48 [model.py:547] Resolved architecture: PanguProMoEForCausalLM
+INFO 05-19 21:58:48 [model.py:1510] Using max model len 6144
+INFO 05-19 21:58:48 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 05-19 21:58:48 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 05-19 21:58:48 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 05-19 21:58:48 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+INFO 05-19 21:58:48 [model.py:547] Resolved architecture: PanguProMoEForCausalLM
+INFO 05-19 21:58:48 [model.py:1510] Using max model len 6144
+INFO 05-19 21:58:48 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 05-19 21:58:48 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 05-19 21:58:48 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 05-19 21:58:48 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+WARNING 05-19 21:58:49 [tokenizer.py:253] Using a slow tokenizer. This might cause a significant slowdown. Consider using a fast tokenizer instead.
+WARNING 05-19 21:58:49 [tokenizer.py:253] Using a slow tokenizer. This might cause a significant slowdown. Consider using a fast tokenizer instead.
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:49 [core.py:667] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:49 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/sharedata/models/pangu-pro-moe-model', speculative_config=None, tokenizer='/home/sharedata/models/pangu-pro-moe-model', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=6144, download_dir=None, load_format=auto, tensor_parallel_size=4, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/sharedata/models/pangu-pro-moe-model, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m WARNING 05-19 21:58:49 [multiproc_executor.py:775] Reducing Torch parallelism from 320 threads to 1 to avoid unnecessary CPU contention. Set OMP_NUM_THREADS in the external environment to tune this value as needed.
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:123] Multiproc executor distributed init host=192.168.0.163
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:49 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0, 1, 2, 3], buffer_handle=(4, 16777216, 10, 'psm_446f348f'), local_subscribe_addr='ipc:///tmp/e0efb4f8-c4cc-4308-b301-1f27cb73d1b7', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=0 local_rank=0 world_size=4
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=1 local_rank=1 world_size=4
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=2 local_rank=2 world_size=4
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=3 local_rank=3 world_size=4
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:49 [core.py:667] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:49 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/sharedata/models/pangu-pro-moe-model', speculative_config=None, tokenizer='/home/sharedata/models/pangu-pro-moe-model', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=6144, download_dir=None, load_format=auto, tensor_parallel_size=4, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/sharedata/models/pangu-pro-moe-model, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m WARNING 05-19 21:58:49 [multiproc_executor.py:775] Reducing Torch parallelism from 320 threads to 1 to avoid unnecessary CPU contention. Set OMP_NUM_THREADS in the external environment to tune this value as needed.
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:123] Multiproc executor distributed init host=192.168.0.163
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:49 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0, 1, 2, 3], buffer_handle=(4, 16777216, 10, 'psm_fece144f'), local_subscribe_addr='ipc:///tmp/008341e4-4264-45c0-80e2-f60724200ab7', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=0 local_rank=0 world_size=4
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=1 local_rank=1 world_size=4
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=2 local_rank=2 world_size=4
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:49 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=3 local_rank=3 world_size=4
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:57 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_5cac098d'), local_subscribe_addr='ipc:///tmp/87a90d86-0229-40fe-8254-1765117d00c6', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:58 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_9d888d77'), local_subscribe_addr='ipc:///tmp/f178ce26-2a3b-440b-b21c-077272f461f2', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:58 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_c9c5faf8'), local_subscribe_addr='ipc:///tmp/604da087-fef8-49af-a6e8-b851f2790937', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:58 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_5d7f2041'), local_subscribe_addr='ipc:///tmp/1d1c9eb8-59fd-43de-a267-8a3f46f14421', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 21:58:58 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_169ea67b'), local_subscribe_addr='ipc:///tmp/eded7904-7ef0-4737-a27e-18ba17e44caa', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:58:59 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_e82fc2df'), local_subscribe_addr='ipc:///tmp/d867804f-04d7-4b1d-ad09-afafa0e6db56', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:59:00 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_cf5fe0a9'), local_subscribe_addr='ipc:///tmp/2ebe215f-07bb-4406-8f23-c992a29977be', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 21:59:00 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_c089a6b8'), local_subscribe_addr='ipc:///tmp/fadf33af-7f66-408a-a9de-074c0a92d9c2', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 22:01:58 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3]
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 22:01:58 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3]
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m [1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 22:01:58 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3]
+INFO 05-19 22:01:58 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3]
+[1;36m(EngineCore_DP0 pid=2407064)[0;0m INFO 05-19 22:01:58 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[1, 2, 3], buffer_handle=(3, 4194304, 6, 'psm_1178f8d3'), local_subscribe_addr='ipc:///tmp/dcac189f-b4e9-4f5b-b1de-f765bb330743', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 22:01:58 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3]
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m [1;36m(EngineCore_DP0 pid=2407031)[0;0m [1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 22:01:58 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3]
+INFO 05-19 22:01:58 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3]
+INFO 05-19 22:01:58 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3]
+[1;36m(EngineCore_DP0 pid=2407031)[0;0m INFO 05-19 22:01:58 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[1, 2, 3], buffer_handle=(3, 4194304, 6, 'psm_48520925'), local_subscribe_addr='ipc:///tmp/9340a180-74fd-4305-bc41-a126f22503b7', remote_subscribe_addr=None, remote_addr_ipv6=False)
+sidecar_deadline_signal_time=1779199525.052803143
+sidecar_deadline_signal_line=[36m(TaskRunner pid=2362675)[0m [Rank 0 | Local Rank 0] 2026-05-19 22:05:24,833 INFO [verl.trainer.ppo.ray_trainer:373] => Elastic parallel restore requested before rollout restore rpc
+sidecar_stop_request_time=1779199525.056444979 reason=training_rollout_done_or_restore pid=2406165 stop_file=sidecar_runs/record_72b_tp4dp2_20260519211649/outputs.jsonl.stop_requested
+sidecar_kill_time=1779199528.078145685 reason=training_rollout_done_or_restore pid=2406165 after_soft_stop=1
+Terminated
+watch_end_time=1779199528.290917195

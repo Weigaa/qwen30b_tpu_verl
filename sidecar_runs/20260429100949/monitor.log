@@ -1,0 +1,832 @@
+watch_start_time=1777428589.462053555
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260429100949_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+shrink_window_detected_time=1777428780.834373752 active_count=8
+shrink_window_line=[36m(WorkerDict pid=1168429)[0m INFO 04-29 10:13:00 [worker_v1.py:2843] Elastic parallel detach done: rank=0 active_ranks=[8, 9, 10, 11, 12, 13, 14, 15] total_ms=346.23
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1777428780.870568240
+sidecar_active_ranks=8,9,10,11,12,13,14,15
+sidecar_devices=0,1,2,3,4,5,6,7
+sidecar_pid=1186856
+sidecar_start_time=1777428780.921962612
+sidecar_devices=0,1,2,3,4,5,6,7
+sidecar_device_count=8
+sidecar_parallel_mode=dp
+sidecar_tensor_parallel_size=1
+sidecar_model=/home/data/Qwen2.5-1.5B-Instruct
+sidecar_output=sidecar_runs/20260429100949/outputs.jsonl
+sidecar_shard_start_time=1777428780.928460218 shard=0 device=0 output=sidecar_runs/20260429100949/outputs.jsonl.shard0
+sidecar_shard_start_time=1777428780.932578850 shard=1 device=1 output=sidecar_runs/20260429100949/outputs.jsonl.shard1
+sidecar_shard_start_time=1777428780.936671213 shard=2 device=2 output=sidecar_runs/20260429100949/outputs.jsonl.shard2
+sidecar_shard_start_time=1777428780.940661245 shard=3 device=3 output=sidecar_runs/20260429100949/outputs.jsonl.shard3
+sidecar_shard_start_time=1777428780.944717597 shard=4 device=4 output=sidecar_runs/20260429100949/outputs.jsonl.shard4
+sidecar_shard_start_time=1777428780.950092186 shard=5 device=5 output=sidecar_runs/20260429100949/outputs.jsonl.shard5
+sidecar_shard_start_time=1777428780.953586985 shard=6 device=6 output=sidecar_runs/20260429100949/outputs.jsonl.shard6
+sidecar_shard_start_time=1777428780.957595257 shard=7 device=7 output=sidecar_runs/20260429100949/outputs.jsonl.shard7
+INFO 04-29 10:13:07 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 04-29 10:13:07 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 04-29 10:13:07 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-29 10:13:07 [__init__.py:207] Platform plugin ascend is activated
+INFO 04-29 10:13:07 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 04-29 10:13:07 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 04-29 10:13:07 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-29 10:13:07 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 04-29 10:13:07 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 04-29 10:13:07 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-29 10:13:07 [__init__.py:207] Platform plugin ascend is activated
+INFO 04-29 10:13:07 [__init__.py:207] Platform plugin ascend is activated
+INFO 04-29 10:13:07 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 04-29 10:13:07 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 04-29 10:13:07 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-29 10:13:07 [__init__.py:207] Platform plugin ascend is activated
+INFO 04-29 10:13:07 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 04-29 10:13:07 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 04-29 10:13:07 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-29 10:13:07 [__init__.py:207] Platform plugin ascend is activated
+INFO 04-29 10:13:07 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 04-29 10:13:07 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 04-29 10:13:07 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-29 10:13:07 [__init__.py:207] Platform plugin ascend is activated
+INFO 04-29 10:13:07 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 04-29 10:13:07 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 04-29 10:13:07 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-29 10:13:07 [__init__.py:207] Platform plugin ascend is activated
+INFO 04-29 10:13:07 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 04-29 10:13:07 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 04-29 10:13:07 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 04-29 10:13:07 [__init__.py:207] Platform plugin ascend is activated
+INFO 04-29 10:13:11 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 04-29 10:13:11 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 04-29 10:13:11 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+INFO 04-29 10:13:11 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 04-29 10:13:11 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 04-29 10:13:11 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen2.5-1.5B-Instruct", "devices": "7", "master_port": "24307", "hccl_if_base_port": "52112", "num_prompts": 4, "total_prompts": 32, "shard_index": 7, "num_shards": 8, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "max_prompts": 32, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_num_seqs": 16, "max_num_batched_tokens": 1024, "trust_remote_code": true, "enforce_eager": true}}
+INFO 04-29 10:13:11 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 04-29 10:13:11 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 04-29 10:13:11 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 04-29 10:13:11 [utils.py:233] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.8, 'max_num_batched_tokens': 1024, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen2.5-1.5B-Instruct'}
+WARNING 04-29 10:13:11 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen2.5-1.5B-Instruct", "devices": "0", "master_port": "24300", "hccl_if_base_port": "52000", "num_prompts": 4, "total_prompts": 32, "shard_index": 0, "num_shards": 8, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "max_prompts": 32, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_num_seqs": 16, "max_num_batched_tokens": 1024, "trust_remote_code": true, "enforce_eager": true}}
+INFO 04-29 10:13:11 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 04-29 10:13:11 [utils.py:233] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.8, 'max_num_batched_tokens': 1024, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen2.5-1.5B-Instruct'}
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen2.5-1.5B-Instruct", "devices": "4", "master_port": "24304", "hccl_if_base_port": "52064", "num_prompts": 4, "total_prompts": 32, "shard_index": 4, "num_shards": 8, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "max_prompts": 32, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_num_seqs": 16, "max_num_batched_tokens": 1024, "trust_remote_code": true, "enforce_eager": true}}
+INFO 04-29 10:13:11 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 04-29 10:13:11 [utils.py:233] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.8, 'max_num_batched_tokens': 1024, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen2.5-1.5B-Instruct'}
+INFO 04-29 10:13:11 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 04-29 10:13:11 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 04-29 10:13:11 [model.py:547] Resolved architecture: Qwen2ForCausalLM
+INFO 04-29 10:13:11 [model.py:1510] Using max model len 32768
+WARNING 04-29 10:13:11 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+INFO 04-29 10:13:11 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 04-29 10:13:11 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+INFO 04-29 10:13:11 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 04-29 10:13:11 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 04-29 10:13:11 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+WARNING 04-29 10:13:11 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+INFO 04-29 10:13:11 [model.py:547] Resolved architecture: Qwen2ForCausalLM
+INFO 04-29 10:13:11 [model.py:1510] Using max model len 32768
+### USING MY PATCHED vLLM core.py ###
+INFO 04-29 10:13:11 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=1024.
+INFO 04-29 10:13:11 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 04-29 10:13:11 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 04-29 10:13:11 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 04-29 10:13:11 [model.py:547] Resolved architecture: Qwen2ForCausalLM
+INFO 04-29 10:13:11 [model.py:1510] Using max model len 32768
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen2.5-1.5B-Instruct", "devices": "1", "master_port": "24301", "hccl_if_base_port": "52016", "num_prompts": 4, "total_prompts": 32, "shard_index": 1, "num_shards": 8, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "max_prompts": 32, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_num_seqs": 16, "max_num_batched_tokens": 1024, "trust_remote_code": true, "enforce_eager": true}}
+INFO 04-29 10:13:11 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 04-29 10:13:11 [utils.py:233] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.8, 'max_num_batched_tokens': 1024, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen2.5-1.5B-Instruct'}
+INFO 04-29 10:13:11 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=1024.
+INFO 04-29 10:13:11 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 04-29 10:13:11 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 04-29 10:13:11 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen2.5-1.5B-Instruct", "devices": "3", "master_port": "24303", "hccl_if_base_port": "52048", "num_prompts": 4, "total_prompts": 32, "shard_index": 3, "num_shards": 8, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "max_prompts": 32, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_num_seqs": 16, "max_num_batched_tokens": 1024, "trust_remote_code": true, "enforce_eager": true}}
+INFO 04-29 10:13:11 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=1024.
+INFO 04-29 10:13:11 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 04-29 10:13:11 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 04-29 10:13:11 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen2.5-1.5B-Instruct", "devices": "5", "master_port": "24305", "hccl_if_base_port": "52080", "num_prompts": 4, "total_prompts": 32, "shard_index": 5, "num_shards": 8, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "max_prompts": 32, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_num_seqs": 16, "max_num_batched_tokens": 1024, "trust_remote_code": true, "enforce_eager": true}}
+INFO 04-29 10:13:11 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 04-29 10:13:11 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 04-29 10:13:11 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+INFO 04-29 10:13:11 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 04-29 10:13:11 [utils.py:233] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.8, 'max_num_batched_tokens': 1024, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen2.5-1.5B-Instruct'}
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 04-29 10:13:11 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 04-29 10:13:11 [utils.py:233] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.8, 'max_num_batched_tokens': 1024, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen2.5-1.5B-Instruct'}
+WARNING 04-29 10:13:11 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+INFO 04-29 10:13:11 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 04-29 10:13:11 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 04-29 10:13:11 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+### USING MY PATCHED vLLM core.py ###
+INFO 04-29 10:13:11 [model.py:547] Resolved architecture: Qwen2ForCausalLM
+INFO 04-29 10:13:11 [model.py:1510] Using max model len 32768
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen2.5-1.5B-Instruct", "devices": "6", "master_port": "24306", "hccl_if_base_port": "52096", "num_prompts": 4, "total_prompts": 32, "shard_index": 6, "num_shards": 8, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "max_prompts": 32, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_num_seqs": 16, "max_num_batched_tokens": 1024, "trust_remote_code": true, "enforce_eager": true}}
+INFO 04-29 10:13:11 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 04-29 10:13:11 [model.py:547] Resolved architecture: Qwen2ForCausalLM
+INFO 04-29 10:13:11 [model.py:1510] Using max model len 32768
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 04-29 10:13:12 [utils.py:233] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.8, 'max_num_batched_tokens': 1024, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen2.5-1.5B-Instruct'}
+### run_engine_core entered ###
+vllm parallel config: ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24307, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+INFO 04-29 10:13:12 [model.py:547] Resolved architecture: Qwen2ForCausalLM
+INFO 04-29 10:13:12 [model.py:1510] Using max model len 32768
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen2.5-1.5B-Instruct", "devices": "2", "master_port": "24302", "hccl_if_base_port": "52032", "num_prompts": 4, "total_prompts": 32, "shard_index": 2, "num_shards": 8, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "max_prompts": 32, "engine_kwargs": {"tensor_parallel_size": 1, "gpu_memory_utilization": 0.8, "max_num_seqs": 16, "max_num_batched_tokens": 1024, "trust_remote_code": true, "enforce_eager": true}}
+INFO 04-29 10:13:12 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=1024.
+INFO 04-29 10:13:12 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 04-29 10:13:12 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 04-29 10:13:12 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+vllm parallel config, ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24307, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:12 [core.py:664] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:12 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen2.5-1.5B-Instruct', speculative_config=None, tokenizer='/home/data/Qwen2.5-1.5B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen2.5-1.5B-Instruct, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81] EngineCore __init__ pid=1188836 stack=
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/tmp/elastic_sidecar_infer.ZVUGLW.py", line 180, in <module>
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     llm = LLM(**engine_kwargs)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.llm_engine = LLMEngine.from_engine_args(
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 208, in from_engine_args
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return cls(vllm_config=vllm_config,
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 119, in __init__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.engine_core = EngineCoreClient.make_client(
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 80, in make_client
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return SyncMPClient(vllm_config, executor_class, log_stats)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 604, in __init__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 450, in __init__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     with launch_core_engines(vllm_config, executor_class,
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/contextlib.py", line 137, in __enter__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return next(self.gen)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 715, in launch_core_engines
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     local_engine_manager = CoreEngineProcManager(
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 133, in __init__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     proc.start()
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 121, in start
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._popen = self._Popen(self)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/context.py", line 281, in _Popen
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return Popen(process_obj)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 19, in __init__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._launch(process_obj)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 71, in _launch
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     code = process_obj._bootstrap(parent_sentinel=child_r)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.run()
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 108, in run
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._target(*self._args, **self._kwargs)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 722, in run_engine_core
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     engine_core = EngineCoreProc(*args, **kwargs)
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 518, in __init__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(vllm_config, executor_class, log_stats,
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 82, in __init__
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81]     os.getpid(), "".join(traceback.format_stack(limit=30)))
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:12 [core.py:81] 
+INFO 04-29 10:13:12 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 04-29 10:13:12 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 04-29 10:13:12 [utils.py:233] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.8, 'max_num_batched_tokens': 1024, 'max_num_seqs': 16, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen2.5-1.5B-Instruct'}
+### run_engine_core entered ###
+vllm parallel config: ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24300, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+vllm parallel config, ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24300, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:12 [core.py:664] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:12 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen2.5-1.5B-Instruct', speculative_config=None, tokenizer='/home/data/Qwen2.5-1.5B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen2.5-1.5B-Instruct, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81] EngineCore __init__ pid=1188847 stack=
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/tmp/elastic_sidecar_infer.ZVUGLW.py", line 180, in <module>
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     llm = LLM(**engine_kwargs)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.llm_engine = LLMEngine.from_engine_args(
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 208, in from_engine_args
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return cls(vllm_config=vllm_config,
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 119, in __init__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.engine_core = EngineCoreClient.make_client(
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 80, in make_client
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return SyncMPClient(vllm_config, executor_class, log_stats)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 604, in __init__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 450, in __init__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     with launch_core_engines(vllm_config, executor_class,
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/contextlib.py", line 137, in __enter__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return next(self.gen)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 715, in launch_core_engines
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     local_engine_manager = CoreEngineProcManager(
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 133, in __init__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     proc.start()
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 121, in start
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._popen = self._Popen(self)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/context.py", line 281, in _Popen
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return Popen(process_obj)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 19, in __init__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._launch(process_obj)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 71, in _launch
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     code = process_obj._bootstrap(parent_sentinel=child_r)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.run()
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 108, in run
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._target(*self._args, **self._kwargs)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 722, in run_engine_core
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     engine_core = EngineCoreProc(*args, **kwargs)
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 518, in __init__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(vllm_config, executor_class, log_stats,
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 82, in __init__
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81]     os.getpid(), "".join(traceback.format_stack(limit=30)))
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:12 [core.py:81] 
+### run_engine_core entered ###
+vllm parallel config: ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24304, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+vllm parallel config, ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24304, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:12 [core.py:664] Waiting for init message from front-end.
+INFO 04-29 10:13:12 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=1024.
+INFO 04-29 10:13:12 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 04-29 10:13:12 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 04-29 10:13:12 [platform.py:179] Compilation disabled, using eager mode by default
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:12 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen2.5-1.5B-Instruct', speculative_config=None, tokenizer='/home/data/Qwen2.5-1.5B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen2.5-1.5B-Instruct, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+multiprocess_mode: True external_launcher_dp: False
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81] EngineCore __init__ pid=1188853 stack=
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/tmp/elastic_sidecar_infer.ZVUGLW.py", line 180, in <module>
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     llm = LLM(**engine_kwargs)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.llm_engine = LLMEngine.from_engine_args(
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 208, in from_engine_args
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return cls(vllm_config=vllm_config,
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 119, in __init__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.engine_core = EngineCoreClient.make_client(
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 80, in make_client
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return SyncMPClient(vllm_config, executor_class, log_stats)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 604, in __init__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 450, in __init__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     with launch_core_engines(vllm_config, executor_class,
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/contextlib.py", line 137, in __enter__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return next(self.gen)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 715, in launch_core_engines
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     local_engine_manager = CoreEngineProcManager(
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 133, in __init__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     proc.start()
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 121, in start
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._popen = self._Popen(self)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/context.py", line 281, in _Popen
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return Popen(process_obj)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 19, in __init__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._launch(process_obj)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 71, in _launch
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     code = process_obj._bootstrap(parent_sentinel=child_r)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.run()
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 108, in run
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._target(*self._args, **self._kwargs)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 722, in run_engine_core
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     engine_core = EngineCoreProc(*args, **kwargs)
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 518, in __init__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(vllm_config, executor_class, log_stats,
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 82, in __init__
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81]     os.getpid(), "".join(traceback.format_stack(limit=30)))
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:12 [core.py:81] 
+INFO 04-29 10:13:12 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=1024.
+INFO 04-29 10:13:12 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 04-29 10:13:12 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 04-29 10:13:12 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 04-29 10:13:12 [model.py:547] Resolved architecture: Qwen2ForCausalLM
+INFO 04-29 10:13:12 [model.py:1510] Using max model len 32768
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 04-29 10:13:12 [model.py:547] Resolved architecture: Qwen2ForCausalLM
+INFO 04-29 10:13:12 [model.py:1510] Using max model len 32768
+### run_engine_core entered ###
+vllm parallel config: ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24301, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+INFO 04-29 10:13:12 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=1024.
+INFO 04-29 10:13:12 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 04-29 10:13:12 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 04-29 10:13:12 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+vllm parallel config, ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24301, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:12 [core.py:664] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:12 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen2.5-1.5B-Instruct', speculative_config=None, tokenizer='/home/data/Qwen2.5-1.5B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen2.5-1.5B-Instruct, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81] EngineCore __init__ pid=1188873 stack=
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/tmp/elastic_sidecar_infer.ZVUGLW.py", line 180, in <module>
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     llm = LLM(**engine_kwargs)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.llm_engine = LLMEngine.from_engine_args(
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 208, in from_engine_args
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return cls(vllm_config=vllm_config,
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 119, in __init__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.engine_core = EngineCoreClient.make_client(
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 80, in make_client
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return SyncMPClient(vllm_config, executor_class, log_stats)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 604, in __init__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 450, in __init__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     with launch_core_engines(vllm_config, executor_class,
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/contextlib.py", line 137, in __enter__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return next(self.gen)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 715, in launch_core_engines
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     local_engine_manager = CoreEngineProcManager(
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 133, in __init__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     proc.start()
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 121, in start
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._popen = self._Popen(self)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/context.py", line 281, in _Popen
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return Popen(process_obj)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 19, in __init__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._launch(process_obj)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 71, in _launch
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     code = process_obj._bootstrap(parent_sentinel=child_r)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.run()
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 108, in run
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._target(*self._args, **self._kwargs)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 722, in run_engine_core
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     engine_core = EngineCoreProc(*args, **kwargs)
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 518, in __init__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(vllm_config, executor_class, log_stats,
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 82, in __init__
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81]     os.getpid(), "".join(traceback.format_stack(limit=30)))
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:12 [core.py:81] 
+INFO 04-29 10:13:12 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=1024.
+INFO 04-29 10:13:12 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 04-29 10:13:12 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 04-29 10:13:12 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+### run_engine_core entered ###
+vllm parallel config: ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24303, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+### run_engine_core entered ###
+vllm parallel config: ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24305, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+vllm parallel config, ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24303, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:12 [core.py:664] Waiting for init message from front-end.
+vllm parallel config, ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24305, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:12 [core.py:664] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:12 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen2.5-1.5B-Instruct', speculative_config=None, tokenizer='/home/data/Qwen2.5-1.5B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen2.5-1.5B-Instruct, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81] EngineCore __init__ pid=1188886 stack=
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/tmp/elastic_sidecar_infer.ZVUGLW.py", line 180, in <module>
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     llm = LLM(**engine_kwargs)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.llm_engine = LLMEngine.from_engine_args(
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 208, in from_engine_args
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return cls(vllm_config=vllm_config,
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 119, in __init__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.engine_core = EngineCoreClient.make_client(
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 80, in make_client
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return SyncMPClient(vllm_config, executor_class, log_stats)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 604, in __init__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 450, in __init__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     with launch_core_engines(vllm_config, executor_class,
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/contextlib.py", line 137, in __enter__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return next(self.gen)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 715, in launch_core_engines
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     local_engine_manager = CoreEngineProcManager(
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 133, in __init__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     proc.start()
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 121, in start
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._popen = self._Popen(self)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/context.py", line 281, in _Popen
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return Popen(process_obj)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 19, in __init__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._launch(process_obj)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 71, in _launch
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     code = process_obj._bootstrap(parent_sentinel=child_r)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.run()
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 108, in run
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._target(*self._args, **self._kwargs)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 722, in run_engine_core
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     engine_core = EngineCoreProc(*args, **kwargs)
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 518, in __init__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(vllm_config, executor_class, log_stats,
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 82, in __init__
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81]     os.getpid(), "".join(traceback.format_stack(limit=30)))
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:12 [core.py:81] 
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:12 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen2.5-1.5B-Instruct', speculative_config=None, tokenizer='/home/data/Qwen2.5-1.5B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen2.5-1.5B-Instruct, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81] EngineCore __init__ pid=1188888 stack=
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/tmp/elastic_sidecar_infer.ZVUGLW.py", line 180, in <module>
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     llm = LLM(**engine_kwargs)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.llm_engine = LLMEngine.from_engine_args(
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 208, in from_engine_args
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return cls(vllm_config=vllm_config,
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 119, in __init__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.engine_core = EngineCoreClient.make_client(
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 80, in make_client
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return SyncMPClient(vllm_config, executor_class, log_stats)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 604, in __init__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 450, in __init__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     with launch_core_engines(vllm_config, executor_class,
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/contextlib.py", line 137, in __enter__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return next(self.gen)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 715, in launch_core_engines
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     local_engine_manager = CoreEngineProcManager(
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 133, in __init__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     proc.start()
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 121, in start
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._popen = self._Popen(self)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/context.py", line 281, in _Popen
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return Popen(process_obj)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 19, in __init__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._launch(process_obj)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 71, in _launch
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     code = process_obj._bootstrap(parent_sentinel=child_r)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.run()
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 108, in run
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._target(*self._args, **self._kwargs)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 722, in run_engine_core
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     engine_core = EngineCoreProc(*args, **kwargs)
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 518, in __init__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(vllm_config, executor_class, log_stats,
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 82, in __init__
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81]     os.getpid(), "".join(traceback.format_stack(limit=30)))
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:12 [core.py:81] 
+### run_engine_core entered ###
+vllm parallel config: ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24306, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+vllm parallel config, ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24306, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:12 [core.py:664] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:12 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen2.5-1.5B-Instruct', speculative_config=None, tokenizer='/home/data/Qwen2.5-1.5B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen2.5-1.5B-Instruct, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81] EngineCore __init__ pid=1188907 stack=
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/tmp/elastic_sidecar_infer.ZVUGLW.py", line 180, in <module>
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     llm = LLM(**engine_kwargs)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.llm_engine = LLMEngine.from_engine_args(
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 208, in from_engine_args
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return cls(vllm_config=vllm_config,
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 119, in __init__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.engine_core = EngineCoreClient.make_client(
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 80, in make_client
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return SyncMPClient(vllm_config, executor_class, log_stats)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 604, in __init__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 450, in __init__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     with launch_core_engines(vllm_config, executor_class,
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/contextlib.py", line 137, in __enter__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return next(self.gen)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 715, in launch_core_engines
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     local_engine_manager = CoreEngineProcManager(
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 133, in __init__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     proc.start()
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 121, in start
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._popen = self._Popen(self)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/context.py", line 281, in _Popen
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     return Popen(process_obj)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 19, in __init__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._launch(process_obj)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 71, in _launch
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     code = process_obj._bootstrap(parent_sentinel=child_r)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self.run()
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 108, in run
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     self._target(*self._args, **self._kwargs)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 722, in run_engine_core
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     engine_core = EngineCoreProc(*args, **kwargs)
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 518, in __init__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     super().__init__(vllm_config, executor_class, log_stats,
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 82, in __init__
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81]     os.getpid(), "".join(traceback.format_stack(limit=30)))
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:12 [core.py:81] 
+### run_engine_core entered ###
+vllm parallel config: ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24302, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+vllm parallel config, ParallelConfig(pipeline_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1, data_parallel_size_local=1, data_parallel_rank=0, data_parallel_rank_local=0, data_parallel_master_ip='127.0.0.1', data_parallel_rpc_port=29550, data_parallel_master_port=24302, data_parallel_backend='mp', data_parallel_external_lb=False, data_parallel_hybrid_lb=False, enable_expert_parallel=False, enable_eplb=False, eplb_config=EPLBConfig(window_size=1000, step_interval=3000, num_redundant_experts=0, log_balancedness=False), expert_placement_strategy='linear', num_redundant_experts=None, eplb_window_size=None, eplb_step_interval=None, eplb_log_balancedness=None, max_parallel_loading_workers=None, disable_custom_all_reduce=True, enable_dbo=False, dbo_decode_token_threshold=32, dbo_prefill_token_threshold=512, ray_workers_use_nsight=False, ray_runtime_env=None, placement_group=None, distributed_executor_backend='uni', worker_cls='vllm_ascend.worker.worker_v1.NPUWorker', sd_worker_cls='auto', worker_extension_cls='', world_size=1, rank=0, _data_parallel_master_port_list=[], decode_context_parallel_size=1, _api_process_count=1, _api_process_rank=0)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:13 [core.py:664] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:13 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen2.5-1.5B-Instruct', speculative_config=None, tokenizer='/home/data/Qwen2.5-1.5B-Instruct', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen2.5-1.5B-Instruct, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81] EngineCore __init__ pid=1188918 stack=
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/tmp/elastic_sidecar_infer.ZVUGLW.py", line 180, in <module>
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     llm = LLM(**engine_kwargs)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/entrypoints/llm.py", line 304, in __init__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     self.llm_engine = LLMEngine.from_engine_args(
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 208, in from_engine_args
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     return cls(vllm_config=vllm_config,
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/llm_engine.py", line 119, in __init__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     self.engine_core = EngineCoreClient.make_client(
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 80, in make_client
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     return SyncMPClient(vllm_config, executor_class, log_stats)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 604, in __init__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     super().__init__(
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core_client.py", line 450, in __init__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     with launch_core_engines(vllm_config, executor_class,
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/contextlib.py", line 137, in __enter__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     return next(self.gen)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 715, in launch_core_engines
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     local_engine_manager = CoreEngineProcManager(
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/utils.py", line 133, in __init__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     proc.start()
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 121, in start
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     self._popen = self._Popen(self)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/context.py", line 281, in _Popen
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     return Popen(process_obj)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 19, in __init__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     self._launch(process_obj)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/popen_fork.py", line 71, in _launch
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     code = process_obj._bootstrap(parent_sentinel=child_r)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     self.run()
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/usr/local/python3.11.13/lib/python3.11/multiprocessing/process.py", line 108, in run
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     self._target(*self._args, **self._kwargs)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 722, in run_engine_core
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     engine_core = EngineCoreProc(*args, **kwargs)
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 518, in __init__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     super().__init__(vllm_config, executor_class, log_stats,
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]   File "/workspace/cann-recipes-train/llm_rl/qwen3/vllm/v1/engine/core.py", line 82, in __init__
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81]     os.getpid(), "".join(traceback.format_stack(limit=30)))
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:13 [core.py:81] 
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:28 [parallel_state.py:1208] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:29 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen2.5-1.5B-Instruct...
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.40it/s]
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.40it/s]
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m 
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:30 [default_loader.py:267] Loading weights took 0.43 seconds
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:30 [model_runner_v1.py:2992] Loading model weights took 2.8834 GB
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:30 [parallel_state.py:1208] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:30 [parallel_state.py:1208] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:31 [parallel_state.py:1208] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:31 [parallel_state.py:1208] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:32 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen2.5-1.5B-Instruct...
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:32 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen2.5-1.5B-Instruct...
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:32 [worker_v1.py:341] Available memory: 26991102054, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:32 [kv_cache_utils.py:1087] GPU KV cache size: 941,312 tokens
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:32 [kv_cache_utils.py:1091] Maximum concurrency for 32,768 tokens per request: 28.73x
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:32 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen2.5-1.5B-Instruct...
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:32 [core.py:214] init engine (profile, create kv cache, warmup model) took 2.16 seconds
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.05it/s]
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.05it/s]
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m 
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:33 [core.py:116] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m max_num_running_reqs: 16 max_num_scheduled_tokens: 32768 max_model_len: 32768
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:33 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:33 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:33 [platform.py:179] Compilation disabled, using eager mode by default
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:33 [default_loader.py:267] Loading weights took 0.33 seconds
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.45it/s]
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.44it/s]
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m 
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:33 [default_loader.py:267] Loading weights took 0.43 seconds
+INFO 04-29 10:13:33 [llm.py:313] Supported_tasks: ['generate']
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:33 [core.py:266] Elastic first model exec: entering model_fn scheduled_tokens=52 num_reqs=1
+INFO 04-29 10:13:33 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m WARNING 04-29 10:13:33 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=1188886)[0;0m INFO 04-29 10:13:33 [core.py:279] Elastic first model exec: model_fn returned
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.41it/s]
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.40it/s]
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m 
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:33 [model_runner_v1.py:2992] Loading model weights took 2.8834 GB
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:33 [default_loader.py:267] Loading weights took 0.43 seconds
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:34 [model_runner_v1.py:2992] Loading model weights took 2.8834 GB
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:34 [model_runner_v1.py:2992] Loading model weights took 2.8834 GB
+{"event": "sidecar_done", "model_load_time_s": 21.801821373403072, "inference_time_s": 2.2017345540225506, "total_time_s": 24.004099706187844, "num_requests": 4, "total_prompts": 32, "shard_index": 3, "num_shards": 8, "num_output_tokens": 512, "tokens_per_s": 232.54392727069677, "output_file": "sidecar_runs/20260429100949/outputs.jsonl.shard3"}
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:35 [worker_v1.py:341] Available memory: 26671489536, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:35 [kv_cache_utils.py:1087] GPU KV cache size: 930,176 tokens
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:35 [kv_cache_utils.py:1091] Maximum concurrency for 32,768 tokens per request: 28.39x
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:36 [core.py:214] init engine (profile, create kv cache, warmup model) took 2.09 seconds
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [worker_v1.py:341] Available memory: 26940725350, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [kv_cache_utils.py:1087] GPU KV cache size: 939,520 tokens
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [kv_cache_utils.py:1091] Maximum concurrency for 32,768 tokens per request: 28.67x
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [core.py:214] init engine (profile, create kv cache, warmup model) took 2.06 seconds
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:36 [parallel_state.py:1208] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+ERROR 04-29 10:13:36 [core_client.py:566] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:36 [parallel_state.py:1208] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:36 [core.py:116] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m max_num_running_reqs: 16 max_num_scheduled_tokens: 32768 max_model_len: 32768
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:36 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:36 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:36 [platform.py:179] Compilation disabled, using eager mode by default
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:36 [core.py:116] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m max_num_running_reqs: 16 max_num_scheduled_tokens: 32768 max_model_len: 32768
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [platform.py:179] Compilation disabled, using eager mode by default
+INFO 04-29 10:13:36 [llm.py:313] Supported_tasks: ['generate']
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:36 [core.py:266] Elastic first model exec: entering model_fn scheduled_tokens=128 num_reqs=1
+INFO 04-29 10:13:36 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m WARNING 04-29 10:13:36 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=1188853)[0;0m INFO 04-29 10:13:36 [core.py:279] Elastic first model exec: model_fn returned
+INFO 04-29 10:13:36 [llm.py:313] Supported_tasks: ['generate']
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [core.py:266] Elastic first model exec: entering model_fn scheduled_tokens=73 num_reqs=1
+INFO 04-29 10:13:36 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m WARNING 04-29 10:13:36 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=1188888)[0;0m INFO 04-29 10:13:36 [core.py:279] Elastic first model exec: model_fn returned
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:37 [worker_v1.py:341] Available memory: 26663789056, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:37 [kv_cache_utils.py:1087] GPU KV cache size: 929,920 tokens
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:37 [kv_cache_utils.py:1091] Maximum concurrency for 32,768 tokens per request: 28.38x
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:37 [core.py:214] init engine (profile, create kv cache, warmup model) took 2.29 seconds
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:37 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen2.5-1.5B-Instruct...
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:37 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen2.5-1.5B-Instruct...
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:37 [core.py:116] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m max_num_running_reqs: 16 max_num_scheduled_tokens: 32768 max_model_len: 32768
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:37 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:37 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:37 [platform.py:179] Compilation disabled, using eager mode by default
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:37 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen2.5-1.5B-Instruct...
+INFO 04-29 10:13:38 [llm.py:313] Supported_tasks: ['generate']
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:38 [core.py:266] Elastic first model exec: entering model_fn scheduled_tokens=59 num_reqs=1
+INFO 04-29 10:13:38 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m WARNING 04-29 10:13:38 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=1188907)[0;0m INFO 04-29 10:13:38 [core.py:279] Elastic first model exec: model_fn returned
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.96it/s]
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.96it/s]
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m 
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:38 [default_loader.py:267] Loading weights took 0.34 seconds
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.41it/s]
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.41it/s]
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m 
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.53it/s]
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.53it/s]
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m 
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:38 [default_loader.py:267] Loading weights took 0.41 seconds
+sidecar_shard_end_time=1777428818.760070174 shard=3 device=3 exit_code=0
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:38 [default_loader.py:267] Loading weights took 0.43 seconds
+{"event": "sidecar_done", "model_load_time_s": 25.18744275905192, "inference_time_s": 2.2234863825142384, "total_time_s": 27.41148490458727, "num_requests": 4, "total_prompts": 32, "shard_index": 4, "num_shards": 8, "num_output_tokens": 512, "tokens_per_s": 230.26900637954384, "output_file": "sidecar_runs/20260429100949/outputs.jsonl.shard4"}
+{"event": "sidecar_done", "model_load_time_s": 25.037216890603304, "inference_time_s": 2.0564552191644907, "total_time_s": 27.094224464148283, "num_requests": 4, "total_prompts": 32, "shard_index": 5, "num_shards": 8, "num_output_tokens": 502, "tokens_per_s": 244.1093758433289, "output_file": "sidecar_runs/20260429100949/outputs.jsonl.shard5"}
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:39 [model_runner_v1.py:2992] Loading model weights took 2.8834 GB
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:39 [model_runner_v1.py:2992] Loading model weights took 2.8834 GB
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:39 [model_runner_v1.py:2992] Loading model weights took 2.8834 GB
+{"event": "sidecar_done", "model_load_time_s": 26.021562859416008, "inference_time_s": 1.976544078439474, "total_time_s": 27.998689183965325, "num_requests": 4, "total_prompts": 32, "shard_index": 6, "num_shards": 8, "num_output_tokens": 512, "tokens_per_s": 259.03798735631307, "output_file": "sidecar_runs/20260429100949/outputs.jsonl.shard6"}
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:41 [parallel_state.py:1208] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [worker_v1.py:341] Available memory: 26714096128, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [kv_cache_utils.py:1087] GPU KV cache size: 931,712 tokens
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [kv_cache_utils.py:1091] Maximum concurrency for 32,768 tokens per request: 28.43x
+ERROR 04-29 10:13:41 [core_client.py:566] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [core.py:214] init engine (profile, create kv cache, warmup model) took 2.12 seconds
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:41 [worker_v1.py:341] Available memory: 27001985126, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:41 [kv_cache_utils.py:1087] GPU KV cache size: 941,696 tokens
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:41 [kv_cache_utils.py:1091] Maximum concurrency for 32,768 tokens per request: 28.74x
+ERROR 04-29 10:13:41 [core_client.py:566] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:41 [core.py:214] init engine (profile, create kv cache, warmup model) took 2.09 seconds
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:41 [worker_v1.py:341] Available memory: 26730205696, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:41 [kv_cache_utils.py:1087] GPU KV cache size: 932,224 tokens
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:41 [kv_cache_utils.py:1091] Maximum concurrency for 32,768 tokens per request: 28.45x
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:41 [core.py:116] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m max_num_running_reqs: 16 max_num_scheduled_tokens: 32768 max_model_len: 32768
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [platform.py:179] Compilation disabled, using eager mode by default
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:41 [core.py:214] init engine (profile, create kv cache, warmup model) took 2.16 seconds
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:41 [core.py:116] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m max_num_running_reqs: 16 max_num_scheduled_tokens: 32768 max_model_len: 32768
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:41 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:41 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:41 [platform.py:179] Compilation disabled, using eager mode by default
+INFO 04-29 10:13:41 [llm.py:313] Supported_tasks: ['generate']
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [core.py:266] Elastic first model exec: entering model_fn scheduled_tokens=81 num_reqs=1
+INFO 04-29 10:13:41 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m WARNING 04-29 10:13:41 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=1188847)[0;0m INFO 04-29 10:13:41 [core.py:279] Elastic first model exec: model_fn returned
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:41 [core.py:116] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m max_num_running_reqs: 16 max_num_scheduled_tokens: 32768 max_model_len: 32768
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:41 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:41 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:41 [platform.py:179] Compilation disabled, using eager mode by default
+INFO 04-29 10:13:42 [llm.py:313] Supported_tasks: ['generate']
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:42 [core.py:266] Elastic first model exec: entering model_fn scheduled_tokens=43 num_reqs=1
+INFO 04-29 10:13:42 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m WARNING 04-29 10:13:42 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+ERROR 04-29 10:13:42 [core_client.py:566] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+[1;36m(EngineCore_DP0 pid=1188873)[0;0m INFO 04-29 10:13:42 [core.py:279] Elastic first model exec: model_fn returned
+INFO 04-29 10:13:42 [llm.py:313] Supported_tasks: ['generate']
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:42 [core.py:266] Elastic first model exec: entering model_fn scheduled_tokens=74 num_reqs=1
+INFO 04-29 10:13:42 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m WARNING 04-29 10:13:42 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=1188918)[0;0m INFO 04-29 10:13:42 [core.py:279] Elastic first model exec: model_fn returned
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:42 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen2.5-1.5B-Instruct...
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.35it/s]
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  3.35it/s]
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m 
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:43 [default_loader.py:267] Loading weights took 0.42 seconds
+{"event": "sidecar_done", "model_load_time_s": 30.471092561259866, "inference_time_s": 2.0693632680922747, "total_time_s": 32.5410051625222, "num_requests": 4, "total_prompts": 32, "shard_index": 0, "num_shards": 8, "num_output_tokens": 512, "tokens_per_s": 247.41910127360464, "output_file": "sidecar_runs/20260429100949/outputs.jsonl.shard0"}
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:44 [model_runner_v1.py:2992] Loading model weights took 2.8834 GB
+sidecar_shard_end_time=1777428824.164522332 shard=4 device=4 exit_code=0
+{"event": "sidecar_done", "model_load_time_s": 30.30385892279446, "inference_time_s": 2.2286486718803644, "total_time_s": 32.53304477967322, "num_requests": 4, "total_prompts": 32, "shard_index": 1, "num_shards": 8, "num_output_tokens": 512, "tokens_per_s": 229.73562700127755, "output_file": "sidecar_runs/20260429100949/outputs.jsonl.shard1"}
+{"event": "sidecar_done", "model_load_time_s": 30.23791774176061, "inference_time_s": 2.2918534874916077, "total_time_s": 32.53038657642901, "num_requests": 4, "total_prompts": 32, "shard_index": 2, "num_shards": 8, "num_output_tokens": 512, "tokens_per_s": 223.39996984727622, "output_file": "sidecar_runs/20260429100949/outputs.jsonl.shard2"}
+sidecar_shard_end_time=1777428824.647515621 shard=5 device=5 exit_code=0
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:46 [worker_v1.py:341] Available memory: 26946361446, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:46 [kv_cache_utils.py:1087] GPU KV cache size: 939,776 tokens
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:46 [kv_cache_utils.py:1091] Maximum concurrency for 32,768 tokens per request: 28.68x
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:46 [core.py:214] init engine (profile, create kv cache, warmup model) took 2.20 seconds
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:46 [core.py:116] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m max_num_running_reqs: 16 max_num_scheduled_tokens: 32768 max_model_len: 32768
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:46 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:46 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:46 [platform.py:179] Compilation disabled, using eager mode by default
+sidecar_shard_end_time=1777428826.835786391 shard=6 device=6 exit_code=0
+INFO 04-29 10:13:46 [llm.py:313] Supported_tasks: ['generate']
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:46 [core.py:266] Elastic first model exec: entering model_fn scheduled_tokens=86 num_reqs=1
+INFO 04-29 10:13:47 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m WARNING 04-29 10:13:47 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=1188836)[0;0m INFO 04-29 10:13:47 [core.py:279] Elastic first model exec: model_fn returned
+ERROR 04-29 10:13:47 [core_client.py:566] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+ERROR 04-29 10:13:47 [core_client.py:566] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+ERROR 04-29 10:13:48 [core_client.py:566] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+{"event": "sidecar_done", "model_load_time_s": 35.65029123239219, "inference_time_s": 2.2610290087759495, "total_time_s": 37.912070168182254, "num_requests": 4, "total_prompts": 32, "shard_index": 7, "num_shards": 8, "num_output_tokens": 512, "tokens_per_s": 226.44556881522755, "output_file": "sidecar_runs/20260429100949/outputs.jsonl.shard7"}
+sidecar_shard_end_time=1777428829.329151355 shard=0 device=0 exit_code=0
+sidecar_shard_end_time=1777428832.460518957 shard=1 device=1 exit_code=0
+sidecar_shard_end_time=1777428832.469138354 shard=2 device=2 exit_code=0
+ERROR 04-29 10:13:53 [core_client.py:566] Engine core proc EngineCore_DP0 died unexpectedly, shutting down client.
+sidecar_shard_end_time=1777428835.743576231 shard=7 device=7 exit_code=0
+sidecar_end_time=1777428835.754212410
+sidecar_exit_code=0
+sidecar_killed_by_deadline=0
+sidecar_exit_time=1777428836.317479979 sidecar_exit_code=0
+watch_end_time=1777428836.319708191

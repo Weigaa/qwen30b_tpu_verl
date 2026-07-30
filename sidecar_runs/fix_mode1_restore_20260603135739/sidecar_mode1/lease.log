@@ -1,0 +1,23 @@
+watch_start_time=1780495059.979478512
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603215739_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+watch_start_trigger=shrink_done
+watch_graceful_kill_seconds=3
+watch_max_shrink_total_ms=0
+watch_sidecar_stop_file=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/outputs.jsonl.stop_requested
+shrink_window_detected_time=1780495311.122177681 active_count=8
+shrink_window_line=[36m(WorkerDict pid=1197307)[0m INFO 06-03 22:01:50 [worker_v1.py:7354] Elastic parallel shrink done: rank=10 active_ranks=[8, 9, 10, 11, 12, 13, 14, 15] dp_size=8 ep_size=8 no_ep_tail=False rebuild_ms=12016.96 refresh_ms=137.53 warmup_ms=823.33 total_ms=14900.57
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1780495311.156456727
+sidecar_active_ranks=8,9,10,11,12,13,14,15
+sidecar_devices=0,1,2,3,4,5,6,7
+sidecar_pid=1220767
+sidecar_deadline_signal_time=1780495375.602252611
+sidecar_deadline_signal_line=[36m(TaskRunner pid=1194024)[0m [Rank 0 | Local Rank 0] 2026-06-03 22:02:53,570 INFO [verl.trainer.ppo.ray_trainer:373] => Elastic parallel restore requested before rollout restore rpc
+sidecar_stop_request_time=1780495375.606626371 reason=training_rollout_done_or_restore pid=1220767 stop_file=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/outputs.jsonl.stop_requested
+sidecar_kill_time=1780495378.037254602 reason=training_rollout_done_or_restore pid=1220767 after_soft_stop=1
+sidecar_output_merge_time=1780495378.268583024 output=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/outputs.jsonl shards=8
+watch_end_time=1780495378.273882018
+sidecar_output_merge_time=1780495378.292163791 output=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_20260603135739/sidecar_mode1/outputs.jsonl shards=8

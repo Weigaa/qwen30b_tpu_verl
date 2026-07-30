@@ -1,4 +1,7 @@
-set -ex
+set -e
+if [[ "${VERL_SCRIPT_XTRACE:-0}" == "1" ]]; then
+    set -x
+fi
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
@@ -7,6 +10,11 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/asdsip/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [[ "${VERL_ELASTIC_PREFLIGHT_CLEANUP:-0}" == "1" ]]; then
+    "${ROOT_DIR}/internal/cleanup_elastic_runtime.sh" --kill
+fi
 
 export HYDRA_FULL_ERROR=1
 #export ASCEND_LAUNCH_BLOCKING=1         
@@ -24,7 +32,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export MASTER_PORT=23300    # vllm port error
 export D2D_DATA_TRANSFER=1
 export VLLM_USE_V1=1
-export PRINT_MEMORY=1
+export PRINT_MEMORY=${PRINT_MEMORY:-0}
 export USE_ALLTOALL_OVERLAP=1
 export HCCL_OP_EXPANSION_MODE=AIV
 export VLLM_LOGGING_LEVEL=INFO
@@ -143,8 +151,8 @@ export VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC:-
 export VLLM_ASCEND_MODE3_TRANSFER_LOG=${VLLM_ASCEND_MODE3_TRANSFER_LOG:-0}
 export VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG:-0}
 export VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N:-4}
-export VLLM_ASCEND_MODE3_TIMING_LOG=${VLLM_ASCEND_MODE3_TIMING_LOG:-1}
-export VLLM_ASCEND_MODE3_TIMING_SYNC=${VLLM_ASCEND_MODE3_TIMING_SYNC:-1}
+export VLLM_ASCEND_MODE3_TIMING_LOG=${VLLM_ASCEND_MODE3_TIMING_LOG:-0}
+export VLLM_ASCEND_MODE3_TIMING_SYNC=${VLLM_ASCEND_MODE3_TIMING_SYNC:-0}
 export VLLM_ASCEND_MODE3_TIMING_EVERY=${VLLM_ASCEND_MODE3_TIMING_EVERY:-1024}
 export VLLM_ASCEND_MODE3_TIMING_FIRST_N=${VLLM_ASCEND_MODE3_TIMING_FIRST_N:-1}
 export VLLM_ASCEND_MODE3_TIMING_LAYERS=${VLLM_ASCEND_MODE3_TIMING_LAYERS:-all}
@@ -152,7 +160,7 @@ export VLLM_ASCEND_MODE3_TIMING_LAYERS=${VLLM_ASCEND_MODE3_TIMING_LAYERS:-all}
 export VLLM_MOE_PATTERN_STATS=${VLLM_MOE_PATTERN_STATS:-0}  # 1: enable MoE pattern stats collection, 0: disable
 export VLLM_MOE_STATS=${VLLM_MOE_PATTERN_STATS}
 export VLLM_MOE_STATS_DIR=${VLLM_MOE_STATS_DIR:-./moe_stats}
-echo "[moe pattern stats] enabled=${VLLM_MOE_PATTERN_STATS} dir=${VLLM_MOE_STATS_DIR} mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} hybrid_slots=${VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS} mode3_async_npu_prefetch=${VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH} mode3_async_cpu_stage=${VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE} mode3_async_cpu_pack=${VLLM_ASCEND_MODE3_ASYNC_CPU_PACK} mode3_direct_cpu_slot=${VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT} mode3_bulk_npu_copy=${VLLM_ASCEND_MODE3_BULK_NPU_COPY} mode3_bulk_cpu_stage=${VLLM_ASCEND_MODE3_BULK_CPU_STAGE} mode3_bulk_cpu_direct=${VLLM_ASCEND_MODE3_BULK_CPU_DIRECT} mode3_layer_local_buffer=${VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER} mode3_use_fused_experts_path=${VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH} mode3_expert_token_nums_type=${VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE} mode3_active_rows_sync=${VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC} mode3_device_ready_wait=${VLLM_ASCEND_MODE3_DEVICE_READY_WAIT} mode3_transfer_log=${VLLM_ASCEND_MODE3_TRANSFER_LOG} mode3_transfer_plan_log=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG} mode3_transfer_plan_first_n=${VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N} mode3_timing_log=${VLLM_ASCEND_MODE3_TIMING_LOG} mode3_timing_sync=${VLLM_ASCEND_MODE3_TIMING_SYNC} mode3_timing_every=${VLLM_ASCEND_MODE3_TIMING_EVERY} mode3_timing_first_n=${VLLM_ASCEND_MODE3_TIMING_FIRST_N} mode3_timing_layers=${VLLM_ASCEND_MODE3_TIMING_LAYERS} elastic_cache_mc2=${VLLM_ASCEND_ELASTIC_CACHE_MC2_GROUPS} elastic_keep_group_cache=${VLLM_ASCEND_ELASTIC_KEEP_GROUP_CACHE} elastic_group_stage_barrier=${VLLM_ASCEND_ELASTIC_GROUP_STAGE_BARRIER}"
+echo "[elastic config] mode=${VLLM_ASCEND_ELASTIC_EXECUTION_MODE} floor=${VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE} cache_mc2=${VLLM_ASCEND_ELASTIC_CACHE_MC2_GROUPS} keep_group_cache=${VLLM_ASCEND_ELASTIC_KEEP_GROUP_CACHE} group_stage_barrier=${VLLM_ASCEND_ELASTIC_GROUP_STAGE_BARRIER} moe_stats=${VLLM_MOE_PATTERN_STATS} mode3_timing=${VLLM_ASCEND_MODE3_TIMING_LOG}/${VLLM_ASCEND_MODE3_TIMING_SYNC}"
 #模拟样本缩短规则
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=4,8,12,16,20
 # export VERL_ELASTIC_TAIL_VALIDATE_LEVEL_TOKENS=256,512,640,768,896
@@ -183,8 +191,9 @@ export VERL_SIDECAR_MODEL_PATH=${VERL_SIDECAR_MODEL_PATH:-"/home/sharedata/model
 export VERL_SIDECAR_PROMPTS_FILE=${VERL_SIDECAR_PROMPTS_FILE:-"/home/qiuzy/verl_dev/data/gsm8k"}
 # Only keep non-default sidecar knobs here. Defaults live in
 # internal/run_elastic_sidecar_infer.sh.
+export VERL_SIDECAR_GPU_MEMORY_UTILIZATION=0.9
 export VERL_SIDECAR_MAX_NUM_SEQS=${VERL_SIDECAR_MAX_NUM_SEQS:-2}
-export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS:-65536}
+export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS:-8192}
 export VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-6144}
 export VERL_SIDECAR_MAX_TOKENS=${VERL_SIDECAR_MAX_TOKENS:-4096}
 export VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA=${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA:-4}
@@ -193,8 +202,14 @@ export VERL_SIDECAR_STATE_DIR=${VERL_SIDECAR_STATE_DIR:-"sidecar_runs/state/pang
 export VERL_SIDECAR_PARALLEL_MODE=${VERL_SIDECAR_PARALLEL_MODE:-hybrid}
 export VERL_SIDECAR_TENSOR_PARALLEL_SIZE=${VERL_SIDECAR_TENSOR_PARALLEL_SIZE:-4}
 export VERL_SIDECAR_REPLICA_COUNT=${VERL_SIDECAR_REPLICA_COUNT:-2}
-export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL:-0}
+export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL=${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL:-1}
 export VERL_SIDECAR_MODEL_IS_MOE=${VERL_SIDECAR_MODEL_IS_MOE:-1}
+# Pangu-72B startup is heavy. If the training-side shrink already falls into
+# an abnormal HCCL slow path, skip sidecar instead of adding more pressure.
+export VERL_SIDECAR_MAX_SHRINK_TOTAL_MS=${VERL_SIDECAR_MAX_SHRINK_TOTAL_MS:-30000}
+# Training restore has priority over preserving partial sidecar progress for
+# this large-model validation.
+export VERL_SIDECAR_GRACEFUL_KILL_SECONDS=${VERL_SIDECAR_GRACEFUL_KILL_SECONDS:-0}
 sidecar_record_name="record_72b_tp${VERL_SIDECAR_TENSOR_PARALLEL_SIZE}dp${VERL_SIDECAR_REPLICA_COUNT}_${time}"
 logfile="${HOME}/${sidecar_record_name}${elastic_suffix}.txt"
 export VERL_SIDECAR_LOG_DIR=${VERL_SIDECAR_LOG_DIR:-"sidecar_runs/${sidecar_record_name}"}
@@ -222,7 +237,9 @@ else
     echo "[elastic sidecar] enabled=0"
 fi
 
-set -x
+if [[ "${VERL_SCRIPT_XTRACE:-0}" == "1" ]]; then
+    set -x
+fi
 
 python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     --config-name='ppo_megatron_trainer.yaml'\

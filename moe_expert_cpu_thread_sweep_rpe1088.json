@@ -1,0 +1,120 @@
+{
+  "model_config": "/home/data/Qwen3-30B-A3B/config.json",
+  "tokens": 17408,
+  "rows_per_expert": [
+    1088
+  ],
+  "active_experts": null,
+  "ep_size": 16,
+  "dtype": "bfloat16",
+  "cpu": "Kunpeng 920 7285Z To be filled by O.E.M. CPU @ 3.0GHz",
+  "torch": null,
+  "torch_npu": null,
+  "cases": [
+    {
+      "scope": "ep-local",
+      "hidden_size": 2048,
+      "intermediate_size": 768,
+      "num_experts": 128,
+      "top_k": 8,
+      "ep_size": 16,
+      "num_tokens": 17408,
+      "active_experts": 8,
+      "expanded_rows": 8704,
+      "rows_per_expert": 1088
+    }
+  ],
+  "results": [
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe1088",
+      "device": "cpu-openblas-numa-fp32",
+      "workers": "8x1,1,1,1,1,1,1,1",
+      "active_experts": 8,
+      "expanded_rows": 8704,
+      "rows_per_expert": 1088,
+      "median_ms": 391.09389996156096,
+      "min_ms": 389.7531939437613,
+      "p90_ms": 403.44597194343805,
+      "tflops": 0.21002948280214376
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe1088",
+      "device": "cpu-openblas-numa-fp32",
+      "workers": "8x2,2,2,2,2,2,2,2",
+      "active_experts": 8,
+      "expanded_rows": 8704,
+      "rows_per_expert": 1088,
+      "median_ms": 254.58337808959186,
+      "min_ms": 250.72280992753804,
+      "p90_ms": 260.94996756874025,
+      "tflops": 0.32264969595577137
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe1088",
+      "device": "cpu-openblas-numa-fp32",
+      "workers": "8x4,4,4,4,4,4,4,4",
+      "active_experts": 8,
+      "expanded_rows": 8704,
+      "rows_per_expert": 1088,
+      "median_ms": 155.51304793916643,
+      "min_ms": 149.3084189714864,
+      "p90_ms": 286.99493356980383,
+      "tflops": 0.528195226217494
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe1088",
+      "device": "cpu-openblas-numa-fp32",
+      "workers": "8x5,5,5,5,5,5,5,5",
+      "active_experts": 8,
+      "expanded_rows": 8704,
+      "rows_per_expert": 1088,
+      "median_ms": 83.31207907758653,
+      "min_ms": 79.05468996614218,
+      "p90_ms": 85.47608149237931,
+      "tflops": 0.9859464611308504
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe1088",
+      "device": "cpu-openblas-numa-fp32",
+      "workers": "8x10,10,10,10,10,10,10,10",
+      "active_experts": 8,
+      "expanded_rows": 8704,
+      "rows_per_expert": 1088,
+      "median_ms": 42.2754620667547,
+      "min_ms": 32.27218601386994,
+      "p90_ms": 43.565276404842734,
+      "tflops": 1.9430006325252125
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe1088",
+      "device": "cpu-openblas-numa-fp32",
+      "workers": "8x20,20,20,20,20,20,20,20",
+      "active_experts": 8,
+      "expanded_rows": 8704,
+      "rows_per_expert": 1088,
+      "median_ms": 227.58094500750303,
+      "min_ms": 43.121347087435424,
+      "p90_ms": 291.89933463931084,
+      "tflops": 0.36093201710403267
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e8/rpe1088",
+      "device": "cpu-openblas-numa-fp32",
+      "workers": "8x40,40,40,40,40,40,40,40",
+      "active_experts": 8,
+      "expanded_rows": 8704,
+      "rows_per_expert": 1088,
+      "median_ms": 335.9915289329365,
+      "min_ms": 324.2269059410319,
+      "p90_ms": 355.2801202284172,
+      "tflops": 0.2444741681341475
+    }
+  ]
+}

@@ -13,6 +13,7 @@
 # limitations under the License.
 import inspect
 import logging
+import os
 import socket
 import threading
 from copy import deepcopy
@@ -31,10 +32,62 @@ from verl.utils.py_functional import temp_env_var
 __all__ = ["Worker"]
 
 
+_MASTER_PORT_LOCK = threading.Lock()
 _HCCL_IF_BASE_PORT_LOCK = threading.Lock()
-_HCCL_IF_BASE_PORT_NEXT = 20000
-_HCCL_IF_BASE_PORT_BLOCK = 12288
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _normalize_port_start(port: int, default: int, upper_limit: int) -> int:
+    if port < 1024 or port > upper_limit:
+        return default
+    return port
+
+
+def _ranges_overlap(a_start: int, a_size: int, b_start: int, b_size: int) -> bool:
+    return a_start < b_start + b_size and b_start < a_start + a_size
+
+
+def _can_bind_port(port: int) -> bool:
+    try:
+        with socket.socket() as sock:
+            sock.bind(("", port))
+        return True
+    except OSError:
+        return False
+
+
+_MASTER_PORT_BLOCK = _env_int("VERL_MASTER_PORT_BLOCK", 128)
+_MASTER_PORT_LIMIT = 65535 - _MASTER_PORT_BLOCK
+_MASTER_PORT_START = _normalize_port_start(
+    _env_int("VERL_MASTER_PORT_START", _env_int("MASTER_PORT", 12000)),
+    default=12000,
+    upper_limit=_MASTER_PORT_LIMIT,
+)
+_MASTER_PORT_NEXT = _MASTER_PORT_START
+
+# Respect an explicitly exported launcher HCCL base-port first. The mode5
+# launcher already threads HCCL_IF_BASE_PORT through the top-level environment,
+# but the WorkerGroup allocator used to ignore it and always restart from
+# 20000, which made repeated validations self-collide on the same HCCL port
+# range even when the launcher asked for a different block.
+_HCCL_IF_BASE_PORT_BLOCK = _env_int("VERL_HCCL_IF_BASE_PORT_BLOCK", 12288)
 _HCCL_IF_BASE_PORT_LIMIT = 65535 - _HCCL_IF_BASE_PORT_BLOCK
+_HCCL_IF_BASE_PORT_START = _normalize_port_start(
+    _env_int(
+        "VERL_HCCL_IF_BASE_PORT_START",
+        _env_int("HCCL_IF_BASE_PORT", 20000),
+    ),
+    default=20000,
+    upper_limit=_HCCL_IF_BASE_PORT_LIMIT,
+)
+_HCCL_IF_BASE_PORT_NEXT = _HCCL_IF_BASE_PORT_START
+_HCCL_PHASE_PORT_OFFSETS = (0, 4096, 8192)
 
 
 def get_random_string(length: int) -> str:
@@ -48,12 +101,41 @@ def get_random_string(length: int) -> str:
 def _alloc_hccl_if_base_port() -> str:
     global _HCCL_IF_BASE_PORT_NEXT
     with _HCCL_IF_BASE_PORT_LOCK:
-        port = _HCCL_IF_BASE_PORT_NEXT
-        if port > _HCCL_IF_BASE_PORT_LIMIT:
-            port = 20000
-            _HCCL_IF_BASE_PORT_NEXT = 20000
-        _HCCL_IF_BASE_PORT_NEXT += _HCCL_IF_BASE_PORT_BLOCK
-        return str(port)
+        for _ in range(512):
+            port = _HCCL_IF_BASE_PORT_NEXT
+            if port > _HCCL_IF_BASE_PORT_LIMIT:
+                port = _HCCL_IF_BASE_PORT_START
+                _HCCL_IF_BASE_PORT_NEXT = _HCCL_IF_BASE_PORT_START
+            _HCCL_IF_BASE_PORT_NEXT += _HCCL_IF_BASE_PORT_BLOCK
+            if all(_can_bind_port(port + offset) for offset in _HCCL_PHASE_PORT_OFFSETS):
+                return str(port)
+    raise RuntimeError(
+        "Unable to allocate a free HCCL_IF_BASE_PORT block. "
+        "Set VERL_HCCL_IF_BASE_PORT_START/HCCL_IF_BASE_PORT to a free range."
+    )
+
+
+def _alloc_master_port(hccl_if_base_port: str) -> str:
+    global _MASTER_PORT_NEXT
+    hccl_port = int(hccl_if_base_port)
+    with _MASTER_PORT_LOCK:
+        for _ in range(512):
+            port = _MASTER_PORT_NEXT
+            if port > _MASTER_PORT_LIMIT:
+                port = _MASTER_PORT_START
+                _MASTER_PORT_NEXT = _MASTER_PORT_START
+            _MASTER_PORT_NEXT += _MASTER_PORT_BLOCK
+            if _ranges_overlap(port, _MASTER_PORT_BLOCK, hccl_port, _HCCL_IF_BASE_PORT_BLOCK):
+                continue
+            if not _can_bind_port(port):
+                continue
+            return str(port)
+    raise RuntimeError(
+        "Unable to allocate a free MASTER_PORT outside the HCCL port window "
+        f"[{hccl_port}, {hccl_port + _HCCL_IF_BASE_PORT_BLOCK}). "
+        "Set VERL_MASTER_PORT_START/MASTER_PORT or VERL_HCCL_IF_BASE_PORT_START "
+        "to non-overlapping ranges."
+    )
 
 
 def func_generator(self, method_name, dispatch_fn, collect_fn, execute_fn, blocking):
@@ -382,7 +464,7 @@ class RayWorkerGroup(WorkerGroup):
 
     def _get_master_addr_port(self, pg):
         """Get master addr and port for this worker group"""
-        self._master_addr, self._master_port, _ = ray.get(
+        self._master_addr, _, _ = ray.get(
             get_master_addr_port.options(
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg, placement_group_bundle_index=0
@@ -394,6 +476,9 @@ class RayWorkerGroup(WorkerGroup):
         # "base" is not enough because actor/rollout/ref phases then carve out
         # overlapping sub-ranges and can race into Bind_Failed(EJ0003).
         self._hccl_if_base_port = _alloc_hccl_if_base_port()
+        # MASTER_PORT must not fall inside the HCCL reserved window. A random
+        # free port can be valid for TCP but still collide with HCCL internals.
+        self._master_port = _alloc_master_port(self._hccl_if_base_port)
         logging.info(
             "WorkerGroup %s uses MASTER_PORT=%s HCCL_IF_BASE_PORT=%s",
             self.name_prefix,

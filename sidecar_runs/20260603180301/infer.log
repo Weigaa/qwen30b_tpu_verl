@@ -1,0 +1,45 @@
+sidecar_start_time=1780481188.771229623
+sidecar_devices=0,1,2,3,4,5,6,7
+sidecar_device_count=8
+sidecar_replica_count=8
+sidecar_parallel_mode=dp
+sidecar_tensor_parallel_size=1
+sidecar_data_parallel_size=1
+sidecar_device_groups=0;1;2;3;4;5;6;7
+sidecar_unused_devices=
+sidecar_master_addr=192.168.0.163
+sidecar_force_host_ip_for_tp=1
+sidecar_vllm_host_ip=
+sidecar_vllm_multiproc_host_ip=
+sidecar_vllm_reuse_world_group=
+sidecar_master_port_base=24300
+sidecar_master_ports=24300,24332,24364,24396,24428,24460,24492,24524
+sidecar_master_port_stride=32
+sidecar_data_parallel_rpc_ports=
+sidecar_hccl_if_base_port=52000
+sidecar_hccl_if_base_ports=52000,52000,52000,52000,52000,52000,52000,52000
+sidecar_hccl_host_socket_port_range=52000-52063
+sidecar_hccl_npu_socket_port_range=52064-52127
+sidecar_hccl_if_base_port_fixed=0
+sidecar_hccl_port_stride=2048
+sidecar_hccl_port_window=64
+sidecar_vllm_set_worker_rank_envs=
+sidecar_ep_allowed=0
+sidecar_model_is_moe=0
+sidecar_model_is_moe_reason=dense_or_unknown
+sidecar_ep_effective=0
+sidecar_model=/home/data/Qwen2.5-1.5B-Instruct
+sidecar_output=sidecar_runs/20260603180301/outputs.jsonl
+sidecar_state_dir=sidecar_runs/state/qwen25_15b_gsm8k_train
+sidecar_generate_chunk_size=32
+sidecar_stream_checkpoint=1
+sidecar_partial_sync_every_steps=0
+sidecar_stop_file=sidecar_runs/20260603180301/outputs.jsonl.stop_requested
+sidecar_shard_start_time=1780481188.779131019 shard=0 device_group=0 tp=1 dp=1 master_port=24300 data_parallel_rpc_port= hccl_if_base_port=52000 hccl_host_socket_port_range=52000-52063 hccl_npu_socket_port_range=52064-52127 output=sidecar_runs/20260603180301/outputs.jsonl.shard0
+sidecar_shard_start_time=1780481188.783750050 shard=1 device_group=1 tp=1 dp=1 master_port=24332 data_parallel_rpc_port= hccl_if_base_port=52000 hccl_host_socket_port_range=52000-52063 hccl_npu_socket_port_range=52064-52127 output=sidecar_runs/20260603180301/outputs.jsonl.shard1
+sidecar_shard_start_time=1780481188.788451612 shard=2 device_group=2 tp=1 dp=1 master_port=24364 data_parallel_rpc_port= hccl_if_base_port=52000 hccl_host_socket_port_range=52000-52063 hccl_npu_socket_port_range=52064-52127 output=sidecar_runs/20260603180301/outputs.jsonl.shard2
+sidecar_shard_start_time=1780481188.793473205 shard=3 device_group=3 tp=1 dp=1 master_port=24396 data_parallel_rpc_port= hccl_if_base_port=52000 hccl_host_socket_port_range=52000-52063 hccl_npu_socket_port_range=52064-52127 output=sidecar_runs/20260603180301/outputs.jsonl.shard3
+sidecar_shard_start_time=1780481188.798408337 shard=4 device_group=4 tp=1 dp=1 master_port=24428 data_parallel_rpc_port= hccl_if_base_port=52000 hccl_host_socket_port_range=52000-52063 hccl_npu_socket_port_range=52064-52127 output=sidecar_runs/20260603180301/outputs.jsonl.shard4
+sidecar_shard_start_time=1780481188.803327339 shard=5 device_group=5 tp=1 dp=1 master_port=24460 data_parallel_rpc_port= hccl_if_base_port=52000 hccl_host_socket_port_range=52000-52063 hccl_npu_socket_port_range=52064-52127 output=sidecar_runs/20260603180301/outputs.jsonl.shard5
+sidecar_shard_start_time=1780481188.808130461 shard=6 device_group=6 tp=1 dp=1 master_port=24492 data_parallel_rpc_port= hccl_if_base_port=52000 hccl_host_socket_port_range=52000-52063 hccl_npu_socket_port_range=52064-52127 output=sidecar_runs/20260603180301/outputs.jsonl.shard6
+sidecar_shard_start_time=1780481188.812874203 shard=7 device_group=7 tp=1 dp=1 master_port=24524 data_parallel_rpc_port= hccl_if_base_port=52000 hccl_host_socket_port_range=52000-52063 hccl_npu_socket_port_range=52064-52127 output=sidecar_runs/20260603180301/outputs.jsonl.shard7

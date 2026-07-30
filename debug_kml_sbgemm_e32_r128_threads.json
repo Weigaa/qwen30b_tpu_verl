@@ -1,0 +1,83 @@
+{
+  "model_config": "/home/data/Qwen3-30B-A3B/config.json",
+  "tokens": 17408,
+  "rows_per_expert": [
+    128
+  ],
+  "active_experts": [
+    32
+  ],
+  "ep_size": 16,
+  "dtype": "bfloat16",
+  "cpu": "Kunpeng 920 7285Z To be filled by O.E.M. CPU @ 3.0GHz",
+  "torch": null,
+  "torch_npu": null,
+  "cases": [
+    {
+      "scope": "ep-local",
+      "hidden_size": 2048,
+      "intermediate_size": 768,
+      "num_experts": 128,
+      "top_k": 8,
+      "ep_size": 16,
+      "num_tokens": 512,
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128
+    }
+  ],
+  "results": [
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e32/rpe128",
+      "device": "cpu-kml-sbgemm-numa-bf16-fp32",
+      "workers": "8x5,5,5,5,5,5,5,5",
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128,
+      "median_ms": 38.09502301737666,
+      "min_ms": 36.760517046786845,
+      "p90_ms": 40.09552837815136,
+      "tflops": 1.0146917524204682
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e32/rpe128",
+      "device": "cpu-kml-sbgemm-numa-bf16-fp32",
+      "workers": "8x10,10,10,10,10,10,10,10",
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128,
+      "median_ms": 29.910666053183377,
+      "min_ms": 13.906182954087853,
+      "p90_ms": 33.151938766241074,
+      "tflops": 1.2923385121303912
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e32/rpe128",
+      "device": "cpu-kml-sbgemm-numa-bf16-fp32",
+      "workers": "8x20,20,20,20,20,20,20,20",
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128,
+      "median_ms": 18.096162006258965,
+      "min_ms": 10.041565052233636,
+      "p90_ms": 26.9702787976712,
+      "tflops": 2.1360720384040772
+    },
+    {
+      "scope": "ep-local",
+      "case_key": "ep-local/e32/rpe128",
+      "device": "cpu-kml-sbgemm-numa-bf16-fp32",
+      "workers": "8x40,40,40,40,40,40,40,40",
+      "active_experts": 32,
+      "expanded_rows": 4096,
+      "rows_per_expert": 128,
+      "median_ms": 123.71284305118024,
+      "min_ms": 99.87463511060923,
+      "p90_ms": 186.20507142040879,
+      "tflops": 0.31245507508067266
+    }
+  ]
+}

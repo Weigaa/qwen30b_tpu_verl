@@ -129,6 +129,48 @@ def _dummy_profile_range(message: str):
             pass
 
 
+def _stage_decode_profile_message(kind: str,
+                                  layer: Any,
+                                  *,
+                                  path: str = "",
+                                  extra: str = "") -> str:
+    mode = int(getattr(layer, "elastic_execution_mode", 0))
+    stage = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+    layer_idx = int(getattr(layer, "layer_idx", -1))
+    parts = [
+        f"vllm_stage_decode_{kind}",
+        f"rank={_profile_rank()}",
+        f"mode={mode}",
+        f"stage={stage}",
+        f"layer={layer_idx}",
+    ]
+    if path:
+        parts.append(f"path={path}")
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
+
+def _stage_decode_profile_range_start(message: str) -> Optional[Any]:
+    if not _env_flag("VLLM_ASCEND_STAGE_DECODE_PROFILE_MARKERS", "0"):
+        return None
+    try:
+        from torch_npu.npu import mstx
+        return mstx.range_start(message=message)
+    except Exception:
+        return None
+
+
+def _stage_decode_profile_range_end(range_id: Optional[Any]) -> None:
+    if range_id is None:
+        return
+    try:
+        from torch_npu.npu import mstx
+        mstx.range_end(range_id)
+    except Exception:
+        pass
+
+
 def _profile_rank() -> int:
     try:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -617,6 +659,10 @@ class Mode3DoubleBufferManager:
         self.prefetch_hit = defaultdict(int)
         self.prefetch_wait_count = defaultdict(int)
         self.last_bind_timing: dict[str, Any] = {}
+        self.last_prefetch_timing_by_target_layer: dict[int, dict[str, Any]] = {}
+        self.last_ffn_enter_wall_ts_by_layer: dict[int, float] = {}
+        self._stage_decode_compute_ranges_by_target_layer: dict[int, Any] = {}
+        self._stage_decode_comm_ranges_by_target_layer: dict[int, Any] = {}
         self._logged_slot_bindings: set[tuple[int, int, int]] = set()
         self._logged_prefetches: set[tuple[int, int]] = set()
         self._logged_prefetch_deferrals: set[tuple[int, int]] = set()
@@ -1983,6 +2029,12 @@ class Mode3DoubleBufferManager:
         if self._slot_matches(slot, layer):
             return slot
         submit_start = time.perf_counter()
+        prefetch_submit_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "prefetch_submit",
+                layer,
+                path=reason,
+                extra=f"slot={slot_id} async={int(async_copy)}"))
         host_timing: Optional[dict[str, float]] = (
             {} if self.enable_timing_logs else None)
         event_alloc_start = time.perf_counter()
@@ -2113,6 +2165,7 @@ class Mode3DoubleBufferManager:
                 list(slot.expert_ids[:8]),
             )
             self._logged_prefetches.add((int(layer.layer_idx), slot_id))
+        _stage_decode_profile_range_end(prefetch_submit_range)
         return slot
 
     def prepare_mode4_block_slot(self,
@@ -2130,6 +2183,14 @@ class Mode3DoubleBufferManager:
             raise RuntimeError(
                 f"Mode4 block prefetch found no active layers at start={block_start}.")
         submit_start = time.perf_counter()
+        prefetch_submit_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "prefetch_submit",
+                layer,
+                path=reason,
+                extra=(f"slot={slot_id} async={int(async_copy)} "
+                       f"block_start={block_start} "
+                       f"block_layers={len(block_layers)}")))
         host_timing: Optional[dict[str, float]] = (
             {} if self.enable_timing_logs else None)
         event_alloc_start = time.perf_counter()
@@ -2234,6 +2295,7 @@ class Mode3DoubleBufferManager:
                 slot.source_from_remote_npu,
             )
             self._logged_mode4_block_prefetch.add(log_key)
+        _stage_decode_profile_range_end(prefetch_submit_range)
         return slot
 
     def bind_current_layer(self, layer: Any) -> _Mode3DoubleBufferSlot:
@@ -2252,6 +2314,16 @@ class Mode3DoubleBufferManager:
                     f"layer={getattr(layer, 'layer_idx', -1)} "
                     f"block_start={slot.block_start_layer}")
         wait_start = time.perf_counter()
+        bind_wait_begin_wall_ts = wait_start
+        current_layer_idx = int(layer.layer_idx)
+        _stage_decode_profile_range_end(
+            self._stage_decode_compute_ranges_by_target_layer.pop(
+                current_layer_idx, None))
+        bind_wait_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "bind_wait",
+                layer,
+                extra=f"prefetched_hit={int(prefetched_hit)}"))
         ready_wait_start_event = None
         ready_wait_end_event = None
         # Ensure the current layer never starts computing before every expert
@@ -2273,6 +2345,11 @@ class Mode3DoubleBufferManager:
         cpu_fill_start = time.perf_counter()
         self._fill_pending_cpu_rows(slot, layer)
         cpu_fill_us = (time.perf_counter() - cpu_fill_start) * 1e6
+        bind_ready_wall_ts = time.perf_counter()
+        _stage_decode_profile_range_end(bind_wait_range)
+        _stage_decode_profile_range_end(
+            self._stage_decode_comm_ranges_by_target_layer.pop(
+                current_layer_idx, None))
         self.prefetch_wait_us[int(layer.layer_idx)] += wait_us
         self.prefetch_wait_count[int(layer.layer_idx)] += 1
         if prefetched_hit:
@@ -2306,6 +2383,39 @@ class Mode3DoubleBufferManager:
             "prefetched_hit": bool(prefetched_hit),
             "prefetch_hit_count": int(self.prefetch_hit[int(layer.layer_idx)]),
         }
+        prefetch_timing = self.last_prefetch_timing_by_target_layer.get(
+            current_layer_idx, {})
+        source_layer_idx = current_layer_idx - 1
+        ffn_enter_wall_ts = float(
+            self.last_ffn_enter_wall_ts_by_layer.get(source_layer_idx, -1.0))
+        prefetch_start_wall_ts = float(
+            prefetch_timing.get(
+                "prefetch_start_wall_ts",
+                prefetch_timing.get("prefetch_issue_wall_ts", -1.0)))
+        prefetch_issue_wall_ts = prefetch_start_wall_ts
+        strict_overlap_start_wall_ts = prefetch_issue_wall_ts
+        strict_compute_wall_ms = -1.0
+        strict_comm_wall_ms = -1.0
+        strict_wait_wall_ms = -1.0
+        if strict_overlap_start_wall_ts > 0:
+            strict_compute_wall_ms = (
+                bind_wait_begin_wall_ts - strict_overlap_start_wall_ts) * 1e3
+            strict_comm_wall_ms = (
+                bind_ready_wall_ts - strict_overlap_start_wall_ts) * 1e3
+        if bind_ready_wall_ts >= bind_wait_begin_wall_ts:
+            strict_wait_wall_ms = (
+                bind_ready_wall_ts - bind_wait_begin_wall_ts) * 1e3
+        self.last_bind_timing.update({
+            "ffn_enter_wall_ts": ffn_enter_wall_ts,
+            "prefetch_start_wall_ts": prefetch_start_wall_ts,
+            "prefetch_issue_wall_ts": prefetch_issue_wall_ts,
+            "strict_overlap_start_wall_ts": strict_overlap_start_wall_ts,
+            "bind_wait_begin_wall_ts": bind_wait_begin_wall_ts,
+            "bind_ready_wall_ts": bind_ready_wall_ts,
+            "strict_compute_wall_ms": strict_compute_wall_ms,
+            "strict_comm_wall_ms": strict_comm_wall_ms,
+            "strict_wait_wall_ms": strict_wait_wall_ms,
+        })
         layer.runtime_w13_weight = slot.w13[row_base:row_base +
                                             valid_expert_count]
         layer.runtime_w2_weight = slot.w2[row_base:row_base +
@@ -2376,6 +2486,27 @@ class Mode3DoubleBufferManager:
                 list(tuple(self._ordered_mode3_slot_expert_ids(layer))[:8]),
             )
             self._logged_slot_bindings.add(log_key)
+        if self.should_profile_layer(layer, "strict-ffn"):
+            logger.info(
+                "Mode%s strict-ffn-timing: rank=%s layer=%s stage=%s ffn_enter_wall_ts=%.6f prefetch_issue_wall_ts=%.6f strict_overlap_start_wall_ts=%.6f bind_wait_begin_wall_ts=%.6f bind_ready_wall_ts=%.6f strict_compute_wall_ms=%.3f strict_comm_wall_ms=%.3f strict_wait_wall_ms=%.3f bind_wait_us=%.1f prefetched_hit=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s",
+                int(getattr(layer, "elastic_execution_mode", 3)),
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                ffn_enter_wall_ts,
+                prefetch_issue_wall_ts,
+                strict_overlap_start_wall_ts,
+                bind_wait_begin_wall_ts,
+                bind_ready_wall_ts,
+                strict_compute_wall_ms,
+                strict_comm_wall_ms,
+                strict_wait_wall_ms,
+                wait_us,
+                int(prefetched_hit),
+                source_from_npu,
+                source_from_remote_npu,
+                source_from_cpu,
+            )
         return slot
 
     def _prefetch_layer(self, target_layer: Any, reason: str) -> dict[str, Any]:
@@ -2424,12 +2555,41 @@ class Mode3DoubleBufferManager:
             }
         next_slot_id = self._slot_id_for_runtime_layer(target_layer)
         was_match = self._slot_matches(self.slots[next_slot_id], target_layer)
+        prefetch_start_wall_ts = float(time.perf_counter())
+        target_layer_idx = int(target_layer.layer_idx)
+        _stage_decode_profile_range_end(
+            self._stage_decode_compute_ranges_by_target_layer.pop(
+                target_layer_idx, None))
+        _stage_decode_profile_range_end(
+            self._stage_decode_comm_ranges_by_target_layer.pop(
+                target_layer_idx, None))
+        self._stage_decode_compute_ranges_by_target_layer[
+            target_layer_idx] = _stage_decode_profile_range_start(
+                _stage_decode_profile_message(
+                    "compute_window",
+                    target_layer,
+                    path="prefetch_to_bind_wait",
+                    extra=f"target_layer={target_layer_idx} slot={next_slot_id} hit={int(was_match)}"))
+        self._stage_decode_comm_ranges_by_target_layer[
+            target_layer_idx] = _stage_decode_profile_range_start(
+                _stage_decode_profile_message(
+                    "comm_window",
+                    target_layer,
+                    path="prefetch_to_bind_ready",
+                    extra=f"target_layer={target_layer_idx} slot={next_slot_id} hit={int(was_match)}"))
         slot = self.prepare_slot(target_layer,
                                  next_slot_id,
                                  async_copy=True,
                                  reason=reason)
         timing = dict(getattr(slot, "prefetch_timing", {}))
         timing["status"] = "hit" if was_match else "scheduled"
+        timing["target_layer_idx"] = target_layer_idx
+        timing["prefetch_start_wall_ts"] = prefetch_start_wall_ts
+        # Backward compatibility: older analysis scripts used the issue field.
+        # It now intentionally means the real prefetch-start wall timestamp.
+        timing["prefetch_issue_wall_ts"] = prefetch_start_wall_ts
+        self.last_prefetch_timing_by_target_layer[target_layer_idx] = dict(
+            timing)
         return timing
 
     def prefetch_next_layer(self, current_layer: Any) -> dict[str, Any]:
@@ -2899,12 +3059,20 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             raise RuntimeError(
                 "Mode3/4 single-rank AllGather path requires forward-context "
                 f"model instance and prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
         profile_timing = manager.should_profile_layer(layer,
                                                       "single_rank_allgather")
         bound_slot = manager.bind_current_layer(layer)
         bind_timing = dict(manager.last_bind_timing)
         next_prefetch_timing = manager.prefetch_next_layer(layer)
         compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="single_rank_allgather"))
         compute_start_event = manager.new_timing_event() if profile_timing else None
         compute_end_event = manager.new_timing_event() if profile_timing else None
         remap_start_event = manager.new_timing_event() if profile_timing else None
@@ -2975,6 +3143,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 token_dispatcher.num_experts_local = old_num_experts_local
         fused_wall_ms = (time.perf_counter() - fused_wall_start) * 1e3
         _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
         compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
         layer.lossless_hybrid_last_stats = {
@@ -3126,6 +3295,11 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             raise RuntimeError(
                 "Mode3 fused-experts path requires forward-context model "
                 f"instance and moe prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
         profile_timing = manager.should_profile_layer(layer, "fused_experts")
         bound_slot = manager.bind_current_layer(layer)
         bind_timing = dict(manager.last_bind_timing)
@@ -3162,6 +3336,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
 
         compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="fused_experts"))
         compute_start_event = manager.new_timing_event() if profile_timing else None
         compute_end_event = manager.new_timing_event() if profile_timing else None
         fused_start_event = manager.new_timing_event() if profile_timing else None
@@ -3214,6 +3391,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 token_dispatcher.expert_token_nums_type = (
                     old_expert_token_nums_type)
         _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
         compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
         layer.lossless_hybrid_last_stats = {
@@ -3397,11 +3575,19 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 enable_force_load_balance=enable_force_load_balance,
                 kwargs=kwargs,
                 manager=manager)
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
         profile_timing = manager.should_profile_layer(layer, "single_dispatch")
         bound_slot = manager.bind_current_layer(layer)
         bind_timing = dict(manager.last_bind_timing)
         next_prefetch_timing = manager.prefetch_next_layer(layer)
         compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="single_dispatch"))
         compute_start_event = manager.new_timing_event() if profile_timing else None
         compute_end_event = manager.new_timing_event() if profile_timing else None
         remap_start_event = manager.new_timing_event() if profile_timing else None
@@ -3576,6 +3762,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 token_dispatcher.num_experts_local = old_dispatch_num_experts_local
             token_dispatcher.expert_token_nums_type = old_expert_token_nums_type
         _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
         compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
 
         layer.lossless_hybrid_last_stats = {
@@ -5133,7 +5320,9 @@ class AscendFusedMoE(FusedMoE):
                 self.loaded_local_num_experts, self.loaded_expert_map = (
                     determine_redundant_replica_expert_map(
                         num_experts, self.ep_size, self.ep_rank,
-                        self.global_redundant_expert_num))
+                        self.global_redundant_expert_num,
+                        prefer_balanced_cyclic=(
+                            self.elastic_execution_mode == 1)))
                 self.active_local_num_experts = primary_local_num_experts
                 self.local_num_experts = self.active_local_num_experts
                 self.expert_map = primary_expert_map
@@ -5162,6 +5351,10 @@ class AscendFusedMoE(FusedMoE):
             self.loaded_expert_map = self.expert_map.clone()
         if self.elastic_original_expert_map is None and self.expert_map is not None:
             self.elastic_original_expert_map = self.expert_map.clone()
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
         if self.primary_log2phy is None and self.log2phy is not None:
             self.primary_log2phy = self.log2phy.clone()
         self.elastic_original_ep_size = int(
@@ -5328,6 +5521,8 @@ class AscendFusedMoE(FusedMoE):
 
     def update_expert_map(self, new_expert_map):
         self.expert_map = new_expert_map
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         if self.elastic_moe_mode == "lossless" and self.loaded_expert_map is not None:
@@ -5348,6 +5543,59 @@ class AscendFusedMoE(FusedMoE):
         runtime_num_experts = int(num_experts)
         self.moe_config.num_experts = runtime_num_experts
         self.num_experts = runtime_num_experts
+
+    def _set_lossless_expert_map_cpu_from_active(
+            self, active_expert_ids: list[int]) -> None:
+        if self.elastic_moe_mode != "lossless":
+            return
+        map_len = int(getattr(self, "elastic_original_num_experts", 0) or 0)
+        if map_len <= 0:
+            return
+        expert_map_cpu = [-1] * map_len
+        for local_slot, expert_id in enumerate(active_expert_ids):
+            expert_id = int(expert_id)
+            if 0 <= expert_id < map_len:
+                expert_map_cpu[expert_id] = int(local_slot)
+        self._lossless_expert_map_cpu = expert_map_cpu
+        self._lossless_expert_map_cpu_tensor_id = id(self.expert_map)
+        if (self.layer_idx == 0 and self.elastic_execution_mode == 1
+                and not getattr(self, "_mode1_export_slot_map_ready_logged",
+                                False)):
+            logger.info(
+                "Mode1 CPU export slot map ready: layer=%s ep_rank=%s mapped=%s map_len=%s tensor_id=%s",
+                self.layer_idx,
+                self.ep_rank,
+                sum(1 for slot in expert_map_cpu if int(slot) >= 0),
+                map_len,
+                self._lossless_expert_map_cpu_tensor_id,
+            )
+            self._mode1_export_slot_map_ready_logged = True
+
+    def _set_lossless_loaded_map_cpu_from_active(
+            self, active_expert_ids: list[int]) -> None:
+        if self.elastic_moe_mode != "lossless":
+            return
+        map_len = int(getattr(self, "elastic_original_num_experts", 0) or 0)
+        if map_len <= 0:
+            return
+        loaded_map_cpu = [-1] * map_len
+        for local_slot, expert_id in enumerate(active_expert_ids):
+            expert_id = int(expert_id)
+            if 0 <= expert_id < map_len:
+                loaded_map_cpu[expert_id] = int(local_slot)
+        self._lossless_loaded_expert_map_cpu = loaded_map_cpu
+        self._lossless_loaded_expert_map_cpu_tensor_id = id(
+            self.loaded_expert_map)
+
+    def _set_lossless_map_cpu_from_tensor(self, map_tensor: Optional[torch.Tensor],
+                                          attr_name: str) -> None:
+        if self.elastic_moe_mode != "lossless" or map_tensor is None:
+            setattr(self, attr_name, None)
+            setattr(self, f"{attr_name}_tensor_id", None)
+            return
+        setattr(self, attr_name,
+                [int(slot) for slot in map_tensor.detach().cpu().tolist()])
+        setattr(self, f"{attr_name}_tensor_id", id(map_tensor))
 
     @staticmethod
     def _is_power_of_two(value: int) -> bool:
@@ -6357,6 +6605,7 @@ class AscendFusedMoE(FusedMoE):
                 continue
             new_expert_map[expert_id] = slot_idx
         self.expert_map = new_expert_map
+        self._set_lossless_expert_map_cpu_from_active(list(target))
         self.active_local_num_experts = resident_capacity
         self.local_num_experts = resident_capacity
         self.moe_config.num_local_experts = resident_capacity
@@ -6486,6 +6735,8 @@ class AscendFusedMoE(FusedMoE):
             for local_slot, expert_id in enumerate(active_expert_ids):
                 loaded_expert_map[int(expert_id)] = local_slot
             self.loaded_expert_map = loaded_expert_map
+            self._set_lossless_map_cpu_from_tensor(
+                self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
             self.loaded_local_num_experts = len(active_expert_ids)
             self.lossless_cpu_import_expert_ids = [
                 int(expert_id) for expert_id, source_local_id in zip(
@@ -6537,6 +6788,8 @@ class AscendFusedMoE(FusedMoE):
         for local_slot, expert_id in enumerate(active_expert_ids):
             loaded_expert_map[int(expert_id)] = local_slot
         self.loaded_expert_map = loaded_expert_map
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
         self.loaded_local_num_experts = len(active_expert_ids)
         self.lossless_cpu_import_expert_ids = [
             int(expert_id) for expert_id, source_local_id in zip(
@@ -6917,6 +7170,7 @@ class AscendFusedMoE(FusedMoE):
                 self.ep_size,
                 self.ep_rank,
                 self.global_redundant_expert_num,
+                prefer_balanced_cyclic=(self.elastic_execution_mode == 1),
             ))
         active_mapping = determine_expert_map(
             self.ep_size,
@@ -6944,6 +7198,10 @@ class AscendFusedMoE(FusedMoE):
             if self.log2phy is not None:
                 self.log2phy = self.log2phy.to(device=target_device,
                                                dtype=log2phy_dtype)
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
         self.primary_log2phy = self.log2phy.clone()
         self.local_num_experts = self.active_local_num_experts
         self.moe_config.num_local_experts = self.active_local_num_experts
@@ -7363,12 +7621,171 @@ class AscendFusedMoE(FusedMoE):
             )
         return cpu_weights
 
+    def refresh_lossless_npu_export_slot_cache(self) -> dict[str, float]:
+        """Snapshot tiny expert->slot maps on CPU for shrink-export diagnostics."""
+        stats = {
+            "expert_map_cpu_ms": 0.0,
+            "loaded_map_cpu_ms": 0.0,
+        }
+        if self.expert_map is not None:
+            start_t = time.perf_counter()
+            self._lossless_npu_export_expert_map_cpu = [
+                int(slot) for slot in self.expert_map.detach().cpu().tolist()
+            ]
+            self._lossless_npu_export_expert_map_cpu_tensor_id = id(
+                self.expert_map)
+            stats["expert_map_cpu_ms"] = (time.perf_counter() -
+                                          start_t) * 1000.0
+        else:
+            self._lossless_npu_export_expert_map_cpu = None
+            self._lossless_npu_export_expert_map_cpu_tensor_id = None
+        if self.loaded_expert_map is not None:
+            start_t = time.perf_counter()
+            self._lossless_npu_export_loaded_map_cpu = [
+                int(slot)
+                for slot in self.loaded_expert_map.detach().cpu().tolist()
+            ]
+            self._lossless_npu_export_loaded_map_cpu_tensor_id = id(
+                self.loaded_expert_map)
+            stats["loaded_map_cpu_ms"] = (time.perf_counter() -
+                                          start_t) * 1000.0
+        else:
+            self._lossless_npu_export_loaded_map_cpu = None
+            self._lossless_npu_export_loaded_map_cpu_tensor_id = None
+        return stats
+
+    def clear_lossless_npu_export_slot_cache(self) -> None:
+        self._lossless_npu_export_expert_map_cpu = None
+        self._lossless_npu_export_loaded_map_cpu = None
+        self._lossless_npu_export_expert_map_cpu_tensor_id = None
+        self._lossless_npu_export_loaded_map_cpu_tensor_id = None
+
+    def _lossless_npu_export_slot_from_map(
+            self, export_map: torch.Tensor,
+            expert_id: int) -> tuple[int, str]:
+        if export_map is None:
+            raise RuntimeError(
+                f"Missing export map at layer={self.layer_idx} "
+                f"expert_id={int(expert_id)}.")
+        use_cpu_slot_map_default = (
+            "1" if int(getattr(self, "elastic_execution_mode", 0)) == 1 else "0")
+        use_cpu_slot_map = _env_flag(
+            "VLLM_ASCEND_MODE1_USE_CPU_EXPORT_SLOT_MAP",
+            use_cpu_slot_map_default)
+        if use_cpu_slot_map:
+            if export_map is self.expert_map:
+                expert_map_cpu = getattr(self, "_lossless_expert_map_cpu",
+                                         None)
+                if (expert_map_cpu is not None
+                        and getattr(self,
+                                    "_lossless_expert_map_cpu_tensor_id",
+                                    None) == id(export_map)):
+                    return int(expert_map_cpu[int(expert_id)]), "expert_cpu"
+                expert_map_cpu = getattr(
+                    self, "_lossless_npu_export_expert_map_cpu", None)
+                if (expert_map_cpu is not None
+                        and getattr(
+                            self,
+                            "_lossless_npu_export_expert_map_cpu_tensor_id",
+                            None) == id(export_map)):
+                    return int(expert_map_cpu[int(expert_id)]), "expert_cpu"
+            if export_map is self.loaded_expert_map:
+                loaded_map_cpu = getattr(self,
+                                         "_lossless_loaded_expert_map_cpu",
+                                         None)
+                if (loaded_map_cpu is not None
+                        and getattr(
+                            self,
+                            "_lossless_loaded_expert_map_cpu_tensor_id",
+                            None) == id(export_map)):
+                    return int(loaded_map_cpu[int(expert_id)]), "loaded_cpu"
+                loaded_map_cpu = getattr(
+                    self, "_lossless_npu_export_loaded_map_cpu", None)
+                if (loaded_map_cpu is not None
+                        and getattr(
+                            self,
+                            "_lossless_npu_export_loaded_map_cpu_tensor_id",
+                            None) == id(export_map)):
+                    return int(loaded_map_cpu[int(expert_id)]), "loaded_cpu"
+            if (int(getattr(self, "elastic_execution_mode", 0)) == 1
+                    and not _env_flag(
+                        "VLLM_ASCEND_MODE1_ALLOW_NPU_EXPORT_SLOT_FALLBACK",
+                        "0")):
+                map_kind = ("expert_map" if export_map is self.expert_map else
+                            "loaded_expert_map" if export_map is self.loaded_expert_map
+                            else "unknown_map")
+                raise RuntimeError(
+                    "Mode1 export slot CPU mirror is missing or stale; "
+                    "refusing to fall back to NPU scalar .item() because that "
+                    "is the known 350s stall path. "
+                    f"layer={self.layer_idx} ep_rank={self.ep_rank} "
+                    f"expert_id={int(expert_id)} map_kind={map_kind} "
+                    f"map_tensor_id={id(export_map)} "
+                    f"expert_cpu_id={getattr(self, '_lossless_expert_map_cpu_tensor_id', None)} "
+                    f"loaded_cpu_id={getattr(self, '_lossless_loaded_expert_map_cpu_tensor_id', None)} "
+                    f"diag_cpu_id={getattr(self, '_lossless_npu_export_expert_map_cpu_tensor_id', None)} "
+                    f"diag_loaded_cpu_id={getattr(self, '_lossless_npu_export_loaded_map_cpu_tensor_id', None)}.")
+        return int(export_map[int(expert_id)].item()), "npu_item"
+
+    def lossless_export_slot_map_status(self) -> dict[str, Any]:
+        expert_cpu = getattr(self, "_lossless_expert_map_cpu", None)
+        loaded_cpu = getattr(self, "_lossless_loaded_expert_map_cpu", None)
+        diag_expert_cpu = getattr(self,
+                                  "_lossless_npu_export_expert_map_cpu", None)
+        diag_loaded_cpu = getattr(self,
+                                  "_lossless_npu_export_loaded_map_cpu", None)
+        return {
+            "layer_idx": int(getattr(self, "layer_idx", -1)),
+            "ep_rank": int(getattr(self, "ep_rank", -1)),
+            "expert_map_id": id(self.expert_map)
+            if self.expert_map is not None else None,
+            "loaded_map_id": id(self.loaded_expert_map)
+            if self.loaded_expert_map is not None else None,
+            "expert_cpu_ready": bool(
+                expert_cpu is not None
+                and getattr(self, "_lossless_expert_map_cpu_tensor_id", None)
+                == id(self.expert_map)),
+            "loaded_cpu_ready": bool(
+                loaded_cpu is not None
+                and getattr(self,
+                            "_lossless_loaded_expert_map_cpu_tensor_id", None)
+                == id(self.loaded_expert_map)),
+            "diag_expert_cpu_ready": bool(
+                diag_expert_cpu is not None
+                and getattr(
+                    self,
+                    "_lossless_npu_export_expert_map_cpu_tensor_id", None)
+                == id(self.expert_map)),
+            "diag_loaded_cpu_ready": bool(
+                diag_loaded_cpu is not None
+                and getattr(
+                    self,
+                    "_lossless_npu_export_loaded_map_cpu_tensor_id", None)
+                == id(self.loaded_expert_map)),
+            "expert_cpu_len": len(expert_cpu) if expert_cpu is not None else 0,
+            "loaded_cpu_len": len(loaded_cpu) if loaded_cpu is not None else 0,
+            "diag_expert_cpu_len": len(diag_expert_cpu)
+            if diag_expert_cpu is not None else 0,
+            "diag_loaded_cpu_len": len(diag_loaded_cpu)
+            if diag_loaded_cpu is not None else 0,
+        }
+
     def export_lossless_expert_npu_weights(
             self, expert_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        self._last_lossless_npu_export_debug = {}
         if self.elastic_moe_mode != "lossless" or not expert_ids:
             empty_w13 = self.w13_weight[:0]
             empty_w2 = self.w2_weight[:0]
             return empty_w13, empty_w2
+        diag_export_timing = _env_flag(
+            "VLLM_ASCEND_MODE1_DIAG_EXPORT_INTERNAL_TIMING", "0")
+        export_total_start_t = time.perf_counter() if diag_export_timing else 0.0
+        source_select_start_t = (
+            time.perf_counter() if diag_export_timing else 0.0)
+        runtime_slot_map_ms = 0.0
+        source_kind = "unknown"
+        runtime_slot_lookup_source = "none"
+        export_slot_lookup_source = "none"
         runtime_w13 = (self.runtime_w13_buffer
                        if self.runtime_w13_buffer is not None else
                        self.runtime_w13_weight)
@@ -7376,12 +7793,26 @@ class AscendFusedMoE(FusedMoE):
                       else self.runtime_w2_weight)
         if (runtime_w13 is not None and runtime_w2 is not None
                 and self.expert_map is not None):
-            runtime_slots = [int(self.expert_map[expert_id].item())
-                             for expert_id in expert_ids]
+            runtime_slot_map_start_t = (
+                time.perf_counter() if diag_export_timing else 0.0)
+            runtime_slots = []
+            runtime_slot_sources: list[str] = []
+            for expert_id in expert_ids:
+                runtime_slot, lookup_source = (
+                    self._lossless_npu_export_slot_from_map(
+                        self.expert_map, int(expert_id)))
+                runtime_slots.append(runtime_slot)
+                runtime_slot_sources.append(lookup_source)
+            runtime_slot_lookup_source = (
+                runtime_slot_sources[0] if runtime_slot_sources else "none")
+            runtime_slot_map_ms = (
+                (time.perf_counter() - runtime_slot_map_start_t) * 1000.0
+                if diag_export_timing else 0.0)
             if all(local_slot >= 0 for local_slot in runtime_slots):
                 source_w13 = runtime_w13
                 source_w2 = runtime_w2
                 export_map = self.expert_map
+                source_kind = "runtime"
             elif self.lossless_loaded_offloaded:
                 if self.runtime_w13_weight is None or self.runtime_w2_weight is None:
                     raise RuntimeError(
@@ -7392,6 +7823,7 @@ class AscendFusedMoE(FusedMoE):
                 source_w2 = (self.runtime_w2_buffer if self.runtime_w2_buffer
                              is not None else self.runtime_w2_weight)
                 export_map = self.expert_map
+                source_kind = "runtime_offloaded"
             else:
                 if self.lossless_hybrid_active:
                     source_w13 = (self.runtime_w13_buffer
@@ -7405,12 +7837,14 @@ class AscendFusedMoE(FusedMoE):
                             f"Hybrid resident runtime buffers are missing at "
                             f"layer={self.layer_idx}.")
                     export_map = self.expert_map
+                    source_kind = "hybrid_runtime"
                 else:
                     source_w13 = self.w13_weight
                     source_w2 = self.w2_weight
                     export_map = (self.loaded_expert_map
                                   if self.loaded_expert_map is not None else
                                   self.expert_map)
+                    source_kind = "loaded"
         elif self.lossless_loaded_offloaded:
             if self.runtime_w13_weight is None or self.runtime_w2_weight is None:
                 raise RuntimeError(
@@ -7421,6 +7855,7 @@ class AscendFusedMoE(FusedMoE):
             source_w2 = (self.runtime_w2_buffer if self.runtime_w2_buffer
                          is not None else self.runtime_w2_weight)
             export_map = self.expert_map
+            source_kind = "offloaded"
         else:
             if self.lossless_hybrid_active:
                 source_w13 = (self.runtime_w13_buffer
@@ -7434,13 +7869,30 @@ class AscendFusedMoE(FusedMoE):
                         f"Hybrid resident runtime buffers are missing at "
                         f"layer={self.layer_idx}.")
                 export_map = self.expert_map
+                source_kind = "hybrid_runtime_no_runtime"
             else:
                 source_w13 = self.w13_weight
                 source_w2 = self.w2_weight
                 export_map = (self.loaded_expert_map
                               if self.loaded_expert_map is not None else
                               self.expert_map)
-        local_slots = [int(export_map[expert_id].item()) for expert_id in expert_ids]
+                source_kind = "loaded_no_runtime"
+        source_select_ms = (
+            (time.perf_counter() - source_select_start_t) * 1000.0
+            if diag_export_timing else 0.0)
+        export_map_start_t = time.perf_counter() if diag_export_timing else 0.0
+        local_slots = []
+        export_slot_sources: list[str] = []
+        for expert_id in expert_ids:
+            local_slot, lookup_source = (
+                self._lossless_npu_export_slot_from_map(
+                    export_map, int(expert_id)))
+            local_slots.append(local_slot)
+            export_slot_sources.append(lookup_source)
+        export_slot_lookup_source = (
+            export_slot_sources[0] if export_slot_sources else "none")
+        export_map_ms = ((time.perf_counter() - export_map_start_t) * 1000.0
+                         if diag_export_timing else 0.0)
         if len(local_slots) == 1:
             local_slot = local_slots[0]
             if local_slot < 0:
@@ -7450,10 +7902,106 @@ class AscendFusedMoE(FusedMoE):
             # For the shrink path we export one expert at a time. Return a
             # narrow view of the canonical NPU tensor so P2P send can reuse the
             # source slot directly instead of materializing an index_select copy.
+            export_view_start_t = time.perf_counter() if diag_export_timing else 0.0
             export_w13 = source_w13[local_slot:local_slot + 1]
             export_w2 = source_w2[local_slot:local_slot + 1]
-            return (_npu_zero_offset_alias_for_p2p(source_w13, export_w13),
-                    _npu_zero_offset_alias_for_p2p(source_w2, export_w2))
+            export_view_ms = ((time.perf_counter() - export_view_start_t) *
+                              1000.0 if diag_export_timing else 0.0)
+            alias_w13_start_t = time.perf_counter() if diag_export_timing else 0.0
+            alias_w13 = _npu_zero_offset_alias_for_p2p(source_w13, export_w13)
+            alias_w13_ms = ((time.perf_counter() - alias_w13_start_t) * 1000.0
+                            if diag_export_timing else 0.0)
+            alias_w2_start_t = time.perf_counter() if diag_export_timing else 0.0
+            alias_w2 = _npu_zero_offset_alias_for_p2p(source_w2, export_w2)
+            alias_w2_ms = ((time.perf_counter() - alias_w2_start_t) * 1000.0
+                           if diag_export_timing else 0.0)
+            if diag_export_timing:
+                export_total_ms = (
+                    time.perf_counter() - export_total_start_t) * 1000.0
+                self._last_lossless_npu_export_debug = {
+                    "layer_idx": int(self.layer_idx),
+                    "expert_id": int(expert_ids[0]),
+                    "expert_count": 1,
+                    "local_slot": int(local_slot),
+                    "local_slots_contiguous": True,
+                    "source_kind": source_kind,
+                    "runtime_slot_lookup_source": runtime_slot_lookup_source,
+                    "export_slot_lookup_source": export_slot_lookup_source,
+                    "source_select_ms": float(source_select_ms),
+                    "runtime_slot_map_ms": float(runtime_slot_map_ms),
+                    "map_ms": float(export_map_ms),
+                    "view_ms": float(export_view_ms),
+                    "alias_w13_ms": float(alias_w13_ms),
+                    "alias_w2_ms": float(alias_w2_ms),
+                    "total_ms": float(export_total_ms),
+                    "source_w13_shape0": int(source_w13.shape[0]),
+                    "source_w2_shape0": int(source_w2.shape[0]),
+                    "view_w13_offset": int(export_w13.storage_offset()),
+                    "view_w2_offset": int(export_w2.storage_offset()),
+                    "alias_w13_offset": int(alias_w13.storage_offset()),
+                    "alias_w2_offset": int(alias_w2.storage_offset()),
+                }
+            return alias_w13, alias_w2
+        if any(local_slot < 0 for local_slot in local_slots):
+            raise RuntimeError(
+                f"Missing NPU export slots at layer={self.layer_idx}: "
+                f"expert_ids={expert_ids[:8]} local_slots={local_slots[:8]}.")
+
+        first_slot = int(local_slots[0])
+        contiguous_slots = local_slots == list(
+            range(first_slot, first_slot + len(local_slots)))
+        if contiguous_slots:
+            export_view_start_t = (
+                time.perf_counter() if diag_export_timing else 0.0)
+            export_w13 = source_w13[first_slot:first_slot + len(local_slots)]
+            export_w2 = source_w2[first_slot:first_slot + len(local_slots)]
+            export_view_ms = ((time.perf_counter() - export_view_start_t) *
+                              1000.0 if diag_export_timing else 0.0)
+            alias_w13_start_t = (
+                time.perf_counter() if diag_export_timing else 0.0)
+            alias_w13 = _npu_zero_offset_alias_for_p2p(source_w13, export_w13)
+            alias_w13_ms = ((time.perf_counter() - alias_w13_start_t) * 1000.0
+                            if diag_export_timing else 0.0)
+            alias_w2_start_t = (
+                time.perf_counter() if diag_export_timing else 0.0)
+            alias_w2 = _npu_zero_offset_alias_for_p2p(source_w2, export_w2)
+            alias_w2_ms = ((time.perf_counter() - alias_w2_start_t) * 1000.0
+                           if diag_export_timing else 0.0)
+            if diag_export_timing:
+                export_total_ms = (
+                    time.perf_counter() - export_total_start_t) * 1000.0
+                self._last_lossless_npu_export_debug = {
+                    "layer_idx": int(self.layer_idx),
+                    "expert_id": int(expert_ids[0]),
+                    "expert_count": int(len(expert_ids)),
+                    "local_slot": int(first_slot),
+                    "local_slots_contiguous": True,
+                    "source_kind": source_kind,
+                    "runtime_slot_lookup_source": runtime_slot_lookup_source,
+                    "export_slot_lookup_source": export_slot_lookup_source,
+                    "source_select_ms": float(source_select_ms),
+                    "runtime_slot_map_ms": float(runtime_slot_map_ms),
+                    "map_ms": float(export_map_ms),
+                    "view_ms": float(export_view_ms),
+                    "alias_w13_ms": float(alias_w13_ms),
+                    "alias_w2_ms": float(alias_w2_ms),
+                    "total_ms": float(export_total_ms),
+                    "source_w13_shape0": int(source_w13.shape[0]),
+                    "source_w2_shape0": int(source_w2.shape[0]),
+                    "view_w13_offset": int(export_w13.storage_offset()),
+                    "view_w2_offset": int(export_w2.storage_offset()),
+                    "alias_w13_offset": int(alias_w13.storage_offset()),
+                    "alias_w2_offset": int(alias_w2.storage_offset()),
+                }
+            return alias_w13, alias_w2
+
+        if not _env_flag("VLLM_ASCEND_MODE1_ALLOW_BATCH_INDEX_SELECT_EXPORT",
+                         "0"):
+            raise RuntimeError(
+                "Refusing non-contiguous batched NPU export because the "
+                "index_select materialization path is the known mode=1 "
+                f"floor=2 350s stall path. layer={self.layer_idx} "
+                f"expert_ids={expert_ids[:16]} local_slots={local_slots[:16]}.")
         export_index = torch.tensor(local_slots,
                                     device=source_w13.device,
                                     dtype=torch.long)
@@ -7464,6 +8012,14 @@ class AscendFusedMoE(FusedMoE):
             self, local_slot: int) -> tuple[torch.Tensor, torch.Tensor]:
         recv_w13 = self.w13_weight[local_slot:local_slot + 1]
         recv_w2 = self.w2_weight[local_slot:local_slot + 1]
+        return (_npu_zero_offset_alias_for_p2p(self.w13_weight, recv_w13),
+                _npu_zero_offset_alias_for_p2p(self.w2_weight, recv_w2))
+
+    def get_lossless_expert_npu_slot_range_recv_buffers(
+            self, first_slot: int,
+            rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        recv_w13 = self.w13_weight[first_slot:first_slot + rows]
+        recv_w2 = self.w2_weight[first_slot:first_slot + rows]
         return (_npu_zero_offset_alias_for_p2p(self.w13_weight, recv_w13),
                 _npu_zero_offset_alias_for_p2p(self.w2_weight, recv_w2))
 
@@ -7558,6 +8114,7 @@ class AscendFusedMoE(FusedMoE):
         for local_slot, expert_id in enumerate(active_expert_ids):
             new_expert_map[expert_id] = local_slot
         self.expert_map = new_expert_map
+        self._set_lossless_expert_map_cpu_from_active(active_expert_ids)
         self.active_local_num_experts = new_local_num_experts
         self.local_num_experts = new_local_num_experts
         self.moe_config.num_local_experts = new_local_num_experts
@@ -7623,6 +8180,7 @@ class AscendFusedMoE(FusedMoE):
             # the current active layout so follow-up shrink/export logic sees the
             # real resident experts instead of the initialization-time view.
             self.loaded_expert_map = self.expert_map.clone()
+            self._set_lossless_loaded_map_cpu_from_active(active_expert_ids)
             self.loaded_local_num_experts = new_local_num_experts
             self.lossless_loaded_offloaded = False
             self._clear_lossless_cpu_shadow_state(drop_buffers=True)
@@ -8151,7 +8709,8 @@ class AscendFusedMoE(FusedMoE):
         if self.elastic_moe_mode == "lossless":
             self.loaded_local_num_experts, self.loaded_expert_map = determine_redundant_replica_expert_map(
                 logical_num_experts, self.ep_size, self.ep_rank,
-                self.global_redundant_expert_num)
+                self.global_redundant_expert_num,
+                prefer_balanced_cyclic=(self.elastic_execution_mode == 1))
             active_mapping = determine_expert_map(
                 self.ep_size,
                 self.ep_rank,
@@ -8177,6 +8736,10 @@ class AscendFusedMoE(FusedMoE):
                 if self.log2phy is not None:
                     self.log2phy = self.log2phy.to(device=target_device,
                                                    dtype=log2phy_dtype)
+            self._set_lossless_map_cpu_from_tensor(
+                self.expert_map, "_lossless_expert_map_cpu")
+            self._set_lossless_map_cpu_from_tensor(
+                self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
             self.primary_log2phy = self.log2phy.clone()
             self.local_num_experts = self.active_local_num_experts
             self.moe_config.num_local_experts = self.active_local_num_experts

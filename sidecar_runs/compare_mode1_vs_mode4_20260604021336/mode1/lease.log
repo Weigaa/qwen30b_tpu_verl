@@ -1,0 +1,23 @@
+watch_start_time=1780510416.550206361
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260604021336_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+watch_start_trigger=shrink_done
+watch_graceful_kill_seconds=3
+watch_max_shrink_total_ms=0
+watch_sidecar_stop_file=sidecar_runs/compare_mode1_vs_mode4_20260604021336/mode1/outputs.jsonl.stop_requested
+shrink_window_detected_time=1780510601.233054522 active_count=8
+shrink_window_line=[36m(WorkerDict pid=1954055)[0m INFO 06-04 02:16:40 [worker_v1.py:7420] Elastic parallel shrink done: rank=14 active_ranks=[8, 9, 10, 11, 12, 13, 14, 15] dp_size=8 ep_size=8 no_ep_tail=False rebuild_ms=1375.75 refresh_ms=115.64 warmup_ms=1203.34 total_ms=3932.08
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1780510601.267799130
+sidecar_active_ranks=8,9,10,11,12,13,14,15
+sidecar_devices=0,1,2,3,4,5,6,7
+sidecar_pid=1967510
+sidecar_deadline_signal_time=1780510661.766482603
+sidecar_deadline_signal_line=[36m(TaskRunner pid=1951506)[0m [Rank 0 | Local Rank 0] 2026-06-04 02:17:40,742 INFO [verl.trainer.ppo.ray_trainer:373] => Elastic parallel restore requested before rollout restore rpc
+sidecar_stop_request_time=1780510661.771075294 reason=training_rollout_done_or_restore pid=1967510 stop_file=sidecar_runs/compare_mode1_vs_mode4_20260604021336/mode1/outputs.jsonl.stop_requested
+sidecar_kill_time=1780510664.201903975 reason=training_rollout_done_or_restore pid=1967510 after_soft_stop=1
+sidecar_output_merge_time=1780510664.460521842 output=sidecar_runs/compare_mode1_vs_mode4_20260604021336/mode1/outputs.jsonl shards=8
+watch_end_time=1780510664.475333489
+sidecar_output_merge_time=1780510664.499246408 output=sidecar_runs/compare_mode1_vs_mode4_20260604021336/mode1/outputs.jsonl shards=8

@@ -1,0 +1,246 @@
+watch_start_time=1778724049.739462895
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260514100049_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+watch_start_trigger=shrink_done
+watch_graceful_kill_seconds=3
+watch_sidecar_stop_file=sidecar_runs/20260514100049/outputs.jsonl.stop_requested
+shrink_window_detected_time=1778725120.556413380 active_count=8
+shrink_window_line=[36m(WorkerDict pid=3041678)[0m INFO 05-14 10:18:39 [worker_v1.py:2886] Elastic parallel shrink done: rank=0 active_ranks=[0, 1, 5, 7, 9, 11, 12, 14] dp_size=8 ep_size=8 no_ep_tail=False rebuild_ms=3071.92 refresh_ms=382.51 warmup_ms=1134.28 total_ms=5832.62
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1778725120.593066864
+sidecar_active_ranks=0,1,5,7,9,11,12,14
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_pid=3061314
+sidecar_start_time=1778725120.771826890
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_device_count=8
+sidecar_replica_count=1
+sidecar_parallel_mode=hybrid
+sidecar_tensor_parallel_size=8
+sidecar_data_parallel_size=1
+sidecar_device_groups=2,3,4,6,8,10,13,15
+sidecar_unused_devices=
+sidecar_master_addr=192.168.0.163
+sidecar_force_host_ip_for_tp=1
+sidecar_vllm_host_ip=192.168.0.163
+sidecar_vllm_multiproc_host_ip=192.168.0.163
+sidecar_vllm_reuse_world_group=1
+sidecar_master_port_base=45000
+sidecar_master_port_stride=32
+sidecar_hccl_if_base_port=30000
+sidecar_hccl_host_socket_port_range=30000-30063
+sidecar_hccl_npu_socket_port_range=30064-30127
+sidecar_hccl_if_base_port_fixed=0
+sidecar_hccl_port_stride=2048
+sidecar_hccl_port_window=64
+sidecar_vllm_set_worker_rank_envs=1
+sidecar_ep_allowed=0
+sidecar_model_is_moe=0
+sidecar_model_is_moe_reason=dense_or_unknown
+sidecar_ep_effective=0
+sidecar_model=/home/data/Qwen3-8B
+sidecar_output=sidecar_runs/20260514100049/outputs.jsonl
+sidecar_state_dir=sidecar_runs/state/qwen3_8b_gsm8k_train
+sidecar_generate_chunk_size=16
+sidecar_stream_checkpoint=1
+sidecar_partial_sync_every_steps=0
+sidecar_stop_file=sidecar_runs/20260514100049/outputs.jsonl.stop_requested
+sidecar_shard_start_time=1778725120.773627938 shard=0 device_group=2,3,4,6,8,10,13,15 tp=8 dp=1 master_port=45000 hccl_if_base_port=30000 hccl_host_socket_port_range=30000-30063 hccl_npu_socket_port_range=30064-30127 output=sidecar_runs/20260514100049/outputs.jsonl
+INFO 05-14 10:18:45 [__init__.py:36] Available plugins for group vllm.platform_plugins:
+INFO 05-14 10:18:45 [__init__.py:38] - ascend -> vllm_ascend:register
+INFO 05-14 10:18:45 [__init__.py:41] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 05-14 10:18:45 [__init__.py:207] Platform plugin ascend is activated
+INFO 05-14 10:18:49 [moe_stats.py:166] MoE pattern stats disabled: VLLM_MOE_PATTERN_STATS=0 dir=./moe_stats long_tail_stages=(8, 4, 2)
+INFO 05-14 10:18:49 [moe_stats.py:174] MoE pattern stats timing disabled: VLLM_MOE_STATS_TIMING=0
+successfully reset MoEStats for new epoch.
+WARNING 05-14 10:18:49 [_custom_ops.py:20] Failed to import from vllm._C with ModuleNotFoundError("No module named 'vllm._C'")
+### USING MY PATCHED vLLM core.py ###
+{"event": "sidecar_load_start", "model_path": "/home/data/Qwen3-8B", "devices": "2,3,4,6,8,10,13,15", "master_port": "45000", "master_addr": "192.168.0.163", "hccl_if_base_port": "30000", "hccl_host_socket_port_range": "30000-30063", "hccl_npu_socket_port_range": "30064-30127", "sidecar_hccl_if_base_port_fixed": "0", "sidecar_hccl_port_stride": "2048", "sidecar_hccl_port_window": "64", "vllm_host_ip": "192.168.0.163", "vllm_multiproc_distributed_host_ip": "192.168.0.163", "vllm_multiproc_use_host_ip": "1", "vllm_multiproc_set_worker_rank_envs": "1", "vllm_reuse_world_group_for_full_model_parallel": "1", "num_prompts": 16, "total_prompts": 7473, "completed_prompts": 546, "inflight_prompts": 0, "resume_prompts": 6, "sidecar_epoch": 0, "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "repeat_until_killed": true, "max_iterations": 0, "prompts_source": "/home/qiuzy/verl_dev/data/gsm8k", "data_split": "train", "use_short_data": "0", "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "partials_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/partials.shard0.jsonl", "stop_file": "sidecar_runs/20260514100049/outputs.jsonl.stop_requested", "expert_parallel_allowed": "0", "expert_parallel_effective": "0", "model_is_moe": "0", "model_is_moe_reason": "dense_or_unknown", "vllm_enable_expert_parallel": "0", "max_prompts": 16, "max_prompts_per_device": 16, "max_records_per_iteration": 16, "generate_chunk_size": 16, "engine_kwargs": {"tensor_parallel_size": 8, "gpu_memory_utilization": 0.9, "max_num_seqs": 6, "max_num_batched_tokens": 98304, "trust_remote_code": true, "enforce_eager": true, "max_model_len": 16384}}
+INFO 05-14 10:18:49 [importing.py:63] Triton not installed or not compatible; certain GPU-related functions will not be available.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture Qwen2VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_vl:AscendQwen2VLForConditionalGeneration.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture Qwen3VLMoeForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLMoeForConditionalGeneration.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture Qwen3VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl_without_padding:AscendQwen3VLForConditionalGeneration.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture Qwen2_5_VLForConditionalGeneration is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen2_5_vl:AscendQwen2_5_VLForConditionalGeneration.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture DeepseekV2ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV2ForCausalLM.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture DeepseekV3ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture DeepseekV32ForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_v2:CustomDeepseekV3ForCausalLM.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture DeepSeekMTPModel is already registered, and will be overwritten by the new model class vllm_ascend.models.deepseek_mtp:CustomDeepSeekMTP.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture Qwen3MoeForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_moe:CustomQwen3MoeForCausalLM.
+WARNING 05-14 10:18:49 [registry.py:582] Model architecture Qwen3NextForCausalLM is already registered, and will be overwritten by the new model class vllm_ascend.models.qwen3_next:CustomQwen3NextForCausalLM.
+INFO 05-14 10:18:49 [utils.py:233] non-default args: {'trust_remote_code': True, 'max_model_len': 16384, 'tensor_parallel_size': 8, 'max_num_batched_tokens': 98304, 'max_num_seqs': 6, 'disable_log_stats': True, 'enforce_eager': True, 'model': '/home/data/Qwen3-8B'}
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 05-14 10:18:50 [model.py:547] Resolved architecture: Qwen3ForCausalLM
+INFO 05-14 10:18:50 [model.py:1510] Using max model len 16384
+INFO 05-14 10:18:50 [scheduler.py:205] Chunked prefill is enabled with max_num_batched_tokens=98304.
+INFO 05-14 10:18:50 [__init__.py:381] Cudagraph is disabled under eager mode
+INFO 05-14 10:18:50 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+INFO 05-14 10:18:50 [platform.py:179] Compilation disabled, using eager mode by default
+multiprocess_mode: True external_launcher_dp: False
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [core.py:667] Waiting for init message from front-end.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [core.py:79] Initializing a V1 LLM engine (v0.11.0) with config: model='/home/data/Qwen3-8B', speculative_config=None, tokenizer='/home/data/Qwen3-8B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=16384, download_dir=None, load_format=auto, tensor_parallel_size=8, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=True, quantization=None, enforce_eager=True, kv_cache_dtype=auto, device_config=npu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser=''), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None), seed=0, served_model_name=/home/data/Qwen3-8B, enable_prefix_caching=True, chunked_prefill_enabled=False, pooler_config=None, compilation_config={"level":0,"debug_dump_path":"","cache_dir":"","backend":"","custom_ops":["all"],"splitting_ops":null,"use_inductor":true,"compile_sizes":[],"inductor_compile_config":{"enable_auto_functionalized_v2":false},"inductor_passes":{},"cudagraph_mode":0,"use_cudagraph":true,"cudagraph_num_of_warmups":1,"cudagraph_capture_sizes":[],"cudagraph_copy_inputs":false,"full_cuda_graph":false,"use_inductor_graph_partition":false,"pass_config":{},"max_capture_size":0,"local_cache_dir":null}
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m WARNING 05-14 10:18:50 [multiproc_executor.py:775] Reducing Torch parallelism from 320 threads to 1 to avoid unnecessary CPU contention. Set OMP_NUM_THREADS in the external environment to tune this value as needed.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [multiproc_executor.py:123] Multiproc executor distributed init host=192.168.0.163
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0, 1, 2, 3, 4, 5, 6, 7], buffer_handle=(8, 16777216, 10, 'psm_ca3ea6a9'), local_subscribe_addr='ipc:///tmp/708370ba-57af-4422-b797-f77e2ffcf3fc', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=0 local_rank=0 world_size=8
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=1 local_rank=1 world_size=8
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=2 local_rank=2 world_size=8
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=3 local_rank=3 world_size=8
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=4 local_rank=4 world_size=8
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:50 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=5 local_rank=5 world_size=8
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:51 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=6 local_rank=6 world_size=8
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:51 [multiproc_executor.py:79] Set multiproc worker rank envs: rank=7 local_rank=7 world_size=8
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:58 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_87d5258d'), local_subscribe_addr='ipc:///tmp/e2dd7fbc-fd24-48c3-9e20-999f9642b4c4', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:18:59 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_61a1b85d'), local_subscribe_addr='ipc:///tmp/fc6df395-ef54-4445-bbbc-4c19b7fc27a2', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:00 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_f299091f'), local_subscribe_addr='ipc:///tmp/0f89936e-3008-4d75-8f2a-c0fc69f7872a', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:01 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_0247c3d0'), local_subscribe_addr='ipc:///tmp/6269a1ad-686e-4bc7-8055-66a3186acd77', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:01 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_633bb489'), local_subscribe_addr='ipc:///tmp/0e10e23d-438d-4790-ab16-27b55b340acb', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:01 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_2855888a'), local_subscribe_addr='ipc:///tmp/be044815-0432-417f-95fa-b45190e2411b', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:03 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_dd212751'), local_subscribe_addr='ipc:///tmp/6c883eff-1f08-479e-a137-92ed79120253', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:03 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[0], buffer_handle=(1, 10485760, 10, 'psm_c449a411'), local_subscribe_addr='ipc:///tmp/241ca2e7-03e4-4b58-bbb6-266370e35c10', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:04 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+INFO 05-14 10:19:04 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:04 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:04 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:04 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:04 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:04 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:04 [parallel_state.py:235] Reusing world process groups for tp group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:05 [shm_broadcast.py:289] vLLM message queue communication handle: Handle(local_reader_ranks=[1, 2, 3, 4, 5, 6, 7], buffer_handle=(7, 4194304, 6, 'psm_962fda7e'), local_subscribe_addr='ipc:///tmp/55275764-f545-4694-8cc3-f18a212c994f', remote_subscribe_addr=None, remote_addr_ipv6=False)
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:1232] rank 6 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 6, EP rank 6
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:1232] rank 1 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 1, EP rank 1
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:1232] rank 5 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 5, EP rank 5
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:1232] rank 4 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 4, EP rank 4
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:1232] rank 0 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 0, EP rank 0
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:1232] rank 3 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 3, EP rank 3
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:1232] rank 7 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 7, EP rank 7
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:07 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:08 [parallel_state.py:235] Reusing world process groups for ep group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:08 [parallel_state.py:1232] rank 2 in world size 8 is assigned as DP rank 0, PP rank 0, TP rank 2, EP rank 2
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:08 [parallel_state.py:235] Reusing world process groups for mc2 group ranks=[0, 1, 2, 3, 4, 5, 6, 7]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP6 pid=3061599)[0;0m INFO 05-14 10:19:09 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP1 pid=3061572)[0;0m INFO 05-14 10:19:09 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP5 pid=3061588)[0;0m INFO 05-14 10:19:09 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m INFO 05-14 10:19:09 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP7 pid=3061602)[0;0m INFO 05-14 10:19:09 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP3 pid=3061578)[0;0m INFO 05-14 10:19:09 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP4 pid=3061585)[0;0m INFO 05-14 10:19:09 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP2 pid=3061575)[0;0m INFO 05-14 10:19:09 [model_runner_v1.py:2958] Starting to load model /home/data/Qwen3-8B...
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m Loading safetensors checkpoint shards:   0% Completed | 0/5 [00:00<?, ?it/s]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m Loading safetensors checkpoint shards:  20% Completed | 1/5 [00:00<00:00,  4.20it/s]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m Loading safetensors checkpoint shards:  40% Completed | 2/5 [00:00<00:00,  3.44it/s]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m Loading safetensors checkpoint shards:  60% Completed | 3/5 [00:01<00:00,  2.40it/s]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m Loading safetensors checkpoint shards:  80% Completed | 4/5 [00:01<00:00,  2.33it/s]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP3 pid=3061578)[0;0m INFO 05-14 10:19:12 [default_loader.py:267] Loading weights took 1.59 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP2 pid=3061575)[0;0m INFO 05-14 10:19:12 [default_loader.py:267] Loading weights took 1.57 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m Loading safetensors checkpoint shards: 100% Completed | 5/5 [00:01<00:00,  3.22it/s]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m Loading safetensors checkpoint shards: 100% Completed | 5/5 [00:01<00:00,  2.98it/s]
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m 
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m INFO 05-14 10:19:12 [default_loader.py:267] Loading weights took 1.69 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP4 pid=3061585)[0;0m INFO 05-14 10:19:12 [default_loader.py:267] Loading weights took 1.67 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP1 pid=3061572)[0;0m INFO 05-14 10:19:12 [default_loader.py:267] Loading weights took 1.66 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP5 pid=3061588)[0;0m INFO 05-14 10:19:12 [default_loader.py:267] Loading weights took 1.69 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP6 pid=3061599)[0;0m INFO 05-14 10:19:12 [default_loader.py:267] Loading weights took 1.74 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP7 pid=3061602)[0;0m INFO 05-14 10:19:12 [default_loader.py:267] Loading weights took 1.66 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP2 pid=3061575)[0;0m INFO 05-14 10:19:13 [model_runner_v1.py:2992] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP3 pid=3061578)[0;0m INFO 05-14 10:19:13 [model_runner_v1.py:2992] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m INFO 05-14 10:19:13 [model_runner_v1.py:2992] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP4 pid=3061585)[0;0m INFO 05-14 10:19:13 [model_runner_v1.py:2992] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP7 pid=3061602)[0;0m INFO 05-14 10:19:13 [model_runner_v1.py:2992] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP6 pid=3061599)[0;0m INFO 05-14 10:19:13 [model_runner_v1.py:2992] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP1 pid=3061572)[0;0m INFO 05-14 10:19:13 [model_runner_v1.py:2992] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP5 pid=3061588)[0;0m INFO 05-14 10:19:13 [model_runner_v1.py:2992] Loading model weights took 1.9176 GB
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP6 pid=3061599)[0;0m INFO 05-14 10:19:20 [worker_v1.py:341] Available memory: 30135108915, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP7 pid=3061602)[0;0m INFO 05-14 10:19:20 [worker_v1.py:341] Available memory: 30131131699, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP1 pid=3061572)[0;0m INFO 05-14 10:19:20 [worker_v1.py:341] Available memory: 30156752179, total memory: 65796046848
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP4 pid=3061585)[0;0m INFO 05-14 10:19:20 [worker_v1.py:341] Available memory: 29857792512, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP2 pid=3061575)[0;0m INFO 05-14 10:19:20 [worker_v1.py:341] Available memory: 29839487488, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP3 pid=3061578)[0;0m INFO 05-14 10:19:20 [worker_v1.py:341] Available memory: 29836792320, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP5 pid=3061588)[0;0m INFO 05-14 10:19:20 [worker_v1.py:341] Available memory: 29855171072, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m INFO 05-14 10:19:20 [worker_v1.py:341] Available memory: 29405344256, total memory: 65787658240
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1087] GPU KV cache size: 1,595,264 tokens
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1091] Maximum concurrency for 16,384 tokens per request: 97.37x
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1087] GPU KV cache size: 1,636,096 tokens
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1091] Maximum concurrency for 16,384 tokens per request: 99.86x
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1087] GPU KV cache size: 1,618,816 tokens
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1091] Maximum concurrency for 16,384 tokens per request: 98.80x
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1087] GPU KV cache size: 1,618,688 tokens
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1091] Maximum concurrency for 16,384 tokens per request: 98.80x
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1087] GPU KV cache size: 1,619,840 tokens
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1091] Maximum concurrency for 16,384 tokens per request: 98.87x
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1087] GPU KV cache size: 1,619,712 tokens
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1091] Maximum concurrency for 16,384 tokens per request: 98.86x
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1087] GPU KV cache size: 1,634,816 tokens
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1091] Maximum concurrency for 16,384 tokens per request: 99.78x
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1087] GPU KV cache size: 1,634,688 tokens
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [kv_cache_utils.py:1091] Maximum concurrency for 16,384 tokens per request: 99.77x
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:20 [core.py:217] init engine (profile, create kv cache, warmup model) took 6.88 seconds
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m WARNING 05-14 10:19:21 [core.py:119] Using configured V1 scheduler class vllm_ascend.core.scheduler.AscendScheduler. This scheduler interface is not public and compatibility may not be maintained.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m max_num_running_reqs: 6 max_num_scheduled_tokens: 98304 max_model_len: 16384
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:21 [__init__.py:381] Cudagraph is disabled under eager mode
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:21 [platform.py:141] Non-MLA LLMs forcibly disable the chunked prefill feature,as the performance of operators supporting this feature functionality is currently suboptimal.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:21 [platform.py:179] Compilation disabled, using eager mode by default
+INFO 05-14 10:19:21 [llm.py:313] Supported_tasks: ['generate']
+{"event": "sidecar_chunk_start", "iteration": 0, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [578, 582, 586, 590, 594, 598, 1, 3], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:21 [core.py:269] Elastic first model exec: entering model_fn scheduled_tokens=224 num_reqs=1
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP7 pid=3061602)[0;0m WARNING 05-14 10:19:21 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP1 pid=3061572)[0;0m WARNING 05-14 10:19:21 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP4 pid=3061585)[0;0m WARNING 05-14 10:19:21 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP6 pid=3061599)[0;0m WARNING 05-14 10:19:21 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP3 pid=3061578)[0;0m WARNING 05-14 10:19:21 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP5 pid=3061588)[0;0m WARNING 05-14 10:19:21 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP2 pid=3061575)[0;0m WARNING 05-14 10:19:21 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m [1;36m(Worker_TP0 pid=3061569)[0;0m WARNING 05-14 10:19:21 [cudagraph_dispatcher.py:106] cudagraph dispatching keys are not initialized. No cudagraph will be used.
+INFO 05-14 10:19:21 [llm_engine.py:568] Elastic first live step: entering engine_core.get_output
+[1;36m(EngineCore_DP0 pid=3061562)[0;0m INFO 05-14 10:19:21 [core.py:282] Elastic first model exec: model_fn returned
+{"event": "sidecar_chunk_done", "iteration": 0, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 54.014151167008094, "num_requests": 16, "submitted_requests": 16, "prompt_ids_first": [578, 582, 586, 590, 594, 598, 1, 3], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 151.6639588516515, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 0, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 54.014151167008094, "num_requests": 16, "total_prompts": 7473, "completed_prompts": 562, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 151.6639588516515, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 1, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [21, 23, 25, 27, 29, 31, 33, 35], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+{"event": "sidecar_chunk_done", "iteration": 1, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 47.043638692004606, "num_requests": 16, "submitted_requests": 16, "prompt_ids_first": [21, 23, 25, 27, 29, 31, 33, 35], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 174.1361898817637, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 1, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 47.043638692004606, "num_requests": 16, "total_prompts": 7473, "completed_prompts": 578, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 174.1361898817637, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 2, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [53, 55, 57, 59, 61, 63, 65, 67], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+{"event": "sidecar_chunk_done", "iteration": 2, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 46.83740316599142, "num_requests": 16, "submitted_requests": 16, "prompt_ids_first": [53, 55, 57, 59, 61, 63, 65, 67], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8011, "tokens_per_s": 171.03851747734763, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 2, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 46.83740316599142, "num_requests": 16, "total_prompts": 7473, "completed_prompts": 594, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8011, "tokens_per_s": 171.03851747734763, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 3, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [85, 87, 89, 91, 93, 95, 97, 99], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+{"event": "sidecar_chunk_done", "iteration": 3, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 49.612268000957556, "num_requests": 16, "submitted_requests": 16, "prompt_ids_first": [85, 87, 89, 91, 93, 95, 97, 99], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8123, "tokens_per_s": 163.7296646031828, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 3, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 49.612268000957556, "num_requests": 16, "total_prompts": 7473, "completed_prompts": 610, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8123, "tokens_per_s": 163.7296646031828, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 4, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [117, 119, 121, 123, 125, 127, 129, 131], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+{"event": "sidecar_chunk_done", "iteration": 4, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 46.676002620952204, "num_requests": 16, "submitted_requests": 16, "prompt_ids_first": [117, 119, 121, 123, 125, 127, 129, 131], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 175.5077457366224, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 4, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 46.676002620952204, "num_requests": 16, "total_prompts": 7473, "completed_prompts": 626, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 175.5077457366224, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 5, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [149, 151, 153, 155, 157, 159, 161, 163], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+{"event": "sidecar_chunk_done", "iteration": 5, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 44.936902299989015, "num_requests": 16, "submitted_requests": 16, "prompt_ids_first": [149, 151, 153, 155, 157, 159, 161, 163], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8022, "tokens_per_s": 178.51697801612733, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 5, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 44.936902299989015, "num_requests": 16, "total_prompts": 7473, "completed_prompts": 642, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8022, "tokens_per_s": 178.51697801612733, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 6, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [181, 183, 185, 187, 189, 191, 193, 195], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+{"event": "sidecar_chunk_done", "iteration": 6, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 45.44439515192062, "num_requests": 16, "submitted_requests": 16, "prompt_ids_first": [181, 183, 185, 187, 189, 191, 193, 195], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 180.26425420811836, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 6, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 45.44439515192062, "num_requests": 16, "total_prompts": 7473, "completed_prompts": 658, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 180.26425420811836, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 7, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [213, 215, 217, 219, 221, 223, 225, 227], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+{"event": "sidecar_chunk_done", "iteration": 7, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 45.080206659040414, "num_requests": 16, "submitted_requests": 16, "prompt_ids_first": [213, 215, 217, 219, 221, 223, 225, 227], "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 181.72055114918535, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 7, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 45.080206659040414, "num_requests": 16, "total_prompts": 7473, "completed_prompts": 674, "resume_prompts": 0, "shutdown_requested": false, "shard_index": 0, "num_shards": 1, "num_output_tokens": 8192, "tokens_per_s": 181.72055114918535, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_chunk_start", "iteration": 8, "chunk_start": 0, "sidecar_epoch": 0, "chunk_size": 16, "prompt_ids_first": [245, 247, 249, 251, 253, 255, 257, 259], "stream_checkpoint": true, "shard_index": 0, "num_shards": 1, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train"}
+sidecar_deadline_signal_time=1778725550.054099417
+sidecar_deadline_signal_line=[36m(TaskRunner pid=3039172)[0m [Rank 0 | Local Rank 0] 2026-05-14 10:25:48,459 INFO [verl.trainer.ppo.ray_trainer:373] => Elastic parallel restore requested before rollout restore rpc
+sidecar_stop_request_time=1778725550.058029035 reason=training_rollout_done_or_restore pid=3061314 stop_file=sidecar_runs/20260514100049/outputs.jsonl.stop_requested
+{"event": "sidecar_soft_stop_observed", "time": 1778725550.0843003, "stop_file": "sidecar_runs/20260514100049/outputs.jsonl.stop_requested", "shard_index": 0, "num_shards": 1}
+{"event": "sidecar_soft_stop_checkpointed", "time": 1778725550.0878878, "iteration": 8, "chunk_start": 0, "sidecar_epoch": 0, "active_requests": 16, "checkpointed_requests": 6, "resume_prompts": 6, "shard_index": 0, "num_shards": 1, "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "partials_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/partials.shard0.jsonl"}
+{"event": "sidecar_chunk_done", "iteration": 8, "chunk_start": 0, "sidecar_epoch": 0, "inference_time_s": 5.812775794998743, "num_requests": 0, "submitted_requests": 16, "prompt_ids_first": [245, 247, 249, 251, 253, 255, 257, 259], "shutdown_requested": true, "shard_index": 0, "num_shards": 1, "num_output_tokens": 0, "tokens_per_s": 0.0, "completed_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/completed.shard0.jsonl", "resume_file": "sidecar_runs/state/qwen3_8b_gsm8k_train/resume.shard0.jsonl", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_iteration_done", "iteration": 8, "prompt_offset": 0, "sidecar_epoch": 0, "inference_time_s": 5.812775794998743, "num_requests": 0, "total_prompts": 7473, "completed_prompts": 674, "resume_prompts": 6, "shutdown_requested": true, "shard_index": 0, "num_shards": 1, "num_output_tokens": 0, "tokens_per_s": 0.0, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_done", "model_load_time_s": 31.63396135997027, "inference_time_s": 385.45774355286267, "total_time_s": 420.278099265066, "num_requests": 128, "iterations": 9, "total_prompts_last_iteration": 7473, "completed_prompts": 674, "resume_prompts": 6, "sidecar_epoch": 0, "shutdown_requested": true, "shard_index": 0, "num_shards": 1, "num_output_tokens": 65116, "tokens_per_s": 168.93161725020533, "state_dir": "sidecar_runs/state/qwen3_8b_gsm8k_train", "output_file": "sidecar_runs/20260514100049/outputs.jsonl"}
+{"event": "sidecar_engine_shutdown_start", "time": 1778725550.120958, "shard_index": 0, "num_shards": 1}
+{"event": "sidecar_engine_shutdown_done", "time": 1778725551.8436112, "shutdown_time_s": 1.722659774008207, "results": [{"label": "llm", "status": "no_method"}, {"label": "llm.llm_engine", "status": "no_method"}, {"label": "llm.llm_engine.engine_core", "method": "shutdown", "status": "ok", "time_s": 1.2633708108915016}, {"label": "llm.llm_engine.model_executor", "status": "missing"}, {"label": "torch.npu.empty_cache", "status": "ok"}], "shard_index": 0, "num_shards": 1}
+sidecar_kill_time=1778725553.087064913 reason=training_rollout_done_or_restore pid=3061314 after_soft_stop=1
+Terminated
+watch_end_time=1778725553.297678410

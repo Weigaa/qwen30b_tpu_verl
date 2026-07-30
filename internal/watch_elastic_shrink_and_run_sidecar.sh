@@ -17,6 +17,7 @@ WORLD_SIZE=${VERL_SIDECAR_WORLD_SIZE:-16}
 POLL_INTERVAL=${VERL_SIDECAR_WATCH_POLL_INTERVAL:-1}
 START_ONCE=${VERL_SIDECAR_START_ONCE:-1}
 GRACEFUL_KILL_SECONDS=${VERL_SIDECAR_GRACEFUL_KILL_SECONDS:-3}
+MAX_SHRINK_TOTAL_MS=${VERL_SIDECAR_MAX_SHRINK_TOTAL_MS:-0}
 START_TRIGGER=${VERL_SIDECAR_START_TRIGGER:-shrink_done}
 SIDECAR_STOP_FILE=${VERL_SIDECAR_STOP_FILE:-}
 if [[ -z "${SIDECAR_STOP_FILE}" ]]; then
@@ -38,6 +39,7 @@ echo "watch_expected_active_ranks=${EXPECTED_ACTIVE_RANKS}" | tee -a "${LEASE_LO
 echo "watch_world_size=${WORLD_SIZE}" | tee -a "${LEASE_LOG}"
 echo "watch_start_trigger=${START_TRIGGER}" | tee -a "${LEASE_LOG}"
 echo "watch_graceful_kill_seconds=${GRACEFUL_KILL_SECONDS}" | tee -a "${LEASE_LOG}"
+echo "watch_max_shrink_total_ms=${MAX_SHRINK_TOTAL_MS}" | tee -a "${LEASE_LOG}"
 echo "watch_sidecar_stop_file=${VERL_SIDECAR_STOP_FILE}" | tee -a "${LEASE_LOG}"
 
 sidecar_pid=""
@@ -117,6 +119,25 @@ extract_active_ranks_csv() {
         | tr -d ' '
 }
 
+extract_shrink_total_ms() {
+    local line=$1
+    sed -n 's/.*total_ms=\([0-9.][0-9.]*\).*/\1/p' <<< "${line}" | head -1
+}
+
+shrink_total_allowed() {
+    local total_ms=$1
+    python3 - "$MAX_SHRINK_TOTAL_MS" "$total_ms" <<'PY'
+import sys
+
+limit = float(sys.argv[1] or 0)
+value_arg = sys.argv[2].strip()
+if limit <= 0 or not value_arg:
+    raise SystemExit(0)
+value = float(value_arg)
+raise SystemExit(0 if value <= limit else 1)
+PY
+}
+
 derive_inactive_devices_csv() {
     local active_csv=$1
     python3 - "$WORLD_SIZE" "$active_csv" <<'PY'
@@ -194,6 +215,12 @@ while true; do
             if [[ "${sidecar_started}" == "0" ]] && is_sidecar_start_line "${line}"; then
                 active_count=$(count_active_ranks "${line}")
                 if [[ "${active_count}" == "${EXPECTED_ACTIVE_RANKS}" ]]; then
+                    shrink_total_ms=$(extract_shrink_total_ms "${line}")
+                    if ! shrink_total_allowed "${shrink_total_ms}"; then
+                        echo "sidecar_skip_reason=shrink_total_too_slow shrink_total_ms=${shrink_total_ms} max_shrink_total_ms=${MAX_SHRINK_TOTAL_MS}" | tee -a "${LEASE_LOG}"
+                        sidecar_done=1
+                        continue
+                    fi
                     active_csv=$(extract_active_ranks_csv "${line}")
                     echo "shrink_window_detected_time=$(date +%s.%N) active_count=${active_count}" | tee -a "${LEASE_LOG}"
                     echo "shrink_window_line=${line}" | tee -a "${LEASE_LOG}"

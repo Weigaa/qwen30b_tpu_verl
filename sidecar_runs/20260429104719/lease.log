@@ -1,0 +1,16 @@
+watch_start_time=1777430839.256298693
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260429104719_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+shrink_window_detected_time=1777431900.367709579 active_count=8
+shrink_window_line=[36m(WorkerDict pid=1288464)[0m INFO 04-29 11:04:59 [worker_v1.py:2843] Elastic parallel detach done: rank=2 active_ranks=[0, 1, 5, 7, 9, 11, 12, 14] total_ms=347.23
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1777431900.404969883
+sidecar_active_ranks=0,1,5,7,9,11,12,14
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_pid=1338251
+sidecar_deadline_signal_time=1777432369.091624669
+sidecar_deadline_signal_line=[36m(WorkerDict pid=1288465)[0m INFO 04-29 11:12:48 [worker_v1.py:2937] Elastic parallel restore done: rank=3 dp_size=16 ep_size=16 rebuild_ms=821.16 refresh_ms=892.50 total_ms=1717.54
+sidecar_kill_time=1777432369.095602931 reason=training_rollout_done_or_restore pid=1338251
+watch_end_time=1777432370.133650003

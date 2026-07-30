@@ -1,0 +1,73 @@
+*** Begin Patch
+*** Update File: vllm/v1/engine/llm_engine.py
+@@
+     def has_unfinished_requests_dp(self, has_unfinished: bool) -> bool:
+         active_global_ranks = self._get_active_dp_global_ranks(has_unfinished)
++        natural_active_global_ranks = list(active_global_ranks)
+         self.elastic_ep_runtime_active_ranks = (
+             tuple(active_global_ranks) if active_global_ranks else None)
+@@
+                 active_ranks_tuple = tuple(active_global_ranks)
+                 if self.elastic_ep_active_ranks != active_ranks_tuple:
++                    if self._should_delay_mode1_followup_shrink_for_survivors(
++                            active_ranks_tuple, natural_active_global_ranks,
++                            dp_world_size):
++                        current_active = tuple(self.elastic_ep_active_ranks or ())
++                        unfinished_survivors = sorted(
++                            set(active_ranks_tuple)
++                            & set(natural_active_global_ranks))
++                        logger.info(
++                            "Elastic follow-up shrink delayed until survivor ranks are idle: "
++                            "global_rank=%s unfinished_active_ranks=%s "
++                            "target_active_ranks=%s prev_active_ranks=%s "
++                            "current_group_size=%s local_has_unfinished=%s",
++                            current_global_rank, unfinished_survivors,
++                            list(active_ranks_tuple), current_active,
++                            dp_world_size, has_unfinished)
++                        if current_global_rank not in active_ranks_tuple:
++                            self.should_execute_dummy_batch = True
++                        return True
++
+                     skip_reason = None
+                     if min_compute_group_size is None:
+                         if (self.elastic_ep_active_ranks is not None
+@@
+         return aggregated_has_unfinished
++
++    def _should_delay_mode1_followup_shrink_for_survivors(
++            self, target_active_ranks: tuple[int, ...],
++            natural_active_ranks: list[int], dp_world_size: int) -> bool:
++        """Avoid rebuilding mode=1 groups while survivor ranks are decoding.
++
++        Mode=1 rebuild moves resident expert slots and MC2/EP/DP groups in the
++        same control path used by decode.  The initial full-world shrink is
++        tolerated, but follow-up shrinks from an already-shrunk group can leave
++        exiting ranks and survivor ranks on different communication lifetimes if
++        the survivors still have local unfinished requests.  Keep the old group
++        alive and let exiting ranks run dummy batches until the tail is idle.
++        """
++        if int(getattr(envs_ascend, "VLLM_ASCEND_ELASTIC_EXECUTION_MODE", 0)) != 1:
++            return False
++        if os.getenv(
++                "VLLM_ASCEND_MODE1_DELAY_FOLLOWUP_SHRINK_WITH_UNFINISHED_SURVIVORS",
++                "1").lower() in ("0", "false", "no", "off"):
++            return False
++        current_active = self.elastic_ep_active_ranks
++        if current_active is None:
++            return False
++        if not target_active_ranks:
++            return False
++        current_set = set(current_active)
++        target_set = set(target_active_ranks)
++        if not target_set.issubset(current_set):
++            return False
++        if len(target_set) >= len(current_set):
++            return False
++        if not set(natural_active_ranks) & target_set:
++            return False
++        if dp_world_size != len(current_active):
++            return False
++        return True
+ 
+     def restore_elastic_parallel_groups_if_needed(self) -> None:
+*** End Patch

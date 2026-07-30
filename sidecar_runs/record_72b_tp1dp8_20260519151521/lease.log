@@ -1,0 +1,17 @@
+watch_start_time=1779174921.996720082
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/record_72b_tp1dp8_20260519151521_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+watch_start_trigger=shrink_done
+watch_graceful_kill_seconds=3
+watch_sidecar_stop_file=sidecar_runs/record_72b_tp1dp8_20260519151521/outputs.jsonl.stop_requested
+shrink_window_detected_time=1779175906.404278467 active_count=8
+shrink_window_line=[36m(WorkerDict pid=1989206)[0m INFO 05-19 15:31:46 [worker_v1.py:2983] Elastic parallel shrink done: rank=0 active_ranks=[0, 1, 5, 7, 9, 11, 12, 14] dp_size=8 ep_size=8 no_ep_tail=False rebuild_ms=27.97 refresh_ms=520.29 warmup_ms=1714.18 total_ms=3552.00
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1779175906.442140136
+sidecar_active_ranks=0,1,5,7,9,11,12,14
+sidecar_devices=2,3,4,6,8,10,13,15
+sidecar_pid=2013769
+sidecar_exit_time=1779175965.046385682 sidecar_exit_code=1
+watch_end_time=1779175965.048832733

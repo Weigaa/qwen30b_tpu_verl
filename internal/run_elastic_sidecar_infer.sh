@@ -484,6 +484,24 @@ export VLLM_USE_V1="${VLLM_USE_V1:-1}"
 export VLLM_LOGGING_LEVEL="${VERL_SIDECAR_VLLM_LOGGING_LEVEL:-INFO}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 export VLLM_ENABLE_EXPERT_PARALLEL="${VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE}"
+
+# The sidecar reuses released ranks for an unrelated low-priority dense job and
+# must not inherit training-side elastic headroom reservations. These knobs are
+# correct for the shrunken rollout workers, but they artificially reduce
+# sidecar KV budget if left in the environment.
+unset VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK
+unset VLLM_ASCEND_ELASTIC_EXECUTION_MODE
+unset VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE
+unset VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE
+unset VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE
+unset VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES
+unset VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES
+unset VLLM_ASCEND_MODE4_MOE_DISPATCH_HEADROOM_BYTES
+unset VLLM_ASCEND_MODE4_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES
+unset VLLM_ASCEND_MODE5_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES
+unset VLLM_ASCEND_MODE3_LOW_FLOOR_MC2_WORKSPACE_HEADROOM_BYTES
+unset VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS
+
 if [[ "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "0" \
     && "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "false" \
     && "${VERL_SIDECAR_FORCE_HOST_IP_FOR_TP,,}" != "no" \
@@ -1327,6 +1345,7 @@ load_start = time.perf_counter()
 engine_kwargs = {
     "model": model_path,
     "tensor_parallel_size": int(os.environ.get("VERL_SIDECAR_TENSOR_PARALLEL_SIZE", "1")),
+    "enable_expert_parallel": _as_bool(os.environ.get("VERL_SIDECAR_ENABLE_EXPERT_PARALLEL_EFFECTIVE", "0")),
     "gpu_memory_utilization": float(os.environ.get("VERL_SIDECAR_GPU_MEMORY_UTILIZATION", "0.80")),
     "max_num_seqs": int(os.environ.get("VERL_SIDECAR_MAX_NUM_SEQS", "16")),
     "max_num_batched_tokens": int(os.environ.get("VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS", "1024")),
@@ -1386,6 +1405,10 @@ print(json.dumps({
     "model_is_moe": os.environ.get("VERL_SIDECAR_MODEL_IS_MOE", ""),
     "model_is_moe_reason": os.environ.get("VERL_SIDECAR_MODEL_IS_MOE_REASON", ""),
     "vllm_enable_expert_parallel": os.environ.get("VLLM_ENABLE_EXPERT_PARALLEL", ""),
+    "elastic_mode_env": os.environ.get("VLLM_ASCEND_ELASTIC_EXECUTION_MODE", ""),
+    "elastic_shrink_env": os.environ.get("VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK", ""),
+    "kv_cache_init_headroom_env": os.environ.get("VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES", ""),
+    "custom_mode1_kv_headroom_env": os.environ.get("VLLM_ASCEND_CUSTOM_MODE1_KV_MATERIALIZE_HEADROOM_BYTES", ""),
     "max_prompts": max_prompts,
     "max_prompts_per_device": max_prompts_per_device,
     "max_records_per_iteration": max_records_per_iteration,

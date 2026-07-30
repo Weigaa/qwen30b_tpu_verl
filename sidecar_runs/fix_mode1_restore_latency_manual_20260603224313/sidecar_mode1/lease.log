@@ -1,0 +1,23 @@
+watch_start_time=1780497793.215883326
+watch_train_log=/workspace/cann-recipes-train/llm_rl/qwen3/wjeagerqwen30b-a3b-with_draft_breakdown_20260603224313_elastic.txt
+watch_sidecar_script=/workspace/cann-recipes-train/llm_rl/qwen3/internal/run_elastic_sidecar_infer.sh
+watch_expected_active_ranks=8
+watch_world_size=16
+watch_start_trigger=shrink_done
+watch_graceful_kill_seconds=3
+watch_max_shrink_total_ms=0
+watch_sidecar_stop_file=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_latency_manual_20260603224313/sidecar_mode1/outputs.jsonl.stop_requested
+shrink_window_detected_time=1780498026.216917313 active_count=8
+shrink_window_line=[36m(WorkerDict pid=1377626)[0m INFO 06-03 22:47:05 [worker_v1.py:7418] Elastic parallel shrink done: rank=9 active_ranks=[8, 9, 10, 11, 12, 13, 14, 15] dp_size=8 ep_size=8 no_ep_tail=False rebuild_ms=12541.85 refresh_ms=122.29 warmup_ms=945.80 total_ms=14839.53
+sidecar_devices_source=auto_from_inactive_ranks
+sidecar_start_time=1780498026.255225987
+sidecar_active_ranks=8,9,10,11,12,13,14,15
+sidecar_devices=0,1,2,3,4,5,6,7
+sidecar_pid=1397146
+sidecar_deadline_signal_time=1780498086.701748443
+sidecar_deadline_signal_line=[36m(TaskRunner pid=1374874)[0m [Rank 0 | Local Rank 0] 2026-06-03 22:48:06,009 INFO [verl.trainer.ppo.ray_trainer:373] => Elastic parallel restore requested before rollout restore rpc
+sidecar_stop_request_time=1780498086.705784512 reason=training_rollout_done_or_restore pid=1397146 stop_file=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_latency_manual_20260603224313/sidecar_mode1/outputs.jsonl.stop_requested
+sidecar_kill_time=1780498089.133418808 reason=training_rollout_done_or_restore pid=1397146 after_soft_stop=1
+sidecar_output_merge_time=1780498089.356786135 output=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_latency_manual_20260603224313/sidecar_mode1/outputs.jsonl shards=8
+watch_end_time=1780498089.371375021
+sidecar_output_merge_time=1780498089.388033757 output=/workspace/cann-recipes-train/llm_rl/qwen3/sidecar_runs/fix_mode1_restore_latency_manual_20260603224313/sidecar_mode1/outputs.jsonl shards=8
