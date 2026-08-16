@@ -92,6 +92,39 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
 
 
+def _model_weight_pointer_signature(
+        model: torch.nn.Module) -> tuple[tuple[str, int, tuple[int, ...]], ...]:
+    """Return the parameter-address contract used by native graph sleep.
+
+    ACLGraph replay is safe across an RL weight refresh only while every
+    captured parameter keeps the same device address and logical shape.  The
+    0.14 stack relies on CaMem to preserve that property.  Keep an explicit
+    runtime contract in the 0.11 port so an incompatible loader falls back to
+    graph invalidation and recapture instead of silently replaying stale
+    addresses.
+    """
+    return tuple((name, int(param.data_ptr()), tuple(param.shape))
+                 for name, param in model.named_parameters())
+
+
+def _kv_cache_pointer_signature(value: Any) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Flatten KV-cache tensor addresses for the native-sleep replay guard."""
+    result: list[tuple[int, tuple[int, ...]]] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, torch.Tensor):
+            result.append((int(item.data_ptr()), tuple(item.shape)))
+        elif isinstance(item, dict):
+            for key in sorted(item, key=str):
+                visit(item[key])
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return tuple(result)
+
+
 def _sample_weight_tensor(tensor: torch.Tensor,
                           sample_count: int = 33) -> torch.Tensor:
     """Copy deterministic logical samples without retaining a full weight."""
@@ -1359,6 +1392,12 @@ class vLLMRollout(BaseRollout):
             self.sleep_level = 1
         else:
             self.sleep_level = VLLM_SLEEP_LEVEL
+        sleep_level_override = os.environ.get("VLLM_ROLLOUT_SLEEP_LEVEL")
+        if sleep_level_override:
+            self.sleep_level = int(sleep_level_override)
+        if self.sleep_level not in (1, 2):
+            raise ValueError(
+                f"unsupported VLLM_ROLLOUT_SLEEP_LEVEL={self.sleep_level}")
 
         model_path = model_config.local_path
         tokenizer = model_config.tokenizer
@@ -1507,6 +1546,14 @@ class vLLMRollout(BaseRollout):
             )
         self.elastic_execution_mode = elastic_execution_mode
         self.elastic_init_redundancy_expert = init_redundancy_expert
+        self.native_sleep_mode = _env_flag(
+            "VLLM_ROLLOUT_NATIVE_SLEEP_MODE", "0")
+        if self.native_sleep_mode and elastic_execution_mode != 0:
+            raise RuntimeError(
+                "0.11 native CaMem graph sleep is currently validated only "
+                "for Full16 Vanilla. AdaFloor shrink uses the existing manual "
+                "weight/KV lifecycle until topology-aware CaMem remapping is "
+                "validated.")
         cold_init_env_prev = os.environ.get(
             "VLLM_ASCEND_MODE1_IN_COLD_ENGINE_INIT")
         cold_init_enabled = (
@@ -1538,7 +1585,8 @@ class vLLMRollout(BaseRollout):
         })
         self.inference_engine = LLM(
             model=model_path,
-            enable_sleep_mode=False,
+            enable_sleep_mode=(config.free_cache_engine
+                               and self.native_sleep_mode),
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
             dtype=config.dtype,
@@ -1552,15 +1600,16 @@ class vLLMRollout(BaseRollout):
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
+            async_scheduling=config.async_scheduling,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=False,
+            enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
             additional_config={
                 "torchair_graph_config": torchair_graph_config,
                 "ascend_scheduler_config": {
                     "enabled": True,
-                    "enable_chunked_prefill": False,
+                    "enable_chunked_prefill": config.enable_chunked_prefill,
                 },
                 "refresh": True,
                 "elastic_moe_mode": elastic_moe_mode,
@@ -1649,12 +1698,30 @@ class vLLMRollout(BaseRollout):
         self.cpu_model = {}
         self.gpu_buffer_formats = {}
         self.gpu_buffers = None
-        for name, params in self.model.named_parameters():
-            self.cpu_model[name] = torch.empty_like(params, device="cpu")
-            self.gpu_buffer_formats[name] = _get_npu_buffer_format(params)
-        self.free_cache_engine()
-        if not self._preserve_initial_hf_weights:
-            self.offload_model_weights()
+        self._native_sleep_weight_ptr_signature = None
+        self._native_sleep_kv_ptr_signature = None
+        if self.native_sleep_mode:
+            if self._preserve_initial_hf_weights:
+                raise RuntimeError(
+                    "native rollout sleep is incompatible with preserved HF weights")
+            self._native_sleep_weight_ptr_signature = (
+                _model_weight_pointer_signature(self.model))
+            self._native_sleep_kv_ptr_signature = _kv_cache_pointer_signature(
+                self.model_runner.kv_caches)
+            self.inference_engine.reset_prefix_cache()
+            self.inference_engine.sleep(level=self.sleep_level)
+            logger.warning(
+                "0.11 optimized rollout uses native CaMem sleep level=%s; "
+                "parameter addresses are guarded before ACLGraph reuse",
+                self.sleep_level,
+            )
+        else:
+            for name, params in self.model.named_parameters():
+                self.cpu_model[name] = torch.empty_like(params, device="cpu")
+                self.gpu_buffer_formats[name] = _get_npu_buffer_format(params)
+            self.free_cache_engine()
+            if not self._preserve_initial_hf_weights:
+                self.offload_model_weights()
 
         kwargs = dict(
             n=1,
@@ -1907,6 +1974,9 @@ class vLLMRollout(BaseRollout):
         self._refresh_gpu_buffer_format_metadata()
 
     def offload_model_weights(self):
+        if self.native_sleep_mode:
+            raise RuntimeError(
+                "manual offload_model_weights called while native rollout sleep is active")
         if self._preserve_initial_hf_weights:
             logger.warning(
                 "Retaining initial DeepSeek HF rollout weights during offload")
@@ -2010,6 +2080,9 @@ class vLLMRollout(BaseRollout):
         _log_custom_mode1_rollout_memory("after_offload_model_weights")
 
     def free_cache_engine(self):
+        if self.native_sleep_mode:
+            raise RuntimeError(
+                "manual free_cache_engine called while native rollout sleep is active")
         if _rollout_elastic_aclgraph_enabled(self.model_runner):
             _invalidate_rollout_aclgraphs(self.model_runner,
                                           "free_cache_engine")
@@ -2764,6 +2837,34 @@ class vLLMRollout(BaseRollout):
         if not self.config.free_cache_engine:
             return
 
+        if self.native_sleep_mode:
+            self.inference_engine.wake_up(tags=tags)
+            current_signature = _model_weight_pointer_signature(self.model)
+            expected_signature = self._native_sleep_weight_ptr_signature
+            if (expected_signature is not None
+                    and current_signature != expected_signature):
+                logger.warning(
+                    "Native sleep remapped rollout parameter addresses; "
+                    "invalidate ACLGraph and recapture after weight refresh")
+                _invalidate_rollout_aclgraphs(
+                    self.model_runner, "native_sleep_pointer_change")
+                self._needs_rollout_aclgraph_recapture = True
+                self._native_sleep_weight_ptr_signature = current_signature
+            if "kv_cache" in tags:
+                current_kv_signature = _kv_cache_pointer_signature(
+                    self.model_runner.kv_caches)
+                expected_kv_signature = self._native_sleep_kv_ptr_signature
+                if (expected_kv_signature is not None
+                        and current_kv_signature != expected_kv_signature):
+                    logger.warning(
+                        "Native sleep remapped rollout KV-cache addresses; "
+                        "invalidate ACLGraph before generation")
+                    _invalidate_rollout_aclgraphs(
+                        self.model_runner, "native_sleep_kv_pointer_change")
+                    self._needs_rollout_aclgraph_recapture = True
+                self._native_sleep_kv_ptr_signature = current_kv_signature
+            return
+
         if "weights" in tags:
             self.onload_model_weights()
         elif "kv_cache" in tags:
@@ -2772,6 +2873,16 @@ class vLLMRollout(BaseRollout):
     async def release(self, preserve_kv_cache: bool = False):
         """Release weights and kv cache in GPU memory."""
         if not self.config.free_cache_engine:
+            return
+
+
+        if self.native_sleep_mode:
+            if preserve_kv_cache:
+                raise RuntimeError(
+                    "native rollout sleep does not yet support AdaFloor's "
+                    "same-floor KV preservation path")
+            self.inference_engine.reset_prefix_cache()
+            self.inference_engine.sleep(level=self.sleep_level)
             return
 
         if preserve_kv_cache:
@@ -2861,6 +2972,7 @@ class vLLMRollout(BaseRollout):
         if peft_config and base_sync_done:
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
             patch_elapsed_s = 0.0
+        weight_ptr_signature_before = _model_weight_pointer_signature(model)
         if (self.elastic_execution_mode in (1, 2)
                 and self.elastic_init_redundancy_expert > 0
                 and not getattr(self, "_lossless_weight_update_sync_logged", False)):
@@ -2959,10 +3071,29 @@ class vLLMRollout(BaseRollout):
         if mla_refreshed > 0:
             logger.info("Refreshed derived MLA weights for %s layers",
                         mla_refreshed)
-        _invalidate_rollout_aclgraphs(self.model_runner,
-                                      "update_weights_after_finalize")
-        if _rollout_elastic_aclgraph_enabled(self.model_runner):
-            self._needs_rollout_aclgraph_recapture = True
+        weight_ptr_signature_after = _model_weight_pointer_signature(model)
+        reuse_native_graph = (
+            self.native_sleep_mode
+            and _env_flag("VLLM_ROLLOUT_REUSE_ACLGRAPH_AFTER_WEIGHT_UPDATE", "1")
+            and weight_ptr_signature_before == weight_ptr_signature_after
+            and (self._native_sleep_weight_ptr_signature is None
+                 or self._native_sleep_weight_ptr_signature
+                 == weight_ptr_signature_after))
+        if reuse_native_graph:
+            logger.info(
+                "Reuse rollout ACLGraph after weight update: native CaMem "
+                "preserved all parameter addresses")
+            self._native_sleep_weight_ptr_signature = weight_ptr_signature_after
+        else:
+            if self.native_sleep_mode:
+                logger.warning(
+                    "Rollout weight loader changed captured addresses; use "
+                    "safe ACLGraph invalidate/recapture fallback")
+                self._native_sleep_weight_ptr_signature = weight_ptr_signature_after
+            _invalidate_rollout_aclgraphs(self.model_runner,
+                                          "update_weights_after_finalize")
+            if _rollout_elastic_aclgraph_enabled(self.model_runner):
+                self._needs_rollout_aclgraph_recapture = True
         load_call_elapsed_s = time.perf_counter() - load_call_start_t
         load_sync_start_t = time.perf_counter()
         load_sync_elapsed_s = 0.0

@@ -71,6 +71,9 @@ max_model_len: null
 # max length of sequences
 max_num_seqs: 1024
 
+# null lets vLLM decide; true enables v1 async scheduling.
+async_scheduling: null
+
 # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
 enable_chunked_prefill: True
 

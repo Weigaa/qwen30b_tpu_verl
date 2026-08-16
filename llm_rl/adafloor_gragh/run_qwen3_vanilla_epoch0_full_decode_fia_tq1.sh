@@ -65,6 +65,14 @@ KV_BLOCKS=2975
 GPU_MEMORY_UTILIZATION=0.9
 ACTOR_LR=1e-6
 CAPTURE_SIZES="${FULL_DECODE_CAPTURE_SIZES:-[32]}"
+OPTIMIZATION_PROFILE="${FULL_DECODE_OPTIMIZATION_PROFILE:-baseline}"
+case "$OPTIMIZATION_PROFILE" in
+    baseline|v014_runtime_port) ;;
+    *)
+        echo "unsupported FULL_DECODE_OPTIMIZATION_PROFILE=$OPTIMIZATION_PROFILE" >&2
+        exit 2
+        ;;
+esac
 
 PROTOCOL="$EXPERIMENT_ROOT/protocol.env"
 CODE_MANIFEST="$EXPERIMENT_ROOT/code_sha256.txt"
@@ -77,8 +85,14 @@ CODE_PATHS=(
     "$COMMON_RUNNER"
     "$SCRIPT_DIR/run_mode0_no_shrink_baseline.sh"
     "$SCRIPT_DIR/internal/wj_train_grpo_qwen30b_a3b_16die_true_weight_eager_baseline_util.sh"
+    "$SCRIPT_DIR/internal/wj_train_grpo_qwen30b_a3b_16die_true_weight_regroup.sh"
     "$SCRIPT_DIR/verl/single_controller/ray/base.py"
     "$SCRIPT_DIR/verl/trainer/constants_ppo.py"
+    "$SCRIPT_DIR/verl/trainer/config/ppo_megatron_trainer.yaml"
+    "$SCRIPT_DIR/verl/trainer/config/_generated_ppo_megatron_trainer.yaml"
+    "$SCRIPT_DIR/verl/trainer/config/rollout/rollout.yaml"
+    "$SCRIPT_DIR/verl/workers/config/rollout.py"
+    "$SCRIPT_DIR/verl/workers/megatron_workers.py"
     "$SCRIPT_DIR/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py"
     "$SCRIPT_DIR/vllm_ascend/attention/attention_v1.py"
     "$SCRIPT_DIR/vllm_ascend/compilation/acl_graph.py"
@@ -86,6 +100,9 @@ CODE_PATHS=(
     "$SCRIPT_DIR/vllm_ascend/platform.py"
     "$SCRIPT_DIR/vllm_ascend/worker/model_runner_v1.py"
 )
+if [[ -n "${FULL_DECODE_EXTRA_CODE_PATH:-}" ]]; then
+    CODE_PATHS+=("$FULL_DECODE_EXTRA_CODE_PATH")
+fi
 
 sha256_file() {
     sha256sum "$1" | awk '{print $1}'
@@ -120,6 +137,7 @@ write_or_verify_contracts() {
     {
         echo 'schema_version=1'
         echo 'experiment=qwen3_vanilla_epoch0_full_decode_fia_tq1'
+        echo "optimization_profile=$OPTIMIZATION_PROFILE"
         echo 'implementation_stack=vllm-0.11_vllm-ascend-0.11rc0'
         echo "output_root=$EXPERIMENT_ROOT"
         echo "run_name=$RUN_NAME"
@@ -152,6 +170,15 @@ write_or_verify_contracts() {
         echo 'tail_guard=false'
         echo 'shrink=false'
         echo 'sidecar=false'
+        echo "native_sleep_mode=${VLLM_ROLLOUT_NATIVE_SLEEP_MODE:-0}"
+        echo "native_sleep_level=${VLLM_ROLLOUT_SLEEP_LEVEL:-unset}"
+        echo "reuse_aclgraph_after_weight_update=${VLLM_ROLLOUT_REUSE_ACLGRAPH_AFTER_WEIGHT_UPDATE:-0}"
+        echo "async_scheduling=${VLLM_ROLLOUT_ASYNC_SCHEDULING:-false}"
+        echo "prefix_caching=${VLLM_ROLLOUT_ENABLE_PREFIX_CACHING:-false}"
+        echo "chunked_prefill=${VLLM_ROLLOUT_ENABLE_CHUNKED_PREFILL:-true}"
+        echo "filtered_custom_opp=${VLLM_ASCEND_USE_FILTERED_CUSTOM_OPP:-0}"
+        echo "filtered_custom_opp_path=${VLLM_ASCEND_FILTERED_CUSTOM_OPP_PATH:-unset}"
+        echo "filtered_custom_opp_bundle_sha256=${VLLM_ASCEND_FILTERED_CUSTOM_OPP_BUNDLE_SHA256:-unset}"
     } > "$protocol_tmp"
     local candidate destination
     for candidate in "$code_tmp" "$protocol_tmp"; do
@@ -310,7 +337,7 @@ env -u VERL_PAIRED_REQUEST_SAMPLING_SEEDS \
     COMMON_EPOCH0_PREEMPTION_POLICY=forbid \
     COMMON_EPOCH0_WORKLOAD_PROFILE_ID=qwen3_vanilla_epoch0_seed0_bs32_n16_len16384 \
     COMMON_EPOCH0_WORKLOAD_PROFILE_SHA256="$(sha256_file "$PROTOCOL")" \
-    COMMON_EPOCH0_EXECUTION_PROFILE=full_decode_fia_tq1 \
+    COMMON_EPOCH0_EXECUTION_PROFILE="full_decode_fia_tq1_${OPTIMIZATION_PROFILE}" \
     COMMON_EPOCH0_ORIGINAL_EXECUTION_CODE_SHA256="$(sha256_file "$CODE_MANIFEST")" \
     MODEL_PATH="$MODEL_PATH" DISTCP_PATH="$DISTCP_PATH" \
     TRAIN_FILE="$TRAIN_FILE" TEST_FILE="$TEST_FILE" \

@@ -1292,6 +1292,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         # FIXME(@wuxibin): megatron+sglang failed with `expandable_segments:True` in ci,
         # can't reproduce it in dev environment, temporary disable it.
         # https://github.com/volcengine/verl/actions/runs/17382936845/job/49344264323?pr=3285
+        # Native vLLM graph sleep must remap weights and KV cache to their
+        # original virtual addresses on the next rollout. Do not let the
+        # intervening Megatron phase occupy those ranges.
         if os.environ.get("MEGATRON_CI_DISABLE_EXPANDABLE_SEGMENTS", "0") == "0":
             set_expandable_segments(True)
 

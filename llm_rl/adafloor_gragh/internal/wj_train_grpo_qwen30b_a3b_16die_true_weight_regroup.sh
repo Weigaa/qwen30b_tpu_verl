@@ -15,10 +15,32 @@ if [[ "${ADAFLOOR_TRAIN_LAUNCHER_SNAPSHOT_ACTIVE:-0}" != "1" ]]; then
 fi
 
 SCRIPT_DIR_INTERNAL=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd "${SCRIPT_DIR_INTERNAL}/.." && pwd)
 LOG_NOISE_FILTER="${LOG_NOISE_FILTER:-${SCRIPT_DIR_INTERNAL}/filter_known_log_noise.py}"
 
+# The optimized FULL graph profile can reuse the filtered 0.14 custom OPP
+# bundle.  It keeps graph-required custom kernels but deliberately leaves the
+# MoE dispatch/combine registrations to the faster system CANN implementation.
+# The default remains disabled so historical 0.11 runs are unchanged.
+if [ "${VLLM_ASCEND_USE_FILTERED_CUSTOM_OPP:-0}" = "1" ]; then
+    FILTERED_CUSTOM_OPP_PATH="${VLLM_ASCEND_FILTERED_CUSTOM_OPP_PATH:-${PROJECT_ROOT}/../qwen3/vllm_ascend/_cann_ops_custom_moe_filtered/vendors/vllm-ascend}"
+    if [ ! -d "${FILTERED_CUSTOM_OPP_PATH}" ]; then
+        echo "missing filtered custom OPP package: ${FILTERED_CUSTOM_OPP_PATH}" >&2
+        exit 2
+    fi
+    case ":${ASCEND_CUSTOM_OPP_PATH:-}:" in
+        *":${FILTERED_CUSTOM_OPP_PATH}:"*) ;;
+        *) export ASCEND_CUSTOM_OPP_PATH="${FILTERED_CUSTOM_OPP_PATH}:${ASCEND_CUSTOM_OPP_PATH:-}" ;;
+    esac
+    echo "[run] filtered_custom_opp=${FILTERED_CUSTOM_OPP_PATH}"
+fi
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"
+if [ "${MEGATRON_CI_DISABLE_EXPANDABLE_SEGMENTS:-0}" = "1" ]; then
+    export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-garbage_collection_threshold:0.6,max_split_size_mb:24}"
+else
+    export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}"
+fi
 
 export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -51,6 +73,12 @@ export VLLM_DP_SIZE=${VLLM_DP_SIZE:-16}       # vLLM EP group size
 export HCCL_BUFFSIZE=800
 
 export TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-2}
+
+# These are opt-in at the launcher layer.  Keeping the historical defaults
+# here makes the existing eager and graph protocols byte-for-byte comparable.
+export VLLM_ROLLOUT_ASYNC_SCHEDULING=${VLLM_ROLLOUT_ASYNC_SCHEDULING:-false}
+export VLLM_ROLLOUT_ENABLE_PREFIX_CACHING=${VLLM_ROLLOUT_ENABLE_PREFIX_CACHING:-false}
+export VLLM_ROLLOUT_ENABLE_CHUNKED_PREFILL=${VLLM_ROLLOUT_ENABLE_CHUNKED_PREFILL:-true}
 
 export VLLM_ENABLE_FIX_ROUTE=0    
 export VLLM_MODEL_EXECUTE_TIME_OBSERVE=0     # decode prefill的耗时打印
@@ -341,6 +369,9 @@ run_trainer_with_log_filter python3 -m verl.trainer.main_ppo --config-path="${CO
     actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}" \
     actor_rollout_ref.rollout.enforce_eager=${ROLLOUT_ENFORCE_EAGER} \
     actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}" \
+    actor_rollout_ref.rollout.async_scheduling=${VLLM_ROLLOUT_ASYNC_SCHEDULING} \
+    actor_rollout_ref.rollout.enable_prefix_caching=${VLLM_ROLLOUT_ENABLE_PREFIX_CACHING} \
+    actor_rollout_ref.rollout.enable_chunked_prefill=${VLLM_ROLLOUT_ENABLE_CHUNKED_PREFILL} \
     actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
     actor_rollout_ref.rollout.temperature=0.9 \
     actor_rollout_ref.rollout.top_k=50 \

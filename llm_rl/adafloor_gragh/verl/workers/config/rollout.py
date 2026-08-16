@@ -136,6 +136,9 @@ class RolloutConfig(BaseConfig):
 
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
+    # None lets vLLM choose its default.  True enables the v1 scheduler's
+    # one-step CPU/NPU overlap, matching the optimized vLLM 0.14 rollout path.
+    async_scheduling: Optional[bool] = None
 
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size: Optional[int] = None
