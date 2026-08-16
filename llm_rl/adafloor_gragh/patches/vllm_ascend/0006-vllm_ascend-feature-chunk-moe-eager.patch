@@ -1,0 +1,164 @@
+From acb67b6d696d41182709eefa353edf2ce880a973 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi2@huawei.com>
+Date: Mon, 1 Dec 2025 15:12:03 +0800
+Subject: [PATCH] chunk moe eager
+For MoE computation scenarios, implement chunk processing optimization to address excessive peak memory
+in prefill phase.
+
+---
+ .../vllm_ascend/ops/moe/moe_comm_method.py    | 132 +++++++++++++-----
+ 1 file changed, 96 insertions(+), 36 deletions(-)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/ops/moe/moe_comm_method.py b/llm_rl/qwen3/vllm_ascend/ops/moe/moe_comm_method.py
+index 5fb24da..51ac235 100644
+--- a/llm_rl/qwen3/vllm_ascend/ops/moe/moe_comm_method.py
++++ b/llm_rl/qwen3/vllm_ascend/ops/moe/moe_comm_method.py
+@@ -19,6 +19,7 @@ from abc import ABC, abstractmethod
+ from typing import Any, Dict, Optional
+ 
+ import torch
++import os
+ from vllm.config import get_current_vllm_config
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
+@@ -119,42 +120,101 @@ class MoECommMethod(ABC):
+         moe_comm_method = get_forward_context().moe_comm_method
+         assert moe_comm_method is not None, "Missing communication context"
+ 
+-        results = self.token_dispatcher.token_dispatch(
+-            hidden_states=hidden_states,
+-            topk_weights=topk_weights,
+-            topk_ids=topk_ids,
+-            row_idx=row_idx,
+-            expert_map=expert_map,
+-            log2phy=log2phy,
+-            global_redundant_expert_num=global_redundant_expert_num,
+-            shared_experts=shared_experts,
+-            quantized_x_for_share=quantized_x_for_share,
+-            dynamic_scale_for_share=dynamic_scale_for_share,
+-            mc2_mask=self.mc2_mask,
+-            apply_router_weight_on_input=apply_router_weight_on_input,
+-            with_quant=use_int8_w8a8 or use_int4_w4a8)
+-
+-        permuted_hidden_states, expert_tokens, dynamic_scale, group_list_type, topk_scales = \
+-            results["hidden_states"], results["group_list"], results.get("dynamic_scale"), results["group_list_type"], results.get("topk_scales")
+-
+-        mlp_output = unified_apply_mlp(hidden_states=permuted_hidden_states,
+-                                       w1=w1,
+-                                       w1_scale=w1_scale,
+-                                       w2=w2,
+-                                       w2_scale=w2_scale,
+-                                       group_list=expert_tokens,
+-                                       dynamic_scale=dynamic_scale,
+-                                       group_list_type=group_list_type,
+-                                       w1_scale_bias=w1_scale_bias,
+-                                       w2_scale_bias=w2_scale_bias,
+-                                       topk_scales=topk_scales,
+-                                       with_quant=use_int8_w8a8
+-                                       or use_int4_w4a8,
+-                                       fusion=use_int8_w8a8,
+-                                       need_trans=need_trans)
+-
+-        final_hidden_states = self.token_dispatcher.token_combine(
+-            hidden_states=mlp_output)
++        final_hidden_states = torch.zeros_like(hidden_states)
++        chunk_start_index = 0
++        chunk_moe_size = int(os.environ.get('VLLM_CHUNK_MOE_SIZE', 512))
++        ctx = get_forward_context()
++
++        from vllm.distributed import get_tensor_model_parallel_world_size
++        tp_size = get_tensor_model_parallel_world_size()
++        max_tokens = (ctx.max_tokens_across_dp + tp_size - 1) // tp_size
++        num_tokens = hidden_states.size(0)
++
++        if max_tokens < chunk_moe_size:
++            results = self.token_dispatcher.token_dispatch(
++                hidden_states=hidden_states,
++                topk_weights=topk_weights,
++                topk_ids=topk_ids,
++                row_idx=row_idx,
++                expert_map=expert_map,
++                log2phy=log2phy,
++                global_redundant_expert_num=global_redundant_expert_num,
++                shared_experts=shared_experts,
++                quantized_x_for_share=quantized_x_for_share,
++                dynamic_scale_for_share=dynamic_scale_for_share,
++                mc2_mask=self.mc2_mask,
++                apply_router_weight_on_input=apply_router_weight_on_input,
++                with_quant=use_int8_w8a8 or use_int4_w4a8)
++            permuted_hidden_states, expert_tokens, dynamic_scale, group_list_type, topk_scales = \
++                results["hidden_states"], results["group_list"], results.get("dynamic_scale"), results["group_list_type"], results.get("topk_scales")
++            mlp_output = unified_apply_mlp(hidden_states=permuted_hidden_states,
++                                            w1=w1,
++                                            w1_scale=w1_scale,
++                                            w2=w2,
++                                            w2_scale=w2_scale,
++                                            group_list=expert_tokens,
++                                            dynamic_scale=dynamic_scale,
++                                            group_list_type=group_list_type,
++                                            w1_scale_bias=w1_scale_bias,
++                                            w2_scale_bias=w2_scale_bias,
++                                            topk_scales=topk_scales,
++                                            with_quant=use_int8_w8a8
++                                            or use_int4_w4a8,
++                                            fusion=use_int8_w8a8,
++                                            need_trans=need_trans)
++            mlp_hidden_states = self.token_dispatcher.token_combine(
++                hidden_states=mlp_output)
++            return mlp_hidden_states
++        
++        for chunk_start in range(0, max_tokens, chunk_moe_size):
++            skip_result_store = chunk_start >= num_tokens
++            chunk_end = min(chunk_start + chunk_moe_size, max_tokens)
++            chunk_start = min(chunk_start, num_tokens - 1)
++            chunk_end = min(chunk_end, num_tokens)
++            chunk_hidden_states = hidden_states[chunk_start:chunk_end]
++            chunk_topk_ids = topk_ids[chunk_start:chunk_end]
++            chunk_topk_weights = topk_weights[chunk_start:chunk_end]
++            chunk_shared_experts = None if shared_experts is None else shared_experts[chunk_start:chunk_end]
++            results = self.token_dispatcher.token_dispatch(
++                hidden_states=chunk_hidden_states,
++                topk_weights=chunk_topk_weights,
++                topk_ids=chunk_topk_ids,
++                row_idx=row_idx,
++                expert_map=expert_map,
++                log2phy=log2phy,
++                global_redundant_expert_num=global_redundant_expert_num,
++                shared_experts=chunk_shared_experts,
++                quantized_x_for_share=quantized_x_for_share,
++                dynamic_scale_for_share=dynamic_scale_for_share,
++                mc2_mask=self.mc2_mask,
++                apply_router_weight_on_input=apply_router_weight_on_input,
++                with_quant=use_int8_w8a8 or use_int4_w4a8)
++            
++            permuted_hidden_states, expert_tokens, dynamic_scale, group_list_type, topk_scales = \
++                results["hidden_states"], results["group_list"], results.get("dynamic_scale"), results["group_list_type"], results.get("topk_scales")
++
++            mlp_output = unified_apply_mlp(hidden_states=permuted_hidden_states,
++                                            w1=w1,
++                                            w1_scale=w1_scale,
++                                            w2=w2,
++                                            w2_scale=w2_scale,
++                                            group_list=expert_tokens,
++                                            dynamic_scale=dynamic_scale,
++                                            group_list_type=group_list_type,
++                                            w1_scale_bias=w1_scale_bias,
++                                            w2_scale_bias=w2_scale_bias,
++                                            topk_scales=topk_scales,
++                                            with_quant=use_int8_w8a8
++                                            or use_int4_w4a8,
++                                            fusion=use_int8_w8a8,
++                                            need_trans=need_trans)
++            mlp_hidden_states = self.token_dispatcher.token_combine(
++                hidden_states=mlp_output)
++            if skip_result_store:
++                continue
++            chunk_end_idx = chunk_start_index + mlp_hidden_states.shape[0]
++            final_hidden_states[chunk_start_index: chunk_end_idx, :] = mlp_hidden_states
++            chunk_start_index = chunk_end_idx
+ 
+         if dynamic_eplb:
+             return (final_hidden_states, group_list_type, expert_tokens)
+-- 
+2.50.1.windows.1
+

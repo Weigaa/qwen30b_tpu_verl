@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+RUN_STAMP="${RUN_STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
+
+# A/B baseline: reproduce the real 2,2,4,4,16 floor history while keeping
+# steps 1-4 short.  Step5 is the only long/full-response decode step.
+#
+# This variant refreshes full-world groups before the floor16 KV allocation but
+# does not run the extra full-world MC2 dispatcher warmup.
+export DYNAMIC_RUN_NAME="${DYNAMIC_RUN_NAME:-mode1_dynamic_floor2_to_floor4_kv_probe_5step_step5full_nohot_${RUN_STAMP}}"
+export DYNAMIC_PLAN_STEPS="${DYNAMIC_PLAN_STEPS:-5}"
+export DYNAMIC_TRAIN_STEPS="${DYNAMIC_TRAIN_STEPS:-5}"
+export DYNAMIC_FORCE_SELECTED_FLOORS="${DYNAMIC_FORCE_SELECTED_FLOORS:-2,2,4,4,16}"
+
+export DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP="${DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP:-8,16,32,64,64;8,16,32,64,64;8,16,32,64,64;8,16,32,64,64;16384,16384,16384,16384,16384}"
+export DYNAMIC_FULL_MAX_RESPONSE_LENGTH="${DYNAMIC_FULL_MAX_RESPONSE_LENGTH:-16384}"
+export DYNAMIC_FULL_MAX_RESPONSE_LEN="${DYNAMIC_FULL_MAX_RESPONSE_LEN:-16384}"
+export DYNAMIC_FULL_MAX_NUM_BATCHED_TOKENS="${DYNAMIC_FULL_MAX_NUM_BATCHED_TOKENS:-17408}"
+export DYNAMIC_FULL_MAX_PROMPT_LENGTH="${DYNAMIC_FULL_MAX_PROMPT_LENGTH:-1024}"
+
+export VLLM_ASCEND_MODE1_REFRESH_GROUPS_ON_KV_RESIZE="${VLLM_ASCEND_MODE1_REFRESH_GROUPS_ON_KV_RESIZE:-1}"
+export VLLM_ASCEND_MODE1_FULLWORLD_REFRESH_MC2_WARMUP=0
+export VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_MC2_WARMUP="${VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_MC2_WARMUP:-1}"
+export VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_MC2_WARMUP_TOKENS="${VLLM_ASCEND_MODE1_PARITY_POST_RESTORE_MC2_WARMUP_TOKENS:-32}"
+export VLLM_ASCEND_MODE1_PARITY_MC2_WARMUP_ROUTE="${VLLM_ASCEND_MODE1_PARITY_MC2_WARMUP_ROUTE:-global}"
+
+echo "[floor2->floor4 kv probe 5step step5full nohot] run_name=$DYNAMIC_RUN_NAME"
+echo "[floor2->floor4 kv probe 5step step5full nohot] floors=$DYNAMIC_FORCE_SELECTED_FLOORS steps=$DYNAMIC_TRAIN_STEPS"
+echo "[floor2->floor4 kv probe 5step step5full nohot] runtime_caps_by_step=$DYNAMIC_RUNTIME_TAIL_VALIDATE_LEVEL_TOKENS_BY_STEP"
+echo "[floor2->floor4 kv probe 5step step5full nohot] refresh_groups=$VLLM_ASCEND_MODE1_REFRESH_GROUPS_ON_KV_RESIZE mc2_warmup=$VLLM_ASCEND_MODE1_FULLWORLD_REFRESH_MC2_WARMUP route=$VLLM_ASCEND_MODE1_PARITY_MC2_WARMUP_ROUTE"
+
+exec "$SCRIPT_DIR/run_mode1_dynamic_floor2_to_floor4_kv_probe.sh" "$@"

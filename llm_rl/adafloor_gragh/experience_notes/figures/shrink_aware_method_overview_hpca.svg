@@ -1,0 +1,195 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#24324a"/>
+    </marker>
+    <linearGradient id="timeGrad" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#f4f7fb"/>
+      <stop offset="100%" stop-color="#dce8f7"/>
+    </linearGradient>
+    <style>
+      .bg { fill: #ffffff; }
+      .title { font-family: Arial; font-size: 34px; font-weight: 700; fill: #172033; }
+      .subtitle { font-family: Arial; font-size: 17px; fill: #536178; }
+      .panel { fill: #f8fafc; stroke: #cbd6e3; stroke-width: 2; rx: 14; }
+      .panelTitle { font-family: Arial; font-size: 21px; font-weight: 700; fill: #1b2a41; }
+      .panelNum { font-family: Arial; font-size: 18px; font-weight: 700; fill: #ffffff; }
+      .body { font-family: Arial; font-size: 15px; fill: #27364d; }
+      .small { font-family: Arial; font-size: 13px; fill: #4e5d73; }
+      .tiny { font-family: Arial; font-size: 11px; fill: #5d6a7d; }
+      .mono { font-family: Arial; font-size: 13px; fill: #26364f; }
+      .eq { font-family: Arial; font-size: 15px; fill: #1f2e43; font-style: italic; }
+      .badge { fill: #eef4fb; stroke: #b8c8d9; stroke-width: 1.2; rx: 8; }
+      .blue { fill: #2d6cdf; }
+      .blueLight { fill: #dce9ff; stroke: #8eb5f5; }
+      .green { fill: #2b9a66; }
+      .greenLight { fill: #e1f3ea; stroke: #87c6a9; }
+      .amber { fill: #c77b18; }
+      .amberLight { fill: #fff0d8; stroke: #e5b46d; }
+      .redLight { fill: #fde6e8; stroke: #e59aa3; }
+      .grayLine { stroke: #9aa9ba; stroke-width: 1; }
+      .arrow { stroke: #24324a; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+      .thinArrow { stroke: #536178; stroke-width: 1.7; fill: none; marker-end: url(#arrow); }
+      .rankLine { stroke: #d4dde8; stroke-width: 1; }
+      .released { fill: #bfe6d2; stroke: #79bd9a; stroke-width: 1; }
+      .active { fill: #dbe8ff; stroke: #82a9e9; stroke-width: 1; }
+      .dummy { fill: #f6d9b2; stroke: #d49a4f; stroke-width: 1; }
+      .danger { fill: #fce7ea; stroke: #df9ca5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="900"/>
+
+  <text class="title" x="60" y="62">Shrink-Aware Rollout Scheduling for RLHF Training</text>
+  <text class="subtitle" x="60" y="92">A three-stage method: construct no-preemption batches, maximize releasable rank-time, and reuse released ranks safely.</text>
+
+  <rect class="badge" x="1120" y="36" width="390" height="70"/>
+  <text class="small" x="1142" y="62">Inputs from previous epoch</text>
+  <text class="mono" x="1142" y="86">length EMA + p95 tailguard + calibrated KV caps</text>
+
+  <rect class="panel" x="55" y="140" width="450" height="620"/>
+  <circle class="blue" cx="90" cy="173" r="18"/>
+  <text class="panelNum" x="84" y="180">1</text>
+  <text class="panelTitle" x="118" y="180">Epoch-Level Batch Construction</text>
+  <text class="body" x="85" y="222">Goal: minimize end-to-end epoch rollout time</text>
+  <text class="body" x="85" y="246">while keeping every step KV-feasible.</text>
+
+  <rect class="blueLight" x="85" y="276" width="370" height="92" rx="10"/>
+  <text class="small" x="105" y="304">Prompt-level predictor</text>
+  <text class="mono" x="105" y="328">tail_i = max(response_i,1..16)</text>
+  <text class="mono" x="105" y="350">safe_tail_i = EMA(tail_i) x tailguard</text>
+
+  <text class="small" x="85" y="397">Sort by predicted safe tail</text>
+  <line x1="105" y1="465" x2="420" y2="465" stroke="#8da4bf" stroke-width="2"/>
+  <g>
+    <rect x="105" y="449" width="18" height="16" fill="#7fb3ff"/>
+    <rect x="127" y="447" width="18" height="18" fill="#7fb3ff"/>
+    <rect x="149" y="444" width="18" height="21" fill="#7fb3ff"/>
+    <rect x="171" y="441" width="18" height="24" fill="#7fb3ff"/>
+    <rect x="193" y="437" width="18" height="28" fill="#7fb3ff"/>
+    <rect x="215" y="432" width="18" height="33" fill="#7fb3ff"/>
+    <rect x="237" y="426" width="18" height="39" fill="#7fb3ff"/>
+    <rect x="259" y="420" width="18" height="45" fill="#7fb3ff"/>
+    <rect x="281" y="413" width="18" height="52" fill="#7fb3ff"/>
+    <rect x="303" y="405" width="18" height="60" fill="#7fb3ff"/>
+    <rect x="325" y="397" width="18" height="68" fill="#7fb3ff"/>
+    <rect x="347" y="390" width="18" height="75" fill="#7fb3ff"/>
+  </g>
+  <text class="tiny" x="105" y="484">short prompts</text>
+  <text class="tiny" x="332" y="484">long prompts</text>
+
+  <rect class="greenLight" x="85" y="496" width="370" height="122" rx="10"/>
+  <text class="small" x="105" y="524">Build length-homogeneous steps</text>
+  <g>
+    <rect x="105" y="545" width="54" height="34" rx="5" fill="#dce9ff" stroke="#7ca7e8"/>
+    <rect x="168" y="545" width="54" height="34" rx="5" fill="#dce9ff" stroke="#7ca7e8"/>
+    <rect x="231" y="545" width="54" height="34" rx="5" fill="#dce9ff" stroke="#7ca7e8"/>
+    <rect x="294" y="545" width="54" height="34" rx="5" fill="#dce9ff" stroke="#7ca7e8"/>
+    <rect x="357" y="545" width="54" height="34" rx="5" fill="#dce9ff" stroke="#7ca7e8"/>
+    <text class="tiny" x="122" y="567">B1</text>
+    <text class="tiny" x="185" y="567">B2</text>
+    <text class="tiny" x="248" y="567">B3</text>
+    <text class="tiny" x="311" y="567">B4</text>
+    <text class="tiny" x="374" y="567">B5</text>
+  </g>
+  <text class="tiny" x="105" y="600">Neighbor swap only when KV feasibility fails</text>
+
+  <rect class="badge" x="85" y="648" width="370" height="68"/>
+  <text class="eq" x="105" y="674">minimize  Sum_t Tail(B_t)</text>
+  <text class="small" x="105" y="700">subject to no preemption: active_KV(pair) &lt;= C_f</text>
+
+  <path class="arrow" d="M505 450 C535 450, 545 450, 575 450"/>
+
+  <rect class="panel" x="575" y="140" width="450" height="620"/>
+  <circle class="green" cx="610" cy="173" r="18"/>
+  <text class="panelNum" x="604" y="180">2</text>
+  <text class="panelTitle" x="638" y="180">Batch-Level Rank Assignment</text>
+  <text class="body" x="605" y="222">Given one 32-prompt batch, choose a feasible</text>
+  <text class="body" x="605" y="246">floor and maximize reusable rank-time area.</text>
+
+  <rect class="badge" x="605" y="276" width="370" height="62"/>
+  <text class="small" x="625" y="302">Deepest feasible floor</text>
+  <text class="mono" x="625" y="324">f in {16, 8, 4, 2},  active_KV &lt;= C_f</text>
+
+  <text class="small" x="605" y="374">Enumerate shrink schedules and quotas</text>
+  <rect x="625" y="398" width="310" height="190" fill="url(#timeGrad)" stroke="#b9c8d8" rx="8"/>
+  <text class="tiny" x="635" y="418">ranks</text>
+  <text class="tiny" x="900" y="575">time</text>
+  <line class="grayLine" x1="660" y1="565" x2="918" y2="565"/>
+  <line class="grayLine" x1="660" y1="423" x2="660" y2="565"/>
+  <line class="rankLine" x1="660" y1="458" x2="918" y2="458"/>
+  <line class="rankLine" x1="660" y1="494" x2="918" y2="494"/>
+  <line class="rankLine" x1="660" y1="530" x2="918" y2="530"/>
+  <line x1="734" y1="423" x2="734" y2="565" stroke="#476eab" stroke-width="2" stroke-dasharray="5 5"/>
+  <line x1="812" y1="423" x2="812" y2="565" stroke="#476eab" stroke-width="2" stroke-dasharray="5 5"/>
+  <line x1="878" y1="423" x2="878" y2="565" stroke="#476eab" stroke-width="2" stroke-dasharray="5 5"/>
+  <text class="tiny" x="728" y="389">a</text>
+  <text class="tiny" x="806" y="389">b</text>
+  <text class="tiny" x="872" y="389">c</text>
+  <text class="tiny" x="912" y="389">T</text>
+  <rect class="released" x="734" y="423" width="184" height="35"/>
+  <rect class="released" x="812" y="458" width="106" height="36"/>
+  <rect class="released" x="878" y="494" width="40" height="36"/>
+  <rect class="active" x="660" y="423" width="74" height="142"/>
+  <rect class="active" x="734" y="458" width="78" height="107"/>
+  <rect class="active" x="812" y="494" width="66" height="71"/>
+  <rect class="active" x="878" y="530" width="40" height="35"/>
+  <text class="tiny" x="675" y="445">16</text>
+  <text class="tiny" x="746" y="481">8</text>
+  <text class="tiny" x="824" y="517">4</text>
+  <text class="tiny" x="890" y="552">2</text>
+  <text class="tiny" x="742" y="445">released rank-time</text>
+
+  <rect class="amberLight" x="605" y="620" width="370" height="96" rx="10"/>
+  <text class="small" x="625" y="648">Quota-aware exact matching oracle</text>
+  <text class="eq" x="625" y="674">maximize  8(T-a) + 4(T-b) + 2(T-c)</text>
+  <text class="small" x="625" y="700">then tie-break by load skew and KV peak</text>
+
+  <path class="arrow" d="M1025 450 C1055 450, 1065 450, 1095 450"/>
+
+  <rect class="panel" x="1095" y="140" width="450" height="620"/>
+  <circle class="amber" cx="1130" cy="173" r="18"/>
+  <text class="panelNum" x="1124" y="180">3</text>
+  <text class="panelTitle" x="1158" y="180">Runtime Reuse Policy</text>
+  <text class="body" x="1125" y="222">Decide when ranks leave the rollout group and</text>
+  <text class="body" x="1125" y="246">how the released rank-time is consumed.</text>
+
+  <rect class="blueLight" x="1125" y="276" width="380" height="82" rx="10"/>
+  <text class="small" x="1145" y="303">Natural</text>
+  <text class="tiny" x="1145" y="327">Runtime unfinished ranks choose survivors;</text>
+  <text class="tiny" x="1145" y="345">lower residency, less deterministic.</text>
+
+  <rect class="greenLight" x="1125" y="382" width="380" height="82" rx="10"/>
+  <text class="small" x="1145" y="409">Planner</text>
+  <text class="tiny" x="1145" y="433">Fixed survivor topology with cached floor groups;</text>
+  <text class="tiny" x="1145" y="451">deterministic handoff, higher headroom cost.</text>
+
+  <path class="thinArrow" d="M1315 358 L1315 382"/>
+  <text class="tiny" x="1324" y="374">or</text>
+
+  <rect class="badge" x="1125" y="494" width="380" height="66"/>
+  <text class="small" x="1145" y="519">Released ranks form a side pool</text>
+  <text class="mono" x="1145" y="546">usable_area = rank-time area - transition cost</text>
+
+  <g>
+    <rect x="1128" y="596" width="112" height="66" rx="8" fill="#e1f3ea" stroke="#7ebf9d"/>
+    <rect x="1259" y="596" width="112" height="66" rx="8" fill="#e7edff" stroke="#95aef0"/>
+    <rect x="1390" y="596" width="112" height="66" rx="8" fill="#fff0d8" stroke="#dfa85e"/>
+    <text class="small" x="1164" y="624">Sidecar</text>
+    <text class="tiny" x="1161" y="645">inference</text>
+    <text class="small" x="1297" y="624">Draft</text>
+    <text class="tiny" x="1287" y="645">model train</text>
+    <text class="small" x="1428" y="624">Other</text>
+    <text class="tiny" x="1432" y="645">jobs</text>
+  </g>
+  <path class="thinArrow" d="M1315 560 L1315 590"/>
+
+  <rect class="danger" x="1125" y="682" width="380" height="66" rx="10"/>
+  <text class="small" x="1145" y="705">Runtime guardrails</text>
+  <text class="tiny" x="1145" y="724">calibrated KV caps, no preemption,</text>
+  <text class="tiny" x="1145" y="740">communication-group headroom</text>
+
+  <rect x="95" y="800" width="1410" height="58" rx="12" fill="#f3f6fa" stroke="#c8d3df"/>
+  <text class="panelTitle" x="122" y="835">Output:</text>
+  <text class="body" x="205" y="835">a per-epoch rollout plan with no-preemption batches, rank assignments, shrink schedules, and sidecar-ready released-rank windows.</text>
+</svg>

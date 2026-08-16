@@ -1,0 +1,10914 @@
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2023 The vLLM team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
+# Adapted from vllm/tests/kernels/test_moe.py
+
+import gc
+import os
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
+from typing import Any, Callable, Optional
+
+import torch
+import torch_npu
+from vllm.config import get_current_vllm_config
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
+                                             get_tp_group)
+from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.config import \
+    FusedMoEConfig  # isort: skip
+from vllm.model_executor.layers.fused_moe.config import \
+    FusedMoEParallelConfig  # isort: skip
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE, UnquantizedFusedMoEMethod, determine_expert_map)
+from vllm.model_executor.layers.quantization.base_config import \
+    QuantizationConfig
+from vllm.utils import direct_register_custom_op
+
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_forward_context import FusedMoEState, MoECommType
+from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend import envs as envs_ascend
+from vllm_ascend.eplb.core.eplb_utils import (
+    determine_default_expert_map, determine_default_log2phy_map,
+    determine_redundant_replica_expert_map,
+    determine_redundant_replica_log2phy_map)
+from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
+from vllm_ascend.ops.moe.experts_selector import return_row_idx, select_experts
+from vllm_ascend.ops.moe.moe_mlp import unified_apply_mlp
+from vllm_ascend.ops.moe.moe_comm_method import (get_moe_comm_method,
+                                                 setup_moe_comm_method)
+from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ,
+                               get_all_reduce_merge_state,
+                               get_rm_router_logits_state, is_310p,
+                               vllm_version_is)
+from vllm.utils.moe_stats import moe_stats
+import time
+
+logger = init_logger(__name__)
+_MODE3_TIMING_COUNTS = defaultdict(int)
+
+
+def _recover_mode3_invalid_topk(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        scoring_func: str,
+        layer: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if scoring_func != "softmax":
+        raise RuntimeError(
+            "Mode3 topk recovery only supports softmax routing, got "
+            f"scoring_func={scoring_func} at layer="
+            f"{getattr(layer, 'layer_idx', -1)}")
+    scores = torch.softmax(router_logits.to(torch.float32), dim=-1)
+    topk_weights, topk_ids = torch.topk(scores, k=int(top_k), dim=-1)
+    if renormalize:
+        denom = topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / denom.clamp_min(1e-20)
+    return (topk_weights.to(dtype=router_logits.dtype),
+            topk_ids.to(dtype=torch.int32),
+            return_row_idx(hidden_states, int(top_k)))
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+def _mode1_in_profile_run() -> bool:
+    if _env_flag("VLLM_ASCEND_MODE1_IN_PROFILE_RUN", "0"):
+        return True
+    try:
+        return bool(getattr(get_forward_context(), "in_profile_run", False))
+    except Exception:
+        return False
+
+
+def _mode1_target_floor_for_weight_reload() -> Optional[int]:
+    for name in (
+            "VLLM_ASCEND_MODE1_WEIGHT_RELOAD_TARGET_FLOOR",
+            "VLLM_ASCEND_MODE1_PARITY_CURRENT_FLOOR",
+    ):
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        try:
+            value = int(float(raw.strip()))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _mode5_use_legacy_cpu_shadow_runtime() -> bool:
+    return _env_flag("VLLM_ASCEND_MODE5_USE_LEGACY_CPU_SHADOW_RUNTIME", "0")
+
+
+def _mode5_cpu_shadow_runtime_strategy() -> str:
+    return ("legacy_cpu_shadow"
+            if _mode5_use_legacy_cpu_shadow_runtime() else "dual_source")
+
+
+def _mode5_group_cpu_remote_slot_order() -> bool:
+    return _env_flag("VLLM_ASCEND_MODE5_GROUP_CPU_REMOTE_SLOT_ORDER", "1")
+
+
+@contextmanager
+def _dummy_profile_range(message: str):
+    if not _env_flag("VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS", "0"):
+        yield
+        return
+    range_id = None
+    try:
+        from torch_npu.npu import mstx
+        range_id = mstx.range_start(message=message)
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            mstx.range_end(range_id)
+        except Exception:
+            pass
+
+
+def _stage_decode_profile_message(kind: str,
+                                  layer: Any,
+                                  *,
+                                  path: str = "",
+                                  extra: str = "") -> str:
+    mode = int(getattr(layer, "elastic_execution_mode", 0))
+    stage = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+    layer_idx = int(getattr(layer, "layer_idx", -1))
+    parts = [
+        f"vllm_stage_decode_{kind}",
+        f"rank={_profile_rank()}",
+        f"mode={mode}",
+        f"stage={stage}",
+        f"layer={layer_idx}",
+    ]
+    if path:
+        parts.append(f"path={path}")
+    if extra:
+        parts.append(extra)
+    return " ".join(parts)
+
+
+def _stage_decode_profile_range_start(message: str) -> Optional[Any]:
+    if not _env_flag("VLLM_ASCEND_STAGE_DECODE_PROFILE_MARKERS", "0"):
+        return None
+    try:
+        from torch_npu.npu import mstx
+        return mstx.range_start(message=message)
+    except Exception:
+        return None
+
+
+def _stage_decode_profile_range_end(range_id: Optional[Any]) -> None:
+    if range_id is None:
+        return
+    try:
+        from torch_npu.npu import mstx
+        mstx.range_end(range_id)
+    except Exception:
+        pass
+
+
+def _profile_rank() -> int:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return -1
+
+
+def _parse_layer_filter(value: str) -> Optional[set[int]]:
+    value = value.strip().lower()
+    if value in ("", "all", "*"):
+        return None
+    layers: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            layers.add(int(item))
+        except ValueError:
+            continue
+    return layers
+
+
+def _new_npu_event(*, enable_timing: bool = False) -> torch.npu.Event:
+    try:
+        return torch.npu.Event(enable_timing=enable_timing)
+    except TypeError:
+        return torch.npu.Event()
+
+
+def _elapsed_ms(start_event: Any, end_event: Any) -> float:
+    if start_event is None or end_event is None:
+        return -1.0
+    try:
+        end_event.synchronize()
+        return float(start_event.elapsed_time(end_event))
+    except Exception:
+        return -1.0
+
+
+def _event_record(event: Optional[Any]) -> None:
+    if event is None:
+        return
+    try:
+        event.record()
+    except Exception:
+        pass
+
+
+_MODE3_SUBMIT_TIMING_KEYS = (
+    "submit_event_alloc_us",
+    "submit_stream_wait_us",
+    "submit_prefetch_wait_stream_us",
+    "submit_start_event_record_us",
+    "submit_populate_us",
+    "submit_order_us",
+    "submit_assign_us",
+    "submit_layer_local_check_us",
+    "submit_npu_us",
+    "submit_remote_npu_us",
+    "submit_cpu_us",
+    "submit_cpu_direct_async_us",
+    "submit_cpu_stage_async_us",
+    "submit_plan_log_us",
+    "submit_expert_map_us",
+    "submit_dispatch_cache_us",
+    "submit_slot_state_us",
+    "submit_post_cpu_wait_us",
+    "submit_ready_record_us",
+)
+
+
+def _timing_float(timing: Optional[dict[str, Any]], key: str) -> float:
+    if not timing:
+        return -1.0
+    try:
+        return float(timing.get(key, -1.0))
+    except Exception:
+        return -1.0
+
+
+def _mode3_submit_accounted_us(timing: Optional[dict[str, Any]]) -> float:
+    if not timing:
+        return -1.0
+    total = 0.0
+    seen = False
+    for key in _MODE3_SUBMIT_TIMING_KEYS:
+        value = _timing_float(timing, key)
+        if value >= 0.0:
+            total += value
+            seen = True
+    return total if seen else -1.0
+
+
+def _tensor_is_pinned(tensor: Optional[torch.Tensor]) -> int:
+    if tensor is None or tensor.device.type != "cpu":
+        return 0
+    try:
+        return int(bool(tensor.is_pinned()))
+    except Exception:
+        return -1
+
+
+def _tensor_is_contiguous(tensor: Optional[torch.Tensor]) -> int:
+    if tensor is None:
+        return 0
+    try:
+        return int(bool(tensor.is_contiguous()))
+    except Exception:
+        return -1
+
+
+def _maybe_pin_cpu_tensor(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if tensor is None or tensor.device.type != "cpu":
+        return tensor
+    try:
+        if tensor.is_pinned():
+            return tensor
+    except Exception:
+        pass
+    try:
+        return tensor.pin_memory()
+    except Exception:
+        return tensor
+
+
+def _stable_cpu_transfer_source(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "cpu":
+        return tensor
+    stable = tensor.detach()
+    if not stable.is_contiguous():
+        stable = stable.contiguous()
+    # Pinned-host -> NPU transfers have been the most fragile part of the
+    # mode3 path on Ascend. Use a fresh pageable CPU copy before sending rows
+    # to NPU runtime slots so layer-entry population favors stability over
+    # overlap.
+    stable = stable.to(device="cpu", copy=True)
+    return stable
+
+
+def _lossless_weight_row_means(weight: Optional[torch.Tensor],
+                               rows: Optional[list[int]] = None,
+                               limit: int = 4) -> list[tuple[int, float]]:
+    if weight is None or weight.numel() == 0:
+        return []
+    row_count = int(weight.shape[0])
+    if rows is None:
+        indices = list(range(min(row_count, limit)))
+    else:
+        indices = []
+        for row in rows:
+            row = int(row)
+            if 0 <= row < row_count and row not in indices:
+                indices.append(row)
+            if len(indices) >= limit:
+                break
+    result: list[tuple[int, float]] = []
+    for row in indices:
+        result.append((row, round(float(weight[row].float().abs().mean().item()),
+                                  6)))
+    return result
+
+
+def _lossless_weight_meta(weight: Optional[torch.Tensor]) -> dict[str, Any]:
+    if weight is None:
+        return {
+            "shape": None,
+            "dtype": None,
+            "device": None,
+            "stride": None,
+            "ptr": None,
+            "storage_offset": None,
+        }
+    return {
+        "shape": tuple(weight.shape),
+        "dtype": str(weight.dtype),
+        "device": str(weight.device),
+        "stride": tuple(weight.stride()),
+        "ptr": int(weight.data_ptr()),
+        "storage_offset": int(weight.storage_offset()),
+    }
+
+
+def _lossless_weight_format(weight: Optional[torch.Tensor]) -> str:
+    if weight is None:
+        return "none"
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        return "cpu"
+    try:
+        import torch_npu  # type: ignore
+        return str(torch_npu.get_npu_format(weight))
+    except Exception:
+        return "unknown"
+
+
+def _npu_weight_format_value(weight: Optional[torch.Tensor]) -> Optional[Any]:
+    if weight is None or weight.device.type != "npu":
+        return None
+    try:
+        return torch_npu.get_npu_format(weight)
+    except Exception:
+        return None
+
+
+def _npu_weight_format_matches(weight: Optional[torch.Tensor],
+                               target_format: Any) -> bool:
+    current_format = _npu_weight_format_value(weight)
+    if current_format is None:
+        return False
+    return current_format == target_format or str(current_format) == str(
+        target_format)
+
+
+def _mode1_reload_allocator_trim_enabled() -> bool:
+    try:
+        floor = int(
+            os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", "0")
+            or "0")
+    except ValueError:
+        floor = 0
+    default = "1" if 0 < floor <= 2 else "0"
+    return _env_flag("VLLM_ASCEND_MODE1_RELOAD_TRIM_ALLOCATOR", default)
+
+
+def _trim_npu_allocator_for_mode1_reload(layer: Any, reason: str) -> None:
+    if not _mode1_reload_allocator_trim_enabled():
+        return
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        return
+    try:
+        if _env_flag("VLLM_ASCEND_MODE1_RELOAD_SYNC_ON_TRIM", "1"):
+            torch.npu.synchronize()
+        gc.collect()
+        torch.npu.empty_cache()
+    except Exception:
+        return
+    if getattr(layer, "layer_idx", -1) == 0 and not getattr(
+            layer, "_mode1_reload_trim_logged", False):
+        logger.info(
+            "Mode1 reload allocator trim enabled: floor=%s reason=%s",
+            os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", ""),
+            reason,
+        )
+        layer._mode1_reload_trim_logged = True
+
+
+def _maybe_npu_format_cast_for_mode1_reload(weight: torch.Tensor,
+                                            target_format: Any, *,
+                                            layer: Any,
+                                            weight_name: str,
+                                            mode1_reload: bool) -> torch.Tensor:
+    if weight.device.type != "npu":
+        return weight
+    if not mode1_reload:
+        return torch_npu.npu_format_cast(weight, target_format)
+
+    current_format = _npu_weight_format_value(weight)
+    force_cast = _env_flag("VLLM_ASCEND_MODE1_RELOAD_FORCE_FORMAT_CAST", "0")
+    skip_same = _env_flag("VLLM_ASCEND_MODE1_RELOAD_SKIP_SAME_FORMAT_CAST", "1")
+    same_format = (current_format is not None and
+                   (current_format == target_format
+                    or str(current_format) == str(target_format)))
+    if skip_same and same_format and not force_cast:
+        if getattr(layer, "layer_idx", -1) == 0 and not getattr(
+                layer, f"_mode1_reload_skip_cast_logged_{weight_name}", False):
+            logger.info(
+                "Mode1 reload skips redundant npu_format_cast: weight=%s "
+                "format=%s target=%s floor=%s",
+                weight_name,
+                current_format,
+                target_format,
+                os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", ""),
+            )
+            setattr(layer, f"_mode1_reload_skip_cast_logged_{weight_name}",
+                    True)
+        return weight
+
+    if getattr(layer, "layer_idx", -1) == 0 and not getattr(
+            layer, f"_mode1_reload_do_cast_logged_{weight_name}", False):
+        logger.info(
+            "Mode1 reload executes npu_format_cast: weight=%s format=%s "
+            "target=%s force=%s floor=%s",
+            weight_name,
+            current_format,
+            target_format,
+            force_cast,
+            os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE", ""),
+        )
+        setattr(layer, f"_mode1_reload_do_cast_logged_{weight_name}", True)
+    return torch_npu.npu_format_cast(weight, target_format)
+
+
+def _allocate_formatted_buffer_like(weight: torch.Tensor,
+                                    row_count: int,
+                                    *,
+                                    dtype: Optional[torch.dtype] = None
+                                    ) -> torch.Tensor:
+    buffer = torch.empty((row_count, ) + tuple(weight.shape[1:]),
+                         device=weight.device,
+                         dtype=weight.dtype if dtype is None else dtype)
+    if weight.device.type != "npu":
+        return buffer
+    try:
+        import torch_npu  # type: ignore
+        target_format = torch_npu.get_npu_format(weight)
+        buffer = torch_npu.npu_format_cast(buffer, target_format)
+    except Exception:
+        pass
+    return buffer
+
+
+def _copy_logical_row_to_weight_slot(dst_weight: torch.Tensor,
+                                     dst_slot: int,
+                                     src_row: torch.Tensor,
+                                     *,
+                                     non_blocking: bool = False) -> None:
+    """Copy a logical expert row into an execution weight slot.
+
+    Keep the expert dimension in the destination view.  On Ascend formatted
+    MoE weights, copying through ``dst_weight[slot]`` can silently miss rows in
+    some floor2 layouts, while allocating a temporary NPU staging row for every
+    expert makes shrink refresh much slower.  The one-row slice preserves the
+    formatted destination semantics without the extra NPU allocation/copy.
+    """
+    dst_slot = int(dst_slot)
+    target = dst_weight[dst_slot:dst_slot + 1]
+    source = src_row
+    if source.ndim == target.ndim - 1:
+        source = source.unsqueeze(0)
+    if source.device != dst_weight.device or source.dtype != dst_weight.dtype:
+        source = source.to(device=dst_weight.device, dtype=dst_weight.dtype)
+    target.copy_(source, non_blocking=non_blocking)
+
+
+def _release_npu_parameter_storage(param: Optional[torch.nn.Parameter],
+                                   *,
+                                   reason: str = "") -> bool:
+    """Detach stale Parameter storage so old NPU buffers cannot pin HBM."""
+    if not _env_flag("VLLM_ASCEND_MODE1_AGGRESSIVE_RELEASE_OLD_PARAM_STORAGE",
+                     "0"):
+        return False
+    if param is None:
+        return False
+    data = getattr(param, "data", None)
+    if data is None or not isinstance(data, torch.Tensor):
+        return False
+    if data.device.type != "npu":
+        return False
+    try:
+        param.data = torch.empty((0, ), device=data.device, dtype=data.dtype)
+        return True
+    except Exception:
+        logger.exception("Failed to release stale NPU parameter storage: %s",
+                         reason)
+        return False
+
+
+def _replace_parameter(module: torch.nn.Module, name: str,
+                       tensor: torch.Tensor) -> torch.nn.Parameter:
+    """Replace a Parameter through nn.Module bookkeeping.
+
+    Direct attribute assignment usually works, but using register_parameter
+    makes the intent explicit and guarantees the module's _parameters table no
+    longer owns the old Parameter object.
+    """
+    if name in module._parameters:
+        del module._parameters[name]
+    param = torch.nn.Parameter(tensor, requires_grad=False)
+    module.register_parameter(name, param)
+    return param
+
+
+def _tensor_storage_nbytes(tensor: Optional[torch.Tensor]) -> int:
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return 0
+    try:
+        return int(tensor.untyped_storage().nbytes())
+    except Exception:
+        return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _npu_zero_offset_alias_for_p2p(base: torch.Tensor,
+                                   slot_view: torch.Tensor) -> torch.Tensor:
+    if slot_view.device.type != "npu":
+        return slot_view
+    if int(slot_view.storage_offset()) == 0:
+        return slot_view
+
+    try:
+        target_format = torch_npu.get_npu_format(slot_view)
+        alias = torch.empty(tuple(slot_view.shape),
+                            device=slot_view.device,
+                            dtype=slot_view.dtype)
+        alias = torch_npu.npu_format_cast(alias, target_format)
+
+        ptr_delta = int(slot_view.data_ptr()) - int(base.data_ptr())
+        element_size = int(slot_view.element_size())
+        storage_index = int(slot_view.storage_offset())
+        if ptr_delta >= 0 and element_size > 0 and ptr_delta % element_size == 0:
+            storage_index = ptr_delta // element_size
+        torch_npu.npu_change_data_ptr(alias, base, int(storage_index))
+
+        if int(alias.storage_offset()) != 0:
+            raise RuntimeError(
+                f"alias storage_offset={int(alias.storage_offset())}")
+        if int(alias.data_ptr()) != int(slot_view.data_ptr()):
+            raise RuntimeError(
+                f"alias data_ptr={int(alias.data_ptr())} "
+                f"view data_ptr={int(slot_view.data_ptr())}")
+        return alias
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to build zero-offset NPU P2P alias for formatted expert "
+            f"slot: base_meta={_lossless_weight_meta(base)} "
+            f"slot_meta={_lossless_weight_meta(slot_view)}") from exc
+
+
+def _hybrid_rank_owned_signature(
+        rank_owned: Optional[list[list[int]]]) -> tuple[tuple[int, ...], ...]:
+    if not rank_owned:
+        return ()
+    return tuple(
+        tuple(int(expert_id) for expert_id in expert_ids)
+        for expert_ids in rank_owned)
+
+
+def _hybrid_dispatch_topology_signature(layer: Any) -> tuple[Any, ...]:
+    remote_sources = getattr(layer, "lossless_mode4_remote_source_by_expert", {})
+    if remote_sources:
+        remote_signature = tuple(
+            sorted((int(expert_id), int(source_rank), int(source_slot))
+                   for expert_id, (source_rank, source_slot) in
+                   remote_sources.items()))
+    else:
+        remote_signature = ()
+    return (
+        int(
+            getattr(layer, "elastic_original_num_experts",
+                    getattr(layer, "num_experts", 0))),
+        tuple(
+            int(rank)
+            for rank in getattr(layer, "lossless_hybrid_active_ranks", [])),
+        _hybrid_rank_owned_signature(
+            getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)),
+        remote_signature,
+    )
+
+
+def _build_dispatch_log2phy_tensor(
+        logical_num_experts: int,
+        rank_owned: list[list[int]],
+        owned_per_rank: int,
+        device: torch.device) -> tuple[torch.Tensor, int]:
+    dispatch_num_experts = len(rank_owned) * owned_per_rank
+    dispatch_log2phy_cpu = torch.full((logical_num_experts, ),
+                                      -1,
+                                      dtype=torch.int32,
+                                      device="cpu")
+    for rank_idx, expert_ids in enumerate(rank_owned):
+        if len(expert_ids) != owned_per_rank:
+            raise RuntimeError(
+                "Hybrid single-dispatch requires uniform owned experts per "
+                f"rank: owned_counts={[len(ids) for ids in rank_owned]}")
+        if not expert_ids:
+            continue
+        expert_index = torch.tensor([int(expert_id) for expert_id in expert_ids],
+                                    dtype=torch.long,
+                                    device="cpu")
+        dense_ids = torch.arange(rank_idx * owned_per_rank,
+                                 (rank_idx + 1) * owned_per_rank,
+                                 dtype=torch.int32,
+                                 device="cpu")
+        dispatch_log2phy_cpu[expert_index] = dense_ids
+    return dispatch_log2phy_cpu.to(device=device, non_blocking=False), \
+        dispatch_num_experts
+
+
+def _active_moe_weight_view(layer: torch.nn.Module,
+                            weight: torch.Tensor) -> torch.Tensor:
+    active_num_experts = int(
+        getattr(layer, "active_local_num_experts",
+                getattr(layer, "local_num_experts", int(weight.shape[0]))))
+    if active_num_experts == int(weight.shape[0]):
+        return weight
+    if active_num_experts <= 0 or active_num_experts > int(weight.shape[0]):
+        raise RuntimeError(
+            "Invalid active local expert count for MoE weight view: "
+            f"active={active_num_experts}, weight_shape={tuple(weight.shape)}, "
+            f"layer={getattr(layer, 'layer_idx', 'unknown')}")
+    return weight[:active_num_experts]
+
+
+class _Mode3DoubleBufferSlot:
+
+    def __init__(self) -> None:
+        self.w13 = None
+        self.w2 = None
+        self.cpu_stage_w13 = None
+        self.cpu_stage_w2 = None
+        self.reset_runtime_state()
+
+    def reset_runtime_state(self) -> None:
+        # Mode4 keeps the large NPU double-buffer tensors across rollout
+        # steps, but stream events and logical slot bindings are per forward
+        # context. Reusing the latter can make the next step wait on stale
+        # events or incorrectly treat an old prefetch as a valid hit.
+        self.expert_map = None
+        self.layer_idx = None
+        self.expert_ids: tuple[int, ...] = ()
+        self.cpu_stage_slot_ids: tuple[int, ...] = ()
+        self.cpu_stage_cpu_slots: tuple[int, ...] = ()
+        self.cpu_stage_count = 0
+        self.valid_expert_count = 0
+        self.source_from_npu = 0
+        self.source_from_remote_npu = 0
+        self.source_from_cpu = 0
+        self.inflight_prefetch = False
+        self.has_async_cpu_copy = False
+        self.has_async_cpu_pack = False
+        self.has_async_cpu_direct = False
+        self.needs_sync_cpu_fill = False
+        self.uses_layer_local_buffer = False
+        self.ready_event = torch.npu.Event()
+        self.cpu_ready_event = torch.npu.Event()
+        self.cpu_pack_event = torch.npu.Event()
+        self.prefetch_start_event = None
+        self.prefetch_end_event = None
+        self.prefetch_timing: dict[str, Any] = {}
+        self.prefetch_cpu_path = "none"
+        self.dispatch_log2phy = None
+        self.dispatch_num_experts = 0
+        self.dispatch_signature: Optional[tuple[Any, ...]] = None
+        self.dispatch_active_rank_count = 0
+        self.dispatch_owned_per_rank = 0
+        self.block_start_layer = None
+        self.block_layer_count = 1
+        self.block_layer_states: dict[int, dict[str, Any]] = {}
+
+
+class Mode3DoubleBufferManager:
+
+    def __init__(self, model_instance: Any,
+                 prefetch_stream: Optional[torch.npu.Stream]) -> None:
+        self.prefetch_stream = prefetch_stream
+        self.cpu_prefetch_stream = None
+        if prefetch_stream is not None:
+            try:
+                self.cpu_prefetch_stream = torch.npu.Stream()
+            except Exception:
+                self.cpu_prefetch_stream = None
+        self.layer_lookup = self._build_layer_lookup(model_instance)
+        self.slots = self._get_or_create_persistent_slots(model_instance)
+        self.prefetch_wait_us = defaultdict(float)
+        self.prefetch_hit = defaultdict(int)
+        self.prefetch_wait_count = defaultdict(int)
+        self.last_bind_timing: dict[str, Any] = {}
+        self.last_prefetch_timing_by_target_layer: dict[int, dict[str, Any]] = {}
+        self.last_ffn_enter_wall_ts_by_layer: dict[int, float] = {}
+        self._stage_decode_compute_ranges_by_target_layer: dict[int, Any] = {}
+        self._stage_decode_comm_ranges_by_target_layer: dict[int, Any] = {}
+        self._logged_slot_bindings: set[tuple[int, int, int]] = set()
+        self._logged_prefetches: set[tuple[int, int]] = set()
+        self._logged_prefetch_deferrals: set[tuple[int, int]] = set()
+        self._logged_cpu_fill_deferrals: set[tuple[int, int]] = set()
+        self._logged_async_cpu_stage: set[tuple[int, int]] = set()
+        self._logged_transfer_plans: set[tuple[int, int, str]] = set()
+        self._dispatch_remap_cache: dict[
+            tuple[str, tuple[Any, ...]], dict[str, Any]] = {}
+        self._slot_expert_map_cache: dict[
+            tuple[str, int, tuple[int, ...]], torch.Tensor] = {}
+        self.enable_async_npu_prefetch = _env_flag(
+            "VLLM_ASCEND_MODE3_ASYNC_NPU_PREFETCH")
+        self.enable_async_cpu_stage = _env_flag(
+            "VLLM_ASCEND_MODE3_ASYNC_CPU_STAGE")
+        self.enable_async_cpu_pack = _env_flag(
+            "VLLM_ASCEND_MODE3_ASYNC_CPU_PACK")
+        self.enable_direct_cpu_slot = _env_flag(
+            "VLLM_ASCEND_MODE3_DIRECT_CPU_SLOT")
+        self.enable_device_ready_wait = _env_flag(
+            "VLLM_ASCEND_MODE3_DEVICE_READY_WAIT")
+        self.enable_bulk_npu_copy = _env_flag(
+            "VLLM_ASCEND_MODE3_BULK_NPU_COPY", "1")
+        self.enable_bulk_cpu_stage = _env_flag(
+            "VLLM_ASCEND_MODE3_BULK_CPU_STAGE", "1")
+        self.enable_bulk_cpu_direct = _env_flag(
+            "VLLM_ASCEND_MODE3_BULK_CPU_DIRECT")
+        self.enable_layer_local_buffer = _env_flag(
+            "VLLM_ASCEND_MODE3_LAYER_LOCAL_BUFFER")
+        self.enable_active_rows_sync = _env_flag(
+            "VLLM_ASCEND_MODE3_ACTIVE_ROWS_SYNC")
+        self.expert_token_nums_type = _env_int(
+            "VLLM_ASCEND_MODE3_EXPERT_TOKEN_NUMS_TYPE", 0, minimum=0)
+        if self.expert_token_nums_type not in (0, 1):
+            self.expert_token_nums_type = 0
+        self.use_fused_experts_path = _env_flag(
+            "VLLM_ASCEND_MODE3_USE_FUSED_EXPERTS_PATH", "1")
+        self.enable_transfer_logs = _env_flag(
+            "VLLM_ASCEND_MODE3_TRANSFER_LOG")
+        self.enable_verbose_transfer_logs = _env_flag(
+            "VLLM_ASCEND_MODE3_VERBOSE_TRANSFER_LOG")
+        self.enable_transfer_plan_logs = _env_flag(
+            "VLLM_ASCEND_MODE3_TRANSFER_PLAN_LOG")
+        self.transfer_plan_first_n = _env_int(
+            "VLLM_ASCEND_MODE3_TRANSFER_PLAN_FIRST_N", 4, minimum=0)
+        self.enable_timing_logs = _env_flag(
+            "VLLM_ASCEND_MODE3_TIMING_LOG")
+        self.enable_timing_sync = _env_flag(
+            "VLLM_ASCEND_MODE3_TIMING_SYNC")
+        self.timing_every = _env_int("VLLM_ASCEND_MODE3_TIMING_EVERY",
+                                     512,
+                                     minimum=1)
+        self.timing_first_n = _env_int("VLLM_ASCEND_MODE3_TIMING_FIRST_N",
+                                       1,
+                                       minimum=0)
+        self.timing_layers = _parse_layer_filter(
+            os.getenv("VLLM_ASCEND_MODE3_TIMING_LAYERS", "all"))
+        self.mode4_block_prefetch_layers = _env_int(
+            "VLLM_ASCEND_MODE4_BLOCK_PREFETCH_LAYERS", 1, minimum=1)
+        if self.mode4_block_prefetch_layers <= 1:
+            self.mode4_block_prefetch_layers = 1
+        self._logged_mode4_block_prefetch: set[tuple[int, int, int]] = set()
+
+    @staticmethod
+    def _model_has_mode4_layer(model_instance: Any) -> bool:
+        for layer in Mode3DoubleBufferManager._build_layer_lookup(
+                model_instance).values():
+            if int(getattr(layer, "elastic_execution_mode", 0)) in (4, 5):
+                return True
+        return False
+
+    @staticmethod
+    def _get_or_create_persistent_slots(
+            model_instance: Any) -> list[_Mode3DoubleBufferSlot]:
+        if Mode3DoubleBufferManager._model_has_mode4_layer(model_instance):
+            slots = getattr(model_instance,
+                            "_mode4_remote_npu_double_buffer_slots", None)
+            if slots is None or len(slots) != 2:
+                slots = [_Mode3DoubleBufferSlot(), _Mode3DoubleBufferSlot()]
+                setattr(model_instance,
+                        "_mode4_remote_npu_double_buffer_slots", slots)
+            return slots
+        slots = getattr(model_instance, "_mode3_cpu_npu_double_buffer_slots",
+                        None)
+        if slots is None or len(slots) != 2:
+            slots = [_Mode3DoubleBufferSlot(), _Mode3DoubleBufferSlot()]
+            setattr(model_instance, "_mode3_cpu_npu_double_buffer_slots",
+                    slots)
+        else:
+            for slot in slots:
+                slot.reset_runtime_state()
+        return slots
+
+    @staticmethod
+    def _build_layer_lookup(model_instance: Any) -> dict[int, Any]:
+        layer_lookup: dict[int, Any] = {}
+        model = getattr(model_instance, "model", None)
+        layers = getattr(model, "layers", None)
+        if layers is None:
+            return layer_lookup
+        for decoder_layer in layers:
+            mlp = getattr(decoder_layer, "mlp", None)
+            experts = getattr(mlp, "experts", None)
+            if experts is None:
+                continue
+            layer_idx = getattr(experts, "layer_idx", None)
+            if isinstance(layer_idx, int):
+                layer_lookup[layer_idx] = experts
+        return layer_lookup
+
+    @staticmethod
+    def _slot_id_for_layer(layer_idx: int) -> int:
+        return int(layer_idx) & 1
+
+    def _is_mode4_block_prefetch_enabled(self, layer: Any) -> bool:
+        return (self.mode4_block_prefetch_layers > 1
+                and int(getattr(layer, "elastic_execution_mode", 0)) in (4, 5))
+
+    def _block_start_for_layer(self, layer_idx: int) -> int:
+        block_layers = max(int(self.mode4_block_prefetch_layers), 1)
+        return (int(layer_idx) // block_layers) * block_layers
+
+    def _slot_id_for_runtime_layer(self, layer: Any) -> int:
+        layer_idx = int(getattr(layer, "layer_idx", -1))
+        if self._is_mode4_block_prefetch_enabled(layer):
+            return (layer_idx // max(int(self.mode4_block_prefetch_layers), 1)) & 1
+        return self._slot_id_for_layer(layer_idx)
+
+    def _block_layers_for_start(self, block_start: int) -> list[Any]:
+        block_layers = max(int(self.mode4_block_prefetch_layers), 1)
+        layers = []
+        for layer_idx in range(int(block_start), int(block_start) + block_layers):
+            layer = self.layer_lookup.get(layer_idx)
+            if layer is None:
+                break
+            if int(getattr(layer, "elastic_execution_mode", 0)) not in (4, 5):
+                break
+            if not getattr(layer, "lossless_hybrid_active", False):
+                break
+            layers.append(layer)
+        return layers
+
+    def should_profile_layer(self, layer: Any, path: str) -> bool:
+        if not self.enable_timing_logs:
+            return False
+        layer_idx = int(getattr(layer, "layer_idx", -1))
+        if self.timing_layers is not None and layer_idx not in self.timing_layers:
+            return False
+        active_rank_count = len(
+            getattr(layer, "lossless_hybrid_active_ranks", []))
+        rank = int(getattr(layer, "rank", -1))
+        key = (rank, path, active_rank_count, layer_idx)
+        _MODE3_TIMING_COUNTS[key] += 1
+        count = _MODE3_TIMING_COUNTS[key]
+        return count <= self.timing_first_n or count % self.timing_every == 0
+
+    def new_timing_event(self) -> Optional[torch.npu.Event]:
+        if not self.enable_timing_sync:
+            return None
+        return _new_npu_event(enable_timing=True)
+
+    def _prefetch_device_ms(self, timing: Optional[dict[str, Any]]) -> float:
+        if not timing:
+            return -1.0
+        return _elapsed_ms(timing.get("start_event"), timing.get("end_event"))
+
+    def _get_next_layer(self, current_layer_idx: int) -> Optional[Any]:
+        for layer_idx in sorted(self.layer_lookup):
+            if layer_idx > current_layer_idx:
+                return self.layer_lookup[layer_idx]
+        return None
+
+    @staticmethod
+    def _build_slot_expert_map(layer: Any, expert_ids: list[int],
+                               device: torch.device) -> torch.Tensor:
+        expert_map = torch.full((int(layer.elastic_original_num_experts), ),
+                                -1,
+                                dtype=torch.int32,
+                                device=device)
+        seen_experts: set[int] = set()
+        for slot_idx, expert_id in enumerate(expert_ids):
+            if int(expert_id) in seen_experts:
+                continue
+            seen_experts.add(int(expert_id))
+            expert_map[int(expert_id)] = slot_idx
+        return expert_map
+
+    def _get_cached_slot_expert_map(
+            self, layer: Any, expert_ids: list[int],
+            device: torch.device) -> tuple[torch.Tensor, bool]:
+        expert_ids_key = tuple(int(expert_id) for expert_id in expert_ids)
+        cache_key = (str(device), int(layer.elastic_original_num_experts),
+                     expert_ids_key)
+        cached = self._slot_expert_map_cache.get(cache_key)
+        if cached is not None:
+            return cached, True
+        expert_map = self._build_slot_expert_map(layer, expert_ids, device)
+        self._slot_expert_map_cache[cache_key] = expert_map
+        return expert_map, False
+
+    @staticmethod
+    def _ordered_mode3_slot_expert_ids(layer: Any) -> list[int]:
+        owned_expert_ids = [
+            int(expert_id)
+            for expert_id in getattr(layer, "lossless_hybrid_owned_expert_ids",
+                                     [])
+        ]
+        if not owned_expert_ids:
+            return []
+        resident_capacity = int(
+            getattr(layer, "lossless_hybrid_resident_capacity", 0))
+        primary_slots = {
+            int(expert_id): int(local_slot)
+            for expert_id, local_slot in getattr(
+                layer, "lossless_mode3_primary_prefix_local_slots",
+                {}).items()
+        }
+        ordered_primary = [
+            expert_id for expert_id, _local_slot in sorted(
+                primary_slots.items(), key=lambda item: item[1])
+            if expert_id in set(owned_expert_ids)
+        ]
+        if resident_capacity > 0:
+            ordered_primary = ordered_primary[:resident_capacity]
+        ordered_primary_set = set(ordered_primary)
+        ordered_remaining = [
+            expert_id for expert_id in owned_expert_ids
+            if expert_id not in ordered_primary_set
+        ]
+        slot_expert_ids = ordered_primary + ordered_remaining
+        if (int(getattr(layer, "elastic_execution_mode", 0)) == 5
+                and _mode5_group_cpu_remote_slot_order()
+                and ordered_remaining):
+            remote_sources = {
+                int(expert_id): (int(source_rank), int(source_slot))
+                for expert_id, (source_rank, source_slot) in getattr(
+                    layer, "lossless_mode4_remote_source_by_expert",
+                    {}).items()
+            }
+            cpu_only_expert_ids: list[int] = []
+            remote_expert_ids_by_rank: dict[int, list[tuple[int, int]]] = {}
+            for expert_id in ordered_remaining:
+                remote_source = remote_sources.get(int(expert_id))
+                if remote_source is None:
+                    cpu_only_expert_ids.append(int(expert_id))
+                    continue
+                remote_rank, remote_slot = remote_source
+                remote_expert_ids_by_rank.setdefault(
+                    int(remote_rank), []).append((int(remote_slot),
+                                                 int(expert_id)))
+            ordered_remote_expert_ids: list[int] = []
+            for remote_rank in sorted(remote_expert_ids_by_rank):
+                remote_items = remote_expert_ids_by_rank[int(remote_rank)]
+                remote_items.sort(key=lambda item: (int(item[0]), int(item[1])))
+                ordered_remote_expert_ids.extend(
+                    int(expert_id) for _remote_slot, expert_id in remote_items)
+            slot_expert_ids = (ordered_primary + cpu_only_expert_ids
+                               + ordered_remote_expert_ids)
+        if len(slot_expert_ids) != len(owned_expert_ids):
+            raise RuntimeError(
+                "Mode3 slot expert ordering mismatch at layer="
+                f"{getattr(layer, 'layer_idx', -1)}: "
+                f"owned={len(owned_expert_ids)} ordered={len(slot_expert_ids)}")
+        return slot_expert_ids
+
+    def _get_cached_dispatch_remap(
+            self, layer: Any,
+            device: torch.device) -> tuple[Optional[torch.Tensor], int,
+                                           Optional[tuple[Any, ...]], int, int]:
+        topology_signature = _hybrid_dispatch_topology_signature(layer)
+        rank_owned = getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)
+        if not rank_owned:
+            return None, 0, topology_signature, 0, 0
+        active_rank_count = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+        if active_rank_count <= 0:
+            return None, 0, topology_signature, 0, 0
+        owned_per_rank = len(rank_owned[0]) if rank_owned else 0
+        if owned_per_rank <= 0:
+            return None, 0, topology_signature, active_rank_count, 0
+        cache_key = (str(device), topology_signature)
+        cached = self._dispatch_remap_cache.get(cache_key)
+        if cached is None:
+            dispatch_log2phy, dispatch_num_experts = _build_dispatch_log2phy_tensor(
+                int(layer.elastic_original_num_experts),
+                rank_owned,
+                owned_per_rank,
+                device,
+            )
+            cached = {
+                "dispatch_log2phy": dispatch_log2phy,
+                "dispatch_num_experts": dispatch_num_experts,
+                "dispatch_signature": topology_signature,
+                "active_rank_count": active_rank_count,
+                "owned_per_rank": owned_per_rank,
+            }
+            self._dispatch_remap_cache[cache_key] = cached
+        return (
+            cached["dispatch_log2phy"],
+            int(cached["dispatch_num_experts"]),
+            cached["dispatch_signature"],
+            int(cached["active_rank_count"]),
+            int(cached["owned_per_rank"]),
+        )
+
+    @staticmethod
+    def _copy_row(dst: torch.Tensor, src: torch.Tensor) -> None:
+        # Pinned CPU -> NPU row copies may dispatch through an internal
+        # copy_stream on Ascend. Recording the slot ready-event immediately
+        # after issuing those async copies allowed the next layer to observe a
+        # "ready" slot before the host->device rows had actually drained,
+        # which in turn caused copy_stream/AICORE faults in mode3 prefetch.
+        #
+        # Keep NPU->NPU copies asynchronous, but make CPU-sourced copies
+        # blocking so the slot contents are fully materialized before the
+        # prefetch ready-event is recorded.
+        if src.device.type == "cpu" and dst.device.type == "npu":
+            stable_src = _stable_cpu_transfer_source(src)
+            staged = stable_src.to(device=dst.device, non_blocking=False)
+            dst.copy_(staged, non_blocking=False)
+            return
+        non_blocking = src.device.type != "cpu"
+        dst.copy_(src, non_blocking=non_blocking)
+
+    @staticmethod
+    def _copy_row_sync(dst: torch.Tensor, src: torch.Tensor) -> None:
+        # This matches the proven mode2 swap path: materialize CPU rows on the
+        # destination device first, then copy into the formatted expert slot
+        # with an explicit blocking copy. Use it for layer-entry binding where
+        # correctness is more important than overlap.
+        if src.device.type == "cpu" and dst.device.type == "npu":
+            src = _stable_cpu_transfer_source(src).to(device=dst.device,
+                                                      non_blocking=False)
+        dst.copy_(src, non_blocking=False)
+
+    @staticmethod
+    def _copy_cpu_row_to_stage_async(dst: torch.Tensor,
+                                     src: torch.Tensor) -> None:
+        if src.device.type != "cpu" or dst.device.type != "npu":
+            dst.copy_(src, non_blocking=True)
+            return
+        src = src.detach()
+        if not src.is_contiguous():
+            # Do not launch an async H2D copy from a short-lived contiguous
+            # temporary. Fall back to the conservative synchronous path for
+            # unusual CPU shadow layouts.
+            staged = _stable_cpu_transfer_source(src).to(device=dst.device,
+                                                          non_blocking=False)
+            dst.copy_(staged, non_blocking=False)
+            return
+        dst.copy_(src, non_blocking=True)
+
+    @staticmethod
+    def _copy_cpu_row_to_runtime_slot_async(dst: torch.Tensor,
+                                            src: torch.Tensor) -> None:
+        if src.device.type != "cpu" or dst.device.type != "npu":
+            dst.copy_(src, non_blocking=True)
+            return
+        src = src.detach()
+        if not src.is_contiguous():
+            # Avoid launching async copies from short-lived contiguous
+            # temporaries. This keeps the direct-slot experiment scoped to the
+            # common contiguous CPU shadow layout.
+            src = _stable_cpu_transfer_source(src)
+            dst.copy_(src, non_blocking=False)
+            return
+        dst.copy_(src, non_blocking=True)
+
+    @staticmethod
+    def _assignment_runs(
+            assignments: list[tuple[int, int]]) -> list[tuple[int, int, int]]:
+        if not assignments:
+            return []
+        runs: list[tuple[int, int, int]] = []
+        dst_start, src_start = assignments[0]
+        prev_dst, prev_src = dst_start, src_start
+        length = 1
+        for dst_idx, src_idx in assignments[1:]:
+            if dst_idx == prev_dst + 1 and src_idx == prev_src + 1:
+                length += 1
+            else:
+                runs.append((int(dst_start), int(src_start), int(length)))
+                dst_start, src_start = dst_idx, src_idx
+                length = 1
+            prev_dst, prev_src = dst_idx, src_idx
+        runs.append((int(dst_start), int(src_start), int(length)))
+        return runs
+
+    def _assignment_submit_count(self, assignments: list[tuple[int, int]],
+                                 *, bulk_enabled: bool) -> int:
+        if not assignments:
+            return 0
+        if not bulk_enabled:
+            return len(assignments)
+        return len(self._assignment_runs(assignments))
+
+    def _maybe_log_transfer_plan(
+            self, layer: Any, *, reason: str, async_copy: bool,
+            slot_id: int, npu_assignments: list[tuple[int, int]],
+            cpu_assignments: list[tuple[int, int]], cpu_path: str,
+            use_layer_local_buffer: bool,
+            cpu_prefetch_stream: Optional[torch.npu.Stream],
+            cpu_w13: Optional[torch.Tensor],
+            cpu_w2: Optional[torch.Tensor]) -> None:
+        if not self.enable_transfer_plan_logs:
+            return
+        layer_idx = int(getattr(layer, "layer_idx", -1))
+        if self.transfer_plan_first_n <= 0:
+            return
+        if layer_idx >= self.transfer_plan_first_n:
+            return
+        log_key = (layer_idx, int(async_copy), str(reason))
+        if log_key in self._logged_transfer_plans:
+            return
+        stage_assignments = [
+            (stage_idx, int(cpu_slot))
+            for stage_idx, (_slot_idx, cpu_slot) in enumerate(cpu_assignments)
+        ]
+        stage_to_slot = [
+            (int(slot_idx), stage_idx)
+            for stage_idx, (slot_idx, _cpu_slot) in enumerate(cpu_assignments)
+        ]
+        npu_path = "layer_local" if use_layer_local_buffer else (
+            "bulk" if self.enable_bulk_npu_copy else "per_row")
+        npu_submit_count = 0 if use_layer_local_buffer else \
+            self._assignment_submit_count(
+                npu_assignments, bulk_enabled=self.enable_bulk_npu_copy)
+        cpu_direct_submits = -1
+        cpu_stage_submits = -1
+        cpu_pack_submits = -1
+        if cpu_path == "direct_async":
+            cpu_direct_submits = self._assignment_submit_count(
+                cpu_assignments, bulk_enabled=self.enable_bulk_cpu_direct)
+        elif cpu_path in ("stage_async_pack", "stage_async_wait_pack",
+                          "sync_stage"):
+            cpu_stage_submits = self._assignment_submit_count(
+                stage_assignments, bulk_enabled=self.enable_bulk_cpu_stage)
+            if cpu_path in ("stage_async_pack", "sync_stage"):
+                cpu_pack_submits = self._assignment_submit_count(
+                    stage_to_slot, bulk_enabled=self.enable_bulk_npu_copy)
+        elif cpu_path == "defer_sync_fill":
+            cpu_stage_submits = self._assignment_submit_count(
+                stage_assignments, bulk_enabled=self.enable_bulk_cpu_stage)
+            cpu_pack_submits = self._assignment_submit_count(
+                stage_to_slot, bulk_enabled=self.enable_bulk_npu_copy)
+
+        logger.info(
+            "Mode%s transfer plan: layer=%s slot=%s reason=%s async=%s "
+            "cpu_stream=%s valid_experts=%s npu_rows=%s npu_path=%s "
+            "npu_submit_count=%s cpu_rows=%s cpu_path=%s "
+            "cpu_direct_submit_count=%s cpu_stage_submit_count=%s "
+            "cpu_pack_submit_count=%s bulk_npu=%s bulk_cpu_stage=%s "
+            "bulk_cpu_direct=%s async_cpu_stage=%s async_cpu_pack=%s "
+            "direct_cpu_slot=%s device_ready_wait=%s layer_local=%s "
+            "cpu_w13_contig=%s cpu_w2_contig=%s "
+            "cpu_w13_pinned=%s cpu_w2_pinned=%s npu_head=%s cpu_head=%s",
+            int(getattr(layer, "elastic_execution_mode", 3)),
+            layer_idx,
+            slot_id,
+            reason,
+            int(async_copy),
+            int(cpu_prefetch_stream is not None),
+            len(npu_assignments) + len(cpu_assignments),
+            len(npu_assignments),
+            npu_path,
+            npu_submit_count,
+            len(cpu_assignments),
+            cpu_path,
+            cpu_direct_submits,
+            cpu_stage_submits,
+            cpu_pack_submits,
+            int(self.enable_bulk_npu_copy),
+            int(self.enable_bulk_cpu_stage),
+            int(self.enable_bulk_cpu_direct),
+            int(self.enable_async_cpu_stage),
+            int(self.enable_async_cpu_pack),
+            int(self.enable_direct_cpu_slot),
+            int(self.enable_device_ready_wait),
+            int(use_layer_local_buffer),
+            _tensor_is_contiguous(cpu_w13),
+            _tensor_is_contiguous(cpu_w2),
+            _tensor_is_pinned(cpu_w13),
+            _tensor_is_pinned(cpu_w2),
+            npu_assignments[:4],
+            cpu_assignments[:4],
+        )
+        self._logged_transfer_plans.add(log_key)
+
+    def _copy_npu_assignment_runs(self, dst: torch.Tensor, src: torch.Tensor,
+                                  assignments: list[tuple[int, int]],
+                                  *, async_copy: bool) -> None:
+        if not assignments:
+            return
+        copy_row = self._copy_row if async_copy else self._copy_row_sync
+        if not self.enable_bulk_npu_copy:
+            for dst_idx, src_idx in assignments:
+                copy_row(dst[int(dst_idx)], src[int(src_idx)])
+            return
+        for dst_start, src_start, length in self._assignment_runs(assignments):
+            if length <= 1:
+                copy_row(dst[dst_start], src[src_start])
+                continue
+            non_blocking = async_copy and src.device.type != "cpu"
+            dst[dst_start:dst_start + length].copy_(
+                src[src_start:src_start + length],
+                non_blocking=non_blocking)
+
+    def _copy_cpu_assignments_to_stage(
+            self, slot: _Mode3DoubleBufferSlot,
+            cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
+            cpu_w2: torch.Tensor, *, async_copy: bool) -> None:
+        if not cpu_assignments:
+            return
+        if not self.enable_bulk_cpu_stage:
+            for stage_idx, (_slot_idx, cpu_slot) in enumerate(cpu_assignments):
+                copy_fn = (self._copy_cpu_row_to_stage_async
+                           if async_copy else self._copy_row_sync)
+                copy_fn(slot.cpu_stage_w13[stage_idx], cpu_w13[int(cpu_slot)])
+                copy_fn(slot.cpu_stage_w2[stage_idx], cpu_w2[int(cpu_slot)])
+            return
+        stage_assignments = [
+            (stage_idx, int(cpu_slot))
+            for stage_idx, (_slot_idx, cpu_slot) in enumerate(cpu_assignments)
+        ]
+        copy_row = (self._copy_cpu_row_to_stage_async
+                    if async_copy else self._copy_row_sync)
+        for stage_start, cpu_start, length in self._assignment_runs(
+                stage_assignments):
+            if length <= 1:
+                copy_row(slot.cpu_stage_w13[stage_start], cpu_w13[cpu_start])
+                copy_row(slot.cpu_stage_w2[stage_start], cpu_w2[cpu_start])
+                continue
+            src_w13 = cpu_w13[cpu_start:cpu_start + length].detach()
+            src_w2 = cpu_w2[cpu_start:cpu_start + length].detach()
+            if not src_w13.is_contiguous() or not src_w2.is_contiguous():
+                for offset in range(length):
+                    copy_row(slot.cpu_stage_w13[stage_start + offset],
+                             cpu_w13[cpu_start + offset])
+                    copy_row(slot.cpu_stage_w2[stage_start + offset],
+                             cpu_w2[cpu_start + offset])
+                continue
+            slot.cpu_stage_w13[stage_start:stage_start + length].copy_(
+                src_w13, non_blocking=async_copy)
+            slot.cpu_stage_w2[stage_start:stage_start + length].copy_(
+                src_w2, non_blocking=async_copy)
+
+    def _copy_cpu_assignments_to_runtime_direct(
+            self, slot: _Mode3DoubleBufferSlot,
+            cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
+            cpu_w2: torch.Tensor) -> None:
+        if not cpu_assignments:
+            return
+        if not self.enable_bulk_cpu_direct:
+            for slot_idx, cpu_slot in cpu_assignments:
+                self._copy_cpu_row_to_runtime_slot_async(
+                    slot.w13[int(slot_idx)], cpu_w13[int(cpu_slot)])
+                self._copy_cpu_row_to_runtime_slot_async(
+                    slot.w2[int(slot_idx)], cpu_w2[int(cpu_slot)])
+            return
+        for slot_start, cpu_start, length in self._assignment_runs(
+                cpu_assignments):
+            if length <= 1:
+                self._copy_cpu_row_to_runtime_slot_async(
+                    slot.w13[slot_start], cpu_w13[cpu_start])
+                self._copy_cpu_row_to_runtime_slot_async(
+                    slot.w2[slot_start], cpu_w2[cpu_start])
+                continue
+            src_w13 = cpu_w13[cpu_start:cpu_start + length].detach()
+            src_w2 = cpu_w2[cpu_start:cpu_start + length].detach()
+            if not src_w13.is_contiguous() or not src_w2.is_contiguous():
+                for offset in range(length):
+                    self._copy_cpu_row_to_runtime_slot_async(
+                        slot.w13[slot_start + offset],
+                        cpu_w13[cpu_start + offset])
+                    self._copy_cpu_row_to_runtime_slot_async(
+                        slot.w2[slot_start + offset],
+                        cpu_w2[cpu_start + offset])
+                continue
+            slot.w13[slot_start:slot_start + length].copy_(
+                src_w13, non_blocking=True)
+            slot.w2[slot_start:slot_start + length].copy_(
+                src_w2, non_blocking=True)
+
+    @staticmethod
+    def _copy_rows(dst: torch.Tensor, src: torch.Tensor) -> None:
+        if src.device.type == "cpu" and dst.device.type == "npu":
+            for row_idx in range(int(dst.shape[0])):
+                stable_row = _stable_cpu_transfer_source(src[row_idx])
+                staged_row = stable_row.to(device=dst.device,
+                                           non_blocking=False)
+                dst[row_idx].copy_(staged_row, non_blocking=False)
+            return
+        non_blocking = src.device.type != "cpu"
+        dst.copy_(src, non_blocking=non_blocking)
+
+    def _ensure_slot_capacity(self, slot: _Mode3DoubleBufferSlot,
+                              layer: Any,
+                              required_expert_count: Optional[int] = None) -> None:
+        # Mode 3 preallocates for the smallest configured compute group. Modes
+        # 4 and 5 retain a full logical-expert cache. Derive both capacities
+        # from the model instead of assuming Qwen3's 128 routed experts.
+        logical_num_experts = int(
+            getattr(
+                layer,
+                "elastic_original_num_experts",
+                getattr(layer, "global_num_experts",
+                        getattr(layer, "num_experts", 0)),
+            ))
+        if logical_num_experts <= 0:
+            logical_num_experts = int(layer.w13_weight.shape[0])
+        if logical_num_experts <= 0:
+            raise RuntimeError(
+                "Cannot infer logical expert count for elastic MoE buffer")
+
+        required_rows = max(int(required_expert_count or 0), 1)
+        is_mode3 = int(getattr(layer, "elastic_execution_mode", 0)) == 3
+        if is_mode3:
+            min_compute_group_size = (
+                envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE)
+
+            if min_compute_group_size is not None and min_compute_group_size > 0:
+                if logical_num_experts % int(min_compute_group_size) != 0:
+                    raise RuntimeError(
+                        "Logical expert count must be divisible by the mode3 "
+                        f"floor: experts={logical_num_experts} "
+                        f"floor={min_compute_group_size}")
+                target_row_count = max(
+                    required_rows,
+                    logical_num_experts // int(min_compute_group_size),
+                )
+            else:
+                target_row_count = max(required_rows, logical_num_experts)
+        else:
+            target_row_count = max(required_rows, logical_num_experts)
+
+        target_shape_w13 = (target_row_count, ) + tuple(layer.w13_weight.shape[1:])
+        target_shape_w2 = (target_row_count, ) + tuple(layer.w2_weight.shape[1:])
+        target_device = layer.w13_weight.device
+        target_dtype_w13 = layer.w13_weight.dtype
+        target_dtype_w2 = layer.w2_weight.dtype
+        target_format_w13 = _lossless_weight_format(layer.w13_weight)
+        target_format_w2 = _lossless_weight_format(layer.w2_weight)
+        if slot.w13 is not None and slot.w2 is not None:
+            same_storage_shape = (
+                slot.w13.shape == target_shape_w13
+                and slot.w2.shape == target_shape_w2
+                and slot.w13.device == target_device
+                and slot.w2.device == target_device
+                and slot.w13.dtype == target_dtype_w13
+                and slot.w2.dtype == target_dtype_w2)
+            if same_storage_shape:
+                same_format = (
+                    _lossless_weight_format(slot.w13) == target_format_w13
+                    and _lossless_weight_format(slot.w2) == target_format_w2)
+                if same_format:
+                    return
+                # Mode3 must not late-allocate a second pair of floor-sized
+                # runtime slots after shrink: those tensors were already charged
+                # to the KV budget up front.  Some refresh paths can change the
+                # source weight format string while the existing slot remains a
+                # valid formatted NPU tensor for the fused path; keep the slot and
+                # let subsequent row copies preserve runtime stability.
+                if is_mode3:
+                    log_key = (id(slot), int(getattr(layer, "layer_idx", -1)))
+                    if log_key not in getattr(self,
+                                             "_logged_mode3_slot_format_reuse",
+                                             set()):
+                        logger.info(
+                            "Mode3 reuses existing runtime slot despite format mismatch: layer=%s shape=%s slot_w13_format=%s target_w13_format=%s slot_w2_format=%s target_w2_format=%s",
+                            getattr(layer, "layer_idx", -1),
+                            tuple(target_shape_w13),
+                            _lossless_weight_format(slot.w13),
+                            target_format_w13,
+                            _lossless_weight_format(slot.w2),
+                            target_format_w2,
+                        )
+                        self._logged_mode3_slot_format_reuse = getattr(
+                            self, "_logged_mode3_slot_format_reuse", set())
+                        self._logged_mode3_slot_format_reuse.add(log_key)
+                    return
+        slot.w13 = _allocate_formatted_buffer_like(layer.w13_weight, target_row_count)
+        slot.w2 = _allocate_formatted_buffer_like(layer.w2_weight, target_row_count)
+
+    def _ensure_cpu_stage_capacity(self, slot: _Mode3DoubleBufferSlot,
+                                   layer: Any, row_count: int) -> None:
+        row_count = max(int(row_count), 1)
+        target_row_count = row_count
+        if int(getattr(layer, "elastic_execution_mode", 0)) == 3:
+            min_compute_group_size = (
+                envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE)
+            if min_compute_group_size is not None and min_compute_group_size > 0:
+                logical_num_experts = int(
+                    getattr(
+                        layer,
+                        "elastic_original_num_experts",
+                        getattr(layer, "global_num_experts",
+                                getattr(layer, "num_experts", 0)),
+                    ))
+                if logical_num_experts <= 0:
+                    logical_num_experts = int(layer.w13_weight.shape[0])
+                if logical_num_experts % int(min_compute_group_size) != 0:
+                    raise RuntimeError(
+                        "Logical expert count must be divisible by the mode3 "
+                        f"floor: experts={logical_num_experts} "
+                        f"floor={min_compute_group_size}")
+                target_row_count = max(
+                    target_row_count,
+                    max(1, logical_num_experts // int(min_compute_group_size)))
+        target_shape_w13 = (target_row_count, ) + tuple(layer.w13_weight.shape[1:])
+        target_shape_w2 = (target_row_count, ) + tuple(layer.w2_weight.shape[1:])
+        target_device = layer.w13_weight.device
+        target_dtype_w13 = layer.w13_weight.dtype
+        target_dtype_w2 = layer.w2_weight.dtype
+        if (slot.cpu_stage_w13 is not None and slot.cpu_stage_w2 is not None
+                and int(slot.cpu_stage_w13.shape[0]) >= target_row_count
+                and int(slot.cpu_stage_w2.shape[0]) >= target_row_count
+                and tuple(slot.cpu_stage_w13.shape[1:]) == tuple(
+                    target_shape_w13[1:])
+                and tuple(slot.cpu_stage_w2.shape[1:]) == tuple(
+                    target_shape_w2[1:])
+                and slot.cpu_stage_w13.device == target_device
+                and slot.cpu_stage_w2.device == target_device
+                and slot.cpu_stage_w13.dtype == target_dtype_w13
+                and slot.cpu_stage_w2.dtype == target_dtype_w2):
+            return
+        # This is only a transport staging area for async CPU->NPU copies.
+        # Keep it in a plain contiguous NPU layout instead of FRACTAL_NZ so the
+        # host->device DMA never targets the final formatted expert buffer
+        # directly. The final pack into slot.w13/slot.w2 still happens on the
+        # prefetch stream via NPU->NPU copies.
+        slot.cpu_stage_w13 = torch.empty(target_shape_w13,
+                                         device=target_device,
+                                         dtype=target_dtype_w13)
+        slot.cpu_stage_w2 = torch.empty(target_shape_w2,
+                                        device=target_device,
+                                        dtype=target_dtype_w2)
+
+    def _copy_cpu_assignments_via_stage(
+            self, slot: _Mode3DoubleBufferSlot, layer: Any,
+            cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
+            cpu_w2: torch.Tensor) -> None:
+        if not cpu_assignments:
+            return
+        self._ensure_cpu_stage_capacity(slot, layer, len(cpu_assignments))
+        if slot.cpu_stage_w13 is None or slot.cpu_stage_w2 is None:
+            raise RuntimeError(
+                "Mode3 CPU staging buffers were not allocated: "
+                f"layer={getattr(layer, 'layer_idx', -1)}")
+        # First materialize CPU rows into a plain NPU staging buffer. The final
+        # runtime slot may be FRACTAL_NZ, so keep that formatted copy as an
+        # explicit NPU->NPU step instead of targeting it from host.
+        self._copy_cpu_assignments_to_stage(slot,
+                                            cpu_assignments,
+                                            cpu_w13,
+                                            cpu_w2,
+                                            async_copy=False)
+        stage_to_slot = [
+            (int(slot_idx), stage_idx)
+            for stage_idx, (slot_idx, _cpu_slot) in enumerate(cpu_assignments)
+        ]
+        self._copy_npu_assignment_runs(slot.w13,
+                                       slot.cpu_stage_w13,
+                                       stage_to_slot,
+                                       async_copy=False)
+        self._copy_npu_assignment_runs(slot.w2,
+                                       slot.cpu_stage_w2,
+                                       stage_to_slot,
+                                       async_copy=False)
+
+    def _can_use_layer_local_buffer(
+            self, layer: Any, valid_expert_count: int,
+            npu_assignments: list[tuple[int, int]]) -> bool:
+        if not self.enable_layer_local_buffer:
+            return False
+        if valid_expert_count <= 0:
+            return False
+        if (layer.w13_weight is None or layer.w2_weight is None
+                or int(layer.w13_weight.shape[0]) < valid_expert_count
+                or int(layer.w2_weight.shape[0]) < valid_expert_count):
+            return False
+        # The fixed resident experts are already materialized in the layer's
+        # prefix slots. Reuse them only when the desired dense runtime slot is
+        # exactly the resident source slot; otherwise fall back to the safe
+        # runtime double-buffer copy path.
+        return all(int(dst_idx) == int(src_idx)
+                   for dst_idx, src_idx in npu_assignments)
+
+    def _schedule_cpu_assignments_to_stage_async(
+            self, slot: _Mode3DoubleBufferSlot, layer: Any,
+            cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
+            cpu_w2: torch.Tensor, cpu_prefetch_stream: torch.npu.Stream,
+            *, pack_to_runtime: bool,
+            timing_events: Optional[dict[str, Any]] = None,
+            host_timing: Optional[dict[str, float]] = None) -> None:
+        if not cpu_assignments:
+            return
+        host_start = time.perf_counter() if host_timing is not None else 0.0
+        self._ensure_cpu_stage_capacity(slot, layer, len(cpu_assignments))
+        if slot.cpu_stage_w13 is None or slot.cpu_stage_w2 is None:
+            raise RuntimeError(
+                "Mode3 async CPU staging buffers were not allocated: "
+                f"layer={getattr(layer, 'layer_idx', -1)}")
+        with torch.npu.stream(cpu_prefetch_stream):
+            _event_record((timing_events or {}).get("cpu_start_event"))
+            self._copy_cpu_assignments_to_stage(slot,
+                                                cpu_assignments,
+                                                cpu_w13,
+                                                cpu_w2,
+                                                async_copy=True)
+            _event_record((timing_events or {}).get("cpu_end_event"))
+            if pack_to_runtime:
+                stage_to_slot = [
+                    (int(slot_idx), stage_idx)
+                    for stage_idx, (slot_idx, _cpu_slot) in enumerate(
+                        cpu_assignments)
+                ]
+                _event_record((timing_events or {}).get("cpu_pack_start_event"))
+                self._copy_npu_assignment_runs(slot.w13,
+                                               slot.cpu_stage_w13,
+                                               stage_to_slot,
+                                               async_copy=True)
+                self._copy_npu_assignment_runs(slot.w2,
+                                               slot.cpu_stage_w2,
+                                               stage_to_slot,
+                                               async_copy=True)
+                _event_record((timing_events or {}).get("cpu_pack_end_event"))
+                slot.cpu_pack_event.record()
+            else:
+                slot.cpu_ready_event.record()
+        if host_timing is not None:
+            host_timing["submit_cpu_stage_async_us"] = (
+                time.perf_counter() - host_start) * 1e6
+        slot.has_async_cpu_copy = not pack_to_runtime
+        slot.has_async_cpu_pack = pack_to_runtime
+        slot.needs_sync_cpu_fill = False
+        log_key = (int(layer.layer_idx), len(cpu_assignments))
+        if self.enable_transfer_logs and log_key not in self._logged_async_cpu_stage:
+            logger.info(
+                "Mode3 async CPU stage scheduled: layer=%s cpu_rows=%s staging=plain_npu pack_to_runtime=%s",
+                layer.layer_idx,
+                len(cpu_assignments),
+                pack_to_runtime,
+            )
+            self._logged_async_cpu_stage.add(log_key)
+
+    def _schedule_cpu_assignments_to_slot_async(
+            self, slot: _Mode3DoubleBufferSlot, layer: Any,
+            cpu_assignments: list[tuple[int, int]], cpu_w13: torch.Tensor,
+            cpu_w2: torch.Tensor, cpu_prefetch_stream: torch.npu.Stream,
+            timing_events: Optional[dict[str, Any]] = None,
+            host_timing: Optional[dict[str, float]] = None) -> None:
+        if not cpu_assignments:
+            return
+        host_start = time.perf_counter() if host_timing is not None else 0.0
+        with torch.npu.stream(cpu_prefetch_stream):
+            _event_record((timing_events or {}).get("cpu_start_event"))
+            self._copy_cpu_assignments_to_runtime_direct(
+                slot, cpu_assignments, cpu_w13, cpu_w2)
+            _event_record((timing_events or {}).get("cpu_end_event"))
+            slot.cpu_pack_event.record()
+        if host_timing is not None:
+            host_timing["submit_cpu_direct_async_us"] = (
+                time.perf_counter() - host_start) * 1e6
+        slot.has_async_cpu_copy = False
+        slot.has_async_cpu_pack = False
+        slot.has_async_cpu_direct = True
+        slot.needs_sync_cpu_fill = False
+        log_key = (int(layer.layer_idx), len(cpu_assignments))
+        if self.enable_transfer_logs and log_key not in self._logged_async_cpu_stage:
+            logger.info(
+                "Mode3 async CPU direct slot scheduled: layer=%s cpu_rows=%s target=runtime_slot",
+                layer.layer_idx,
+                len(cpu_assignments),
+            )
+            self._logged_async_cpu_stage.add(log_key)
+
+    def _fill_pending_cpu_rows(self, slot: _Mode3DoubleBufferSlot,
+                               layer: Any) -> None:
+        if not slot.needs_sync_cpu_fill or slot.source_from_cpu <= 0:
+            slot.needs_sync_cpu_fill = False
+            return
+        cpu_w13 = _maybe_pin_cpu_tensor(getattr(layer, "lossless_cpu_w13_weight",
+                                                None))
+        cpu_w2 = _maybe_pin_cpu_tensor(getattr(layer, "lossless_cpu_w2_weight",
+                                               None))
+        if cpu_w13 is None or cpu_w2 is None:
+            raise RuntimeError(
+                "Mode3 sync CPU fill requested but CPU shadow weights are missing: "
+                f"layer={layer.layer_idx}.")
+        cpu_shadow_slots = getattr(layer, "lossless_cpu_shadow_local_slots", {})
+        mode5_cpu_rows = getattr(layer, "lossless_mode5_cpu_shadow_row_by_expert",
+                                 {})
+        mode5_strategy = _mode5_cpu_shadow_runtime_strategy()
+        if (slot.cpu_stage_count > 0
+                and len(slot.cpu_stage_slot_ids) >= slot.cpu_stage_count
+                and len(slot.cpu_stage_cpu_slots) >= slot.cpu_stage_count):
+            cpu_assignments = list(
+                zip(slot.cpu_stage_slot_ids[:slot.cpu_stage_count],
+                    slot.cpu_stage_cpu_slots[:slot.cpu_stage_count]))
+        else:
+            cpu_assignments = []
+            start_idx = int(slot.source_from_npu)
+            end_idx = int(slot.valid_expert_count)
+            for slot_idx in range(start_idx, end_idx):
+                expert_id = int(slot.expert_ids[slot_idx])
+                if mode5_strategy == "legacy_cpu_shadow":
+                    cpu_slot = cpu_shadow_slots.get(expert_id)
+                    if cpu_slot is None:
+                        cpu_slot = mode5_cpu_rows.get(expert_id)
+                else:
+                    cpu_slot = mode5_cpu_rows.get(expert_id)
+                    if cpu_slot is None:
+                        cpu_slot = cpu_shadow_slots.get(expert_id)
+                if cpu_slot is None:
+                    raise RuntimeError(
+                        "Mode3 sync CPU fill missing CPU shadow slot mapping: "
+                        f"layer={layer.layer_idx} expert_id={expert_id}")
+                cpu_assignments.append((slot_idx, int(cpu_slot)))
+        self._copy_cpu_assignments_via_stage(slot, layer, cpu_assignments,
+                                             cpu_w13, cpu_w2)
+        slot.needs_sync_cpu_fill = False
+
+    def _populate_slot(self,
+                       slot: _Mode3DoubleBufferSlot,
+                       layer: Any,
+                       *,
+                       async_copy: bool,
+                       cpu_prefetch_stream: Optional[torch.npu.Stream] = None,
+                       reason: str = "",
+                       timing_events: Optional[dict[str, Any]] = None,
+                       host_timing: Optional[dict[str, float]] = None) -> None:
+        populate_host_start = (
+            time.perf_counter() if host_timing is not None else 0.0)
+        phase_start = time.perf_counter() if host_timing is not None else 0.0
+        slot_expert_ids = self._ordered_mode3_slot_expert_ids(layer)
+        valid_expert_count = len(slot_expert_ids)
+        if valid_expert_count <= 0:
+            raise RuntimeError(
+                f"Mode3 slot population requires owned experts at layer={layer.layer_idx}.")
+        if host_timing is not None:
+            host_timing["submit_order_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        primary_slots = getattr(layer, "lossless_mode3_primary_prefix_local_slots",
+                                {})
+        cpu_shadow_slots = getattr(layer, "lossless_cpu_shadow_local_slots", {})
+        mode5_cpu_rows = getattr(layer, "lossless_mode5_cpu_shadow_row_by_expert",
+                                 {})
+        mode5_strategy = _mode5_cpu_shadow_runtime_strategy()
+        elastic_mode = int(getattr(layer, "elastic_execution_mode", 0))
+        is_mode4 = elastic_mode == 4
+        is_mode5 = elastic_mode == 5
+        cpu_w13 = getattr(layer, "lossless_cpu_w13_weight", None)
+        cpu_w2 = getattr(layer, "lossless_cpu_w2_weight", None)
+        if (not is_mode4) and (cpu_w13 is None or cpu_w2 is None):
+            raise RuntimeError(
+                f"Mode{elastic_mode} slot population requires CPU shadow weights at layer={layer.layer_idx}.")
+        if host_timing is not None:
+            if is_mode4:
+                host_timing["cpu_w13_pinned"] = 0.0
+                host_timing["cpu_w2_pinned"] = 0.0
+                host_timing["cpu_w13_contig"] = 0.0
+                host_timing["cpu_w2_contig"] = 0.0
+            else:
+                host_timing["cpu_w13_pinned"] = float(_tensor_is_pinned(cpu_w13))
+                host_timing["cpu_w2_pinned"] = float(_tensor_is_pinned(cpu_w2))
+                host_timing["cpu_w13_contig"] = float(
+                    _tensor_is_contiguous(cpu_w13))
+                host_timing["cpu_w2_contig"] = float(
+                    _tensor_is_contiguous(cpu_w2))
+        source_from_npu = 0
+        source_from_cpu = 0
+        source_from_remote_npu = 0
+        npu_assignments: list[tuple[int, int]] = []
+        cpu_assignments: list[tuple[int, int]] = []
+        remote_assignments: list[tuple[int, int, int, int]] = []
+        remote_sources = getattr(layer, "lossless_mode4_remote_source_by_expert",
+                                 {})
+        for slot_idx, expert_id in enumerate(slot_expert_ids):
+            source_local_slot = primary_slots.get(int(expert_id))
+            if source_local_slot is not None:
+                npu_assignments.append((slot_idx, int(source_local_slot)))
+                source_from_npu += 1
+            else:
+                remote_source = remote_sources.get(int(expert_id))
+                if remote_source is not None:
+                    remote_rank, remote_slot = remote_source
+                    remote_assignments.append(
+                        (slot_idx, int(remote_rank), int(remote_slot),
+                         int(expert_id)))
+                    source_from_remote_npu += 1
+                    continue
+                if is_mode4:
+                    raise RuntimeError(
+                        "Mode4 slot population missing remote NPU source: "
+                        f"layer={layer.layer_idx} expert_id={int(expert_id)}")
+                if mode5_strategy == "legacy_cpu_shadow":
+                    cpu_slot = cpu_shadow_slots.get(int(expert_id))
+                    if cpu_slot is None:
+                        cpu_slot = mode5_cpu_rows.get(int(expert_id))
+                else:
+                    cpu_slot = mode5_cpu_rows.get(int(expert_id))
+                    if cpu_slot is None:
+                        cpu_slot = cpu_shadow_slots.get(int(expert_id))
+                if cpu_slot is None:
+                    raise RuntimeError(
+                        f"Mode{elastic_mode} slot population missing CPU shadow slot mapping: "
+                        f"layer={layer.layer_idx} expert_id={int(expert_id)}")
+                cpu_assignments.append((slot_idx, int(cpu_slot)))
+                source_from_cpu += 1
+        if host_timing is not None:
+            host_timing["submit_assign_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        use_layer_local_buffer = self._can_use_layer_local_buffer(
+            layer, valid_expert_count, npu_assignments)
+        if host_timing is not None:
+            host_timing["submit_layer_local_check_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        if use_layer_local_buffer:
+            slot.w13 = layer.w13_weight
+            slot.w2 = layer.w2_weight
+        else:
+            if slot.uses_layer_local_buffer:
+                slot.w13 = None
+                slot.w2 = None
+            self._ensure_slot_capacity(slot, layer)
+            _event_record((timing_events or {}).get("npu_start_event"))
+            self._copy_npu_assignment_runs(slot.w13,
+                                           layer.w13_weight,
+                                           npu_assignments,
+                                           async_copy=async_copy)
+            self._copy_npu_assignment_runs(slot.w2,
+                                           layer.w2_weight,
+                                           npu_assignments,
+                                           async_copy=async_copy)
+            _event_record((timing_events or {}).get("npu_end_event"))
+        if host_timing is not None:
+            host_timing["submit_npu_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        slot.has_async_cpu_copy = False
+        slot.has_async_cpu_pack = False
+        slot.has_async_cpu_direct = False
+        slot.needs_sync_cpu_fill = False
+        slot.uses_layer_local_buffer = bool(use_layer_local_buffer)
+        slot.cpu_stage_slot_ids = tuple(slot_idx for slot_idx, _ in cpu_assignments)
+        slot.cpu_stage_cpu_slots = tuple(cpu_slot for _, cpu_slot in cpu_assignments)
+        slot.cpu_stage_count = len(cpu_assignments)
+        cpu_path = "none"
+        def _submit_cpu_path(local_host_timing: Optional[dict[str, float]]) -> str:
+            local_cpu_path = "none"
+            if not cpu_assignments:
+                return local_cpu_path
+            cpu_phase_start = (time.perf_counter()
+                               if local_host_timing is not None else 0.0)
+            if (async_copy and cpu_prefetch_stream is not None
+                    and self.enable_direct_cpu_slot):
+                # Direct-slot experiment: write CPU shadow rows directly into
+                # their final runtime expert slots on the CPU prefetch stream,
+                # bypassing the plain NPU staging buffer.
+                local_cpu_path = "direct_async"
+                self._schedule_cpu_assignments_to_slot_async(
+                    slot, layer, cpu_assignments, cpu_w13, cpu_w2,
+                    cpu_prefetch_stream, timing_events=timing_events,
+                    host_timing=local_host_timing)
+            elif (async_copy and cpu_prefetch_stream is not None
+                    and self.enable_async_cpu_stage):
+                # CPU shadow rows first land in a plain NPU staging buffer on
+                # a separate stream. When async CPU pack is enabled, that same
+                # stream also copies staged rows into their final runtime
+                # slots; otherwise the main prefetch stream does that after
+                # waiting on the CPU staging event.
+                local_cpu_path = ("stage_async_pack" if self.enable_async_cpu_pack
+                                  else "stage_async_wait_pack")
+                self._schedule_cpu_assignments_to_stage_async(
+                    slot, layer, cpu_assignments, cpu_w13, cpu_w2,
+                    cpu_prefetch_stream,
+                    pack_to_runtime=self.enable_async_cpu_pack,
+                    timing_events=timing_events,
+                    host_timing=local_host_timing)
+            elif async_copy and cpu_prefetch_stream is not None:
+                # Keep resident NPU experts prefetched, but fill CPU shadow rows
+                # at bind-time through the plain NPU staging buffer when async
+                # CPU staging is disabled.
+                local_cpu_path = "defer_sync_fill"
+                self._ensure_cpu_stage_capacity(slot, layer, len(cpu_assignments))
+                slot.needs_sync_cpu_fill = True
+                log_key = (int(layer.layer_idx), len(cpu_assignments))
+                if (self.enable_transfer_logs
+                        and log_key not in self._logged_cpu_fill_deferrals):
+                    logger.info(
+                        "Mode3 CPU shadow fill deferred to bind: layer=%s cpu_rows=%s reason=async_cpu_stage_disabled staging=plain_npu",
+                        layer.layer_idx,
+                        len(cpu_assignments),
+                    )
+                    self._logged_cpu_fill_deferrals.add(log_key)
+            else:
+                local_cpu_path = "sync_stage"
+                self._copy_cpu_assignments_via_stage(slot, layer,
+                                                     cpu_assignments, cpu_w13,
+                                                     cpu_w2)
+            if local_host_timing is not None:
+                local_host_timing["submit_cpu_us"] = (
+                    time.perf_counter() - cpu_phase_start) * 1e6
+            return local_cpu_path
+
+        def _submit_remote_path(local_host_timing: Optional[dict[str, float]]) -> None:
+            if not remote_assignments:
+                return
+            remote_phase_start = (time.perf_counter()
+                                  if local_host_timing is not None else 0.0)
+            remote_fetcher = getattr(layer, "lossless_mode4_remote_fetcher",
+                                     None)
+            if not callable(remote_fetcher):
+                raise RuntimeError(
+                    f"Mode{elastic_mode} remote-NPU double-buffer path requires a remote "
+                    f"fetcher at layer={layer.layer_idx}; refusing to use CPU "
+                    "or fixed-slot fallback.")
+            _event_record((timing_events or {}).get("remote_start_event"))
+            remote_fetcher(layer, remote_assignments, slot.w13, slot.w2,
+                           timing_events=timing_events,
+                           async_copy=async_copy)
+            _event_record((timing_events or {}).get("remote_end_event"))
+            if local_host_timing is not None:
+                local_host_timing["submit_remote_npu_us"] = (
+                    time.perf_counter() - remote_phase_start) * 1e6
+
+        cpu_path = _submit_cpu_path(host_timing)
+        if host_timing is not None:
+            phase_start = time.perf_counter()
+        _submit_remote_path(host_timing)
+        if host_timing is not None:
+            phase_start = time.perf_counter()
+        self._maybe_log_transfer_plan(
+            layer,
+            reason=reason,
+            async_copy=async_copy,
+            slot_id=self._slot_id_for_layer(int(layer.layer_idx)),
+            npu_assignments=npu_assignments,
+            cpu_assignments=cpu_assignments,
+            cpu_path=cpu_path,
+            use_layer_local_buffer=use_layer_local_buffer,
+            cpu_prefetch_stream=cpu_prefetch_stream,
+            cpu_w13=cpu_w13,
+            cpu_w2=cpu_w2,
+        )
+        if host_timing is not None:
+            host_timing["submit_plan_log_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        slot.prefetch_cpu_path = cpu_path
+        slot.expert_map, expert_map_cache_hit = \
+            self._get_cached_slot_expert_map(layer, slot_expert_ids,
+                                             slot.w13.device)
+        if host_timing is not None:
+            host_timing["submit_expert_map_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            host_timing["expert_map_cache_hit"] = float(
+                int(expert_map_cache_hit))
+            phase_start = time.perf_counter()
+        dispatch_log2phy, dispatch_num_experts, dispatch_signature, \
+            dispatch_active_rank_count, dispatch_owned_per_rank = \
+            self._get_cached_dispatch_remap(layer, slot.w13.device)
+        if host_timing is not None:
+            host_timing["submit_dispatch_cache_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        slot.layer_idx = int(layer.layer_idx)
+        slot.expert_ids = tuple(slot_expert_ids)
+        slot.valid_expert_count = valid_expert_count
+        slot.source_from_npu = source_from_npu
+        slot.source_from_cpu = source_from_cpu
+        slot.source_from_remote_npu = source_from_remote_npu
+        slot.dispatch_log2phy = dispatch_log2phy
+        slot.dispatch_num_experts = dispatch_num_experts
+        slot.dispatch_signature = dispatch_signature
+        slot.dispatch_active_rank_count = dispatch_active_rank_count
+        slot.dispatch_owned_per_rank = dispatch_owned_per_rank
+        if host_timing is not None:
+            host_timing["submit_slot_state_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            host_timing["submit_populate_total_us"] = (
+                time.perf_counter() - populate_host_start) * 1e6
+
+    def _populate_mode4_block_slot(
+            self,
+            slot: _Mode3DoubleBufferSlot,
+            block_layers: list[Any],
+            *,
+            async_copy: bool,
+            timing_events: Optional[dict[str, Any]] = None,
+            host_timing: Optional[dict[str, float]] = None) -> None:
+        if not block_layers:
+            raise RuntimeError("Mode4 block prefetch requires at least one layer.")
+        first_layer = block_layers[0]
+        block_start = int(first_layer.layer_idx)
+        rows_by_layer: list[tuple[Any, int, list[int]]] = []
+        total_rows = 0
+        total_local = 0
+        total_remote = 0
+        total_cpu = 0
+        all_npu_assignments: list[tuple[int, int, torch.Tensor]] = []
+        all_remote_assignments: list[tuple[int, int, int, int, int]] = []
+        layer_states: dict[int, dict[str, Any]] = {}
+        phase_start = time.perf_counter() if host_timing is not None else 0.0
+
+        for layer in block_layers:
+            slot_expert_ids = self._ordered_mode3_slot_expert_ids(layer)
+            valid_count = len(slot_expert_ids)
+            if valid_count <= 0:
+                raise RuntimeError(
+                    "Mode4 block prefetch requires owned experts: "
+                    f"layer={getattr(layer, 'layer_idx', -1)}")
+            row_base = total_rows
+            total_rows += valid_count
+            rows_by_layer.append((layer, row_base, slot_expert_ids))
+            primary_slots = getattr(layer,
+                                    "lossless_mode3_primary_prefix_local_slots",
+                                    {})
+            remote_sources = getattr(layer,
+                                     "lossless_mode4_remote_source_by_expert",
+                                     {})
+            local_count = 0
+            remote_count = 0
+            for local_idx, expert_id in enumerate(slot_expert_ids):
+                dst_idx = row_base + local_idx
+                source_local_slot = primary_slots.get(int(expert_id))
+                if source_local_slot is not None:
+                    all_npu_assignments.append(
+                        (dst_idx, int(source_local_slot), layer))
+                    local_count += 1
+                    continue
+                remote_source = remote_sources.get(int(expert_id))
+                if remote_source is None:
+                    raise RuntimeError(
+                        "Mode4 block prefetch missing remote NPU source: "
+                        f"layer={getattr(layer, 'layer_idx', -1)} "
+                        f"expert_id={int(expert_id)}")
+                remote_rank, remote_slot = remote_source
+                all_remote_assignments.append(
+                    (dst_idx, int(remote_rank), int(remote_slot),
+                     int(expert_id), int(layer.layer_idx)))
+                remote_count += 1
+            expert_map, _expert_map_cache_hit = self._get_cached_slot_expert_map(
+                layer, slot_expert_ids, first_layer.w13_weight.device)
+            dispatch_log2phy, dispatch_num_experts, dispatch_signature, \
+                dispatch_active_rank_count, dispatch_owned_per_rank = \
+                self._get_cached_dispatch_remap(layer,
+                                                first_layer.w13_weight.device)
+            layer_states[int(layer.layer_idx)] = {
+                "row_base": row_base,
+                "expert_ids": tuple(slot_expert_ids),
+                "valid_expert_count": valid_count,
+                "source_from_npu": local_count,
+                "source_from_remote_npu": remote_count,
+                "source_from_cpu": 0,
+                "expert_map": expert_map,
+                "dispatch_log2phy": dispatch_log2phy,
+                "dispatch_num_experts": dispatch_num_experts,
+                "dispatch_signature": dispatch_signature,
+                "dispatch_active_rank_count": dispatch_active_rank_count,
+                "dispatch_owned_per_rank": dispatch_owned_per_rank,
+            }
+            total_local += local_count
+            total_remote += remote_count
+
+        if total_rows > 128:
+            raise RuntimeError(
+                "Mode4 block prefetch exceeds runtime slot capacity: "
+                f"block_start={block_start} rows={total_rows} capacity=128 "
+                f"layers={len(block_layers)}")
+        self._ensure_slot_capacity(slot, first_layer)
+        if host_timing is not None:
+            host_timing["submit_assign_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            phase_start = time.perf_counter()
+        _event_record((timing_events or {}).get("npu_start_event"))
+        for dst_idx, src_idx, layer in all_npu_assignments:
+            slot.w13[int(dst_idx)].copy_(layer.w13_weight[int(src_idx)],
+                                         non_blocking=async_copy)
+            slot.w2[int(dst_idx)].copy_(layer.w2_weight[int(src_idx)],
+                                        non_blocking=async_copy)
+        _event_record((timing_events or {}).get("npu_end_event"))
+        if host_timing is not None:
+            host_timing["submit_npu_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            host_timing["submit_local_npu_us"] = host_timing["submit_npu_us"]
+            phase_start = time.perf_counter()
+        if all_remote_assignments:
+            remote_fetcher = getattr(first_layer, "lossless_mode4_remote_fetcher",
+                                     None)
+            if not callable(remote_fetcher):
+                raise RuntimeError(
+                    "Mode4 block prefetch requires a remote fetcher at "
+                    f"layer={block_start}.")
+            _event_record((timing_events or {}).get("remote_start_event"))
+            remote_fetcher(first_layer,
+                           all_remote_assignments,
+                           slot.w13,
+                           slot.w2,
+                           timing_events=timing_events,
+                           async_copy=async_copy)
+            _event_record((timing_events or {}).get("remote_end_event"))
+        if host_timing is not None:
+            host_timing["submit_remote_npu_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            host_timing.setdefault("submit_cpu_us", 0.0)
+            phase_start = time.perf_counter()
+        slot.has_async_cpu_copy = False
+        slot.has_async_cpu_pack = False
+        slot.has_async_cpu_direct = False
+        slot.needs_sync_cpu_fill = False
+        slot.uses_layer_local_buffer = False
+        slot.cpu_stage_slot_ids = ()
+        slot.cpu_stage_cpu_slots = ()
+        slot.cpu_stage_count = 0
+        slot.prefetch_cpu_path = "none"
+        slot.block_start_layer = block_start
+        slot.block_layer_count = len(block_layers)
+        slot.block_layer_states = layer_states
+        slot.layer_idx = block_start
+        slot.expert_ids = tuple(
+            expert_id for _layer, _row_base, expert_ids in rows_by_layer
+            for expert_id in expert_ids)
+        slot.valid_expert_count = total_rows
+        slot.source_from_npu = total_local
+        slot.source_from_remote_npu = total_remote
+        slot.source_from_cpu = total_cpu
+        # The active layer-specific fields are filled in bind_current_layer().
+        first_state = layer_states[block_start]
+        slot.expert_map = first_state["expert_map"]
+        slot.dispatch_log2phy = first_state["dispatch_log2phy"]
+        slot.dispatch_num_experts = first_state["dispatch_num_experts"]
+        slot.dispatch_signature = tuple(
+            (layer_idx, state["dispatch_signature"])
+            for layer_idx, state in sorted(layer_states.items()))
+        slot.dispatch_active_rank_count = first_state["dispatch_active_rank_count"]
+        slot.dispatch_owned_per_rank = first_state["dispatch_owned_per_rank"]
+        if host_timing is not None:
+            host_timing["submit_slot_state_us"] = (
+                time.perf_counter() - phase_start) * 1e6
+            host_timing["mode4_block_layers"] = float(len(block_layers))
+            host_timing["mode4_block_rows"] = float(total_rows)
+            host_timing["mode4_block_start_layer"] = float(block_start)
+
+    def _slot_matches(self, slot: _Mode3DoubleBufferSlot, layer: Any) -> bool:
+        if self._is_mode4_block_prefetch_enabled(layer):
+            layer_state = slot.block_layer_states.get(int(layer.layer_idx))
+            if layer_state is None:
+                return False
+            ordered_slot_expert_ids = tuple(
+                self._ordered_mode3_slot_expert_ids(layer))
+            dispatch_signature = _hybrid_dispatch_topology_signature(layer)
+            return (
+                layer_state.get("expert_ids") == ordered_slot_expert_ids
+                and layer_state.get("valid_expert_count")
+                == len(ordered_slot_expert_ids)
+                and layer_state.get("expert_map") is not None
+                and slot.w13 is not None
+                and slot.w2 is not None
+                and layer_state.get("dispatch_signature")
+                == dispatch_signature
+                and slot.block_start_layer == self._block_start_for_layer(
+                    int(layer.layer_idx)))
+        ordered_slot_expert_ids = tuple(self._ordered_mode3_slot_expert_ids(layer))
+        dispatch_signature = _hybrid_dispatch_topology_signature(layer)
+        return (
+            slot.layer_idx == int(layer.layer_idx)
+            and slot.expert_ids == ordered_slot_expert_ids
+            and slot.valid_expert_count == len(ordered_slot_expert_ids)
+            and slot.expert_map is not None
+            and slot.w13 is not None
+            and slot.w2 is not None
+            and slot.dispatch_signature == dispatch_signature
+        )
+
+    def prepare_slot(self,
+                     layer: Any,
+                     slot_id: int,
+                     async_copy: bool,
+                     *,
+                     reason: str) -> _Mode3DoubleBufferSlot:
+        if self._is_mode4_block_prefetch_enabled(layer):
+            return self.prepare_mode4_block_slot(layer,
+                                                 slot_id,
+                                                 async_copy,
+                                                 reason=reason)
+        slot = self.slots[slot_id]
+        if self._slot_matches(slot, layer):
+            return slot
+        submit_start = time.perf_counter()
+        prefetch_submit_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "prefetch_submit",
+                layer,
+                path=reason,
+                extra=f"slot={slot_id} async={int(async_copy)}"))
+        host_timing: Optional[dict[str, float]] = (
+            {} if self.enable_timing_logs else None)
+        event_alloc_start = time.perf_counter()
+        start_event = self.new_timing_event() if async_copy else None
+        end_event = self.new_timing_event() if async_copy else None
+        timing_events = {
+            "npu_start_event": self.new_timing_event() if async_copy else None,
+            "npu_end_event": self.new_timing_event() if async_copy else None,
+            "remote_start_event": self.new_timing_event() if async_copy else None,
+            "remote_end_event": self.new_timing_event() if async_copy else None,
+            "cpu_start_event": self.new_timing_event() if async_copy else None,
+            "cpu_end_event": self.new_timing_event() if async_copy else None,
+            "cpu_pack_start_event": self.new_timing_event() if async_copy else None,
+            "cpu_pack_end_event": self.new_timing_event() if async_copy else None,
+        }
+        if host_timing is not None:
+            host_timing["submit_event_alloc_us"] = (
+                time.perf_counter() - event_alloc_start) * 1e6
+        if async_copy and self.prefetch_stream is not None:
+            stream_wait_start = time.perf_counter()
+            current_stream = torch.npu.current_stream()
+            if self.cpu_prefetch_stream is not None:
+                self.cpu_prefetch_stream.wait_stream(current_stream)
+            if host_timing is not None:
+                host_timing["submit_stream_wait_us"] = (
+                    time.perf_counter() - stream_wait_start) * 1e6
+            with torch.npu.stream(self.prefetch_stream):
+                stream_wait_start = time.perf_counter()
+                self.prefetch_stream.wait_stream(current_stream)
+                if host_timing is not None:
+                    host_timing["submit_prefetch_wait_stream_us"] = (
+                        time.perf_counter() - stream_wait_start) * 1e6
+                record_start = time.perf_counter()
+                _event_record(start_event)
+                if host_timing is not None:
+                    host_timing["submit_start_event_record_us"] = (
+                        time.perf_counter() - record_start) * 1e6
+                populate_start = time.perf_counter()
+                self._populate_slot(slot,
+                                    layer,
+                                    async_copy=True,
+                                    cpu_prefetch_stream=self.cpu_prefetch_stream,
+                                    reason=reason,
+                                    timing_events=timing_events,
+                                    host_timing=host_timing)
+                if host_timing is not None:
+                    host_timing["submit_populate_us"] = (
+                        time.perf_counter() - populate_start) * 1e6
+                post_cpu_start = time.perf_counter()
+                if slot.has_async_cpu_direct or slot.has_async_cpu_pack:
+                    self.prefetch_stream.wait_event(slot.cpu_pack_event)
+                elif slot.has_async_cpu_copy:
+                    self.prefetch_stream.wait_event(slot.cpu_ready_event)
+                    stage_to_slot = [
+                        (int(slot_idx), stage_idx)
+                        for stage_idx, slot_idx in enumerate(
+                            slot.cpu_stage_slot_ids[:slot.cpu_stage_count])
+                    ]
+                    _event_record(timing_events.get("cpu_pack_start_event"))
+                    self._copy_npu_assignment_runs(slot.w13,
+                                                   slot.cpu_stage_w13,
+                                                   stage_to_slot,
+                                                   async_copy=True)
+                    self._copy_npu_assignment_runs(slot.w2,
+                                                   slot.cpu_stage_w2,
+                                                   stage_to_slot,
+                                                   async_copy=True)
+                    _event_record(timing_events.get("cpu_pack_end_event"))
+                if host_timing is not None:
+                    host_timing["submit_post_cpu_wait_us"] = (
+                        time.perf_counter() - post_cpu_start) * 1e6
+                record_start = time.perf_counter()
+                _event_record(end_event)
+                slot.ready_event.record()
+                if host_timing is not None:
+                    host_timing["submit_ready_record_us"] = (
+                        time.perf_counter() - record_start) * 1e6
+            slot.inflight_prefetch = True
+        else:
+            populate_start = time.perf_counter()
+            self._populate_slot(slot,
+                                layer,
+                                async_copy=False,
+                                reason=reason,
+                                timing_events=timing_events,
+                                host_timing=host_timing)
+            if host_timing is not None:
+                host_timing["submit_populate_us"] = (
+                    time.perf_counter() - populate_start) * 1e6
+            record_start = time.perf_counter()
+            slot.ready_event.record()
+            if host_timing is not None:
+                host_timing["submit_ready_record_us"] = (
+                    time.perf_counter() - record_start) * 1e6
+            slot.inflight_prefetch = False
+        slot.prefetch_timing = {
+            "layer_idx": int(layer.layer_idx),
+            "slot_id": int(slot_id),
+            "reason": reason,
+            "async": bool(async_copy),
+            "submit_us": (time.perf_counter() - submit_start) * 1e6,
+            "start_event": start_event,
+            "end_event": end_event,
+            **timing_events,
+            "valid_experts": int(slot.valid_expert_count),
+            "source_from_npu": int(slot.source_from_npu),
+            "source_from_remote_npu": int(
+                getattr(slot, "source_from_remote_npu", 0)),
+            "source_from_cpu": int(slot.source_from_cpu),
+            "cpu_path": slot.prefetch_cpu_path,
+            "layer_local_buffer": int(slot.uses_layer_local_buffer),
+        }
+        if host_timing is not None:
+            slot.prefetch_timing.update(host_timing)
+        if ((int(layer.layer_idx), slot_id) not in self._logged_prefetches
+                and async_copy and self.enable_verbose_transfer_logs):
+            logger.info(
+                "Mode%s prefetch scheduled: layer=%s slot=%s reason=%s valid_experts=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s layer_local_buffer=%s slot_head=%s",
+                int(getattr(layer, "elastic_execution_mode", 3)),
+                layer.layer_idx,
+                slot_id,
+                reason,
+                slot.valid_expert_count,
+                slot.source_from_npu,
+                int(getattr(slot, "source_from_remote_npu", 0)),
+                slot.source_from_cpu,
+                int(slot.uses_layer_local_buffer),
+                list(slot.expert_ids[:8]),
+            )
+            self._logged_prefetches.add((int(layer.layer_idx), slot_id))
+        _stage_decode_profile_range_end(prefetch_submit_range)
+        return slot
+
+    def prepare_mode4_block_slot(self,
+                                 layer: Any,
+                                 slot_id: int,
+                                 async_copy: bool,
+                                 *,
+                                 reason: str) -> _Mode3DoubleBufferSlot:
+        slot = self.slots[slot_id]
+        if self._slot_matches(slot, layer):
+            return slot
+        block_start = self._block_start_for_layer(int(layer.layer_idx))
+        block_layers = self._block_layers_for_start(block_start)
+        if not block_layers:
+            raise RuntimeError(
+                f"Mode4 block prefetch found no active layers at start={block_start}.")
+        submit_start = time.perf_counter()
+        prefetch_submit_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "prefetch_submit",
+                layer,
+                path=reason,
+                extra=(f"slot={slot_id} async={int(async_copy)} "
+                       f"block_start={block_start} "
+                       f"block_layers={len(block_layers)}")))
+        host_timing: Optional[dict[str, float]] = (
+            {} if self.enable_timing_logs else None)
+        event_alloc_start = time.perf_counter()
+        start_event = self.new_timing_event() if async_copy else None
+        end_event = self.new_timing_event() if async_copy else None
+        timing_events = {
+            "npu_start_event": self.new_timing_event() if async_copy else None,
+            "npu_end_event": self.new_timing_event() if async_copy else None,
+            "remote_start_event": self.new_timing_event() if async_copy else None,
+            "remote_end_event": self.new_timing_event() if async_copy else None,
+            "cpu_start_event": self.new_timing_event() if async_copy else None,
+            "cpu_end_event": self.new_timing_event() if async_copy else None,
+            "cpu_pack_start_event": self.new_timing_event() if async_copy else None,
+            "cpu_pack_end_event": self.new_timing_event() if async_copy else None,
+        }
+        if host_timing is not None:
+            host_timing["submit_event_alloc_us"] = (
+                time.perf_counter() - event_alloc_start) * 1e6
+        if async_copy and self.prefetch_stream is not None:
+            stream_wait_start = time.perf_counter()
+            current_stream = torch.npu.current_stream()
+            if self.cpu_prefetch_stream is not None:
+                self.cpu_prefetch_stream.wait_stream(current_stream)
+            if host_timing is not None:
+                host_timing["submit_stream_wait_us"] = (
+                    time.perf_counter() - stream_wait_start) * 1e6
+            with torch.npu.stream(self.prefetch_stream):
+                stream_wait_start = time.perf_counter()
+                self.prefetch_stream.wait_stream(current_stream)
+                if host_timing is not None:
+                    host_timing["submit_prefetch_wait_stream_us"] = (
+                        time.perf_counter() - stream_wait_start) * 1e6
+                record_start = time.perf_counter()
+                _event_record(start_event)
+                if host_timing is not None:
+                    host_timing["submit_start_event_record_us"] = (
+                        time.perf_counter() - record_start) * 1e6
+                populate_start = time.perf_counter()
+                self._populate_mode4_block_slot(slot,
+                                                block_layers,
+                                                async_copy=True,
+                                                timing_events=timing_events,
+                                                host_timing=host_timing)
+                if host_timing is not None:
+                    host_timing["submit_populate_us"] = (
+                        time.perf_counter() - populate_start) * 1e6
+                record_start = time.perf_counter()
+                _event_record(end_event)
+                slot.ready_event.record()
+                if host_timing is not None:
+                    host_timing["submit_ready_record_us"] = (
+                        time.perf_counter() - record_start) * 1e6
+            slot.inflight_prefetch = True
+        else:
+            populate_start = time.perf_counter()
+            self._populate_mode4_block_slot(slot,
+                                            block_layers,
+                                            async_copy=False,
+                                            timing_events=timing_events,
+                                            host_timing=host_timing)
+            if host_timing is not None:
+                host_timing["submit_populate_us"] = (
+                    time.perf_counter() - populate_start) * 1e6
+            record_start = time.perf_counter()
+            slot.ready_event.record()
+            if host_timing is not None:
+                host_timing["submit_ready_record_us"] = (
+                    time.perf_counter() - record_start) * 1e6
+            slot.inflight_prefetch = False
+        slot.prefetch_timing = {
+            "layer_idx": int(layer.layer_idx),
+            "slot_id": int(slot_id),
+            "reason": reason,
+            "async": bool(async_copy),
+            "submit_us": (time.perf_counter() - submit_start) * 1e6,
+            "start_event": start_event,
+            "end_event": end_event,
+            **timing_events,
+            "valid_experts": int(slot.valid_expert_count),
+            "source_from_npu": int(slot.source_from_npu),
+            "source_from_remote_npu": int(slot.source_from_remote_npu),
+            "source_from_cpu": int(slot.source_from_cpu),
+            "cpu_path": slot.prefetch_cpu_path,
+            "layer_local_buffer": 0,
+            "mode4_block_start_layer": int(block_start),
+            "mode4_block_layers": int(len(block_layers)),
+            "mode4_block_rows": int(slot.valid_expert_count),
+        }
+        if host_timing is not None:
+            slot.prefetch_timing.update(host_timing)
+        log_key = (int(block_start), int(slot_id), int(len(block_layers)))
+        if async_copy and self.enable_transfer_logs and log_key not in \
+                self._logged_mode4_block_prefetch:
+            logger.info(
+                "Mode4 block prefetch scheduled: block_start=%s block_layers=%s slot=%s reason=%s rows=%s source_from_local_npu=%s source_from_remote_npu=%s",
+                block_start,
+                len(block_layers),
+                slot_id,
+                reason,
+                slot.valid_expert_count,
+                slot.source_from_npu,
+                slot.source_from_remote_npu,
+            )
+            self._logged_mode4_block_prefetch.add(log_key)
+        _stage_decode_profile_range_end(prefetch_submit_range)
+        return slot
+
+    def bind_current_layer(self, layer: Any) -> _Mode3DoubleBufferSlot:
+        slot_id = self._slot_id_for_runtime_layer(layer)
+        slot = self.slots[slot_id]
+        prefetched_hit = self._slot_matches(slot, layer)
+        if not self._slot_matches(slot, layer):
+            slot = self.prepare_slot(layer, slot_id, async_copy=False,
+                                     reason="sync_current")
+        layer_state = None
+        if self._is_mode4_block_prefetch_enabled(layer):
+            layer_state = slot.block_layer_states.get(int(layer.layer_idx))
+            if layer_state is None:
+                raise RuntimeError(
+                    "Mode4 block slot missing layer state at bind: "
+                    f"layer={getattr(layer, 'layer_idx', -1)} "
+                    f"block_start={slot.block_start_layer}")
+        wait_start = time.perf_counter()
+        bind_wait_begin_wall_ts = wait_start
+        current_layer_idx = int(layer.layer_idx)
+        _stage_decode_profile_range_end(
+            self._stage_decode_compute_ranges_by_target_layer.pop(
+                current_layer_idx, None))
+        bind_wait_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "bind_wait",
+                layer,
+                extra=f"prefetched_hit={int(prefetched_hit)}"))
+        ready_wait_start_event = None
+        ready_wait_end_event = None
+        # Ensure the current layer never starts computing before every expert
+        # row for this slot has fully arrived in the runtime buffer. The
+        # device-event path preserves the dependency without blocking Python,
+        # which lets the double-buffered prefetch pipeline stay deeper.
+        wait_mode = "host_sync"
+        if slot.inflight_prefetch and self.enable_device_ready_wait:
+            ready_wait_start_event = self.new_timing_event()
+            ready_wait_end_event = self.new_timing_event()
+            current_stream = torch.npu.current_stream()
+            _event_record(ready_wait_start_event)
+            current_stream.wait_event(slot.ready_event)
+            _event_record(ready_wait_end_event)
+            wait_mode = "device_event"
+        else:
+            slot.ready_event.synchronize()
+        wait_us = (time.perf_counter() - wait_start) * 1e6
+        cpu_fill_start = time.perf_counter()
+        self._fill_pending_cpu_rows(slot, layer)
+        cpu_fill_us = (time.perf_counter() - cpu_fill_start) * 1e6
+        bind_ready_wall_ts = time.perf_counter()
+        _stage_decode_profile_range_end(bind_wait_range)
+        _stage_decode_profile_range_end(
+            self._stage_decode_comm_ranges_by_target_layer.pop(
+                current_layer_idx, None))
+        self.prefetch_wait_us[int(layer.layer_idx)] += wait_us
+        self.prefetch_wait_count[int(layer.layer_idx)] += 1
+        if prefetched_hit:
+            self.prefetch_hit[int(layer.layer_idx)] += 1
+        valid_expert_count = int(slot.valid_expert_count)
+        source_from_npu = int(slot.source_from_npu)
+        source_from_remote_npu = int(getattr(slot, "source_from_remote_npu", 0))
+        source_from_cpu = int(slot.source_from_cpu)
+        layer_local_buffer = int(slot.uses_layer_local_buffer)
+        row_base = 0
+        if layer_state is not None:
+            valid_expert_count = int(layer_state["valid_expert_count"])
+            source_from_npu = int(layer_state["source_from_npu"])
+            source_from_remote_npu = int(layer_state["source_from_remote_npu"])
+            source_from_cpu = int(layer_state["source_from_cpu"])
+            row_base = int(layer_state["row_base"])
+            layer_local_buffer = 0
+        self.last_bind_timing = {
+            "layer_idx": int(layer.layer_idx),
+            "slot_id": int(slot_id),
+            "valid_experts": valid_expert_count,
+            "source_from_npu": source_from_npu,
+            "source_from_remote_npu": source_from_remote_npu,
+            "source_from_cpu": source_from_cpu,
+            "layer_local_buffer": layer_local_buffer,
+            "wait_mode": wait_mode,
+            "wait_us": float(wait_us),
+            "ready_wait_start_event": ready_wait_start_event,
+            "ready_wait_end_event": ready_wait_end_event,
+            "cpu_fill_us": float(cpu_fill_us),
+            "prefetched_hit": bool(prefetched_hit),
+            "prefetch_hit_count": int(self.prefetch_hit[int(layer.layer_idx)]),
+        }
+        prefetch_timing = self.last_prefetch_timing_by_target_layer.get(
+            current_layer_idx, {})
+        source_layer_idx = current_layer_idx - 1
+        ffn_enter_wall_ts = float(
+            self.last_ffn_enter_wall_ts_by_layer.get(source_layer_idx, -1.0))
+        prefetch_start_wall_ts = float(
+            prefetch_timing.get(
+                "prefetch_start_wall_ts",
+                prefetch_timing.get("prefetch_issue_wall_ts", -1.0)))
+        prefetch_issue_wall_ts = prefetch_start_wall_ts
+        strict_overlap_start_wall_ts = prefetch_issue_wall_ts
+        strict_compute_wall_ms = -1.0
+        strict_comm_wall_ms = -1.0
+        strict_wait_wall_ms = -1.0
+        if strict_overlap_start_wall_ts > 0:
+            strict_compute_wall_ms = (
+                bind_wait_begin_wall_ts - strict_overlap_start_wall_ts) * 1e3
+            strict_comm_wall_ms = (
+                bind_ready_wall_ts - strict_overlap_start_wall_ts) * 1e3
+        if bind_ready_wall_ts >= bind_wait_begin_wall_ts:
+            strict_wait_wall_ms = (
+                bind_ready_wall_ts - bind_wait_begin_wall_ts) * 1e3
+        self.last_bind_timing.update({
+            "ffn_enter_wall_ts": ffn_enter_wall_ts,
+            "prefetch_start_wall_ts": prefetch_start_wall_ts,
+            "prefetch_issue_wall_ts": prefetch_issue_wall_ts,
+            "strict_overlap_start_wall_ts": strict_overlap_start_wall_ts,
+            "bind_wait_begin_wall_ts": bind_wait_begin_wall_ts,
+            "bind_ready_wall_ts": bind_ready_wall_ts,
+            "strict_compute_wall_ms": strict_compute_wall_ms,
+            "strict_comm_wall_ms": strict_comm_wall_ms,
+            "strict_wait_wall_ms": strict_wait_wall_ms,
+        })
+        layer.runtime_w13_weight = slot.w13[row_base:row_base +
+                                            valid_expert_count]
+        layer.runtime_w2_weight = slot.w2[row_base:row_base +
+                                          valid_expert_count]
+        layer.runtime_weight_capacity = int(slot.w13.shape[0])
+        layer.runtime_w13_buffer = slot.w13
+        layer.runtime_w2_buffer = slot.w2
+        if layer_state is None:
+            layer.expert_map = slot.expert_map
+            dispatch_log2phy = slot.dispatch_log2phy
+            dispatch_num_experts = slot.dispatch_num_experts
+            dispatch_signature = slot.dispatch_signature
+            dispatch_active_rank_count = slot.dispatch_active_rank_count
+            dispatch_owned_per_rank = slot.dispatch_owned_per_rank
+        else:
+            layer.expert_map = layer_state["expert_map"]
+            dispatch_log2phy = layer_state["dispatch_log2phy"]
+            dispatch_num_experts = layer_state["dispatch_num_experts"]
+            dispatch_signature = layer_state["dispatch_signature"]
+            dispatch_active_rank_count = layer_state[
+                "dispatch_active_rank_count"]
+            dispatch_owned_per_rank = layer_state["dispatch_owned_per_rank"]
+        layer.active_local_num_experts = valid_expert_count
+        layer.local_num_experts = valid_expert_count
+        layer.moe_config.num_local_experts = valid_expert_count
+        layer.lossless_runtime_dispatch_log2phy = dispatch_log2phy
+        layer.lossless_runtime_dispatch_num_experts = int(
+            dispatch_num_experts)
+        if int(getattr(layer, "elastic_execution_mode", 0)) in (4, 5):
+            # The mode=4 runtime buffer may hold only the current active rank's
+            # physical rows (16/32/64), while MC2 dispatch still routes over the
+            # complete logical expert space covered by all active+cache ranks.
+            # Keep moe_config.num_experts on the dispatch domain; otherwise a
+            # later fingerprint/forward observes 16/32 and builds invalid MC2
+            # tiling/workspace at deeper shrink stages.
+            layer.moe_config.num_experts = int(dispatch_num_experts)
+            layer.num_experts = int(dispatch_num_experts)
+        else:
+            layer.moe_config.num_experts = valid_expert_count
+            layer.num_experts = valid_expert_count
+        layer.lossless_runtime_dispatch_signature = dispatch_signature
+        layer.lossless_runtime_dispatch_active_rank_count = int(
+            dispatch_active_rank_count)
+        layer.lossless_runtime_dispatch_owned_per_rank = int(
+            dispatch_owned_per_rank)
+        layer.lossless_runtime_activated = True
+        # A block-prefetched slot remains valid for the rest of the block.  Do
+        # not clear inflight_prefetch until the current layer has consumed the
+        # block dependency; subsequent layers bind the same ready slot.
+        if layer_state is None or int(layer.layer_idx) == int(
+                slot.block_start_layer or layer.layer_idx):
+            slot.inflight_prefetch = False
+        log_key = (int(layer.layer_idx), slot_id, valid_expert_count)
+        if (self.enable_verbose_transfer_logs
+                and log_key not in self._logged_slot_bindings):
+            logger.info(
+                "Mode%s slot binding: layer=%s slot=%s valid_experts=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s wait_mode=%s wait_us=%.1f cpu_fill_us=%.1f slot_head=%s",
+                int(getattr(layer, "elastic_execution_mode", 3)),
+                layer.layer_idx,
+                slot_id,
+                valid_expert_count,
+                source_from_npu,
+                source_from_remote_npu,
+                source_from_cpu,
+                wait_mode,
+                wait_us,
+                cpu_fill_us,
+                list(tuple(self._ordered_mode3_slot_expert_ids(layer))[:8]),
+            )
+            self._logged_slot_bindings.add(log_key)
+        if self.should_profile_layer(layer, "strict-ffn"):
+            logger.info(
+                "Mode%s strict-ffn-timing: rank=%s layer=%s stage=%s ffn_enter_wall_ts=%.6f prefetch_issue_wall_ts=%.6f strict_overlap_start_wall_ts=%.6f bind_wait_begin_wall_ts=%.6f bind_ready_wall_ts=%.6f strict_compute_wall_ms=%.3f strict_comm_wall_ms=%.3f strict_wait_wall_ms=%.3f bind_wait_us=%.1f prefetched_hit=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s",
+                int(getattr(layer, "elastic_execution_mode", 3)),
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                ffn_enter_wall_ts,
+                prefetch_issue_wall_ts,
+                strict_overlap_start_wall_ts,
+                bind_wait_begin_wall_ts,
+                bind_ready_wall_ts,
+                strict_compute_wall_ms,
+                strict_comm_wall_ms,
+                strict_wait_wall_ms,
+                wait_us,
+                int(prefetched_hit),
+                source_from_npu,
+                source_from_remote_npu,
+                source_from_cpu,
+            )
+        return slot
+
+    def _prefetch_layer(self, target_layer: Any, reason: str) -> dict[str, Any]:
+        if target_layer is None:
+            return {"status": "no_target_layer"}
+        if getattr(target_layer, "elastic_execution_mode", 0) not in (3, 4, 5):
+            return {"status": "next_not_mode3_or_mode4"}
+        if not getattr(target_layer, "lossless_hybrid_active", False):
+            return {"status": "next_inactive"}
+        target_mode = int(getattr(target_layer, "elastic_execution_mode", 0))
+        is_remote_npu_mode = target_mode in (4, 5)
+        cpu_only_count = len(
+            getattr(target_layer, "lossless_hybrid_cpu_only_expert_ids", []))
+        if not self.enable_async_npu_prefetch:
+            log_key = (int(target_layer.layer_idx), cpu_only_count)
+            if (self.enable_transfer_logs
+                    and log_key not in self._logged_prefetch_deferrals):
+                logger.info(
+                    "Mode%s prefetch deferred to layer entry: layer=%s reason=async_npu_prefetch_unstable cpu_only_experts=%s",
+                    int(getattr(target_layer, "elastic_execution_mode", 3)),
+                    target_layer.layer_idx,
+                    cpu_only_count,
+                )
+                self._logged_prefetch_deferrals.add(log_key)
+            return {
+                "status": "disabled",
+                "next_layer": int(target_layer.layer_idx),
+                "cpu_only": int(cpu_only_count),
+            }
+        if (not is_remote_npu_mode
+                and cpu_only_count > 0
+                and self.cpu_prefetch_stream is None):
+            log_key = (int(target_layer.layer_idx), cpu_only_count)
+            if (self.enable_transfer_logs
+                    and log_key not in self._logged_prefetch_deferrals):
+                logger.info(
+                    "Mode3 prefetch deferred to layer entry: layer=%s reason=cpu_shadow_copy_stability cpu_only_experts=%s",
+                    target_layer.layer_idx,
+                    cpu_only_count,
+                )
+                self._logged_prefetch_deferrals.add(log_key)
+            return {
+                "status": "no_cpu_stream",
+                "next_layer": int(target_layer.layer_idx),
+                "cpu_only": int(cpu_only_count),
+            }
+        next_slot_id = self._slot_id_for_runtime_layer(target_layer)
+        was_match = self._slot_matches(self.slots[next_slot_id], target_layer)
+        prefetch_start_wall_ts = float(time.perf_counter())
+        target_layer_idx = int(target_layer.layer_idx)
+        _stage_decode_profile_range_end(
+            self._stage_decode_compute_ranges_by_target_layer.pop(
+                target_layer_idx, None))
+        _stage_decode_profile_range_end(
+            self._stage_decode_comm_ranges_by_target_layer.pop(
+                target_layer_idx, None))
+        self._stage_decode_compute_ranges_by_target_layer[
+            target_layer_idx] = _stage_decode_profile_range_start(
+                _stage_decode_profile_message(
+                    "compute_window",
+                    target_layer,
+                    path="prefetch_to_bind_wait",
+                    extra=f"target_layer={target_layer_idx} slot={next_slot_id} hit={int(was_match)}"))
+        self._stage_decode_comm_ranges_by_target_layer[
+            target_layer_idx] = _stage_decode_profile_range_start(
+                _stage_decode_profile_message(
+                    "comm_window",
+                    target_layer,
+                    path="prefetch_to_bind_ready",
+                    extra=f"target_layer={target_layer_idx} slot={next_slot_id} hit={int(was_match)}"))
+        slot = self.prepare_slot(target_layer,
+                                 next_slot_id,
+                                 async_copy=True,
+                                 reason=reason)
+        timing = dict(getattr(slot, "prefetch_timing", {}))
+        timing["status"] = "hit" if was_match else "scheduled"
+        timing["target_layer_idx"] = target_layer_idx
+        timing["prefetch_start_wall_ts"] = prefetch_start_wall_ts
+        # Backward compatibility: older analysis scripts used the issue field.
+        # It now intentionally means the real prefetch-start wall timestamp.
+        timing["prefetch_issue_wall_ts"] = prefetch_start_wall_ts
+        self.last_prefetch_timing_by_target_layer[target_layer_idx] = dict(
+            timing)
+        return timing
+
+    def prefetch_next_layer(self, current_layer: Any) -> dict[str, Any]:
+        if self._is_mode4_block_prefetch_enabled(current_layer):
+            current_idx = int(current_layer.layer_idx)
+            block_start = self._block_start_for_layer(current_idx)
+            block_layers = max(int(self.mode4_block_prefetch_layers), 1)
+            # Start the next block as soon as the current block begins. This
+            # gives the remote NPU transfer a whole block of compute to hide
+            # behind instead of a single MoE layer.
+            if current_idx != block_start:
+                return {
+                    "status": "block_already_scheduled",
+                    "next_layer": block_start + block_layers,
+                }
+            next_layer = self.layer_lookup.get(block_start + block_layers)
+            if next_layer is None:
+                return {"status": "no_next_block"}
+            return self._prefetch_layer(
+                next_layer, reason=f"after_block_{block_start}")
+        next_layer = self._get_next_layer(int(current_layer.layer_idx))
+        if next_layer is None:
+            return {"status": "no_next_layer"}
+        return self._prefetch_layer(
+            next_layer, reason=f"after_layer_{current_layer.layer_idx}")
+
+class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
+
+    def __init__(self, moe: FusedMoEConfig = None):
+
+        super().__init__(moe=moe)
+        vllm_config = get_current_vllm_config()
+
+        self.global_batch_size = vllm_config.scheduler_config.max_num_seqs
+        self.max_model_len = vllm_config.model_config.max_model_len
+        get_ascend_config()
+        self.dynamic_eplb = get_ascend_config().dynamic_eplb
+
+        try:
+            device_group = get_mc2_group().device_group
+            # TODO: Try local_rank = ep_group.rank_in_group
+            local_rank = torch.distributed.get_rank(group=device_group)
+            self.ep_rank = local_rank
+            backend = device_group._get_backend(torch.device("npu"))
+            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
+                local_rank)
+        except AttributeError:
+            self.moe_all_to_all_group_name = None
+
+    @staticmethod
+    def _compact_wave_topk(logical_topk_ids: torch.Tensor,
+                           topk_weights: torch.Tensor,
+                           token_mask: torch.Tensor,
+                           topk_mask: torch.Tensor,
+                           preserve_full_topk: bool = True
+                           ) -> tuple[Optional[torch.Tensor],
+                                      Optional[torch.Tensor],
+                                      Optional[torch.Tensor],
+                                      Optional[torch.Tensor]]:
+        def _empty_wave() -> tuple[Optional[torch.Tensor],
+                                   Optional[torch.Tensor],
+                                   Optional[torch.Tensor],
+                                   Optional[torch.Tensor]]:
+            return None, None, None, None
+
+        if token_mask.numel() == 0 or not torch.any(token_mask):
+            return _empty_wave()
+        token_indices = torch.nonzero(token_mask, as_tuple=False).reshape(-1)
+        selected_ids = logical_topk_ids[token_indices]
+        selected_weights = topk_weights[token_indices]
+        selected_mask = topk_mask[token_indices]
+        per_token_counts = selected_mask.sum(dim=1)
+        if per_token_counts.numel() == 0:
+            return _empty_wave()
+        full_topk = int(selected_ids.shape[1])
+        if full_topk <= 0:
+            return _empty_wave()
+        wave_topk = full_topk
+        if not preserve_full_topk:
+            wave_topk = max(int(per_token_counts.max().item()), 1)
+        wave_ids = torch.zeros((selected_ids.shape[0], wave_topk),
+                               dtype=selected_ids.dtype,
+                               device=selected_ids.device)
+        wave_weights = torch.zeros((selected_weights.shape[0], wave_topk),
+                                   dtype=selected_weights.dtype,
+                                   device=selected_weights.device)
+        fill_pos = torch.zeros((selected_ids.shape[0], ),
+                               dtype=torch.long,
+                               device=selected_ids.device)
+        for col_idx in range(selected_ids.shape[1]):
+            col_mask = selected_mask[:, col_idx]
+            if not torch.any(col_mask):
+                continue
+            row_indices = torch.nonzero(col_mask, as_tuple=False).reshape(-1)
+            write_pos = fill_pos[row_indices]
+            wave_ids[row_indices, write_pos] = selected_ids[row_indices, col_idx]
+            wave_weights[row_indices, write_pos] = selected_weights[
+                row_indices, col_idx]
+            fill_pos[row_indices] += 1
+        # Keep every padded top-k id mapped to a valid expert in this wave.
+        # The corresponding routing weight stays zero, but using a valid id
+        # avoids remapping padded entries to -1 before the device kernel sees
+        # them.
+        filled_mask = (torch.arange(wave_topk, device=selected_ids.device)
+                       .unsqueeze(0) < fill_pos.unsqueeze(1))
+        fallback_ids = wave_ids[:, :1].expand(-1, wave_topk)
+        wave_ids = torch.where(filled_mask, wave_ids, fallback_ids)
+        wave_row_idx = return_row_idx(wave_ids, wave_topk)
+        return token_indices, wave_ids, wave_weights, wave_row_idx
+
+    def _build_padded_mc2_wave_inputs(
+            self,
+            hidden_states: torch.Tensor,
+            logical_topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            token_mask: torch.Tensor,
+            topk_mask: torch.Tensor,
+            fallback_expert_id: int,
+            forced_active_topk: Optional[int] = None
+    ) -> tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        token_indices, compact_ids, compact_weights, compact_row_idx = self._compact_wave_topk(
+            logical_topk_ids=logical_topk_ids,
+            topk_weights=topk_weights,
+            token_mask=token_mask,
+            topk_mask=topk_mask,
+            preserve_full_topk=(forced_active_topk is None))
+        source_tokens = int(hidden_states.shape[0])
+        if source_tokens <= 0:
+            raise RuntimeError("MC2 hybrid wave received empty hidden_states.")
+        logical_topk_width = int(logical_topk_ids.shape[1])
+        active_topk = logical_topk_width
+        if forced_active_topk is not None:
+            active_topk = int(forced_active_topk)
+        if active_topk <= 0:
+            raise RuntimeError(
+                "MC2 hybrid wave requires a positive active top-k width: "
+                f"active_topk={active_topk}")
+        if active_topk > logical_topk_width:
+            raise RuntimeError(
+                "Forced MC2 wave top-k exceeds logical top-k width: "
+                f"forced={active_topk} logical={logical_topk_width}")
+        fallback_expert = int(fallback_expert_id)
+        active_count = 0
+        if (token_indices is not None and compact_ids is not None
+                and compact_weights is not None and compact_row_idx is not None
+                and token_indices.numel() > 0):
+            active_count = int(token_indices.numel())
+            compact_width = int(compact_ids.shape[1])
+            if compact_width > active_topk:
+                raise RuntimeError(
+                    "MC2 hybrid wave compact width mismatch: "
+                    f"compact={compact_width} expected={active_topk}")
+            if compact_width < active_topk:
+                padded_ids = torch.full((active_count, active_topk),
+                                        fallback_expert,
+                                        dtype=compact_ids.dtype,
+                                        device=compact_ids.device)
+                padded_weights = torch.zeros((active_count, active_topk),
+                                             dtype=compact_weights.dtype,
+                                             device=compact_weights.device)
+                padded_ids[:, :compact_width] = compact_ids
+                padded_weights[:, :compact_width] = compact_weights
+                compact_ids = padded_ids
+                compact_weights = padded_weights
+                compact_row_idx = return_row_idx(compact_ids, active_topk)
+            wave_hidden_states = hidden_states.index_select(0, token_indices)
+            wave_ids = compact_ids
+            wave_weights = compact_weights
+            wave_mc2_mask = torch.ones((active_count, ),
+                                       dtype=torch.bool,
+                                       device=hidden_states.device)
+            wave_row_idx = compact_row_idx
+        else:
+            # A3 MC2 dispatch/compute kernels do not tolerate a fully empty
+            # local batch inside a collective wave. Keep a single padded row so
+            # every rank still enters the collective with BS=1, but leave the
+            # active mask fully disabled so dispatch/combine do not process a
+            # fabricated token.
+            wave_hidden_states = hidden_states[:1].clone()
+            wave_hidden_states.zero_()
+            wave_ids = torch.full((1, active_topk),
+                                  fallback_expert,
+                                  dtype=logical_topk_ids.dtype,
+                                  device=logical_topk_ids.device)
+            wave_weights = torch.zeros((1, active_topk),
+                                       dtype=topk_weights.dtype,
+                                       device=topk_weights.device)
+            wave_mc2_mask = torch.zeros((1, ),
+                                        dtype=torch.bool,
+                                        device=hidden_states.device)
+            wave_row_idx = return_row_idx(wave_ids, active_topk)
+        return (token_indices, wave_hidden_states, wave_ids, wave_weights,
+                wave_row_idx, wave_mc2_mask, active_count)
+
+    def _build_grouped_mc2_wave_inputs(
+            self,
+            hidden_states: torch.Tensor,
+            logical_topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            token_mask: torch.Tensor,
+            topk_mask: torch.Tensor,
+            active_topk_values: list[int],
+            fallback_expert_id: int,
+            launch_topk: Optional[int] = None,
+    ) -> list[tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor,
+                    torch.Tensor, torch.Tensor, torch.Tensor, int, bool]]:
+        grouped_inputs = []
+        fallback_expert_id = int(fallback_expert_id)
+        launch_topk = (int(launch_topk)
+                       if launch_topk is not None else None)
+        empty_token_indices = torch.empty((0, ),
+                                          dtype=torch.long,
+                                          device=hidden_states.device)
+        if token_mask.numel() == 0 or not torch.any(token_mask):
+            token_indices = empty_token_indices
+            per_token_counts = torch.empty((0, ),
+                                           dtype=torch.long,
+                                           device=hidden_states.device)
+        else:
+            token_indices = torch.nonzero(token_mask, as_tuple=False).reshape(-1)
+            selected_mask = topk_mask[token_indices]
+            per_token_counts = selected_mask.sum(dim=1)
+
+        for active_topk in active_topk_values:
+            active_topk = int(active_topk)
+            if active_topk <= 0:
+                continue
+            if token_indices.numel() > 0:
+                group_token_indices = token_indices[per_token_counts == active_topk]
+            else:
+                group_token_indices = empty_token_indices
+            group_token_mask = torch.zeros_like(token_mask, dtype=torch.bool)
+            group_token_mask[group_token_indices] = True
+            (group_indices, group_hidden_states, group_ids, group_weights,
+             group_row_idx, group_mc2_mask,
+             active_count) = self._build_padded_mc2_wave_inputs(
+                 hidden_states=hidden_states,
+                 logical_topk_ids=logical_topk_ids,
+                 topk_weights=topk_weights,
+                 token_mask=group_token_mask,
+                 topk_mask=topk_mask,
+                 fallback_expert_id=fallback_expert_id,
+                 forced_active_topk=(launch_topk
+                                     if launch_topk is not None else
+                                     active_topk))
+            grouped_inputs.append((group_indices, group_hidden_states,
+                                   group_ids, group_weights, group_row_idx,
+                                   group_mc2_mask, active_count,
+                                   active_count == 0))
+        return grouped_inputs
+
+    @staticmethod
+    def _group_list_to_counts(group_list: torch.Tensor,
+                              group_list_type: int,
+                              total_tokens: Optional[int] = None) -> torch.Tensor:
+        if group_list_type == 1:
+            return group_list
+        if group_list_type == 0:
+            if group_list.numel() == 0:
+                return group_list
+            return torch.cat([group_list[:1], torch.diff(group_list, dim=0)])
+        raise RuntimeError(
+            f"Unsupported group_list_type for hybrid single-dispatch path: "
+            f"{group_list_type}")
+
+    @staticmethod
+    def _counts_to_offsets(group_counts: torch.Tensor) -> torch.Tensor:
+        if group_counts.numel() == 0:
+            return torch.zeros((1, ),
+                               dtype=torch.long,
+                               device=group_counts.device)
+        counts = group_counts.to(dtype=torch.long)
+        return torch.cat([
+            torch.zeros((1, ), dtype=torch.long, device=counts.device),
+            counts.cumsum(dim=0)
+        ])
+
+    @staticmethod
+    def _get_dispatch_log2phy_for_layer(
+            layer: Any,
+            *,
+            device: torch.device,
+            rank_owned: list[list[int]],
+            active_rank_count: int,
+            owned_per_rank: int) -> tuple[torch.Tensor, int]:
+        topology_signature = _hybrid_dispatch_topology_signature(layer)
+        expected_dispatch_num_experts = active_rank_count * owned_per_rank
+        cached_dispatch_log2phy = getattr(layer, "lossless_runtime_dispatch_log2phy",
+                                          None)
+        cached_dispatch_num_experts = int(
+            getattr(layer, "lossless_runtime_dispatch_num_experts", -1))
+        cached_signature = getattr(layer, "lossless_runtime_dispatch_signature",
+                                   None)
+        if (cached_dispatch_log2phy is not None
+                and cached_dispatch_log2phy.device == device
+                and cached_dispatch_num_experts == expected_dispatch_num_experts
+                and cached_signature == topology_signature):
+            return cached_dispatch_log2phy, cached_dispatch_num_experts
+        dispatch_log2phy, dispatch_num_experts = _build_dispatch_log2phy_tensor(
+            int(layer.elastic_original_num_experts),
+            rank_owned,
+            owned_per_rank,
+            device,
+        )
+        valid_dispatch_ids = dispatch_log2phy[dispatch_log2phy >= 0]
+        valid_count = int(valid_dispatch_ids.numel())
+        if valid_count != int(dispatch_num_experts):
+            raise RuntimeError(
+                f"Hybrid dispatch ownership is incomplete at "
+                f"layer={getattr(layer, 'layer_idx', -1)}: "
+                f"valid_count={valid_count} "
+                f"dispatch_num_experts={int(dispatch_num_experts)} "
+                f"active_rank_count={active_rank_count} "
+                f"owned_per_rank={owned_per_rank}")
+        unique_count = int(torch.unique(valid_dispatch_ids).numel())
+        dispatch_min = int(valid_dispatch_ids.min().item()) if valid_count else -1
+        dispatch_max = int(valid_dispatch_ids.max().item()) if valid_count else -1
+        if (unique_count != int(dispatch_num_experts)
+                or dispatch_min != 0
+                or dispatch_max != int(dispatch_num_experts) - 1):
+            raise RuntimeError(
+                f"Hybrid dispatch dense-id map is invalid at "
+                f"layer={getattr(layer, 'layer_idx', -1)}: "
+                f"unique_count={unique_count} min={dispatch_min} "
+                f"max={dispatch_max} "
+                f"dispatch_num_experts={int(dispatch_num_experts)}")
+        layer.lossless_runtime_dispatch_log2phy = dispatch_log2phy
+        layer.lossless_runtime_dispatch_num_experts = int(dispatch_num_experts)
+        layer.lossless_runtime_dispatch_signature = topology_signature
+        layer.lossless_runtime_dispatch_active_rank_count = int(
+            active_rank_count)
+        layer.lossless_runtime_dispatch_owned_per_rank = int(owned_per_rank)
+        return dispatch_log2phy, dispatch_num_experts
+
+    @staticmethod
+    def _compute_local_dispatch_counts_from_topk(
+            dispatch_topk_ids: torch.Tensor,
+            mc2_mask: Optional[torch.Tensor],
+            local_rank_idx: int,
+            owned_per_rank: int) -> torch.Tensor:
+        local_dense_start = local_rank_idx * owned_per_rank
+        local_dense_end = local_dense_start + owned_per_rank
+        selected_topk_ids = dispatch_topk_ids
+        if mc2_mask is not None:
+            token_mask = mc2_mask.to(device=dispatch_topk_ids.device,
+                                     dtype=torch.bool)
+            if token_mask.shape[0] != dispatch_topk_ids.shape[0]:
+                raise RuntimeError(
+                    "Hybrid mode2 single-dispatch mask/topk length mismatch: "
+                    f"mask_tokens={token_mask.shape[0]} "
+                    f"topk_tokens={dispatch_topk_ids.shape[0]}")
+            selected_topk_ids = dispatch_topk_ids[token_mask]
+        flat_topk_ids = selected_topk_ids.reshape(-1).to(dtype=torch.long)
+        if flat_topk_ids.numel() == 0:
+            return torch.zeros((owned_per_rank, ),
+                               dtype=torch.long,
+                               device=dispatch_topk_ids.device)
+        local_mask = ((flat_topk_ids >= local_dense_start)
+                      & (flat_topk_ids < local_dense_end))
+        local_flat_ids = flat_topk_ids[local_mask] - local_dense_start
+        if local_flat_ids.numel() == 0:
+            return torch.zeros((owned_per_rank, ),
+                               dtype=torch.long,
+                               device=dispatch_topk_ids.device)
+        return torch.bincount(local_flat_ids,
+                              minlength=owned_per_rank).to(dtype=torch.long)
+
+    def _should_use_mode2_single_dispatch_hybrid_path(
+            self,
+            layer: torch.nn.Module,
+            wave_plans: list[dict[str, Any]],
+            use_dense_mc2_waves: bool,
+            shared_experts: Optional[Any]) -> bool:
+        if not use_dense_mc2_waves or len(wave_plans) <= 1:
+            return False
+        if self.dynamic_eplb:
+            return False
+        if getattr(layer, "elastic_execution_mode", 0) != 2:
+            return False
+        if not hasattr(layer, "_is_hybrid_cpu_swap_enabled"):
+            return False
+        if not layer._is_hybrid_cpu_swap_enabled():
+            return False
+        rank_owned = getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)
+        if not rank_owned:
+            return False
+        owned_counts = [len(expert_ids) for expert_ids in rank_owned]
+        if not owned_counts or min(owned_counts) <= 0:
+            return False
+        if len(set(owned_counts)) != 1:
+            return False
+        return True
+
+    @staticmethod
+    def _should_disable_grouped_dense_mc2_multi_wave(
+            layer: torch.nn.Module) -> bool:
+        if getattr(layer, "elastic_execution_mode", 0) != 2:
+            return False
+        if not hasattr(layer, "_is_hybrid_cpu_swap_enabled"):
+            return False
+        return bool(layer._is_hybrid_cpu_swap_enabled())
+
+    @staticmethod
+    def _should_use_mode3_cross_layer_buffer_path(
+            layer: torch.nn.Module,
+            shared_experts: Optional[Any],
+            is_dummy: bool) -> bool:
+        if getattr(layer, "elastic_execution_mode", 0) not in (3, 4, 5):
+            return False
+        if not getattr(layer, "lossless_hybrid_active", False):
+            return False
+        if shared_experts is not None:
+            return False
+        forward_context = get_forward_context()
+        comm_type = getattr(forward_context, "moe_comm_type", None)
+        if comm_type == MoECommType.MC2:
+            return True
+        selected_comm_type = getattr(forward_context, "selected_moe_comm_type",
+                                     None)
+        if selected_comm_type == MoECommType.MC2:
+            return True
+        moe_comm_method = getattr(forward_context, "moe_comm_method", None)
+        token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
+        if (token_dispatcher is not None
+                and token_dispatcher.__class__.__name__
+                == "TokenDispatcherWithMC2"):
+            return True
+        return False
+
+    @staticmethod
+    def _should_use_mode3_single_rank_allgather_path(
+            layer: torch.nn.Module,
+            shared_experts: Optional[Any],
+            is_dummy: bool) -> bool:
+        if getattr(layer, "elastic_execution_mode", 0) not in (3, 4, 5):
+            return False
+        if not getattr(layer, "lossless_hybrid_active", False):
+            return False
+        if shared_experts is not None:
+            return False
+        active_rank_count = len(
+            getattr(layer, "lossless_hybrid_active_ranks", []))
+        if active_rank_count != 1:
+            return False
+        forward_context = get_forward_context()
+        selected_comm_type = getattr(forward_context, "selected_moe_comm_type",
+                                     None)
+        comm_type = getattr(forward_context, "moe_comm_type", None)
+        if selected_comm_type != MoECommType.ALLGATHER and comm_type != MoECommType.ALLGATHER:
+            return False
+        moe_comm_method = getattr(forward_context, "moe_comm_method", None)
+        token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
+        return (token_dispatcher is not None
+                and token_dispatcher.__class__.__name__
+                == "TokenDispatcherWithAllGather")
+
+    @staticmethod
+    def _get_or_create_mode3_double_buffer_manager(
+            layer: torch.nn.Module) -> Optional[Mode3DoubleBufferManager]:
+        forward_context = get_forward_context()
+        manager = getattr(forward_context, "moe_double_buffer_manager", None)
+        if manager is not None:
+            return manager
+        manager = getattr(layer, "_mode3_double_buffer_manager", None)
+        if manager is not None:
+            forward_context.moe_double_buffer_manager = manager
+            return manager
+        prefetch_stream = getattr(forward_context, "moe_prefetch_stream", None)
+        model_instance = getattr(forward_context, "model_instance", None)
+        if prefetch_stream is None or model_instance is None:
+            return None
+        manager = Mode3DoubleBufferManager(model_instance, prefetch_stream)
+        forward_context.moe_double_buffer_manager = manager
+        return manager
+
+    def _execute_mode3_single_rank_allgather_hybrid(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            logical_topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            row_idx: torch.Tensor,
+            shared_experts: Optional[Any],
+            enable_force_load_balance: bool,
+            kwargs: dict[str, Any]) -> torch.Tensor:
+        manager = self._get_or_create_mode3_double_buffer_manager(layer)
+        if manager is None:
+            raise RuntimeError(
+                "Mode3/4 single-rank AllGather path requires forward-context "
+                f"model instance and prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
+        profile_timing = manager.should_profile_layer(layer,
+                                                      "single_rank_allgather")
+        bound_slot = manager.bind_current_layer(layer)
+        bind_timing = dict(manager.last_bind_timing)
+        next_prefetch_timing = manager.prefetch_next_layer(layer)
+        compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="single_rank_allgather"))
+        compute_start_event = manager.new_timing_event() if profile_timing else None
+        compute_end_event = manager.new_timing_event() if profile_timing else None
+        remap_start_event = manager.new_timing_event() if profile_timing else None
+        remap_end_event = manager.new_timing_event() if profile_timing else None
+        fused_start_event = manager.new_timing_event() if profile_timing else None
+        fused_end_event = manager.new_timing_event() if profile_timing else None
+        _event_record(compute_start_event)
+
+        moe_comm_method = get_forward_context().moe_comm_method
+        token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
+        if (token_dispatcher is None
+                or token_dispatcher.__class__.__name__
+                != "TokenDispatcherWithAllGather"):
+            raise RuntimeError(
+                "Mode3/4 single-rank path requires AllGather token dispatcher, got "
+                f"{token_dispatcher.__class__.__name__ if token_dispatcher is not None else None} "
+                f"at layer={getattr(layer, 'layer_idx', -1)}.")
+
+        remap_wall_start = time.perf_counter()
+        _event_record(remap_start_event)
+        slot_log2phy = bound_slot.expert_map.to(device=logical_topk_ids.device)
+        local_topk_ids = slot_log2phy[logical_topk_ids]
+        if torch.any(local_topk_ids < 0):
+            invalid_count = int(torch.count_nonzero(local_topk_ids < 0).item())
+            raise RuntimeError(
+                "Mode3/4 single-rank AllGather saw experts outside the bound slot "
+                f"at layer={getattr(layer, 'layer_idx', -1)}: "
+                f"invalid_count={invalid_count}")
+        if enable_force_load_balance and not self.use_aclgraph:
+            local_topk_ids = (
+                torch.arange(local_topk_ids.numel(),
+                             device=local_topk_ids.device)
+                % bound_slot.valid_expert_count).to(torch.int32).reshape(
+                    local_topk_ids.shape)
+        _event_record(remap_end_event)
+        remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
+
+        old_num_experts = getattr(token_dispatcher, "num_experts", None)
+        old_num_experts_local = getattr(token_dispatcher, "num_experts_local",
+                                        None)
+        token_dispatcher.num_experts = bound_slot.valid_expert_count
+        token_dispatcher.num_experts_local = bound_slot.valid_expert_count
+        fused_wall_start = time.perf_counter()
+        _event_record(fused_start_event)
+        try:
+            final_hidden_states = moe_comm_method.fused_experts(
+                hidden_states=x,
+                w1=layer.runtime_w13_weight,
+                w2=layer.runtime_w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=local_topk_ids,
+                row_idx=row_idx,
+                global_num_experts=bound_slot.valid_expert_count,
+                expert_map=None,
+                shared_experts=shared_experts,
+                quantized_x_for_share=kwargs.get("quantized_x_for_share"),
+                dynamic_scale_for_share=kwargs.get("dynamic_scale_for_share"),
+                log2phy=None,
+                global_redundant_expert_num=0,
+                need_trans=True,
+                dynamic_eplb=self.dynamic_eplb,
+                mc2_mask=None)
+            _event_record(fused_end_event)
+        finally:
+            if old_num_experts is not None:
+                token_dispatcher.num_experts = old_num_experts
+            if old_num_experts_local is not None:
+                token_dispatcher.num_experts_local = old_num_experts_local
+        fused_wall_ms = (time.perf_counter() - fused_wall_start) * 1e3
+        _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
+        compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
+
+        layer.lossless_hybrid_last_stats = {
+            "mode3_slot": int(layer.layer_idx) & 1,
+            "valid_experts": int(bind_timing.get(
+                "valid_experts", bound_slot.valid_expert_count)),
+            "source_from_local_npu": int(bind_timing.get(
+                "source_from_npu", bound_slot.source_from_npu)),
+            "source_from_remote_npu": int(bind_timing.get(
+                "source_from_remote_npu",
+                getattr(bound_slot, "source_from_remote_npu", 0))),
+            "source_from_npu": int(bind_timing.get(
+                "source_from_npu", bound_slot.source_from_npu)),
+            "source_from_cpu": int(bind_timing.get(
+                "source_from_cpu", bound_slot.source_from_cpu)),
+            "single_rank_allgather": 1,
+        }
+        if layer.layer_idx == 0 and manager.enable_transfer_logs:
+            logger.info(
+                "Mode%s single-rank AllGather execution: rank=%s layer=%s valid_experts=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s",
+                int(getattr(layer, "elastic_execution_mode", 3)),
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                int(bind_timing.get("valid_experts",
+                                    bound_slot.valid_expert_count)),
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+            )
+        if profile_timing:
+            prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            prefetch_npu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_start_event"),
+                next_prefetch_timing.get("npu_end_event"))
+            prefetch_cpu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_start_event"),
+                next_prefetch_timing.get("cpu_end_event"))
+            prefetch_cpu_pack_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_pack_start_event"),
+                next_prefetch_timing.get("cpu_pack_end_event"))
+            compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
+            ready_wait_dev_ms = _elapsed_ms(
+                bind_timing.get("ready_wait_start_event"),
+                bind_timing.get("ready_wait_end_event"))
+            logger.info(
+                "Mode%s timing single-rank-allgather: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s ready_wait_dev_ms=%.3f current_fetch_wall_ms=%.3f current_fetch_ready_dev_ms=%.3f current_fetch_source_from_local_npu=%s current_fetch_source_from_remote_npu=%s current_fetch_source_from_cpu=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_local_npu=%s prefetch_source_from_remote_npu=%s prefetch_source_from_cpu=%s prefetch_cpu_path=%s prefetch_cpu_w13_pinned=%s prefetch_cpu_w2_pinned=%s prefetch_cpu_w13_contig=%s prefetch_cpu_w2_contig=%s prefetch_submit_us=%.1f submit_accounted_us=%.1f submit_event_alloc_us=%.1f submit_stream_wait_us=%.1f submit_prefetch_wait_stream_us=%.1f submit_start_event_record_us=%.1f submit_populate_us=%.1f submit_order_us=%.1f submit_assign_us=%.1f submit_layer_local_check_us=%.1f submit_local_npu_us=%.1f submit_remote_npu_us=%.1f submit_cpu_us=%.1f submit_cpu_direct_async_us=%.1f submit_cpu_stage_async_us=%.1f submit_plan_log_us=%.1f submit_expert_map_us=%.1f submit_expert_map_cache_hit=%s submit_dispatch_cache_us=%.1f submit_slot_state_us=%.1f submit_post_cpu_wait_us=%.1f submit_ready_record_us=%.1f prefetch_dev_ms=%.3f prefetch_local_npu_dev_ms=%.3f prefetch_remote_npu_dev_ms=%.3f prefetch_cpu_dev_ms=%.3f prefetch_cpu_pack_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f fused_allgather_wall_ms=%.3f fused_allgather_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s",
+                int(getattr(layer, "elastic_execution_mode", 3)),
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                int(bind_timing.get("slot_id", -1)),
+                int(bind_timing.get("valid_experts",
+                                    bound_slot.valid_expert_count)),
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+                float(bind_timing.get("wait_us", -1.0)),
+                float(bind_timing.get("cpu_fill_us", -1.0)),
+                bind_timing.get("wait_mode", "unknown"),
+                ready_wait_dev_ms,
+                float(bind_timing.get("wait_us", -1.0)) / 1000.0,
+                ready_wait_dev_ms,
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+                next_prefetch_timing.get("layer_idx", -1),
+                next_prefetch_timing.get("slot_id", -1),
+                next_prefetch_timing.get("source_from_npu", -1),
+                next_prefetch_timing.get("source_from_remote_npu", -1),
+                next_prefetch_timing.get("source_from_cpu", -1),
+                next_prefetch_timing.get("cpu_path", "unknown"),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_contig")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_contig")),
+                float(next_prefetch_timing.get("submit_us", -1.0)),
+                _mode3_submit_accounted_us(next_prefetch_timing),
+                _timing_float(next_prefetch_timing, "submit_event_alloc_us"),
+                _timing_float(next_prefetch_timing, "submit_stream_wait_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_prefetch_wait_stream_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_start_event_record_us"),
+                _timing_float(next_prefetch_timing, "submit_populate_us"),
+                _timing_float(next_prefetch_timing, "submit_order_us"),
+                _timing_float(next_prefetch_timing, "submit_assign_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_layer_local_check_us"),
+                _timing_float(next_prefetch_timing, "submit_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_remote_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_cpu_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_direct_async_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_stage_async_us"),
+                _timing_float(next_prefetch_timing, "submit_plan_log_us"),
+                _timing_float(next_prefetch_timing, "submit_expert_map_us"),
+                int(_timing_float(next_prefetch_timing,
+                                  "expert_map_cache_hit")),
+                _timing_float(next_prefetch_timing,
+                              "submit_dispatch_cache_us"),
+                _timing_float(next_prefetch_timing, "submit_slot_state_us"),
+                _timing_float(next_prefetch_timing, "submit_post_cpu_wait_us"),
+                _timing_float(next_prefetch_timing, "submit_ready_record_us"),
+                prefetch_dev_ms,
+                prefetch_npu_dev_ms,
+                _elapsed_ms(next_prefetch_timing.get("remote_start_event"),
+                            next_prefetch_timing.get("remote_end_event")),
+                prefetch_cpu_dev_ms,
+                prefetch_cpu_pack_dev_ms,
+                compute_wall_ms,
+                compute_dev_ms,
+                remap_wall_ms,
+                _elapsed_ms(remap_start_event, remap_end_event),
+                fused_wall_ms,
+                _elapsed_ms(fused_start_event, fused_end_event),
+                prefetch_dev_ms - compute_dev_ms
+                if prefetch_dev_ms >= 0 and compute_dev_ms >= 0 else -1.0,
+                int(x.shape[0]) if hasattr(x, "shape") else -1,
+            )
+        return final_hidden_states
+
+    def _execute_mode3_fused_experts_hybrid(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            logical_topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            row_idx: torch.Tensor,
+            shared_experts: Optional[Any],
+            enable_force_load_balance: bool,
+            kwargs: dict[str, Any],
+            manager: Optional[Mode3DoubleBufferManager] = None) -> torch.Tensor:
+        if manager is None:
+            manager = self._get_or_create_mode3_double_buffer_manager(layer)
+        if manager is None:
+            raise RuntimeError(
+                "Mode3 fused-experts path requires forward-context model "
+                f"instance and moe prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
+        profile_timing = manager.should_profile_layer(layer, "fused_experts")
+        bound_slot = manager.bind_current_layer(layer)
+        bind_timing = dict(manager.last_bind_timing)
+        next_prefetch_timing = manager.prefetch_next_layer(layer)
+
+        local_rank_idx = int(
+            getattr(layer, "lossless_hybrid_active_rank_index", -1))
+        rank_owned = getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)
+        if (rank_owned is None or local_rank_idx < 0
+                or local_rank_idx >= len(rank_owned)):
+            raise RuntimeError(
+                "Invalid hybrid rank ownership state for mode3 fused-experts "
+                f"path at layer={getattr(layer, 'layer_idx', -1)}.")
+        local_owned_expert_ids = [int(x) for x in rank_owned[local_rank_idx]]
+        active_rank_count = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+        owned_per_rank = len(local_owned_expert_ids)
+        if active_rank_count <= 0 or owned_per_rank <= 0:
+            raise RuntimeError(
+                "Invalid hybrid mode3 fused-experts shape: "
+                f"active_rank_count={active_rank_count} "
+                f"owned_per_rank={owned_per_rank}")
+
+        remap_wall_start = time.perf_counter()
+        dispatch_log2phy, dispatch_num_experts = \
+            self._get_dispatch_log2phy_for_layer(
+                layer,
+                device=logical_topk_ids.device,
+                rank_owned=rank_owned,
+                active_rank_count=active_rank_count,
+                owned_per_rank=owned_per_rank,
+            )
+        if int(getattr(layer, "elastic_execution_mode", 0)) in (4, 5):
+            layer.set_runtime_num_experts(int(dispatch_num_experts))
+        remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
+
+        compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="fused_experts"))
+        compute_start_event = manager.new_timing_event() if profile_timing else None
+        compute_end_event = manager.new_timing_event() if profile_timing else None
+        fused_start_event = manager.new_timing_event() if profile_timing else None
+        fused_end_event = manager.new_timing_event() if profile_timing else None
+        _event_record(compute_start_event)
+
+        moe_comm_method = get_forward_context().moe_comm_method
+        token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
+        old_dispatch_num_experts = int(getattr(token_dispatcher, "num_experts", 0)
+                                       ) if token_dispatcher is not None else 0
+        old_dispatch_num_experts_local = (
+            getattr(token_dispatcher, "num_experts_local", None)
+            if token_dispatcher is not None else None)
+        old_expert_token_nums_type = int(
+            getattr(token_dispatcher, "expert_token_nums_type", 0)
+        ) if token_dispatcher is not None else 0
+        try:
+            if token_dispatcher is not None:
+                token_dispatcher.num_experts = dispatch_num_experts
+                token_dispatcher.num_experts_local = owned_per_rank
+                token_dispatcher.expert_token_nums_type = (
+                    manager.expert_token_nums_type)
+            fused_wall_start = time.perf_counter()
+            _event_record(fused_start_event)
+            final_hidden_states = self._execute_single_wave(
+                layer=layer,
+                hidden_states=x,
+                logical_topk_ids=logical_topk_ids,
+                topk_weights=topk_weights,
+                row_idx=row_idx,
+                global_num_experts=dispatch_num_experts,
+                shared_experts=shared_experts,
+                log2phy=dispatch_log2phy,
+                mc2_mask=getattr(moe_comm_method, "mc2_mask", None),
+                enable_force_load_balance=enable_force_load_balance,
+                kwargs=kwargs)
+            _event_record(fused_end_event)
+            fused_wall_ms = (time.perf_counter() - fused_wall_start) * 1e3
+        finally:
+            if token_dispatcher is not None:
+                token_dispatcher.num_experts = old_dispatch_num_experts
+                if old_dispatch_num_experts_local is None:
+                    try:
+                        delattr(token_dispatcher, "num_experts_local")
+                    except AttributeError:
+                        pass
+                else:
+                    token_dispatcher.num_experts_local = (
+                        old_dispatch_num_experts_local)
+                token_dispatcher.expert_token_nums_type = (
+                    old_expert_token_nums_type)
+        _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
+        compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
+
+        layer.lossless_hybrid_last_stats = {
+            "mode3_slot": int(bind_timing.get(
+                "slot_id", int(layer.layer_idx) & 1)),
+            "valid_experts": int(bind_timing.get(
+                "valid_experts", bound_slot.valid_expert_count)),
+            "source_from_npu": int(bind_timing.get(
+                "source_from_npu", bound_slot.source_from_npu)),
+            "source_from_remote_npu": int(bind_timing.get(
+                "source_from_remote_npu",
+                getattr(bound_slot, "source_from_remote_npu", 0))),
+            "source_from_cpu": int(bind_timing.get(
+                "source_from_cpu", bound_slot.source_from_cpu)),
+            "layer_local_buffer": int(bind_timing.get(
+                "layer_local_buffer", int(bound_slot.uses_layer_local_buffer))),
+            "prefetch_wait_us": float(
+                manager.prefetch_wait_us[int(layer.layer_idx)]),
+            "prefetch_hit": int(manager.prefetch_hit[int(layer.layer_idx)]),
+            "fused_experts_path": 1,
+        }
+        mode_label = int(getattr(layer, "elastic_execution_mode", 3))
+        if layer.layer_idx == 0 and manager.enable_transfer_logs:
+            logger.info(
+                "Mode%s fused-experts execution: rank=%s layer=%s stage=%s valid_experts=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s layer_local_buffer=%s dispatch_experts=%s prefetch_wait_us=%.1f prefetch_hit=%s",
+                mode_label,
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                active_rank_count,
+                int(bind_timing.get("valid_experts",
+                                    bound_slot.valid_expert_count)),
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+                int(bind_timing.get("layer_local_buffer",
+                                    int(bound_slot.uses_layer_local_buffer))),
+                dispatch_num_experts,
+                float(manager.prefetch_wait_us[int(layer.layer_idx)]),
+                int(manager.prefetch_hit[int(layer.layer_idx)]),
+            )
+        if profile_timing:
+            prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            prefetch_npu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_start_event"),
+                next_prefetch_timing.get("npu_end_event"))
+            prefetch_remote_npu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("remote_start_event"),
+                next_prefetch_timing.get("remote_end_event"))
+            prefetch_cpu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_start_event"),
+                next_prefetch_timing.get("cpu_end_event"))
+            prefetch_cpu_pack_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_pack_start_event"),
+                next_prefetch_timing.get("cpu_pack_end_event"))
+            compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
+            fused_dev_ms = _elapsed_ms(fused_start_event, fused_end_event)
+            ready_wait_dev_ms = _elapsed_ms(
+                bind_timing.get("ready_wait_start_event"),
+                bind_timing.get("ready_wait_end_event"))
+            logger.info(
+                "Mode%s timing fused-experts: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s layer_local_buffer=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s ready_wait_dev_ms=%.3f current_fetch_wall_ms=%.3f current_fetch_ready_dev_ms=%.3f current_fetch_source_from_local_npu=%s current_fetch_source_from_remote_npu=%s current_fetch_source_from_cpu=%s prefetch_status=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_local_npu=%s prefetch_source_from_remote_npu=%s prefetch_source_from_cpu=%s prefetch_block_start_layer=%s prefetch_block_layers=%s prefetch_block_rows=%s prefetch_cpu_path=%s prefetch_layer_local_buffer=%s prefetch_cpu_w13_pinned=%s prefetch_cpu_w2_pinned=%s prefetch_cpu_w13_contig=%s prefetch_cpu_w2_contig=%s prefetch_submit_us=%.1f submit_accounted_us=%.1f submit_event_alloc_us=%.1f submit_stream_wait_us=%.1f submit_prefetch_wait_stream_us=%.1f submit_start_event_record_us=%.1f submit_populate_us=%.1f submit_order_us=%.1f submit_assign_us=%.1f submit_layer_local_check_us=%.1f submit_local_npu_us=%.1f submit_remote_npu_us=%.1f submit_cpu_us=%.1f submit_cpu_direct_async_us=%.1f submit_cpu_stage_async_us=%.1f submit_plan_log_us=%.1f submit_expert_map_us=%.1f submit_expert_map_cache_hit=%s submit_dispatch_cache_us=%.1f submit_slot_state_us=%.1f submit_post_cpu_wait_us=%.1f submit_ready_record_us=%.1f prefetch_dev_ms=%.3f prefetch_local_npu_dev_ms=%.3f prefetch_remote_npu_dev_ms=%.3f prefetch_cpu_dev_ms=%.3f prefetch_cpu_pack_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f fused_wall_ms=%.3f fused_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s owned_per_rank=%s dispatch_num_experts=%s expert_token_nums_type=%s",
+                mode_label,
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                active_rank_count,
+                int(bind_timing.get("slot_id", -1)),
+                int(bind_timing.get("valid_experts",
+                                    bound_slot.valid_expert_count)),
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+                int(bind_timing.get("layer_local_buffer",
+                                    int(bound_slot.uses_layer_local_buffer))),
+                float(bind_timing.get("wait_us", -1.0)),
+                float(bind_timing.get("cpu_fill_us", -1.0)),
+                bind_timing.get("wait_mode", "unknown"),
+                ready_wait_dev_ms,
+                float(bind_timing.get("wait_us", -1.0)) / 1000.0,
+                ready_wait_dev_ms,
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+                next_prefetch_timing.get("status", "unknown"),
+                next_prefetch_timing.get("layer_idx", -1),
+                next_prefetch_timing.get("slot_id", -1),
+                next_prefetch_timing.get("source_from_npu", -1),
+                next_prefetch_timing.get("source_from_remote_npu", -1),
+                next_prefetch_timing.get("source_from_cpu", -1),
+                next_prefetch_timing.get("mode4_block_start_layer", -1),
+                next_prefetch_timing.get("mode4_block_layers", -1),
+                next_prefetch_timing.get("mode4_block_rows", -1),
+                next_prefetch_timing.get("cpu_path", "unknown"),
+                next_prefetch_timing.get("layer_local_buffer", -1),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_contig")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_contig")),
+                float(next_prefetch_timing.get("submit_us", -1.0)),
+                _mode3_submit_accounted_us(next_prefetch_timing),
+                _timing_float(next_prefetch_timing, "submit_event_alloc_us"),
+                _timing_float(next_prefetch_timing, "submit_stream_wait_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_prefetch_wait_stream_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_start_event_record_us"),
+                _timing_float(next_prefetch_timing, "submit_populate_us"),
+                _timing_float(next_prefetch_timing, "submit_order_us"),
+                _timing_float(next_prefetch_timing, "submit_assign_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_layer_local_check_us"),
+                _timing_float(next_prefetch_timing, "submit_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_remote_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_cpu_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_direct_async_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_stage_async_us"),
+                _timing_float(next_prefetch_timing, "submit_plan_log_us"),
+                _timing_float(next_prefetch_timing, "submit_expert_map_us"),
+                int(_timing_float(next_prefetch_timing,
+                                  "expert_map_cache_hit")),
+                _timing_float(next_prefetch_timing,
+                              "submit_dispatch_cache_us"),
+                _timing_float(next_prefetch_timing, "submit_slot_state_us"),
+                _timing_float(next_prefetch_timing, "submit_post_cpu_wait_us"),
+                _timing_float(next_prefetch_timing, "submit_ready_record_us"),
+                prefetch_dev_ms,
+                prefetch_npu_dev_ms,
+                prefetch_remote_npu_dev_ms,
+                prefetch_cpu_dev_ms,
+                prefetch_cpu_pack_dev_ms,
+                compute_wall_ms,
+                compute_dev_ms,
+                remap_wall_ms,
+                fused_wall_ms,
+                fused_dev_ms,
+                prefetch_dev_ms - compute_dev_ms
+                if prefetch_dev_ms >= 0 and compute_dev_ms >= 0 else -1.0,
+                int(x.shape[0]) if hasattr(x, "shape") else -1,
+                owned_per_rank,
+                dispatch_num_experts,
+                manager.expert_token_nums_type,
+            )
+        return final_hidden_states
+
+    def _execute_mode3_single_dispatch_hybrid(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            logical_topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            row_idx: torch.Tensor,
+            shared_experts: Optional[Any],
+            enable_force_load_balance: bool,
+            kwargs: dict[str, Any]) -> torch.Tensor:
+        manager = self._get_or_create_mode3_double_buffer_manager(layer)
+        if manager is None:
+            raise RuntimeError(
+                f"Mode{int(getattr(layer, 'elastic_execution_mode', 3))} single-dispatch requires forward-context model instance "
+                f"and moe prefetch stream at layer={getattr(layer, 'layer_idx', -1)}.")
+        if manager.use_fused_experts_path:
+            return self._execute_mode3_fused_experts_hybrid(
+                layer=layer,
+                x=x,
+                logical_topk_ids=logical_topk_ids,
+                topk_weights=topk_weights,
+                row_idx=row_idx,
+                shared_experts=shared_experts,
+                enable_force_load_balance=enable_force_load_balance,
+                kwargs=kwargs,
+                manager=manager)
+        ffn_enter_wall_ts = float(
+            getattr(layer, "lossless_ffn_enter_wall_ts", -1.0))
+        if ffn_enter_wall_ts > 0:
+            manager.last_ffn_enter_wall_ts_by_layer[int(layer.layer_idx)] = (
+                ffn_enter_wall_ts)
+        profile_timing = manager.should_profile_layer(layer, "single_dispatch")
+        bound_slot = manager.bind_current_layer(layer)
+        bind_timing = dict(manager.last_bind_timing)
+        next_prefetch_timing = manager.prefetch_next_layer(layer)
+        compute_wall_start = time.perf_counter()
+        compute_range = _stage_decode_profile_range_start(
+            _stage_decode_profile_message(
+                "ffn_compute", layer, path="single_dispatch"))
+        compute_start_event = manager.new_timing_event() if profile_timing else None
+        compute_end_event = manager.new_timing_event() if profile_timing else None
+        remap_start_event = manager.new_timing_event() if profile_timing else None
+        remap_end_event = manager.new_timing_event() if profile_timing else None
+        dispatch_start_event = manager.new_timing_event() if profile_timing else None
+        dispatch_end_event = manager.new_timing_event() if profile_timing else None
+        mlp_start_event = manager.new_timing_event() if profile_timing else None
+        mlp_end_event = manager.new_timing_event() if profile_timing else None
+        combine_start_event = manager.new_timing_event() if profile_timing else None
+        combine_end_event = manager.new_timing_event() if profile_timing else None
+        _event_record(compute_start_event)
+
+        moe_comm_method = get_forward_context().moe_comm_method
+        token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
+        if token_dispatcher is None:
+            raise RuntimeError("Missing MC2 token dispatcher for mode3 path.")
+        if token_dispatcher.__class__.__name__ != "TokenDispatcherWithMC2":
+            raise RuntimeError(
+                f"Mode{int(getattr(layer, 'elastic_execution_mode', 3))} single-dispatch requires MC2 token dispatcher, got "
+                f"{token_dispatcher.__class__.__name__} at "
+                f"layer={getattr(layer, 'layer_idx', -1)}.")
+        local_rank_idx = int(
+            getattr(layer, "lossless_hybrid_active_rank_index", -1))
+        rank_owned = getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)
+        if (rank_owned is None or local_rank_idx < 0
+                or local_rank_idx >= len(rank_owned)):
+            raise RuntimeError(
+                f"Invalid hybrid rank ownership state for mode{int(getattr(layer, 'elastic_execution_mode', 3))} path at "
+                f"layer={getattr(layer, 'layer_idx', -1)}.")
+        local_owned_expert_ids = [int(x) for x in rank_owned[local_rank_idx]]
+        active_rank_count = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+        owned_per_rank = len(local_owned_expert_ids)
+        if active_rank_count <= 0 or owned_per_rank <= 0:
+            raise RuntimeError(
+                f"Invalid hybrid mode{int(getattr(layer, 'elastic_execution_mode', 3))} dispatch shape: "
+                f"active_rank_count={active_rank_count} "
+                f"owned_per_rank={owned_per_rank}")
+        remap_wall_start = time.perf_counter()
+        _event_record(remap_start_event)
+        dispatch_log2phy, dispatch_num_experts = \
+            self._get_dispatch_log2phy_for_layer(
+                layer,
+                device=logical_topk_ids.device,
+                rank_owned=rank_owned,
+                active_rank_count=active_rank_count,
+                owned_per_rank=owned_per_rank,
+            )
+        if int(getattr(layer, "elastic_execution_mode", 0)) in (4, 5):
+            layer.set_runtime_num_experts(int(dispatch_num_experts))
+        dispatch_topk_ids = dispatch_log2phy[logical_topk_ids]
+        if torch.any(dispatch_topk_ids < 0):
+            invalid_count = int(torch.count_nonzero(dispatch_topk_ids < 0).item())
+            raise RuntimeError(
+                f"Mode{int(getattr(layer, 'elastic_execution_mode', 3))} single-dispatch saw experts outside the active rank "
+                f"ownership map at layer={getattr(layer, 'layer_idx', -1)}: "
+                f"invalid_count={invalid_count}")
+        if enable_force_load_balance and not self.use_aclgraph:
+            dispatch_topk_ids = (
+                torch.arange(dispatch_topk_ids.numel(),
+                             device=dispatch_topk_ids.device)
+                % dispatch_num_experts).to(torch.int32).reshape(
+                    dispatch_topk_ids.shape)
+        _event_record(remap_end_event)
+        remap_wall_ms = (time.perf_counter() - remap_wall_start) * 1e3
+
+        old_dispatch_num_experts = int(getattr(token_dispatcher, "num_experts", 0))
+        old_dispatch_num_experts_local = getattr(token_dispatcher,
+                                                 "num_experts_local", None)
+        old_expert_token_nums_type = int(
+            getattr(token_dispatcher, "expert_token_nums_type", 0))
+        token_dispatcher.num_experts = dispatch_num_experts
+        token_dispatcher.num_experts_local = owned_per_rank
+        token_dispatcher.expert_token_nums_type = manager.expert_token_nums_type
+        dispatch_expert_map = torch.arange(dispatch_num_experts,
+                                           device=dispatch_topk_ids.device,
+                                           dtype=torch.int32)
+        if (int(getattr(layer, "layer_idx", -1)) == 0
+                and os.getenv("VLLM_ASCEND_MODE1_FULLWORLD_RESTORE_DIAG",
+                              "0").strip().lower()
+                in {"1", "true", "yes", "on"}):
+            active_mask = getattr(moe_comm_method, "mc2_mask", None)
+            active_mask_count = (
+                int(torch.count_nonzero(active_mask).item())
+                if active_mask is not None else -1)
+            rank_counts = [len([int(x) for x in owned])
+                           for owned in rank_owned]
+            logger.info(
+                "Hybrid MC2 dense dispatch state: mode=%s layer=%s "
+                "active_ranks=%s local_rank_idx=%s rank_counts=%s "
+                "owned_per_rank=%s dispatch_num_experts=%s "
+                "dispatcher_id=%s old_num_experts=%s old_num_local=%s "
+                "new_num_local=%s mc2_mask_count=%s topk_min=%s "
+                "topk_max=%s topk_unique=%s expert_map_len=%s",
+                int(getattr(layer, "elastic_execution_mode", 0)),
+                int(getattr(layer, "layer_idx", -1)),
+                tuple(int(rank) for rank in getattr(
+                    layer, "lossless_hybrid_active_ranks", [])),
+                int(local_rank_idx),
+                tuple(int(count) for count in rank_counts),
+                int(owned_per_rank),
+                int(dispatch_num_experts),
+                id(token_dispatcher),
+                int(old_dispatch_num_experts),
+                (int(old_dispatch_num_experts_local)
+                 if old_dispatch_num_experts_local is not None else -1),
+                int(getattr(token_dispatcher, "num_experts_local", -1)),
+                active_mask_count,
+                int(dispatch_topk_ids.min().item())
+                if dispatch_topk_ids.numel() > 0 else -1,
+                int(dispatch_topk_ids.max().item())
+                if dispatch_topk_ids.numel() > 0 else -1,
+                int(torch.unique(dispatch_topk_ids).numel())
+                if dispatch_topk_ids.numel() > 0 else 0,
+                int(dispatch_expert_map.numel()),
+            )
+        dispatch_wall_ms = -1.0
+        group_wall_ms = -1.0
+        mlp_wall_ms = -1.0
+        combine_wall_ms = -1.0
+        dispatched_rows = -1
+        dispatched_active_rows = -1
+        try:
+            dispatch_wall_start = time.perf_counter()
+            _event_record(dispatch_start_event)
+            dispatch_results = token_dispatcher.token_dispatch(
+                hidden_states=x,
+                topk_weights=topk_weights,
+                topk_ids=dispatch_topk_ids,
+                row_idx=row_idx,
+                expert_map=dispatch_expert_map,
+                log2phy=None,
+                global_redundant_expert_num=kwargs.get(
+                    "global_redundant_expert_num", 0),
+                shared_experts=shared_experts,
+                quantized_x_for_share=kwargs.get("quantized_x_for_share"),
+                dynamic_scale_for_share=kwargs.get("dynamic_scale_for_share"),
+                mc2_mask=getattr(moe_comm_method, "mc2_mask", None),
+                apply_router_weight_on_input=False,
+                with_quant=False)
+            _event_record(dispatch_end_event)
+            dispatch_wall_ms = (time.perf_counter() -
+                                dispatch_wall_start) * 1e3
+            dispatched_hidden_states = dispatch_results["hidden_states"]
+            dispatched_group_list = dispatch_results["group_list"]
+            dispatched_group_list_type = int(dispatch_results["group_list_type"])
+            group_wall_start = time.perf_counter()
+            dispatched_group_counts = self._group_list_to_counts(
+                dispatched_group_list,
+                dispatched_group_list_type,
+                total_tokens=int(dispatched_hidden_states.shape[0]),
+            ).to(dtype=torch.long)
+            if int(dispatched_group_counts.numel()) != int(owned_per_rank):
+                raise RuntimeError(
+                    f"Mode{int(getattr(layer, 'elastic_execution_mode', 3))} single-dispatch expert group size mismatch: "
+                    f"expected_experts={owned_per_rank} "
+                    f"actual_experts={int(dispatched_group_counts.numel())} "
+                    f"group_list_type={dispatched_group_list_type}")
+            dispatched_rows = int(dispatched_hidden_states.shape[0])
+            if profile_timing and manager.enable_active_rows_sync:
+                # Keep the hot path asynchronous. This host read is only for
+                # sampled diagnostics and used to cost ~ms in group_wall_ms.
+                dispatched_active_rows = int(dispatched_group_counts.sum().item())
+            group_wall_ms = (time.perf_counter() - group_wall_start) * 1e3
+            if (dispatched_active_rows >= 0
+                    and dispatched_active_rows > int(dispatched_hidden_states.shape[0])):
+                raise RuntimeError(
+                    f"Mode{int(getattr(layer, 'elastic_execution_mode', 3))} single-dispatch local token count mismatch: "
+                    f"expected<={int(dispatched_hidden_states.shape[0])} "
+                    f"active_rows={dispatched_active_rows} "
+                    f"actual={int(dispatched_hidden_states.shape[0])} "
+                    f"group_list_len={int(dispatched_group_list.numel())} "
+                    f"group_list_type={dispatched_group_list_type} "
+                    f"group_list_sum={int(dispatched_group_list.to(dtype=torch.long).sum().item())} "
+                    f"group_count_sum={int(dispatched_group_counts.sum().item())}")
+            runtime_w13_weight = getattr(layer, "runtime_w13_weight", None)
+            runtime_w2_weight = getattr(layer, "runtime_w2_weight", None)
+            if runtime_w13_weight is None or runtime_w2_weight is None:
+                raise RuntimeError(
+                    f"Missing runtime expert weights for mode3 path at layer={layer.layer_idx}.")
+            mlp_wall_start = time.perf_counter()
+            _event_record(mlp_start_event)
+            dispatched_output = unified_apply_mlp(
+                hidden_states=dispatched_hidden_states,
+                w1=runtime_w13_weight,
+                w1_scale=None,
+                w2=runtime_w2_weight,
+                w2_scale=None,
+                group_list=dispatched_group_counts.to(
+                    dtype=torch.int64, device=dispatched_hidden_states.device),
+                dynamic_scale=None,
+                group_list_type=1,
+                w1_scale_bias=None,
+                w2_scale_bias=None,
+                topk_scales=None,
+                with_quant=False,
+                fusion=False,
+                need_trans=True)
+            _event_record(mlp_end_event)
+            mlp_wall_ms = (time.perf_counter() - mlp_wall_start) * 1e3
+            combine_wall_start = time.perf_counter()
+            _event_record(combine_start_event)
+            final_hidden_states = token_dispatcher.token_combine(dispatched_output)
+            _event_record(combine_end_event)
+            combine_wall_ms = (time.perf_counter() -
+                               combine_wall_start) * 1e3
+        finally:
+            token_dispatcher.num_experts = old_dispatch_num_experts
+            if old_dispatch_num_experts_local is None:
+                try:
+                    delattr(token_dispatcher, "num_experts_local")
+                except AttributeError:
+                    pass
+            else:
+                token_dispatcher.num_experts_local = old_dispatch_num_experts_local
+            token_dispatcher.expert_token_nums_type = old_expert_token_nums_type
+        _event_record(compute_end_event)
+        _stage_decode_profile_range_end(compute_range)
+        compute_wall_ms = (time.perf_counter() - compute_wall_start) * 1e3
+
+        layer.lossless_hybrid_last_stats = {
+            "mode3_slot": int(bind_timing.get(
+                "slot_id", int(layer.layer_idx) & 1)),
+            "valid_experts": int(bind_timing.get(
+                "valid_experts", bound_slot.valid_expert_count)),
+            "source_from_npu": int(bind_timing.get(
+                "source_from_npu", bound_slot.source_from_npu)),
+            "source_from_remote_npu": int(bind_timing.get(
+                "source_from_remote_npu",
+                getattr(bound_slot, "source_from_remote_npu", 0))),
+            "source_from_cpu": int(bind_timing.get(
+                "source_from_cpu", bound_slot.source_from_cpu)),
+            "prefetch_wait_us": float(manager.prefetch_wait_us[int(layer.layer_idx)]),
+            "prefetch_hit": int(manager.prefetch_hit[int(layer.layer_idx)]),
+        }
+        mode_label = int(getattr(layer, "elastic_execution_mode", 3))
+        if layer.layer_idx == 0 and manager.enable_transfer_logs:
+            logger.info(
+                "Mode%s single-dispatch execution: rank=%s layer=%s stage=%s valid_experts=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s prefetch_wait_us=%.1f prefetch_hit=%s",
+                mode_label,
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                int(bind_timing.get("valid_experts",
+                                    bound_slot.valid_expert_count)),
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+                float(manager.prefetch_wait_us[int(layer.layer_idx)]),
+                int(manager.prefetch_hit[int(layer.layer_idx)]),
+            )
+        if profile_timing:
+            prefetch_dev_ms = manager._prefetch_device_ms(next_prefetch_timing)
+            prefetch_npu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("npu_start_event"),
+                next_prefetch_timing.get("npu_end_event"))
+            prefetch_remote_npu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("remote_start_event"),
+                next_prefetch_timing.get("remote_end_event"))
+            prefetch_cpu_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_start_event"),
+                next_prefetch_timing.get("cpu_end_event"))
+            prefetch_cpu_pack_dev_ms = _elapsed_ms(
+                next_prefetch_timing.get("cpu_pack_start_event"),
+                next_prefetch_timing.get("cpu_pack_end_event"))
+            compute_dev_ms = _elapsed_ms(compute_start_event, compute_end_event)
+            ready_wait_dev_ms = _elapsed_ms(
+                bind_timing.get("ready_wait_start_event"),
+                bind_timing.get("ready_wait_end_event"))
+            logger.info(
+                "Mode%s timing single-dispatch: rank=%s layer=%s stage=%s slot=%s valid_experts=%s source_from_local_npu=%s source_from_remote_npu=%s source_from_cpu=%s bind_wait_us=%.1f bind_cpu_fill_us=%.1f bind_wait_mode=%s ready_wait_dev_ms=%.3f current_fetch_wall_ms=%.3f current_fetch_ready_dev_ms=%.3f current_fetch_source_from_local_npu=%s current_fetch_source_from_remote_npu=%s current_fetch_source_from_cpu=%s prefetch_status=%s prefetch_next_layer=%s prefetch_slot=%s prefetch_source_from_local_npu=%s prefetch_source_from_remote_npu=%s prefetch_source_from_cpu=%s prefetch_cpu_path=%s prefetch_cpu_w13_pinned=%s prefetch_cpu_w2_pinned=%s prefetch_cpu_w13_contig=%s prefetch_cpu_w2_contig=%s prefetch_submit_us=%.1f submit_accounted_us=%.1f submit_event_alloc_us=%.1f submit_stream_wait_us=%.1f submit_prefetch_wait_stream_us=%.1f submit_start_event_record_us=%.1f submit_populate_us=%.1f submit_order_us=%.1f submit_assign_us=%.1f submit_layer_local_check_us=%.1f submit_local_npu_us=%.1f submit_remote_npu_us=%.1f submit_cpu_us=%.1f submit_cpu_direct_async_us=%.1f submit_cpu_stage_async_us=%.1f submit_plan_log_us=%.1f submit_expert_map_us=%.1f submit_expert_map_cache_hit=%s submit_dispatch_cache_us=%.1f submit_slot_state_us=%.1f submit_post_cpu_wait_us=%.1f submit_ready_record_us=%.1f prefetch_dev_ms=%.3f prefetch_local_npu_dev_ms=%.3f prefetch_remote_npu_dev_ms=%.3f prefetch_cpu_dev_ms=%.3f prefetch_cpu_pack_dev_ms=%.3f current_compute_wall_ms=%.3f current_compute_dev_ms=%.3f remap_wall_ms=%.3f remap_dev_ms=%.3f token_dispatch_wall_ms=%.3f token_dispatch_dev_ms=%.3f group_wall_ms=%.3f mlp_wall_ms=%.3f mlp_dev_ms=%.3f token_combine_wall_ms=%.3f token_combine_dev_ms=%.3f prefetch_minus_compute_dev_ms=%.3f tokens=%s dispatched_rows=%s active_rows=%s owned_per_rank=%s dispatch_num_experts=%s expert_token_nums_type=%s group_list_type=%s",
+                mode_label,
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                active_rank_count,
+                int(bind_timing.get("slot_id", -1)),
+                int(bind_timing.get("valid_experts",
+                                    bound_slot.valid_expert_count)),
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+                float(bind_timing.get("wait_us", -1.0)),
+                float(bind_timing.get("cpu_fill_us", -1.0)),
+                bind_timing.get("wait_mode", "unknown"),
+                ready_wait_dev_ms,
+                float(bind_timing.get("wait_us", -1.0)) / 1000.0,
+                ready_wait_dev_ms,
+                int(bind_timing.get("source_from_npu",
+                                    bound_slot.source_from_npu)),
+                int(bind_timing.get(
+                    "source_from_remote_npu",
+                    getattr(bound_slot, "source_from_remote_npu", 0))),
+                int(bind_timing.get("source_from_cpu",
+                                    bound_slot.source_from_cpu)),
+                next_prefetch_timing.get("status", "unknown"),
+                next_prefetch_timing.get("layer_idx", -1),
+                next_prefetch_timing.get("slot_id", -1),
+                next_prefetch_timing.get("source_from_npu", -1),
+                next_prefetch_timing.get("source_from_remote_npu", -1),
+                next_prefetch_timing.get("source_from_cpu", -1),
+                next_prefetch_timing.get("cpu_path", "unknown"),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_pinned")),
+                int(_timing_float(next_prefetch_timing, "cpu_w13_contig")),
+                int(_timing_float(next_prefetch_timing, "cpu_w2_contig")),
+                float(next_prefetch_timing.get("submit_us", -1.0)),
+                _mode3_submit_accounted_us(next_prefetch_timing),
+                _timing_float(next_prefetch_timing, "submit_event_alloc_us"),
+                _timing_float(next_prefetch_timing, "submit_stream_wait_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_prefetch_wait_stream_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_start_event_record_us"),
+                _timing_float(next_prefetch_timing, "submit_populate_us"),
+                _timing_float(next_prefetch_timing, "submit_order_us"),
+                _timing_float(next_prefetch_timing, "submit_assign_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_layer_local_check_us"),
+                _timing_float(next_prefetch_timing, "submit_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_remote_npu_us"),
+                _timing_float(next_prefetch_timing, "submit_cpu_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_direct_async_us"),
+                _timing_float(next_prefetch_timing,
+                              "submit_cpu_stage_async_us"),
+                _timing_float(next_prefetch_timing, "submit_plan_log_us"),
+                _timing_float(next_prefetch_timing, "submit_expert_map_us"),
+                int(_timing_float(next_prefetch_timing,
+                                  "expert_map_cache_hit")),
+                _timing_float(next_prefetch_timing,
+                              "submit_dispatch_cache_us"),
+                _timing_float(next_prefetch_timing, "submit_slot_state_us"),
+                _timing_float(next_prefetch_timing, "submit_post_cpu_wait_us"),
+                _timing_float(next_prefetch_timing, "submit_ready_record_us"),
+                prefetch_dev_ms,
+                prefetch_npu_dev_ms,
+                prefetch_remote_npu_dev_ms,
+                prefetch_cpu_dev_ms,
+                prefetch_cpu_pack_dev_ms,
+                compute_wall_ms,
+                compute_dev_ms,
+                remap_wall_ms,
+                _elapsed_ms(remap_start_event, remap_end_event),
+                dispatch_wall_ms,
+                _elapsed_ms(dispatch_start_event, dispatch_end_event),
+                group_wall_ms,
+                mlp_wall_ms,
+                _elapsed_ms(mlp_start_event, mlp_end_event),
+                combine_wall_ms,
+                _elapsed_ms(combine_start_event, combine_end_event),
+                prefetch_dev_ms - compute_dev_ms
+                if prefetch_dev_ms >= 0 and compute_dev_ms >= 0 else -1.0,
+                int(x.shape[0]) if hasattr(x, "shape") else -1,
+                dispatched_rows,
+                dispatched_active_rows,
+                owned_per_rank,
+                dispatch_num_experts,
+                manager.expert_token_nums_type,
+                dispatched_group_list_type,
+            )
+        return final_hidden_states
+
+    def _execute_mode2_single_dispatch_hybrid(
+            self,
+            layer: torch.nn.Module,
+            x: torch.Tensor,
+            logical_topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            row_idx: torch.Tensor,
+            wave_plans: list[dict[str, Any]],
+            shared_experts: Optional[Any],
+            prepared_mc2_mask: Optional[torch.Tensor],
+            enable_force_load_balance: bool,
+            kwargs: dict[str, Any],
+            ids_already_runtime_remapped: bool,
+            is_dummy: bool) -> torch.Tensor:
+        moe_comm_method = get_forward_context().moe_comm_method
+        token_dispatcher = getattr(moe_comm_method, "token_dispatcher", None)
+        if token_dispatcher is None:
+            raise RuntimeError("Missing MC2 token dispatcher for hybrid mode2 path.")
+        local_rank_idx = int(
+            getattr(layer, "lossless_hybrid_active_rank_index", -1))
+        rank_owned = getattr(layer, "lossless_hybrid_rank_owned_expert_ids", None)
+        if (rank_owned is None or local_rank_idx < 0
+                or local_rank_idx >= len(rank_owned)):
+            raise RuntimeError(
+                "Invalid hybrid rank ownership state for mode2 single-dispatch "
+                f"path at layer={getattr(layer, 'layer_idx', -1)}.")
+        active_rank_count = len(getattr(layer, "lossless_hybrid_active_ranks", []))
+        local_owned_expert_ids = [int(x) for x in rank_owned[local_rank_idx]]
+        owned_per_rank = len(local_owned_expert_ids)
+        if active_rank_count <= 0 or owned_per_rank <= 0:
+            raise RuntimeError(
+                "Invalid hybrid mode2 dispatch shape: "
+                f"active_rank_count={active_rank_count} "
+                f"owned_per_rank={owned_per_rank}")
+        dispatch_log2phy, dispatch_num_experts = \
+            self._get_dispatch_log2phy_for_layer(
+                layer,
+                device=logical_topk_ids.device,
+                rank_owned=rank_owned,
+                active_rank_count=active_rank_count,
+                owned_per_rank=owned_per_rank,
+            )
+        dispatch_topk_ids = (
+            logical_topk_ids if ids_already_runtime_remapped else
+            dispatch_log2phy[logical_topk_ids])
+        if torch.any(dispatch_topk_ids < 0):
+            invalid_count = int(torch.count_nonzero(dispatch_topk_ids < 0).item())
+            raise RuntimeError(
+                "Hybrid mode2 single-dispatch saw experts outside the active "
+                f"rank ownership map at layer={getattr(layer, 'layer_idx', -1)}: "
+                f"invalid_count={invalid_count}")
+        if enable_force_load_balance and not self.use_aclgraph:
+            dispatch_topk_ids = (
+                torch.arange(dispatch_topk_ids.numel(),
+                             device=dispatch_topk_ids.device)
+                % dispatch_num_experts).to(torch.int32).reshape(
+                    dispatch_topk_ids.shape)
+
+        old_dispatch_num_experts = int(getattr(token_dispatcher, "num_experts", 0))
+        token_dispatcher.num_experts = dispatch_num_experts
+        dispatch_results = None
+        try:
+            dispatch_results = token_dispatcher.token_dispatch(
+                hidden_states=x,
+                topk_weights=topk_weights,
+                topk_ids=dispatch_topk_ids,
+                row_idx=row_idx,
+                expert_map=layer.expert_map,
+                log2phy=None,
+                global_redundant_expert_num=kwargs.get(
+                    "global_redundant_expert_num", 0),
+                shared_experts=shared_experts,
+                quantized_x_for_share=kwargs.get("quantized_x_for_share"),
+                dynamic_scale_for_share=kwargs.get("dynamic_scale_for_share"),
+                mc2_mask=prepared_mc2_mask,
+                apply_router_weight_on_input=False,
+                with_quant=False)
+            dispatched_hidden_states = dispatch_results["hidden_states"]
+            dispatched_group_list = dispatch_results["group_list"]
+            dispatched_group_list_type = int(dispatch_results["group_list_type"])
+            dispatched_group_counts = self._group_list_to_counts(
+                dispatched_group_list,
+                dispatched_group_list_type,
+                total_tokens=int(dispatched_hidden_states.shape[0]),
+            ).to(dtype=torch.long)
+            if int(dispatched_group_counts.numel()) != int(owned_per_rank):
+                raise RuntimeError(
+                    "Hybrid mode2 single-dispatch expert group size mismatch: "
+                    f"expected_experts={owned_per_rank} "
+                    f"actual_experts={int(dispatched_group_counts.numel())} "
+                    f"group_list_type={dispatched_group_list_type}")
+            dispatch_offsets = self._counts_to_offsets(dispatched_group_counts)
+            dispatched_active_rows = int(dispatch_offsets[-1].item())
+            if dispatched_active_rows > int(dispatched_hidden_states.shape[0]):
+                raise RuntimeError(
+                    "Hybrid mode2 single-dispatch local token count mismatch: "
+                    f"expected<={int(dispatched_hidden_states.shape[0])} "
+                    f"active_rows={dispatched_active_rows} "
+                    f"actual={int(dispatched_hidden_states.shape[0])} "
+                    f"group_list_len={int(dispatched_group_list.numel())} "
+                    f"group_list_type={dispatched_group_list_type} "
+                    f"group_list_sum={int(dispatched_group_list.to(dtype=torch.long).sum().item())} "
+                    f"group_count_sum={int(dispatched_group_counts.sum().item())}")
+
+            dispatched_output = torch.zeros_like(dispatched_hidden_states)
+            local_owned_index_by_expert = {
+                int(expert_id): local_idx
+                for local_idx, expert_id in enumerate(local_owned_expert_ids)
+            }
+            local_wave_counts = []
+            local_cpu_miss = 0
+            local_resident_hits = 0
+
+            for wave_idx, wave_plan in enumerate(wave_plans):
+                effective_token_mask = wave_plan["token_mask"]
+                if prepared_mc2_mask is not None:
+                    mc2_active_mask = prepared_mc2_mask.to(
+                        device=effective_token_mask.device, dtype=torch.bool)
+                    effective_token_mask = effective_token_mask & mc2_active_mask
+                    if (is_dummy and not torch.any(effective_token_mask)
+                            and torch.any(wave_plan["token_mask"])):
+                        effective_token_mask = wave_plan["token_mask"]
+                if (effective_token_mask.numel() > 0
+                        and torch.any(effective_token_mask)):
+                    local_wave_counts.append(
+                        int(torch.count_nonzero(effective_token_mask).item()))
+                else:
+                    local_wave_counts.append(0)
+
+                if 0 <= local_rank_idx < len(wave_plan["rank_resident"]):
+                    target_resident = list(wave_plan["rank_resident"][local_rank_idx])
+                    current_resident = list(
+                        getattr(layer, "lossless_hybrid_resident_expert_ids", []))
+                    current_resident_set = set(current_resident)
+                    local_cpu_miss += len(
+                        [expert_id for expert_id in target_resident
+                         if expert_id not in current_resident_set])
+                    local_resident_hits += len(
+                        [expert_id for expert_id in target_resident
+                         if expert_id in current_resident_set])
+                    layer.materialize_hybrid_resident_experts(target_resident)
+                else:
+                    target_resident = []
+
+                wave_group_by_rank = wave_plan.get("rank_wave_groups", [])
+                local_wave_group = (
+                    [int(x) for x in wave_group_by_rank[local_rank_idx]]
+                    if 0 <= local_rank_idx < len(wave_group_by_rank) else [])
+                local_wave_group_set = set(local_wave_group)
+                resident_capacity = int(layer.lossless_hybrid_resident_capacity)
+                resident_group_counts = torch.zeros((resident_capacity, ),
+                                                   dtype=torch.int64,
+                                                   device=dispatched_hidden_states.device)
+                hidden_segments: list[torch.Tensor] = []
+                segment_targets: list[tuple[int, int, int]] = []
+                for slot_idx, expert_id in enumerate(target_resident[:resident_capacity]):
+                    expert_id = int(expert_id)
+                    if expert_id not in local_wave_group_set:
+                        continue
+                    local_owned_idx = local_owned_index_by_expert.get(expert_id)
+                    if local_owned_idx is None:
+                        continue
+                    start = int(dispatch_offsets[local_owned_idx].item())
+                    end = int(dispatch_offsets[local_owned_idx + 1].item())
+                    token_count = max(0, end - start)
+                    if token_count <= 0:
+                        continue
+                    resident_group_counts[slot_idx] = token_count
+                    hidden_segments.append(dispatched_hidden_states[start:end])
+                    segment_targets.append((slot_idx, start, end))
+
+                if layer.layer_idx == 0:
+                    logger.info(
+                        "Hybrid MC2 single-dispatch wave: rank=%s stage=%s wave=%s active_local_experts=%s dispatched_tokens=%s resident_capacity=%s",
+                        layer.rank if hasattr(layer, "rank") else -1,
+                        len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                        wave_idx,
+                        len(local_wave_group),
+                        int(resident_group_counts.sum().item()),
+                        resident_capacity,
+                    )
+
+                if not hidden_segments:
+                    continue
+
+                wave_hidden_states = torch.cat(hidden_segments, dim=0)
+                runtime_w13_weight = getattr(layer, "runtime_w13_weight", None)
+                runtime_w2_weight = getattr(layer, "runtime_w2_weight", None)
+                if runtime_w13_weight is None or runtime_w2_weight is None:
+                    raise RuntimeError(
+                        "Missing runtime expert weights for hybrid mode2 "
+                        f"single-dispatch path at layer={getattr(layer, 'layer_idx', -1)}.")
+                wave_output = unified_apply_mlp(
+                    hidden_states=wave_hidden_states,
+                    w1=runtime_w13_weight,
+                    w1_scale=None,
+                    w2=runtime_w2_weight,
+                    w2_scale=None,
+                    group_list=resident_group_counts,
+                    dynamic_scale=None,
+                    group_list_type=1,
+                    w1_scale_bias=None,
+                    w2_scale_bias=None,
+                    topk_scales=None,
+                    with_quant=False,
+                    fusion=False,
+                    need_trans=True)
+                output_cursor = 0
+                for _slot_idx, start, end in segment_targets:
+                    token_count = end - start
+                    dispatched_output[start:end] = wave_output[
+                        output_cursor:output_cursor + token_count]
+                    output_cursor += token_count
+            final_hidden_states = token_dispatcher.token_combine(dispatched_output)
+        finally:
+            token_dispatcher.num_experts = old_dispatch_num_experts
+
+        layer.lossless_hybrid_rank_resident_expert_ids = [
+            list(expert_ids) for expert_ids in wave_plans[-1]["final_rank_resident"]
+        ]
+        layer.lossless_hybrid_rank_lru = [
+            list(expert_ids) for expert_ids in wave_plans[-1]["final_rank_resident"]
+        ]
+        if 0 <= local_rank_idx < len(wave_plans[-1]["final_rank_resident"]):
+            layer.materialize_hybrid_resident_experts(
+                list(wave_plans[-1]["final_rank_resident"][local_rank_idx]))
+        layer.lossless_hybrid_last_stats = {
+            "waves": len(wave_plans),
+            "local_wave_tokens": local_wave_counts,
+            "local_cpu_miss": local_cpu_miss,
+            "local_resident_hits": local_resident_hits,
+        }
+        if layer.layer_idx == 0 and wave_plans:
+            logger.info(
+                "Hybrid MoE single-dispatch execution: rank=%s layer=%s stage=%s waves=%s resident_hits=%s cpu_miss=%s local_wave_tokens=%s resident=%s dispatch_experts=%s",
+                layer.rank if hasattr(layer, "rank") else -1,
+                layer.layer_idx,
+                len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                len(wave_plans),
+                local_resident_hits,
+                local_cpu_miss,
+                local_wave_counts[:8],
+                getattr(layer, "lossless_hybrid_resident_expert_ids", [])[:8],
+                dispatch_num_experts,
+            )
+        return final_hidden_states
+
+    def _execute_single_wave(
+            self,
+            layer: torch.nn.Module,
+            hidden_states: torch.Tensor,
+            logical_topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor,
+            row_idx: torch.Tensor,
+            global_num_experts: int,
+            shared_experts: Optional[Any],
+            log2phy: Optional[Any],
+            mc2_mask: Optional[torch.Tensor],
+            enable_force_load_balance: bool,
+            kwargs: dict[str, Any],
+            ids_already_runtime_remapped: bool = False) -> torch.Tensor:
+        moe_comm_method = get_forward_context().moe_comm_method
+        topk_ids = logical_topk_ids
+        downstream_log2phy = log2phy
+        if (log2phy is not None
+                and not ids_already_runtime_remapped
+                and moe_comm_method.__class__.__name__ != "AlltoAllCommImpl"):
+            logical_topk_for_diag = topk_ids
+            topk_ids = log2phy[topk_ids]
+            # MC2 token_dispatch also accepts log2phy and applies it internally.
+            # Once we remap here for the mode3/4 runtime-buffer path, do not
+            # pass the same map downstream or expert ids are remapped twice.
+            downstream_log2phy = None
+            invalid_mask = topk_ids < 0
+            if torch.any(invalid_mask):
+                invalid_logical = logical_topk_for_diag[invalid_mask].detach()
+                invalid_head = invalid_logical[:16].to(device="cpu").tolist()
+                rank_owned = getattr(layer,
+                                     "lossless_hybrid_rank_owned_expert_ids",
+                                     None)
+                rank_owned_head = []
+                rank_owned_counts = []
+                if rank_owned is not None:
+                    rank_owned_counts = [len(ids) for ids in rank_owned]
+                    rank_owned_head = [
+                        [int(expert_id) for expert_id in ids[:8]]
+                        for ids in rank_owned
+                    ]
+                valid_logical = torch.nonzero(
+                    log2phy >= 0, as_tuple=False).flatten()
+                valid_head = valid_logical[:16].to(device="cpu").tolist()
+                valid_tail = valid_logical[-16:].to(device="cpu").tolist()
+                raise RuntimeError(
+                    "Invalid remapped topk_ids encountered before fused "
+                    f"MoE execution at layer={getattr(layer, 'layer_idx', -1)}: "
+                    f"invalid_count={int(invalid_mask.sum().item())} "
+                    f"invalid_logical_head={invalid_head} "
+                    f"valid_logical_head={valid_head} "
+                    f"valid_logical_tail={valid_tail} "
+                    f"rank_owned_counts={rank_owned_counts} "
+                    f"rank_owned_head={rank_owned_head}")
+        if enable_force_load_balance and not self.use_aclgraph:
+            topk_ids = (
+                torch.arange(topk_ids.numel(), device=topk_ids.device)
+                % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
+
+        runtime_w13_weight = getattr(layer, "runtime_w13_weight", None)
+        runtime_w2_weight = getattr(layer, "runtime_w2_weight", None)
+        active_w13_weight = (runtime_w13_weight if runtime_w13_weight is not None
+                             else _active_moe_weight_view(layer,
+                                                          layer.w13_weight))
+        active_w2_weight = (runtime_w2_weight if runtime_w2_weight is not None
+                            else _active_moe_weight_view(layer,
+                                                         layer.w2_weight))
+        if (getattr(layer, "elastic_execution_mode", 0) == 1
+                and getattr(layer, "lossless_mode1_native_parity_ready", False)
+                and getattr(layer, "layer_idx", -1) == 0
+                and _env_flag("VLLM_ASCEND_MODE1_EXECUTE_SHAPE_LOG", "1")):
+            in_profile = _mode1_in_profile_run()
+            shape_flag = ("_mode1_execute_shape_logged_profile"
+                          if in_profile else "_mode1_execute_shape_logged_live")
+            if not getattr(layer, shape_flag, False):
+                dispatch_log2phy = getattr(
+                    layer, "lossless_runtime_dispatch_log2phy", None)
+                runtime_log2phy = getattr(layer, "elastic_runtime_log2phy", None)
+                logger.warning(
+                    "Mode1 execute shape state: phase=%s mode=%s layer=%s "
+                    "active_local=%s local_num=%s moe_local=%s loaded_local=%s "
+                    "loaded_capacity=%s runtime_capacity=%s w13_shape=%s "
+                    "w2_shape=%s runtime_w13_shape=%s runtime_w2_shape=%s "
+                    "active_w13_shape=%s active_w2_shape=%s topk_shape=%s "
+                    "expert_map_shape=%s log2phy_shape=%s runtime_log2phy_shape=%s "
+                    "dispatch_log2phy_shape=%s native_parity_ready=%s "
+                    "runtime_activated=%s lossless_loaded_offloaded=%s "
+                    "direct_preloaded_ok=%s already_remapped=%s comm_impl=%s",
+                    "profile" if in_profile else "live",
+                    getattr(layer, "elastic_execution_mode", 0),
+                    getattr(layer, "layer_idx", -1),
+                    int(getattr(layer, "active_local_num_experts", -1)),
+                    int(getattr(layer, "local_num_experts", -1)),
+                    int(getattr(getattr(layer, "moe_config", None),
+                                "num_local_experts", -1)),
+                    int(getattr(layer, "loaded_local_num_experts", -1)),
+                    int(getattr(layer, "loaded_weight_capacity", -1)),
+                    int(getattr(layer, "runtime_weight_capacity", -1)),
+                    tuple(getattr(getattr(layer, "w13_weight", None), "shape", ())),
+                    tuple(getattr(getattr(layer, "w2_weight", None), "shape", ())),
+                    None if runtime_w13_weight is None else tuple(
+                        runtime_w13_weight.shape),
+                    None if runtime_w2_weight is None else tuple(
+                        runtime_w2_weight.shape),
+                    tuple(active_w13_weight.shape),
+                    tuple(active_w2_weight.shape),
+                    tuple(topk_ids.shape),
+                    tuple(getattr(getattr(layer, "expert_map", None), "shape", ())),
+                    tuple(getattr(getattr(layer, "log2phy", None), "shape", ())),
+                    tuple(getattr(runtime_log2phy, "shape", ())),
+                    tuple(getattr(dispatch_log2phy, "shape", ())),
+                    bool(getattr(layer, "lossless_mode1_native_parity_ready",
+                                 False)),
+                    bool(getattr(layer, "lossless_runtime_activated", False)),
+                    bool(getattr(layer, "lossless_loaded_offloaded", False)),
+                    bool(getattr(layer,
+                                 "_lossless_mode1_direct_preloaded_activation_ok",
+                                 False)),
+                    ids_already_runtime_remapped,
+                    moe_comm_method.__class__.__name__,
+                )
+                setattr(layer, shape_flag, True)
+        if (getattr(layer, "elastic_execution_mode", 0) == 1
+                and getattr(layer, "lossless_mode1_native_parity_ready", False)
+                and not getattr(layer, "_mode1_execute_mapping_validated",
+                                False)):
+            validate_mapping = getattr(
+                layer, "_validate_mode1_lossless_active_mapping", None)
+            if callable(validate_mapping):
+                validate_mapping("execute_single_wave")
+            layer._mode1_execute_mapping_validated = True
+        if (getattr(layer, "elastic_execution_mode", 0) in (1, 4)
+                and getattr(layer, "lossless_mode1_native_parity_ready", False)
+                and getattr(layer, "layer_idx", -1) == 0
+                and (not _mode1_in_profile_run()
+                     or _env_flag("VLLM_ASCEND_MODE1_DIAG_DURING_PROFILE", "0"))
+                and not getattr(layer, "_mode1_execute_single_wave_logged", False)):
+            topk_diag = {}
+            remap_diag = {}
+            weight_diag = {}
+            if _env_flag("VLLM_ASCEND_MODE1_EXECUTE_TOPK_DIAG", "1"):
+                try:
+                    flat_topk = topk_ids.detach().to(device="cpu").reshape(-1)
+                    if flat_topk.numel() > 0:
+                        unique_ids, counts = torch.unique(flat_topk,
+                                                          return_counts=True)
+                        order = torch.argsort(counts, descending=True)
+                        top_pairs = [
+                            (int(unique_ids[int(idx)].item()),
+                             int(counts[int(idx)].item()))
+                            for idx in order[:8].tolist()
+                        ]
+                        topk_diag = {
+                            "min": int(flat_topk.min().item()),
+                            "max": int(flat_topk.max().item()),
+                            "top": top_pairs,
+                            "head": [
+                                int(v) for v in flat_topk[:16].tolist()
+                            ],
+                        }
+                    else:
+                        topk_diag = {"empty": True}
+                except Exception as exc:
+                    topk_diag = {"error": repr(exc)}
+                try:
+                    if log2phy is not None and topk_ids.numel() > 0:
+                        remapped = log2phy[topk_ids].detach().to(
+                            device="cpu").reshape(-1)
+                        remap_diag = {
+                            "min": int(remapped.min().item()),
+                            "max": int(remapped.max().item()),
+                            "head": [
+                                int(v) for v in remapped[:16].tolist()
+                            ],
+                            "negative": int((remapped < 0).sum().item()),
+                        }
+                except Exception as exc:
+                    remap_diag = {"error": repr(exc)}
+                try:
+                    sample_values = max(
+                        1,
+                        int(
+                            os.environ.get(
+                                "VLLM_ASCEND_MODE1_EXECUTE_WEIGHT_DIAG_VALUES",
+                                "8")))
+
+                    def _fp(tensor: Optional[torch.Tensor],
+                            row: int) -> dict[str, Any]:
+                        if tensor is None:
+                            return {"ok": False, "why": "none"}
+                        if row < 0 or row >= int(tensor.shape[0]):
+                            return {
+                                "ok": False,
+                                "why": f"row_oob:{row}/{int(tensor.shape[0])}"
+                            }
+                        vals = tensor[int(row)].reshape(-1)[:sample_values].detach().to(
+                            dtype=torch.float32, device="cpu")
+                        return {
+                            "ok": True,
+                            "sum": round(float(vals.sum().item()), 6),
+                            "abs_mean": round(float(vals.abs().mean().item()), 6),
+                            "head": [
+                                round(float(v), 6)
+                                for v in vals[:min(4, int(vals.numel()))].tolist()
+                            ],
+                        }
+
+                    def _diff(lhs: Optional[torch.Tensor],
+                              rhs: Optional[torch.Tensor],
+                              row: int) -> Optional[float]:
+                        if lhs is None or rhs is None:
+                            return None
+                        if row < 0 or row >= int(lhs.shape[0]) or row >= int(
+                                rhs.shape[0]):
+                            return None
+                        lvals = lhs[int(row)].reshape(
+                            -1)[:sample_values].detach().to(dtype=torch.float32,
+                                                             device="cpu")
+                        rvals = rhs[int(row)].reshape(
+                            -1)[:sample_values].detach().to(dtype=torch.float32,
+                                                             device="cpu")
+                        count = min(int(lvals.numel()), int(rvals.numel()))
+                        if count <= 0:
+                            return None
+                        return round(
+                            float((lvals[:count] - rvals[:count]).abs().mean().item()),
+                            6)
+
+                    weight_diag = {
+                        "active_row0_w13": _fp(active_w13_weight, 0),
+                        "active_row0_w2": _fp(active_w2_weight, 0),
+                        "loaded_row0_w13": _fp(getattr(layer, "w13_weight", None), 0),
+                        "loaded_row0_w2": _fp(getattr(layer, "w2_weight", None), 0),
+                        "runtime_row0_w13": _fp(runtime_w13_weight, 0),
+                        "runtime_row0_w2": _fp(runtime_w2_weight, 0),
+                        "loaded_vs_runtime_w13_row0": _diff(
+                            getattr(layer, "w13_weight", None), runtime_w13_weight, 0),
+                        "loaded_vs_runtime_w2_row0": _diff(
+                            getattr(layer, "w2_weight", None), runtime_w2_weight, 0),
+                    }
+                except Exception as exc:
+                    weight_diag = {"error": repr(exc)}
+            logger.info(
+                "Mode1/4 execute_single_wave: mode=%s layer=%s active_local=%s local_num=%s "
+                "moe_config_local=%s loaded_capacity=%s runtime_w13_shape=%s "
+                "runtime_w2_shape=%s active_w13_shape=%s active_w2_shape=%s "
+                "topk_shape=%s log2phy=%s already_remapped=%s comm_impl=%s "
+                "topk_diag=%s remap_diag=%s weight_diag=%s",
+                getattr(layer, "elastic_execution_mode", 0),
+                getattr(layer, "layer_idx", -1),
+                int(getattr(layer, "active_local_num_experts", -1)),
+                int(getattr(layer, "local_num_experts", -1)),
+                int(getattr(getattr(layer, "moe_config", None),
+                            "num_local_experts", -1)),
+                int(getattr(layer, "loaded_weight_capacity", -1)),
+                None if runtime_w13_weight is None else tuple(runtime_w13_weight.shape),
+                None if runtime_w2_weight is None else tuple(runtime_w2_weight.shape),
+                tuple(active_w13_weight.shape),
+                tuple(active_w2_weight.shape),
+                tuple(topk_ids.shape),
+                log2phy is not None,
+                ids_already_runtime_remapped,
+                moe_comm_method.__class__.__name__,
+                topk_diag,
+                remap_diag,
+                weight_diag,
+            )
+            layer._mode1_execute_single_wave_logged = True
+        return moe_comm_method.fused_experts(
+            hidden_states=hidden_states,
+            w1=active_w13_weight,
+            w2=active_w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            row_idx=row_idx,
+            global_num_experts=global_num_experts,
+            expert_map=layer.expert_map,
+            shared_experts=shared_experts,
+            quantized_x_for_share=kwargs.get("quantized_x_for_share"),
+            dynamic_scale_for_share=kwargs.get("dynamic_scale_for_share"),
+            log2phy=downstream_log2phy,
+            global_redundant_expert_num=kwargs.get(
+                "global_redundant_expert_num", 0),
+            need_trans=True,
+            dynamic_eplb=self.dynamic_eplb,
+            mc2_mask=mc2_mask)
+
+    def process_weights_after_loading(self, layer):
+        pass  # debug log removed
+        super(UnquantizedFusedMoEMethod,
+              self).process_weights_after_loading(layer)
+        pass  # debug log removed
+        # Preserve the original Parameter objects. Rebinding them here breaks
+        # the storage that weight_loader has already populated.
+        layer.w13_weight.data = self._maybe_pad_weight(layer.w13_weight.data)
+        layer.w2_weight.data = self._maybe_pad_weight(layer.w2_weight.data)
+        mode1_reload = (
+            getattr(layer, "elastic_moe_mode", "lossy") == "lossless"
+            and int(getattr(layer, "elastic_execution_mode", 0)) == 1)
+        mode1_pre_format_activation_done = False
+
+        def _diag_enabled() -> bool:
+            if not (mode1_reload and _env_flag(
+                    "VLLM_ASCEND_MODE1_RELOAD_CHAIN_DIAG", "0")):
+                return False
+            raw_layers = os.getenv("VLLM_ASCEND_MODE1_RELOAD_CHAIN_DIAG_LAYERS",
+                                   "0")
+            if raw_layers.strip().lower() in ("all", "*"):
+                return True
+            try:
+                return int(getattr(layer, "layer_idx", -1)) in {
+                    int(item.strip())
+                    for item in raw_layers.split(",") if item.strip()
+                }
+            except (TypeError, ValueError):
+                return int(getattr(layer, "layer_idx", -1)) == 0
+
+        def _tensor_fp(tensor: object, row: int) -> dict[str, Any]:
+            if not torch.is_tensor(tensor):
+                return {"ok": False, "why": "not_tensor"}
+            rows = int(tensor.shape[0]) if getattr(tensor, "ndim", 0) >= 1 else 0
+            if row < 0 or row >= rows:
+                return {"ok": False, "why": f"row_oob:{row}/{rows}"}
+            try:
+                sample_values = _env_int(
+                    "VLLM_ASCEND_MODE1_RELOAD_CHAIN_DIAG_VALUES",
+                    8,
+                    minimum=1)
+                flat = tensor[int(row)].reshape(-1).detach()
+                total_values = int(flat.numel())
+                if total_values <= sample_values:
+                    offsets = list(range(total_values))
+                    sampled = flat
+                else:
+                    offsets = sorted({
+                        int(round(i * (total_values - 1) / (sample_values - 1)))
+                        for i in range(sample_values)
+                    }) if sample_values > 1 else [0]
+                    sampled = flat[torch.tensor(offsets, device=flat.device)]
+                vals = sampled.to(dtype=torch.float32, device="cpu")
+                if vals.numel() == 0:
+                    return {"ok": False, "why": "empty"}
+                abs_vals = vals.abs()
+                return {
+                    "ok": True,
+                    "sum": round(float(vals.sum().item()), 6),
+                    "abs_mean": round(float(abs_vals.mean().item()), 6),
+                    "abs_max": round(float(abs_vals.max().item()), 6),
+                    "zero_like": bool(float(abs_vals.max().item()) == 0.0),
+                    "sample_offsets": offsets[:min(4, len(offsets))],
+                    "numel": total_values,
+                    "head": [
+                        round(float(v), 6)
+                        for v in vals[:min(4, int(vals.numel()))].tolist()
+                    ],
+                }
+            except Exception as exc:
+                return {"ok": False, "why": repr(exc)}
+
+        def _map_head(name: str) -> list[int] | str:
+            tensor = getattr(layer, name, None)
+            if not torch.is_tensor(tensor):
+                return "none"
+            try:
+                return [int(v) for v in tensor.detach().cpu().tolist()[:16]]
+            except Exception:
+                return "copy_failed"
+
+        def _storage_nbytes(tensor: object) -> int:
+            if not torch.is_tensor(tensor):
+                return 0
+            try:
+                return int(tensor.untyped_storage().nbytes())
+            except Exception:
+                try:
+                    return int(tensor.storage().nbytes())
+                except Exception:
+                    return 0
+
+        def _log_reload_diag(stage: str) -> None:
+            if not _diag_enabled():
+                return
+            active_slot = 0
+            loaded_slot = 0
+            try:
+                expert_map = getattr(layer, "expert_map", None)
+                if torch.is_tensor(expert_map):
+                    expert_slots = [
+                        int(v) for v in expert_map.detach().cpu().tolist()
+                    ]
+                    active_slot = next((v for v in expert_slots if v >= 0), 0)
+                loaded_map = getattr(layer, "loaded_expert_map", None)
+                if torch.is_tensor(loaded_map):
+                    loaded_slots = [
+                        int(v) for v in loaded_map.detach().cpu().tolist()
+                    ]
+                    loaded_slot = next((v for v in loaded_slots if v >= 0), 0)
+            except Exception:
+                active_slot = 0
+                loaded_slot = 0
+            runtime_w13 = getattr(layer, "runtime_w13_weight", None)
+            runtime_w2 = getattr(layer, "runtime_w2_weight", None)
+            logger.warning(
+                "Mode1 reload-chain diag: stage=%s layer=%s target_floor=%s "
+                "active_local=%s local_num=%s moe_local=%s loaded_local=%s "
+                "loaded_capacity=%s w13_shape=%s w2_shape=%s "
+                "runtime_w13_shape=%s runtime_w2_shape=%s w13_storage=%s "
+                "w2_storage=%s expert_map_head=%s loaded_map_head=%s "
+                "log2phy_head=%s active_slot=%s loaded_slot=%s "
+                "w13_active=%s w13_loaded=%s w13_runtime=%s w2_active=%s "
+                "w2_loaded=%s w2_runtime=%s",
+                stage,
+                int(getattr(layer, "layer_idx", -1)),
+                _mode1_target_floor_for_weight_reload(),
+                int(getattr(layer, "active_local_num_experts", -1)),
+                int(getattr(layer, "local_num_experts", -1)),
+                int(getattr(getattr(layer, "moe_config", None),
+                            "num_local_experts", -1)),
+                int(getattr(layer, "loaded_local_num_experts", -1)),
+                int(getattr(layer, "loaded_weight_capacity", -1)),
+                tuple(getattr(getattr(layer, "w13_weight", None), "shape", ())),
+                tuple(getattr(getattr(layer, "w2_weight", None), "shape", ())),
+                tuple(getattr(runtime_w13, "shape", ())),
+                tuple(getattr(runtime_w2, "shape", ())),
+                _storage_nbytes(getattr(layer, "w13_weight", None)),
+                _storage_nbytes(getattr(layer, "w2_weight", None)),
+                _map_head("expert_map"),
+                _map_head("loaded_expert_map"),
+                _map_head("log2phy"),
+                active_slot,
+                loaded_slot,
+                _tensor_fp(getattr(layer, "w13_weight", None), active_slot),
+                _tensor_fp(getattr(layer, "w13_weight", None), loaded_slot),
+                _tensor_fp(runtime_w13, active_slot),
+                _tensor_fp(getattr(layer, "w2_weight", None), active_slot),
+                _tensor_fp(getattr(layer, "w2_weight", None), loaded_slot),
+                _tensor_fp(runtime_w2, active_slot),
+            )
+
+        _log_reload_diag("after_super_before_pad")
+        if mode1_reload:
+            # Mode1 may load a redundant floor2/floor4 layout while the active
+            # execution path still reads the dense prefix view.  Materialize
+            # that prefix before npu_format_cast: after format conversion,
+            # copying `weight[slot]` is no longer a reliable logical expert-row
+            # copy on Ascend formatted storage and can silently corrupt logits.
+            layer.activate_lossless_primary_experts()
+            mode1_pre_format_activation_done = True
+            _log_reload_diag("after_activate_primary_before_pre_format_stash")
+            stash_primary = getattr(
+                layer, "_stash_lossless_primary_prefix_for_mode1_full_world",
+                None)
+            if callable(stash_primary):
+                stash_primary()
+            _log_reload_diag("after_stash_primary_before_pre_format_enforce")
+            enforce_target_floor = getattr(
+                layer,
+                "enforce_mode1_target_floor_loaded_capacity_after_reload",
+                None,
+            )
+            if callable(enforce_target_floor):
+                enforce_target_floor(reason="process_weights_after_loading:pre_format")
+            _log_reload_diag("after_pre_format_enforce")
+        if layer.w13_weight.device.type == "cpu":
+            pass  # CPU-staged reload finalizes tensor format after the buffers are moved back to NPU.
+        elif not is_310p():
+            if mode1_reload:
+                _trim_npu_allocator_for_mode1_reload(layer,
+                                                     "before_w13_format_cast")
+            layer.w13_weight.data = _maybe_npu_format_cast_for_mode1_reload(
+                layer.w13_weight.data,
+                ACL_FORMAT_FRACTAL_NZ,
+                layer=layer,
+                weight_name="w13",
+                mode1_reload=mode1_reload)
+            if mode1_reload:
+                _trim_npu_allocator_for_mode1_reload(layer,
+                                                     "before_w2_format_cast")
+            layer.w2_weight.data = _maybe_npu_format_cast_for_mode1_reload(
+                layer.w2_weight.data,
+                ACL_FORMAT_FRACTAL_NZ,
+                layer=layer,
+                weight_name="w2",
+                mode1_reload=mode1_reload)
+            if mode1_reload:
+                _trim_npu_allocator_for_mode1_reload(layer,
+                                                     "after_weight_format_cast")
+                _log_reload_diag("after_weight_format_cast")
+        pass  # debug log removed
+        if getattr(layer, "lossless_zero_redundancy_preallocated_loaded", False):
+            if mode1_reload:
+                # Mode1 uses a fixed-slot loaded layout: the primary full-world
+                # view may only expose loaded_local_num_experts rows, while
+                # smaller floors reuse the preallocated tail slots.  Clearing the
+                # tail here corrupts floor2/floor4 execution after reload.
+                valid_rows = int(
+                    getattr(layer, "loaded_weight_capacity",
+                            getattr(layer, "loaded_local_num_experts", 0)))
+                if (getattr(layer, "layer_idx", -1) == 0
+                        and _env_flag(
+                            "VLLM_ASCEND_MODE1_WEIGHT_RELOAD_CAPACITY_LOG",
+                            "1")):
+                    logger.info(
+                        "Mode1 preserve preallocated loaded tail rows after reload: "
+                        "layer=%s loaded_local=%s loaded_capacity=%s w13_rows=%s w2_rows=%s",
+                        getattr(layer, "layer_idx", -1),
+                        int(getattr(layer, "loaded_local_num_experts", -1)),
+                        valid_rows,
+                        int(layer.w13_weight.shape[0]),
+                        int(layer.w2_weight.shape[0]),
+                    )
+            else:
+                valid_rows = int(getattr(layer, "loaded_local_num_experts", 0))
+            valid_rows = max(
+                0,
+                min(valid_rows, int(layer.w13_weight.shape[0]),
+                    int(layer.w2_weight.shape[0])),
+            )
+            if int(layer.w13_weight.shape[0]) > valid_rows:
+                layer.w13_weight.data[valid_rows:].zero_()
+            if int(layer.w2_weight.shape[0]) > valid_rows:
+                layer.w2_weight.data[valid_rows:].zero_()
+        if getattr(layer, "elastic_moe_mode", "lossy") == "lossless":
+            pass  # debug log removed
+            if not mode1_pre_format_activation_done:
+                layer.activate_lossless_primary_experts()
+                stash_primary = getattr(
+                    layer, "_stash_lossless_primary_prefix_for_mode1_full_world",
+                    None)
+                if callable(stash_primary):
+                    stash_primary()
+                enforce_target_floor = getattr(
+                    layer,
+                    "enforce_mode1_target_floor_loaded_capacity_after_reload",
+                    None,
+                )
+                if callable(enforce_target_floor):
+                    enforce_target_floor(reason="process_weights_after_loading")
+                _log_reload_diag("after_post_format_enforce")
+            validate_mapping = getattr(
+                layer, "_validate_mode1_lossless_active_mapping", None)
+            if callable(validate_mapping):
+                validate_mapping("process_weights_after_loading")
+            _log_reload_diag("after_validate_mapping")
+            pass  # debug log removed
+
+    def invalidate_lossless_runtime_state_for_reload(
+            self,
+            layer: Optional[torch.nn.Module] = None,
+            reason: str = "reload") -> None:
+        target = layer if layer is not None else self
+        if getattr(target, "elastic_moe_mode", None) != "lossless":
+            return False
+        had_runtime = (getattr(target, "runtime_w13_weight", None) is not None
+                       or getattr(target, "runtime_w2_weight", None) is not None
+                       or getattr(target, "runtime_w13_buffer", None) is not None
+                       or getattr(target, "runtime_w2_buffer", None) is not None
+                       or getattr(target, "lossless_cpu_w13_weight", None) is not None
+                       or getattr(target, "lossless_cpu_w2_weight", None) is not None)
+        if getattr(target, "layer_idx", -1) == 0 and had_runtime:
+            pass  # debug log removed
+        target.runtime_w13_weight = None
+        target.runtime_w2_weight = None
+        target.runtime_w13_buffer = None
+        target.runtime_w2_buffer = None
+        target.runtime_weight_capacity = 0
+        target.lossless_runtime_activated = False
+        return had_runtime
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
+        enable_force_load_balance: bool = False,
+        shared_experts: Optional[Any] = None,
+        log2phy: Optional[Any] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        active_expert_mask = kwargs.get("active_expert_mask")
+        if active_expert_mask is not None:
+            mask = active_expert_mask.to(device=router_logits.device,
+                                         dtype=torch.bool)
+            # The topology setter validates that the mask is nonempty. A
+            # torch.any() branch here synchronizes an NPU scalar with the host,
+            # which is illegal while ACLGraph captures the full MoE path.
+            min_value = torch.finfo(router_logits.dtype).min
+            router_logits = router_logits.masked_fill(~mask, min_value)
+
+        topk_weights, topk_ids, row_idx = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            global_num_experts=global_num_experts)
+
+        layer_idx = kwargs.get("layer_idx", getattr(layer, "layer_idx", -1))
+        is_dummy = kwargs.get("is_dummy", False)
+        if (int(getattr(layer, "elastic_execution_mode", 0)) == 3
+                and getattr(layer, "lossless_hybrid_active", False)):
+            logical_num_experts = int(
+                getattr(layer, "elastic_original_num_experts",
+                        router_logits.shape[-1]))
+            if topk_ids.numel() > 0:
+                invalid_topk_mask = (topk_ids < 0) | (topk_ids >= logical_num_experts)
+                if bool(torch.any(invalid_topk_mask).item()):
+                    invalid_count = int(torch.count_nonzero(invalid_topk_mask).item())
+                    invalid_head = topk_ids[invalid_topk_mask][:8].detach().cpu().tolist()
+                    if not getattr(layer, "_mode3_topk_recovery_logged", False):
+                        logger.warning(
+                            "Mode3 recovered invalid router topk ids using native torch topk: "
+                            "layer=%s invalid_count=%s invalid_head=%s logical_num_experts=%s",
+                            getattr(layer, "layer_idx", -1), invalid_count,
+                            invalid_head, logical_num_experts)
+                        layer._mode3_topk_recovery_logged = True
+                    topk_weights, topk_ids, row_idx = _recover_mode3_invalid_topk(
+                        hidden_states=x,
+                        router_logits=router_logits,
+                        top_k=top_k,
+                        renormalize=renormalize,
+                        scoring_func=scoring_func,
+                        layer=layer)
+        topk_weights = topk_weights.to(x.dtype)
+        moe_comm_method = get_forward_context().moe_comm_method
+        debug_info = getattr(get_forward_context(), "elastic_debug_info", None)
+        if debug_info is not None and not is_dummy:
+            flat_topk_ids = topk_ids.reshape(-1)
+            debug_info["pre_topk_min"] = (
+                int(flat_topk_ids.min().item())
+                if flat_topk_ids.numel() > 0 else -1)
+            debug_info["pre_topk_max"] = (
+                int(flat_topk_ids.max().item())
+                if flat_topk_ids.numel() > 0 else -1)
+            debug_info["pre_topk_unique"] = int(
+                torch.unique(flat_topk_ids).numel()) if flat_topk_ids.numel() > 0 else 0
+        logical_topk_ids = topk_ids
+        dummy_waste_timing = getattr(get_forward_context(),
+                                     "dummy_waste_timing", None)
+        dummy_profile_markers_enabled = (
+            bool(is_dummy)
+            and _env_flag("VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS", "0"))
+        dummy_selection_stats_enabled = _env_flag(
+            "VLLM_ASCEND_DUMMY_WASTE_SELECTION_STATS", "0")
+        dummy_selection_enabled = (
+            isinstance(dummy_waste_timing, dict)
+            and _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING", "0")
+            and dummy_selection_stats_enabled)
+        selected_topk_count = 0
+        selected_token_count = 0
+        selected_expert_count = 0
+        if dummy_selection_enabled:
+            try:
+                local_expert_map = expert_map
+                if local_expert_map is None:
+                    local_expert_map = getattr(layer, "expert_map", None)
+                if local_expert_map is not None and local_expert_map.numel() > 0:
+                    if local_expert_map.device != logical_topk_ids.device:
+                        local_expert_map = local_expert_map.to(
+                            device=logical_topk_ids.device)
+                    valid_ids = (
+                        (logical_topk_ids >= 0)
+                        & (logical_topk_ids < int(local_expert_map.numel())))
+                    safe_ids = logical_topk_ids.clamp(
+                        min=0, max=int(local_expert_map.numel()) - 1)
+                    local_slots = local_expert_map[safe_ids]
+                    selected_mask = valid_ids & (local_slots >= 0)
+                    selected_topk_count = int(
+                        torch.count_nonzero(selected_mask).item())
+                    if selected_mask.ndim > 1:
+                        selected_token_count = int(
+                            torch.count_nonzero(
+                                torch.any(selected_mask, dim=-1)).item())
+                    else:
+                        selected_token_count = selected_topk_count
+                    if selected_topk_count > 0:
+                        selected_expert_count = int(
+                            torch.unique(logical_topk_ids[selected_mask]).numel()
+                            .item())
+            except Exception:
+                logger.exception(
+                    "Failed to compute dummy local MoE selection stats")
+            if isinstance(dummy_waste_timing, dict):
+                dummy_waste_timing["_current_moe_selected_topk"] = (
+                    selected_topk_count)
+                dummy_waste_timing["_current_moe_selected_tokens"] = (
+                    selected_token_count)
+                dummy_waste_timing["_current_moe_selected_experts"] = (
+                    selected_expert_count)
+        ids_already_runtime_remapped = False
+        if (log2phy is not None
+                and moe_comm_method.__class__.__name__ != "AlltoAllCommImpl"):
+            # Keep mode=1/mode=2 shrink runtime aligned with common/native
+            # semantics: runtime log2phy is applied exactly once to the
+            # logical expert ids selected by the router. Downstream wave/
+            # single-wave helpers must not remap the already-dense ids again.
+            topk_ids = log2phy[topk_ids]
+            ids_already_runtime_remapped = True
+        # this is a naive implementation for experts load balance so as
+        # to avoid accumulating too much tokens on a single rank.
+        # currently it is only activated when doing profile runs.
+        if enable_force_load_balance and not self.use_aclgraph:
+            topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
+        # 考虑在dummy_run场景下也打开？
+        # if (enable_force_load_balance and not self.use_aclgraph) or is_dummy:
+        #     topk_ids = (torch.arange(topk_ids.numel(), device=topk_ids.device) % global_num_experts).to(torch.int32).reshape(topk_ids.shape)
+        #     # if is_dummy:
+        #     #     print("dummy run enable force load balance, layer_idx:", layer_idx)
+
+        # #记录topk_ids用于统计
+        # if topk_ids.shape[0] == 32:
+        #     moe_stats.record_topk_ids(self.ep_rank, layer_idx, old_topk_ids, topk_ids)
+        # mc = get_forward_context().moe_comm_method
+        # print("moe_comm_method:", type(mc), getattr(mc, "comm_type", None), getattr(mc, "__dict__", None))
+        try:
+            moe_stats.record_pattern(
+                layer_idx=int(layer_idx),
+                topk_ids=logical_topk_ids,
+                num_experts=int(global_num_experts),
+            )
+        except Exception:
+            logger.exception("Failed to record MoE pattern stats")
+        current_ep_size = int(
+            getattr(getattr(layer, "moe_parallel_config", None), "ep_size",
+                    0))
+        initial_ep_size = 0
+        if hasattr(layer, "_get_elastic_initial_ep_size"):
+            try:
+                initial_ep_size = int(layer._get_elastic_initial_ep_size())
+            except Exception:
+                initial_ep_size = 0
+        post_shrink_stage = (current_ep_size > 0 and initial_ep_size > 0
+                             and current_ep_size < initial_ep_size)
+        if (getattr(layer, "elastic_execution_mode", 0) == 3
+                and post_shrink_stage
+                and not getattr(layer, "lossless_hybrid_active", False)
+                and layer.layer_idx == 0
+                and not getattr(layer, "_mode3_hybrid_inactive_logged", False)):
+            logger.warning(
+                "Mode3 forward reached fused MoE without active hybrid state: "
+                "layer=%s is_dummy=%s ep_size=%s initial_ep_size=%s "
+                "active_local=%s num_experts=%s "
+                "runtime_log2phy=%s elastic_runtime_log2phy=%s "
+                "loaded_local=%s cpu_only_local=%s",
+                layer.layer_idx,
+                is_dummy,
+                current_ep_size,
+                initial_ep_size,
+                int(getattr(layer, "active_local_num_experts", 0)),
+                int(getattr(layer, "num_experts", 0)),
+                getattr(layer, "log2phy", None) is not None,
+                getattr(layer, "elastic_runtime_log2phy", None) is not None,
+                int(getattr(layer, "loaded_local_num_experts", 0)),
+                len(getattr(layer, "lossless_hybrid_cpu_only_expert_ids", [])),
+            )
+            layer._mode3_hybrid_inactive_logged = True
+        if getattr(layer, "lossless_hybrid_active", False):
+            is_mode4_remote_npu = (
+                int(getattr(layer, "elastic_execution_mode", 0)) in (4, 5))
+            if self._should_use_mode3_single_rank_allgather_path(
+                    layer=layer,
+                    shared_experts=shared_experts,
+                    is_dummy=is_dummy):
+                return self._execute_mode3_single_rank_allgather_hybrid(
+                    layer=layer,
+                    x=x,
+                    logical_topk_ids=logical_topk_ids,
+                    topk_weights=topk_weights,
+                    row_idx=row_idx,
+                    shared_experts=shared_experts,
+                    enable_force_load_balance=enable_force_load_balance,
+                    kwargs=kwargs)
+            if self._should_use_mode3_cross_layer_buffer_path(
+                    layer=layer,
+                    shared_experts=shared_experts,
+                    is_dummy=is_dummy):
+                try:
+                    return self._execute_mode3_single_dispatch_hybrid(
+                        layer=layer,
+                        x=x,
+                        logical_topk_ids=logical_topk_ids,
+                        topk_weights=topk_weights,
+                        row_idx=row_idx,
+                        shared_experts=shared_experts,
+                        enable_force_load_balance=enable_force_load_balance,
+                        kwargs=kwargs)
+                except RuntimeError as err:
+                    err_msg = str(err)
+                    fatal_mode3_markers = (
+                        "AclrtSynchronizeStreamWithTimeout",
+                        "copy_stream",
+                        "507015",
+                        "EZ9999",
+                        "ERR00100",
+                        "aicore",
+                        "AICORE",
+                        "aclnnIndex",
+                        "NPU out of memory",
+                        "out of memory",
+                        "Tried to allocate",
+                    )
+                    if is_mode4_remote_npu:
+                        raise RuntimeError(
+                            "Mode4 remote-NPU double-buffer path failed; "
+                            "refusing to fallback to mode2 CPU/materialize "
+                            f"wave path at layer={layer.layer_idx}. "
+                            f"Original error: {err}") from err
+                    if any(marker in err_msg for marker in fatal_mode3_markers):
+                        raise
+                    logger.warning(
+                        "Mode3 fallback to mode2 wave path: layer=%s stage=%s reason=%s",
+                        layer.layer_idx,
+                        len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                        err,
+                    )
+            elif is_mode4_remote_npu:
+                forward_context = get_forward_context()
+                moe_comm_method = getattr(forward_context, "moe_comm_method", None)
+                token_dispatcher = getattr(moe_comm_method, "token_dispatcher",
+                                           None)
+                raise RuntimeError(
+                    "Mode4 remote-NPU double-buffer requires the MC2 "
+                    "cross-layer buffer path; refusing to fallback to "
+                    "mode2 CPU/materialize wave path. "
+                    f"layer={layer.layer_idx} stage="
+                    f"{len(getattr(layer, 'lossless_hybrid_active_ranks', []))} "
+                    f"is_dummy={is_dummy} "
+                    f"shared_experts={shared_experts is not None} "
+                    f"moe_comm_type={getattr(forward_context, 'moe_comm_type', None)} "
+                    f"selected_moe_comm_type="
+                    f"{getattr(forward_context, 'selected_moe_comm_type', None)} "
+                    f"moe_comm_method="
+                    f"{moe_comm_method.__class__.__name__ if moe_comm_method is not None else None} "
+                    f"token_dispatcher="
+                    f"{token_dispatcher.__class__.__name__ if token_dispatcher is not None else None} "
+                    f"hybrid_active={getattr(layer, 'lossless_hybrid_active', False)}"
+                )
+            elif (getattr(layer, "elastic_execution_mode", 0) == 3
+                  and (getattr(get_forward_context(),
+                               "selected_moe_comm_type", None)
+                       == MoECommType.ALLTOALL
+                       or getattr(get_forward_context(), "moe_comm_type", None)
+                       == MoECommType.ALLTOALL)):
+                forward_context = get_forward_context()
+                selected_comm_type = getattr(forward_context,
+                                             "selected_moe_comm_type", None)
+                comm_type = getattr(forward_context, "moe_comm_type", None)
+                raise RuntimeError(
+                    "Mode3 CPU/NPU double-buffer does not support "
+                    "post-shrink AllToAll/prefill fallback. This usually "
+                    "means KV cache was under-sized and a request was "
+                    "preempted/resumed as a large prefill after shrink; "
+                    "fix KV headroom or reduce concurrency so mode3 stays "
+                    "on the MC2 decode path. "
+                    f"layer={layer.layer_idx} stage="
+                    f"{len(getattr(layer, 'lossless_hybrid_active_ranks', []))} "
+                    f"is_dummy={is_dummy} moe_comm_type={comm_type} "
+                    f"selected_moe_comm_type={selected_comm_type}"
+                )
+            elif (getattr(layer, "elastic_execution_mode", 0) == 3
+                  and layer.layer_idx == 0
+                  and not getattr(layer, "_mode3_gate_reject_logged", False)):
+                forward_context = get_forward_context()
+                moe_comm_method = getattr(forward_context, "moe_comm_method", None)
+                logger.warning(
+                    "Mode3 gate rejected current forward: layer=%s stage=%s is_dummy=%s "
+                    "shared_experts=%s moe_comm_type=%s selected_moe_comm_type=%s "
+                    "moe_comm_method=%s token_dispatcher=%s hybrid_active=%s",
+                    layer.layer_idx,
+                    len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                    is_dummy,
+                    shared_experts is not None,
+                    getattr(forward_context, "moe_comm_type", None),
+                    getattr(forward_context, "selected_moe_comm_type", None),
+                    moe_comm_method.__class__.__name__
+                    if moe_comm_method is not None else None,
+                    getattr(moe_comm_method, "token_dispatcher", None)
+                    is not None,
+                    getattr(layer, "lossless_hybrid_active", False),
+                )
+                layer._mode3_gate_reject_logged = True
+            wave_plans = layer._plan_lossless_hybrid_rank_waves(logical_topk_ids)
+            if wave_plans:
+                final_hidden_states = torch.zeros_like(x)
+                local_rank_idx = int(
+                    getattr(layer, "lossless_hybrid_active_rank_index", -1))
+                local_wave_counts = []
+                local_cpu_miss = 0
+                local_resident_hits = 0
+                prepared_mc2_mask = getattr(moe_comm_method, "mc2_mask", None)
+                use_dense_mc2_waves = (
+                    getattr(get_forward_context(), "moe_comm_type", None)
+                    == MoECommType.MC2)
+                has_real_mc2_tokens = True
+                if prepared_mc2_mask is not None and prepared_mc2_mask.numel() > 0:
+                    has_real_mc2_tokens = bool(
+                        torch.any(prepared_mc2_mask).item())
+                sync_mc2_multi_wave = use_dense_mc2_waves and len(wave_plans) > 1
+                grouped_dense_mc2_multi_wave = (
+                    sync_mc2_multi_wave
+                    and not self._should_disable_grouped_dense_mc2_multi_wave(
+                        layer))
+                active_rank_count = len(
+                    getattr(layer, "lossless_hybrid_active_ranks", []))
+                metadata_group = None
+                if active_rank_count > 1:
+                    metadata_group = getattr(layer.ep_group, "cpu_group",
+                                             layer.ep_group.device_group)
+                if (layer.layer_idx == 0 and sync_mc2_multi_wave
+                        and not grouped_dense_mc2_multi_wave):
+                    logger.info(
+                        "Hybrid MC2 mode2 swap path using per-wave single-pack MC2: rank=%s stage=%s waves=%s mode=%s",
+                        layer.rank if hasattr(layer, "rank") else -1,
+                        active_rank_count,
+                        len(wave_plans),
+                        getattr(layer, "elastic_execution_mode", -1),
+                    )
+                if self._should_use_mode2_single_dispatch_hybrid_path(
+                        layer=layer,
+                        wave_plans=wave_plans,
+                        use_dense_mc2_waves=use_dense_mc2_waves,
+                        shared_experts=shared_experts) and not is_dummy and has_real_mc2_tokens:
+                    if layer.layer_idx == 0:
+                        logger.info(
+                            "Hybrid MC2 single-dispatch mode enabled: rank=%s stage=%s waves=%s resident_capacity=%s mode=%s",
+                            layer.rank if hasattr(layer, "rank") else -1,
+                            active_rank_count,
+                            len(wave_plans),
+                            int(getattr(layer, "lossless_hybrid_resident_capacity", 0)),
+                            getattr(layer, "elastic_execution_mode", -1),
+                        )
+                    try:
+                        return self._execute_mode2_single_dispatch_hybrid(
+                            layer=layer,
+                            x=x,
+                            logical_topk_ids=logical_topk_ids,
+                            topk_weights=topk_weights,
+                            row_idx=row_idx,
+                            wave_plans=wave_plans,
+                            shared_experts=shared_experts,
+                            prepared_mc2_mask=prepared_mc2_mask,
+                            enable_force_load_balance=enable_force_load_balance,
+                            kwargs=kwargs,
+                            ids_already_runtime_remapped=
+                            ids_already_runtime_remapped,
+                            is_dummy=is_dummy)
+                    except RuntimeError as err:
+                        if "Hybrid mode2 single-dispatch" not in str(err):
+                            raise
+                        logger.warning(
+                            "Hybrid MC2 single-dispatch fallback to per-wave MC2 path: layer=%s stage=%s reason=%s",
+                            layer.layer_idx,
+                            active_rank_count,
+                            err,
+                        )
+                for wave_idx, wave_plan in enumerate(wave_plans):
+                    placeholder_only = False
+                    wave_mc2_mask = None
+                    grouped_dense_mc2_inputs = None
+                    grouped_dense_mc2_topks: list[int] = []
+                    global_wave_active_count = 0
+                    if use_dense_mc2_waves:
+                        if not wave_plan["wave_active_expert_ids"]:
+                            local_wave_counts.append(0)
+                            continue
+                        effective_token_mask = wave_plan["token_mask"]
+                        if prepared_mc2_mask is not None:
+                            mc2_active_mask = prepared_mc2_mask.to(
+                                device=effective_token_mask.device,
+                                dtype=torch.bool)
+                            effective_token_mask = (
+                                effective_token_mask & mc2_active_mask)
+                            if (is_dummy and not torch.any(effective_token_mask)
+                                    and torch.any(wave_plan["token_mask"])):
+                                effective_token_mask = wave_plan["token_mask"]
+                        if (effective_token_mask.numel() > 0
+                                and torch.any(effective_token_mask)):
+                            active_token_count = int(
+                                torch.count_nonzero(effective_token_mask).item())
+                        else:
+                            active_token_count = 0
+                        local_wave_counts.append(active_token_count)
+                        global_wave_active_count = int(active_token_count)
+                        if metadata_group is not None:
+                            gathered_wave_counts: list[Optional[int]] = [
+                                None
+                            ] * active_rank_count
+                            torch.distributed.all_gather_object(
+                                gathered_wave_counts,
+                                int(active_token_count),
+                                group=metadata_group)
+                            global_wave_active_count = max(
+                                int(value) for value in gathered_wave_counts
+                                if value is not None)
+                        if global_wave_active_count <= 0:
+                            continue
+                        if grouped_dense_mc2_multi_wave:
+                            local_group_topks = []
+                            if active_token_count > 0:
+                                local_group_topks = sorted({
+                                    int(value) for value in wave_plan["topk_mask"][
+                                        effective_token_mask].sum(dim=1).tolist()
+                                    if int(value) > 0
+                                }, reverse=True)
+                            if metadata_group is not None:
+                                gathered_group_topks: list[Optional[list[int]]] = [
+                                    None
+                                ] * active_rank_count
+                                torch.distributed.all_gather_object(
+                                    gathered_group_topks,
+                                    local_group_topks,
+                                    group=metadata_group)
+                                grouped_dense_mc2_topks = sorted({
+                                    int(value)
+                                    for group_values in gathered_group_topks
+                                    if group_values is not None
+                                    for value in group_values
+                                    if int(value) > 0
+                                }, reverse=True)
+                            else:
+                                grouped_dense_mc2_topks = local_group_topks
+                            if grouped_dense_mc2_topks:
+                                grouped_dense_mc2_inputs = (
+                                    self._build_grouped_mc2_wave_inputs(
+                                        hidden_states=x,
+                                        logical_topk_ids=logical_topk_ids,
+                                        topk_weights=topk_weights,
+                                        token_mask=effective_token_mask,
+                                        topk_mask=wave_plan["topk_mask"],
+                                        active_topk_values=grouped_dense_mc2_topks,
+                                        fallback_expert_id=int(
+                                            wave_plan["wave_active_expert_ids"][0]),
+                                        launch_topk=int(
+                                            wave_plan.get("wave_topk", 0)),
+                                    ))
+                            else:
+                                grouped_dense_mc2_inputs = []
+                        else:
+                            (token_indices, hidden_states, wave_ids, wave_weights,
+                             wave_row_idx, wave_mc2_mask,
+                             active_token_count) = self._build_padded_mc2_wave_inputs(
+                                 hidden_states=x,
+                                 logical_topk_ids=logical_topk_ids,
+                                 topk_weights=topk_weights,
+                                 token_mask=effective_token_mask,
+                                 topk_mask=wave_plan["topk_mask"],
+                                 fallback_expert_id=int(
+                                     wave_plan["wave_active_expert_ids"][0]),
+                                 forced_active_topk=int(
+                                     wave_plan.get("wave_topk", 0)))
+                            placeholder_only = (active_token_count == 0)
+                    else:
+                        token_indices, wave_ids, wave_weights, wave_row_idx = (
+                            self._compact_wave_topk(logical_topk_ids,
+                                                    topk_weights,
+                                                    wave_plan["token_mask"],
+                                                    wave_plan["topk_mask"]))
+                    if 0 <= local_rank_idx < len(wave_plan["rank_resident"]):
+                        target_resident = list(
+                            wave_plan["rank_resident"][local_rank_idx])
+                        current_resident = list(
+                            getattr(layer, "lossless_hybrid_resident_expert_ids",
+                                    []))
+                        local_cpu_miss += len(
+                            [expert_id for expert_id in target_resident
+                             if expert_id not in set(current_resident)])
+                        local_resident_hits += len(
+                            [expert_id for expert_id in target_resident
+                             if expert_id in set(current_resident)])
+                        layer.materialize_hybrid_resident_experts(target_resident)
+                    logical_num_experts = int(layer.elastic_original_num_experts)
+                    wave_log2phy_cpu = torch.full((logical_num_experts, ),
+                                                  -1,
+                                                  dtype=torch.int32,
+                                                  device=logical_topk_ids.device)
+                    for expert_id, slot in wave_plan["wave_expert_to_slot"].items():
+                        wave_log2phy_cpu[int(expert_id)] = int(slot)
+                    if not use_dense_mc2_waves:
+                        placeholder_only = (
+                            token_indices is None or wave_ids is None
+                            or wave_weights is None or wave_row_idx is None)
+                        if placeholder_only:
+                            if not wave_plan["wave_active_expert_ids"]:
+                                local_wave_counts.append(0)
+                                continue
+                            # Non-MC2 paths still need a non-empty local input
+                            # to enter the wave collective. Keep a single
+                            # zero-weight placeholder token.
+                            placeholder_expert = int(
+                                wave_plan["wave_active_expert_ids"][0])
+                            hidden_states = x[:1].clone()
+                            hidden_states.zero_()
+                            wave_ids = torch.full((1, 1),
+                                                  placeholder_expert,
+                                                  dtype=logical_topk_ids.dtype,
+                                                  device=logical_topk_ids.device)
+                            wave_weights = torch.zeros((1, 1),
+                                                       dtype=topk_weights.dtype,
+                                                       device=topk_weights.device)
+                            wave_row_idx = return_row_idx(wave_ids, 1)
+                            local_wave_counts.append(0)
+                        else:
+                            hidden_states = x.index_select(0, token_indices)
+                            local_wave_counts.append(int(token_indices.numel()))
+                    if prepared_mc2_mask is not None and not use_dense_mc2_waves:
+                        if placeholder_only:
+                            wave_mc2_mask = torch.zeros_like(
+                                prepared_mc2_mask[:1])
+                        else:
+                            wave_mc2_mask = prepared_mc2_mask.index_select(
+                                0, token_indices)
+                            if wave_mc2_mask.shape[0] != token_indices.shape[0]:
+                                raise RuntimeError(
+                                    "Hybrid wave mc2_mask shape mismatch at "
+                                    f"layer={layer.layer_idx}: "
+                                    f"wave_tokens={token_indices.shape[0]} "
+                                    f"mask_tokens={wave_mc2_mask.shape[0]}")
+                    if use_dense_mc2_waves:
+                        if grouped_dense_mc2_inputs is not None:
+                            executed_group = False
+                            for group_idx, group_pack in enumerate(
+                                    grouped_dense_mc2_inputs):
+                                (group_indices, group_hidden_states, group_ids,
+                                 group_weights, group_row_idx, group_mc2_mask,
+                                 group_active_count,
+                                 group_placeholder_only) = group_pack
+                                global_group_active = int(group_active_count)
+                                if metadata_group is not None:
+                                    gathered_group_counts: list[Optional[int]] = [
+                                        None
+                                    ] * active_rank_count
+                                    torch.distributed.all_gather_object(
+                                        gathered_group_counts,
+                                        int(group_active_count),
+                                        group=metadata_group)
+                                    global_group_active = max(
+                                        int(value) for value in gathered_group_counts
+                                        if value is not None)
+                                if global_group_active <= 0:
+                                    continue
+                                if layer.layer_idx == 0:
+                                    logger.info(
+                                        "Hybrid MC2 wave pack: rank=%s stage=%s wave=%s group=%s group_active_topk=%s active_tokens=%s launch_bs=%s wave_topk=%s placeholder_only=%s global_wave_experts=%s",
+                                        layer.rank if hasattr(layer, "rank") else -1,
+                                        len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                                        wave_idx,
+                                        group_idx,
+                                        grouped_dense_mc2_topks[group_idx]
+                                        if group_idx < len(grouped_dense_mc2_topks)
+                                        else -1,
+                                        group_active_count,
+                                        int(group_hidden_states.shape[0]),
+                                        int(group_ids.shape[1]),
+                                        group_placeholder_only,
+                                        len(wave_plan["wave_active_expert_ids"]),
+                                    )
+                                wave_output = self._execute_single_wave(
+                                    layer=layer,
+                                    hidden_states=group_hidden_states,
+                                    logical_topk_ids=group_ids,
+                                    topk_weights=group_weights,
+                                    row_idx=group_row_idx,
+                                    global_num_experts=int(
+                                        len(layer.lossless_hybrid_active_ranks) *
+                                        layer.lossless_hybrid_resident_capacity),
+                                    shared_experts=shared_experts,
+                                    log2phy=wave_log2phy_cpu,
+                                    mc2_mask=group_mc2_mask,
+                                    enable_force_load_balance=
+                                    enable_force_load_balance,
+                                    kwargs=kwargs,
+                                    ids_already_runtime_remapped=True)
+                                executed_group = True
+                                if (not group_placeholder_only
+                                        and group_indices is not None
+                                        and group_indices.numel() > 0):
+                                    final_hidden_states.index_add_(
+                                        0, group_indices,
+                                        wave_output[:group_active_count])
+                                # Grouped MC2 waves reuse the same resident slots
+                                # and comm buffers. Drain each group before
+                                # launching the next one to avoid overlapping
+                                # device work inside a single logical wave.
+                                torch.npu.synchronize()
+                            if sync_mc2_multi_wave and executed_group:
+                                torch.npu.synchronize()
+                            continue
+                        if layer.layer_idx == 0:
+                            logger.info(
+                                "Hybrid MC2 wave pack: rank=%s stage=%s wave=%s group=%s active_tokens=%s launch_bs=%s wave_topk=%s placeholder_only=%s global_wave_experts=%s",
+                                layer.rank if hasattr(layer, "rank") else -1,
+                                len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                                wave_idx,
+                                0,
+                                global_wave_active_count,
+                                int(hidden_states.shape[0]),
+                                int(wave_ids.shape[1]),
+                                placeholder_only,
+                                len(wave_plan["wave_active_expert_ids"]),
+                            )
+                        wave_output = self._execute_single_wave(
+                            layer=layer,
+                            hidden_states=hidden_states,
+                            logical_topk_ids=wave_ids,
+                            topk_weights=wave_weights,
+                            row_idx=wave_row_idx,
+                            global_num_experts=int(
+                                len(layer.lossless_hybrid_active_ranks) *
+                                layer.lossless_hybrid_resident_capacity),
+                            shared_experts=shared_experts,
+                            log2phy=wave_log2phy_cpu,
+                            mc2_mask=wave_mc2_mask,
+                            enable_force_load_balance=
+                            enable_force_load_balance,
+                            kwargs=kwargs,
+                            ids_already_runtime_remapped=True)
+                        if (not placeholder_only and token_indices is not None
+                                and token_indices.numel() > 0):
+                            final_hidden_states.index_add_(
+                                0, token_indices,
+                                wave_output[:active_token_count])
+                    elif not placeholder_only:
+                        wave_output = self._execute_single_wave(
+                            layer=layer,
+                            hidden_states=hidden_states,
+                            logical_topk_ids=wave_ids,
+                            topk_weights=wave_weights,
+                            row_idx=wave_row_idx,
+                            global_num_experts=int(
+                                len(layer.lossless_hybrid_active_ranks) *
+                                layer.lossless_hybrid_resident_capacity),
+                            shared_experts=shared_experts,
+                            log2phy=wave_log2phy_cpu,
+                            mc2_mask=wave_mc2_mask,
+                            enable_force_load_balance=enable_force_load_balance,
+                            kwargs=kwargs,
+                            ids_already_runtime_remapped=False)
+                        final_hidden_states.index_add_(0, token_indices,
+                                                       wave_output)
+                    # MC2 dispatch/combine stays asynchronous longer than the
+                    # AllToAll path. Do not overwrite resident slots for the
+                    # next wave until the current wave has fully drained.
+                    if sync_mc2_multi_wave:
+                        torch.npu.synchronize()
+                layer.lossless_hybrid_rank_resident_expert_ids = [
+                    list(expert_ids)
+                    for expert_ids in wave_plans[-1]["final_rank_resident"]
+                ]
+                layer.lossless_hybrid_rank_lru = [
+                    list(expert_ids)
+                    for expert_ids in wave_plans[-1]["final_rank_resident"]
+                ]
+                if 0 <= local_rank_idx < len(wave_plans[-1]["final_rank_resident"]):
+                    if sync_mc2_multi_wave:
+                        torch.npu.synchronize()
+                    layer.materialize_hybrid_resident_experts(
+                        list(wave_plans[-1]["final_rank_resident"][local_rank_idx]))
+                layer.lossless_hybrid_last_stats = {
+                    "waves": len(wave_plans),
+                    "local_wave_tokens": local_wave_counts,
+                    "local_cpu_miss": local_cpu_miss,
+                    "local_resident_hits": local_resident_hits,
+                }
+                if layer.layer_idx == 0 and wave_plans:
+                    logger.info(
+                        "Hybrid MoE wave execution: rank=%s layer=%s stage=%s waves=%s resident_hits=%s cpu_miss=%s local_wave_tokens=%s resident=%s",
+                        layer.rank if hasattr(layer, "rank") else -1,
+                        layer.layer_idx,
+                        len(getattr(layer, "lossless_hybrid_active_ranks", [])),
+                        len(wave_plans),
+                        local_resident_hits,
+                        local_cpu_miss,
+                        local_wave_counts[:8],
+                        getattr(layer, "lossless_hybrid_resident_expert_ids",
+                                [])[:8],
+                    )
+                return final_hidden_states
+
+        marker_ctx = nullcontext()
+        if dummy_profile_markers_enabled:
+            marker_ctx = _dummy_profile_range(
+                f"vllm_dummy_moe_compute rank={_profile_rank()} "
+                f"layer={layer_idx}")
+        with marker_ctx:
+            return self._execute_single_wave(
+                layer=layer,
+                hidden_states=x,
+                logical_topk_ids=logical_topk_ids,
+                topk_weights=topk_weights,
+                row_idx=row_idx,
+                global_num_experts=global_num_experts,
+                shared_experts=shared_experts,
+                log2phy=log2phy,
+                mc2_mask=None,
+                enable_force_load_balance=enable_force_load_balance,
+                kwargs=kwargs,
+                ids_already_runtime_remapped=ids_already_runtime_remapped)
+
+
+class AscendFusedMoE(FusedMoE):
+
+    # The moe_counter parameter is required during the initialization of EPLB
+    # to identify the current layer index within the MOE model.
+    moe_counter = -1
+
+    def __init__(
+        self,
+        num_experts: int,  # Global number of experts
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        reduce_results: bool = False,
+        renormalize: bool = True,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        ep_size: Optional[int] = None,
+        dp_size: Optional[int] = None,
+        prefix: str = "",
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        layer_idx: Optional[int] = -1,
+    ):
+        # Avoid constructing the native vLLM FusedMoE first. The base
+        # initializer allocates native expert weights, then this custom
+        # initializer immediately replaces them with Ascend-formatted weights.
+        # That transient allocation distorts KV-cache profiling and can leave
+        # enough allocator pressure to OOM when the cache is materialized.
+        torch.nn.Module.__init__(self)
+        AscendFusedMoE.moe_counter += 1
+        self.moe_instance_id = AscendFusedMoE.moe_counter
+        self.layer_idx = layer_idx
+
+        if params_dtype is None:
+            params_dtype = torch.get_default_dtype()
+        self.params_dtype = params_dtype
+
+        vllm_config = get_current_vllm_config()
+        self.model_type = vllm_config.model_config.hf_config.model_type
+        self.total_run_time = 0
+        self.total_comm_time = 0
+        self.is_sequence_parallel = False
+
+        self.moe_parallel_config = FusedMoEParallelConfig.make(
+            tp_size_=(tp_size if tp_size is not None else
+                      get_tensor_model_parallel_world_size()),
+            dp_size_=(dp_size
+                      if dp_size is not None else get_dp_group().world_size),
+            vllm_parallel_config=vllm_config.parallel_config)
+        self.sp_size = self.tp_size
+        compilation_config = vllm_config.compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+        self.layer_name = prefix
+        self.enable_eplb = False
+        self.expert_load_view = None
+        self.logical_to_physical_map = None
+        self.logical_replica_count = None
+        self.local_num_expert_weight_slots = None
+        self.quant_config = quant_config
+        self.moe_quant_config = None
+        self.routed_scaling_factor = 1.0
+        self.apply_router_weight_on_input = apply_router_weight_on_input
+        self.zero_expert_num = 0
+        self.zero_expert_type = None
+        self.hidden_size = hidden_size
+        self.batched_hidden_states = None
+        self.batched_router_logits = None
+        try:
+            self.rank = int(torch.distributed.get_rank())
+        except Exception:
+            self.rank = -1
+
+        self.top_k = top_k
+        self.num_experts = num_experts
+        self.global_num_experts = num_experts
+        assert intermediate_size % self.tp_size == 0
+        self.intermediate_size_per_partition = intermediate_size // self.tp_size
+        self.reduce_results = reduce_results
+        self.renormalize = renormalize
+        self.use_grouped_topk = use_grouped_topk
+        if self.use_grouped_topk:
+            assert num_expert_group is not None and topk_group is not None
+        self.num_expert_group = num_expert_group
+        self.topk_group = topk_group
+        self.custom_routing_function = custom_routing_function
+        self.scoring_func = scoring_func
+        self.e_score_correction_bias = e_score_correction_bias
+        self.expert_map = None
+        self.loaded_expert_map = None
+        self.elastic_original_expert_map = None
+        self.activation = activation
+        self.log2phy = None
+        self.primary_log2phy = None
+        self.active_expert_mask = None
+        self.elastic_runtime_log2phy = None
+        self.global_redundant_expert_num = 0
+        self.active_local_num_experts = num_experts
+        self.loaded_local_num_experts = num_experts
+        self.runtime_w13_weight = None
+        self.runtime_w2_weight = None
+        self.runtime_w13_buffer = None
+        self.runtime_w2_buffer = None
+        self.runtime_weight_capacity = 0
+        self.lossless_runtime_activated = False
+        self.lossless_cpu_w13_weight = None
+        self.lossless_cpu_w2_weight = None
+        self.lossless_cpu_shadow_w13_buffer = None
+        self.lossless_cpu_shadow_w2_buffer = None
+        self.lossless_cpu_shadow_capacity = 0
+        self.lossless_cpu_shadow_local_slots: dict[int, int] = {}
+        self._lossless_p2p_alias_cache: dict[tuple, torch.Tensor] = {}
+        self._deepseek_formatted_w13_pending: dict[
+            tuple, dict[str, torch.Tensor]] = {}
+        self.lossless_mode5_cpu_shadow_row_by_expert: dict[int, int] = {}
+        self.lossless_mode5_cpu_shadow_prepared = False
+        self.lossless_mode5_cpu_shadow_signature: tuple[int, ...] = ()
+        self.lossless_mode5_cpu_expert_weights: dict[
+            int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.lossless_loaded_offloaded = False
+        self.lossless_cpu_import_expert_ids = []
+        self.lossless_zero_redundancy_preallocated = False
+        self.lossless_zero_redundancy_preallocated_loaded = False
+        self.lossless_mode1_native_parity_ready = False
+        self.loaded_weight_capacity = num_experts
+        self.lossless_saved_primary_prefix_w13 = None
+        self.lossless_saved_primary_prefix_w2 = None
+        self.lossless_fixed_slot_plan_logged = False
+        self.lossless_hybrid_reuse_log_budget = 0
+        self.lossless_hybrid_fallback_logged = False
+        self.lossless_primary_prefix_stash_logged = False
+        self.lossless_primary_prefix_restore_logged = False
+        self.lossless_hybrid_cpu_swap_enabled = False
+        self.lossless_hybrid_active = False
+        self.lossless_hybrid_resident_capacity = 0
+        self.lossless_hybrid_owned_expert_ids: list[int] = []
+        self.lossless_hybrid_resident_expert_ids: list[int] = []
+        self.lossless_hybrid_cpu_only_expert_ids: list[int] = []
+        self.lossless_hybrid_active_ranks: list[int] = []
+        self.lossless_hybrid_active_rank_index = -1
+        self.lossless_hybrid_rank_owned_expert_ids: list[list[int]] = []
+        self.lossless_hybrid_rank_resident_expert_ids: list[list[int]] = []
+        self.lossless_hybrid_rank_lru: list[list[int]] = []
+        self.lossless_hybrid_owner_rank_by_expert = None
+        self.lossless_hybrid_owner_global_rank_by_expert = None
+        self.lossless_hybrid_last_stats: dict[str, Any] = {}
+        self.lossless_mode3_primary_prefix_expert_ids: list[int] = []
+        self.lossless_mode3_primary_prefix_local_slots: dict[int, int] = {}
+        self.lossless_mode4_remote_source_by_expert: dict[int, tuple[int, int]] = {}
+        self.lossless_mode5_remote_source_chain_by_expert: dict[
+            int, tuple[int, int]] = {}
+        self.lossless_mode4_remote_fetcher = None
+        self.elastic_debug_budget = 0
+        self.elastic_debug_tag = 0
+        self.elastic_debug_reason = None
+
+        is_deepseek_v3_r1 = self.global_num_experts == 256
+        self.rm_router_logits = get_rm_router_logits_state(
+            self.moe_parallel_config.ep_size, self.dp_size, is_deepseek_v3_r1)
+        self.all_reduce_merge = get_all_reduce_merge_state(
+            self.moe_parallel_config.ep_size, is_deepseek_v3_r1)
+
+        ascend_config = get_ascend_config()
+        self.dynamic_eplb = ascend_config.dynamic_eplb
+        self.elastic_execution_mode = (
+            envs_ascend.VLLM_ASCEND_ELASTIC_EXECUTION_MODE)
+        self.elastic_moe_mode = ascend_config.elastic_moe_mode
+        self.expert_map_path = ascend_config.expert_map_path
+        self.global_redundant_expert_num = (
+            envs_ascend.compute_elastic_init_redundancy_expert(
+                num_experts,
+                int(getattr(self.moe_parallel_config, "ep_size", 1)),
+                ascend_config.init_redundancy_expert,
+            ))
+        effective_init_redundancy_expert = int(
+            self.global_redundant_expert_num)
+        if (self.elastic_moe_mode == "lossless"
+                and self.global_redundant_expert_num <= 0):
+            pass  # debug log removed
+        self.lossless_lazy_activation = (
+            self.elastic_moe_mode == "lossless"
+            and self.global_redundant_expert_num <= 0)
+        self.lossless_hybrid_cpu_swap_enabled = (
+            self.elastic_moe_mode == "lossless"
+            and self.elastic_execution_mode in (2, 3, 4, 5))
+        self.global_num_experts = num_experts
+        if self.elastic_moe_mode != "lossless":
+            self.global_num_experts = num_experts + self.global_redundant_expert_num
+        # static eplb initializing with expert_map_path
+        if self.expert_map_path and os.path.exists(
+                self.expert_map_path) and os.access(self.expert_map_path,
+                                                    os.R_OK):
+            self.expert_load_balancer = ExpertLoadBalancer(
+                self.expert_map_path, self.global_num_experts)
+            self.local_num_experts, self.expert_map = (
+                self.expert_load_balancer.get_rank_placement_map(
+                    self.moe_instance_id, self.ep_rank))
+            self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
+                self.moe_instance_id, self.ep_rank).npu()
+            self.global_redundant_expert_num = (
+                self.expert_load_balancer.get_global_redundant_expert_num())
+        else:
+            # init moe.
+            print("use code in vllm_ascend_ops_fused_moe to init expert_map")
+            primary_mapping = determine_expert_map(
+                self.ep_size, self.ep_rank, num_experts, layer_idx=self.layer_idx)
+            if len(primary_mapping) == 3:
+                primary_local_num_experts, primary_expert_map, primary_log2phy = primary_mapping
+            elif len(primary_mapping) == 2:
+                primary_local_num_experts, primary_expert_map = primary_mapping
+                primary_log2phy = determine_default_log2phy_map(
+                    num_experts, self.ep_size, self.ep_rank, 0)
+            else:
+                raise ValueError(
+                    f"Unexpected determine_expert_map return arity={len(primary_mapping)}")
+            if self.elastic_moe_mode == "lossless":
+                # In unified mode=1 the effective redundancy can be derived
+                # from VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE even when
+                # the legacy init_redundancy knob is left at zero. Preserve
+                # that derived value so custom Qwen3 loads real redundant
+                # expert slots, matching the native fixed-slot mode=1 path.
+                self.global_redundant_expert_num = (
+                    effective_init_redundancy_expert)
+                self.loaded_local_num_experts, self.loaded_expert_map = (
+                    determine_redundant_replica_expert_map(
+                        num_experts, self.ep_size, self.ep_rank,
+                        self.global_redundant_expert_num,
+                        prefer_balanced_cyclic=(
+                            self.elastic_execution_mode == 1)))
+                self.active_local_num_experts = primary_local_num_experts
+                self.local_num_experts = self.active_local_num_experts
+                self.expert_map = primary_expert_map
+                self.log2phy = primary_log2phy
+                self.primary_log2phy = primary_log2phy.clone()
+            # dynamic eplb initializing with not expert_map_path
+            elif self.dynamic_eplb:
+                self.global_redundant_expert_num = ascend_config.init_redundancy_expert
+                self.local_num_experts, self.expert_map = determine_default_expert_map(
+                    self.global_num_experts, self.ep_size, self.ep_rank,
+                    self.global_redundant_expert_num)
+                self.log2phy = determine_default_log2phy_map(
+                    self.global_num_experts, self.ep_size, self.ep_rank,
+                    self.global_redundant_expert_num)
+                self.active_local_num_experts = self.local_num_experts
+                self.loaded_local_num_experts = self.local_num_experts
+            else:
+                self.local_num_experts = primary_local_num_experts
+                self.expert_map = primary_expert_map
+                self.log2phy = primary_log2phy
+                self.active_local_num_experts = self.local_num_experts
+                self.loaded_local_num_experts = self.local_num_experts
+                if self.expert_map is not None:
+                    self.loaded_expert_map = self.expert_map.clone()
+        if self.loaded_expert_map is None and self.expert_map is not None:
+            self.loaded_expert_map = self.expert_map.clone()
+        if self.elastic_original_expert_map is None and self.expert_map is not None:
+            self.elastic_original_expert_map = self.expert_map.clone()
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        if self.primary_log2phy is None and self.log2phy is not None:
+            self.primary_log2phy = self.log2phy.clone()
+        self.elastic_original_ep_size = int(
+            getattr(self.moe_parallel_config, "ep_size", 1))
+        self.loaded_weight_capacity = int(self.loaded_local_num_experts)
+        if self.layer_idx == 0:
+            pass  # debug log removed
+        if self.elastic_moe_mode == "lossless":
+            prealloc_capacity = self._get_lossless_loaded_slot_capacity()
+            if prealloc_capacity > self.loaded_weight_capacity:
+                self.loaded_weight_capacity = prealloc_capacity
+                if getattr(self, "global_redundant_expert_num", 0) <= 0:
+                    self.lossless_zero_redundancy_preallocated_loaded = True
+        if (self.elastic_moe_mode == "lossless"
+                and self.elastic_execution_mode == 1):
+            self.lossless_hybrid_cpu_swap_enabled = False
+            self.lossless_hybrid_active = False
+            self.lossless_hybrid_resident_capacity = 0
+            self.lossless_hybrid_owned_expert_ids = []
+            self.lossless_hybrid_resident_expert_ids = []
+            self.lossless_hybrid_cpu_only_expert_ids = []
+            self.lossless_hybrid_active_ranks = []
+            self.lossless_hybrid_active_rank_index = -1
+            self.lossless_hybrid_rank_owned_expert_ids = []
+            self.lossless_hybrid_rank_resident_expert_ids = []
+            self.lossless_hybrid_rank_lru = []
+            self.lossless_hybrid_owner_rank_by_expert = None
+            self.lossless_hybrid_owner_global_rank_by_expert = None
+            self.lossless_hybrid_last_stats = {}
+            self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+            self.lossless_mode1_native_parity_ready = (
+                self._should_enable_mode1_parity_for_current_layout())
+            if self.layer_idx == 0:
+                logger.info(
+                    "Mode1 fixed-slot parity init: mode=%s layer=%s floor=%s active_local=%s "
+                    "loaded_local=%s loaded_capacity=%s hybrid_disabled=%s "
+                    "runtime_buffers_disabled=%s parity_ready=%s",
+                    self.elastic_execution_mode,
+                    self.layer_idx,
+                    envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE,
+                    int(self.active_local_num_experts),
+                    int(self.loaded_local_num_experts),
+                    int(self.loaded_weight_capacity),
+                    True,
+                    True,
+                    bool(self.lossless_mode1_native_parity_ready),
+                )
+        if self.layer_idx == 0:
+            pass  # debug log removed
+        local_num_experts = (torch.sum(self.expert_map != -1)
+                             if self.expert_map is not None else num_experts)
+        if self.dynamic_eplb:
+            self.moe_load = torch.zeros(local_num_experts, dtype=torch.int64)
+
+        self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
+
+        if self.scoring_func != "softmax" and not self.use_grouped_topk:
+            raise ValueError("Only softmax scoring function is supported for "
+                             "non-grouped topk.")
+        if vllm_version_is("0.10.2"):
+            moe = FusedMoEConfig.make(
+                num_experts=self.global_num_experts,
+                experts_per_token=top_k,
+                hidden_dim=hidden_size,
+                num_local_experts=self.active_local_num_experts,
+                moe_parallel_config=self.moe_parallel_config,
+                # TODO (bnell): this needs to be fixed for quantized types.
+                in_dtype=params_dtype,
+                quant_config=quant_config)
+        else:
+            moe = FusedMoEConfig(
+                num_experts=self.global_num_experts,
+                experts_per_token=top_k,
+                hidden_dim=hidden_size,
+                num_local_experts=self.active_local_num_experts,
+                moe_parallel_config=self.moe_parallel_config,
+                in_dtype=params_dtype,
+            )
+        self.moe_config = moe
+        self.moe_config.model_type = self.model_type
+        self.elastic_original_num_experts = self.moe_config.num_experts
+        # TODO: The self.moe_config.tp_size here is not correct, fixme soon
+
+        if quant_config is None:
+            self.quant_method = AscendUnquantizedFusedMoEMethod(moe)
+        else:
+            self.quant_method = quant_config.get_quant_method(self, prefix)
+
+        assert self.quant_method is not None
+
+        local_num_experts = torch.sum(self.expert_map != -1) \
+            if self.expert_map is not None else num_experts
+
+        self.moe_load = None
+
+        if self.dynamic_eplb:
+            self.moe_load = torch.zeros(local_num_experts, dtype=torch.int64)
+
+        moe_quant_params = {
+            "num_experts": self.loaded_weight_capacity,
+            "hidden_size": hidden_size,
+            "intermediate_size_per_partition":
+            self.intermediate_size_per_partition,
+            "params_dtype": params_dtype,
+            "weight_loader": self.weight_loader,
+        }
+        # need full intermediate size pre-sharding for WNA16 act order
+        if (self.quant_method.__class__.__name__
+                in ("GPTQMarlinMoEMethod", "CompressedTensorsWNA16MoEMethod")):
+            moe_quant_params["intermediate_size_full"] = intermediate_size
+
+        self.ep_group = get_ep_group()
+        # NOTE: self.tp_group is not expert_tp_group
+        self.tp_group = get_tp_group().device_group
+        self.quant_method.create_weights(layer=self, **moe_quant_params)
+        if (os.getenv("VLLM_ASCEND_FULL_REDUNDANCY_EXPERIMENT_LOG", "0")
+                in ("1", "true", "TRUE", "yes", "on")
+                and self.elastic_moe_mode == "lossless"):
+            try:
+                w13_bytes = int(self.w13_weight.numel()) * int(
+                    self.w13_weight.element_size())
+                w2_bytes = int(self.w2_weight.numel()) * int(
+                    self.w2_weight.element_size())
+                total_weight_bytes = w13_bytes + w2_bytes
+                loaded_capacity = max(int(self.loaded_weight_capacity), 1)
+                expert_weight_bytes = total_weight_bytes // loaded_capacity
+                logger.info(
+                    "Elastic redundancy MoE slots: layer=%s ep_rank=%s "
+                    "ep_size=%s mode=%s floor=%s num_experts=%s "
+                    "active_local=%s loaded_local=%s loaded_capacity=%s "
+                    "redundant_experts=%s w13_shape=%s w2_shape=%s "
+                    "expert_weight_bytes=%s total_weight_bytes=%s",
+                    self.layer_idx,
+                    self.ep_rank,
+                    self.ep_size,
+                    self.elastic_execution_mode,
+                    envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE,
+                    self.elastic_original_num_experts,
+                    self.active_local_num_experts,
+                    self.loaded_local_num_experts,
+                    self.loaded_weight_capacity,
+                    self.global_redundant_expert_num,
+                    tuple(self.w13_weight.shape),
+                    tuple(self.w2_weight.shape),
+                    expert_weight_bytes,
+                    total_weight_bytes,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Elastic redundancy MoE slot logging failed at layer=%s: %s",
+                    self.layer_idx,
+                    exc,
+                )
+        if self.layer_idx == 0:
+            pass  # debug log removed
+
+        self.moe_config.tp_group = get_tp_group()
+        self.moe_config.dp_group = get_dp_group()
+        self.moe_config.ep_group = get_ep_group()
+        self.moe_config.mc2_group = get_mc2_group()
+        self.moe_config.num_global_redundant_experts = self.global_redundant_expert_num
+
+        setup_moe_comm_method(self.moe_config)
+
+    def update_expert_map(self, new_expert_map):
+        self.expert_map = new_expert_map
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._sync_mode1_active_log2phy_from_expert_map(
+            "update_expert_map")
+
+    def _sync_mode1_active_log2phy_from_expert_map(
+            self,
+            reason: str,
+            *,
+            update_primary: bool = False) -> bool:
+        """Keep mode=1 dispatch log2phy valid for global AllToAll routing.
+
+        expert_map is local-only (global expert id -> local resident slot), but
+        AllToAll token dispatch applies log2phy to every router topk id before
+        dispatch.  Therefore log2phy must remain a global physical expert table,
+        not a clone of expert_map.  Only materialize a default global table if a
+        path accidentally drops it.
+        """
+        if (self.elastic_moe_mode != "lossless"
+                or int(getattr(self, "elastic_execution_mode", 0)) != 1
+                or self.expert_map is None):
+            return False
+        changed = False
+        if self.log2phy is None:
+            logical_num_experts = int(
+                getattr(self, "elastic_original_num_experts", self.num_experts))
+            self.log2phy = determine_default_log2phy_map(
+                logical_num_experts, self.ep_size, self.ep_rank, 0).to(
+                    device=self.expert_map.device, dtype=torch.int32)
+            changed = True
+        elif self.log2phy.device != self.expert_map.device:
+            self.log2phy = self.log2phy.to(device=self.expert_map.device)
+            changed = True
+        if update_primary:
+            self.primary_log2phy = self.log2phy.clone()
+        self.elastic_runtime_log2phy = None
+        self.lossless_runtime_dispatch_log2phy = None
+        self.lossless_runtime_dispatch_signature = None
+        self.lossless_runtime_dispatch_num_experts = 0
+        self._mode1_execute_mapping_validated = False
+        if (self.layer_idx == 0
+                and _env_flag("VLLM_ASCEND_MODE1_LOG2PHY_SYNC_LOG", "1")):
+            try:
+                expert_slots = [
+                    int(v) for v in self.expert_map.detach().cpu().tolist()
+                    if int(v) >= 0
+                ]
+                log2phy_slots = [
+                    int(v) for v in self.log2phy.detach().cpu().tolist()
+                    if int(v) >= 0
+                ]
+                logger.info(
+                    "Mode1 global log2phy preserved for active expert_map: "
+                    "layer=%s reason=%s mapped=%s expert_slot_max=%s "
+                    "log2phy_min=%s log2phy_max=%s update_primary=%s changed=%s",
+                    self.layer_idx,
+                    reason,
+                    len(expert_slots),
+                    max(expert_slots) if expert_slots else -1,
+                    min(log2phy_slots) if log2phy_slots else -1,
+                    max(log2phy_slots) if log2phy_slots else -1,
+                    update_primary,
+                    changed,
+                )
+            except Exception:
+                logger.exception("Failed to log mode1 active log2phy sync")
+        return True
+
+    def _prepare_expert_weight_write_target(
+            self, base: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if (self.model_type != "deepseek_v2"
+                or target.device.type != "npu"
+                or int(target.storage_offset()) == 0):
+            return target
+        key = (
+            "deepseek_weight_write",
+            int(base.data_ptr()),
+            int(target.data_ptr()),
+            tuple(target.shape),
+            tuple(target.stride()),
+            str(target.dtype),
+        )
+        cached = self._lossless_p2p_alias_cache.get(key)
+        if cached is not None:
+            return cached
+        alias = _npu_zero_offset_alias_for_p2p(base, target)
+        self._lossless_p2p_alias_cache[key] = alias
+        return alias
+
+    def _uses_deepseek_formatted_w13_reload(
+            self, expert_data: torch.Tensor) -> bool:
+        if self.model_type != "deepseek_v2" or expert_data.device.type != "npu":
+            return False
+        try:
+            return int(torch_npu.get_npu_format(
+                expert_data)) == ACL_FORMAT_FRACTAL_NZ
+        except Exception:
+            return False
+
+    def _load_deepseek_formatted_w13_full_row(
+            self,
+            expert_data: torch.Tensor,
+            shard_dim: int,
+            shard_id: str,
+            loaded_weight: torch.Tensor) -> None:
+        """Write a formatted DeepSeek w13 expert as one logical row.
+
+        FRACTAL_NZ does not preserve the ordinary strided semantics needed to
+        address the nonzero-offset up-projection half safely.  Keep the two
+        incoming shards in their plain layout, then copy the combined row via
+        the same zero-offset expert-row alias used by the working w2 path.
+        """
+        key = (
+            int(expert_data.data_ptr()),
+            tuple(expert_data.shape),
+            tuple(expert_data.stride()),
+            str(expert_data.dtype),
+        )
+        pending = self._deepseek_formatted_w13_pending.setdefault(key, {})
+        if shard_id in pending:
+            raise RuntimeError(
+                "Duplicate DeepSeek formatted w13 shard before its pair was "
+                f"completed: layer={self.layer_idx} shard={shard_id}")
+        pending[shard_id] = loaded_weight
+        if "w1" not in pending or "w3" not in pending:
+            return
+
+        combined = torch.cat((pending["w1"], pending["w3"]), dim=shard_dim)
+        combined = combined.to(device=expert_data.device,
+                               dtype=expert_data.dtype).contiguous()
+        if expert_data.ndim == combined.ndim + 1:
+            combined = combined.unsqueeze(0)
+        if tuple(combined.shape) != tuple(expert_data.shape):
+            raise RuntimeError(
+                "DeepSeek formatted w13 pair has an unexpected combined "
+                f"shape at layer={self.layer_idx}: combined="
+                f"{tuple(combined.shape)} target={tuple(expert_data.shape)}")
+        expert_data.copy_(combined)
+        del self._deepseek_formatted_w13_pending[key]
+
+    def _load_w13(self,
+                  expert_data: torch.Tensor,
+                  shard_dim: int,
+                  shard_id: str,
+                  loaded_weight: torch.Tensor,
+                  tp_rank: int,
+                  load_full: bool = False):
+        if not self._uses_deepseek_formatted_w13_reload(expert_data):
+            return super()._load_w13(expert_data=expert_data,
+                                     shard_dim=shard_dim,
+                                     shard_id=shard_id,
+                                     loaded_weight=loaded_weight,
+                                     tp_rank=tp_rank,
+                                     load_full=load_full)
+        if loaded_weight.numel() == 0 or loaded_weight.size(shard_dim) == 0:
+            raise RuntimeError(
+                "Empty DeepSeek formatted w13 reload shard at "
+                f"layer={self.layer_idx} shard={shard_id}")
+
+        preserve_expert_dim = (
+            expert_data.ndim == loaded_weight.ndim + 1
+            and int(expert_data.shape[0]) == 1)
+        if (int(self.tp_size) != 1 or bool(load_full)
+                or int(shard_dim) != 0 or not preserve_expert_dim):
+            raise RuntimeError(
+                "DeepSeek formatted w13 full-row reload currently requires "
+                "TP1 and one two-dimensional expert shard at a time: "
+                f"layer={self.layer_idx} tp_size={self.tp_size} "
+                f"load_full={load_full} shard_dim={shard_dim} "
+                f"target_shape={tuple(expert_data.shape)} "
+                f"loaded_shape={tuple(loaded_weight.shape)}")
+        target_shard_dim = shard_dim + (1 if preserve_expert_dim else 0)
+        shard_size = int(expert_data.shape[target_shard_dim]) // 2
+        if not load_full:
+            loaded_weight = loaded_weight.narrow(shard_dim,
+                                                 shard_size * int(tp_rank),
+                                                 shard_size)
+        self._load_deepseek_formatted_w13_full_row(
+            expert_data=expert_data,
+            shard_dim=shard_dim,
+            shard_id=shard_id,
+            loaded_weight=loaded_weight,
+        )
+
+    def prepare_online_expert_weight_reload(self) -> None:
+        if self._deepseek_formatted_w13_pending:
+            raise RuntimeError(
+                "A previous DeepSeek formatted w13 reload ended with an "
+                f"incomplete pair at layer={self.layer_idx}")
+        self.clear_lossless_p2p_alias_cache()
+
+    def finalize_online_expert_weight_reload(self) -> None:
+        if self._deepseek_formatted_w13_pending:
+            pending = list(self._deepseek_formatted_w13_pending.values())
+            shards = sorted({name for pair in pending for name in pair})
+            self.abort_online_expert_weight_reload()
+            raise RuntimeError(
+                "DeepSeek formatted w13 reload ended with incomplete pairs "
+                f"at layer={self.layer_idx}: pairs={len(pending)} "
+                f"observed_shards={shards}")
+
+    def abort_online_expert_weight_reload(self) -> None:
+        self._deepseek_formatted_w13_pending.clear()
+        self.clear_lossless_p2p_alias_cache()
+
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        if self.elastic_moe_mode == "lossless" and self.loaded_expert_map is not None:
+            local_expert_id = self._get_host_expert_map_value(
+                self.loaded_expert_map,
+                "_host_loaded_expert_map",
+                expert_id,
+            )
+            if self.layer_idx == 0 and 0 <= int(expert_id) < 16:
+                if not hasattr(self, "_lossless_loaded_map_debugged"):
+                    self._lossless_loaded_map_debugged = set()
+                key = int(expert_id)
+                if key not in self._lossless_loaded_map_debugged:
+                    self._lossless_loaded_map_debugged.add(key)
+                    pass  # debug log removed
+            return local_expert_id
+        if self.expert_map is None:
+            return expert_id
+        return self._get_host_expert_map_value(
+            self.expert_map,
+            "_host_expert_map",
+            expert_id,
+        )
+
+    def set_runtime_num_experts(self, num_experts: int) -> None:
+        runtime_num_experts = int(num_experts)
+        self.moe_config.num_experts = runtime_num_experts
+        self.num_experts = runtime_num_experts
+
+    def _set_lossless_expert_map_cpu_from_active(
+            self, active_expert_ids: list[int]) -> None:
+        if self.elastic_moe_mode != "lossless":
+            return
+        map_len = int(getattr(self, "elastic_original_num_experts", 0) or 0)
+        if map_len <= 0:
+            return
+        expert_map_cpu = [-1] * map_len
+        for local_slot, expert_id in enumerate(active_expert_ids):
+            expert_id = int(expert_id)
+            if 0 <= expert_id < map_len:
+                expert_map_cpu[expert_id] = int(local_slot)
+        self._lossless_expert_map_cpu = expert_map_cpu
+        self._lossless_expert_map_cpu_tensor_id = id(self.expert_map)
+        self._cache_host_expert_map(
+            self.expert_map,
+            "_host_expert_map",
+            expert_map_cpu,
+        )
+        if (self.layer_idx == 0 and self.elastic_execution_mode == 1
+                and not getattr(self, "_mode1_export_slot_map_ready_logged",
+                                False)):
+            logger.info(
+                "Mode1 CPU export slot map ready: layer=%s ep_rank=%s mapped=%s map_len=%s tensor_id=%s",
+                self.layer_idx,
+                self.ep_rank,
+                sum(1 for slot in expert_map_cpu if int(slot) >= 0),
+                map_len,
+                self._lossless_expert_map_cpu_tensor_id,
+            )
+            self._mode1_export_slot_map_ready_logged = True
+
+    def _set_lossless_loaded_map_cpu_from_active(
+            self, active_expert_ids: list[int]) -> None:
+        if self.elastic_moe_mode != "lossless":
+            return
+        map_len = int(getattr(self, "elastic_original_num_experts", 0) or 0)
+        if map_len <= 0:
+            return
+        loaded_map_cpu = [-1] * map_len
+        for local_slot, expert_id in enumerate(active_expert_ids):
+            expert_id = int(expert_id)
+            if 0 <= expert_id < map_len:
+                loaded_map_cpu[expert_id] = int(local_slot)
+        self._lossless_loaded_expert_map_cpu = loaded_map_cpu
+        self._lossless_loaded_expert_map_cpu_tensor_id = id(
+            self.loaded_expert_map)
+        self._cache_host_expert_map(
+            self.loaded_expert_map,
+            "_host_loaded_expert_map",
+            loaded_map_cpu,
+        )
+
+    @staticmethod
+    def _expert_map_tensor_version(
+            map_tensor: Optional[torch.Tensor]) -> Optional[int]:
+        if map_tensor is None:
+            return None
+        try:
+            return int(map_tensor._version)
+        except (AttributeError, RuntimeError):
+            return None
+
+    def _cache_host_expert_map(self,
+                               map_tensor: Optional[torch.Tensor],
+                               attr_name: str,
+                               values: Optional[Any] = None) -> None:
+        if map_tensor is None:
+            setattr(self, attr_name, None)
+            setattr(self, f"{attr_name}_tensor_id", None)
+            setattr(self, f"{attr_name}_tensor_version", None)
+            return
+        if values is None:
+            values = map_tensor.detach().contiguous().cpu().tolist()
+        setattr(self, attr_name, tuple(int(slot) for slot in values))
+        setattr(self, f"{attr_name}_tensor_id", id(map_tensor))
+        setattr(self, f"{attr_name}_tensor_version",
+                self._expert_map_tensor_version(map_tensor))
+
+    def _get_host_expert_map_value(self, map_tensor: torch.Tensor,
+                                   attr_name: str, expert_id: int) -> int:
+        tensor_version = self._expert_map_tensor_version(map_tensor)
+        cached_map = getattr(self, attr_name, None)
+        if (cached_map is None
+                or getattr(self, f"{attr_name}_tensor_id", None) != id(map_tensor)
+                or getattr(self, f"{attr_name}_tensor_version", None)
+                != tensor_version):
+            self._cache_host_expert_map(map_tensor, attr_name)
+            cached_map = getattr(self, attr_name, None)
+        expert_id = int(expert_id)
+        if cached_map is None:
+            raise RuntimeError(f"Host expert map {attr_name} is unavailable.")
+        if not 0 <= expert_id < len(cached_map):
+            raise IndexError(
+                f"Expert id {expert_id} is outside host map {attr_name} "
+                f"with length {len(cached_map)}.")
+        return int(cached_map[expert_id])
+
+    def _set_lossless_map_cpu_from_tensor(self, map_tensor: Optional[torch.Tensor],
+                                          attr_name: str) -> None:
+        host_attr_by_lossless_attr = {
+            "_lossless_expert_map_cpu": "_host_expert_map",
+            "_lossless_loaded_expert_map_cpu": "_host_loaded_expert_map",
+        }
+        host_attr = host_attr_by_lossless_attr.get(attr_name)
+        if host_attr is None:
+            raise ValueError(f"Unsupported expert-map cache attribute {attr_name}.")
+        if map_tensor is None:
+            self._cache_host_expert_map(None, host_attr)
+            setattr(self, attr_name, None)
+            setattr(self, f"{attr_name}_tensor_id", None)
+            return
+        values = [
+            int(slot)
+            for slot in map_tensor.detach().contiguous().cpu().tolist()
+        ]
+        self._cache_host_expert_map(map_tensor, host_attr, values)
+        if self.elastic_moe_mode != "lossless":
+            setattr(self, attr_name, None)
+            setattr(self, f"{attr_name}_tensor_id", None)
+            return
+        setattr(self, attr_name, values)
+        setattr(self, f"{attr_name}_tensor_id", id(map_tensor))
+
+    def mark_lossless_loaded_slots_resident(
+            self,
+            expert_slot_map: dict[int, int],
+            reason: str = "") -> int:
+        """Mark already-allocated loaded slots as containing real experts.
+
+        Mode=1 preallocates redundant loaded slots up front. Planned topology can
+        fill those rows before the shrink point, so later shrink planning should
+        see them through loaded_expert_map instead of scheduling another import.
+        This method never grows the expert weight tensors; it only updates rows
+        that already exist inside loaded_weight_capacity.
+        """
+        if self.elastic_moe_mode != "lossless":
+            return 0
+        if self.loaded_expert_map is None:
+            return 0
+        if not expert_slot_map:
+            return 0
+        logical_num_experts = int(
+            getattr(self, "elastic_original_num_experts", self.num_experts))
+        loaded_capacity = int(getattr(self, "loaded_weight_capacity", 0))
+        row_capacity = min(loaded_capacity, int(self.w13_weight.shape[0]),
+                           int(self.w2_weight.shape[0]))
+        if logical_num_experts <= 0 or row_capacity <= 0:
+            return 0
+
+        loaded_map_cpu = [
+            int(slot) for slot in self.loaded_expert_map.detach().cpu().tolist()
+        ]
+        updates = 0
+        for expert_id, local_slot in sorted(expert_slot_map.items()):
+            expert_id = int(expert_id)
+            local_slot = int(local_slot)
+            if not (0 <= expert_id < logical_num_experts):
+                continue
+            if not (0 <= local_slot < row_capacity):
+                continue
+            for other_expert, other_slot in enumerate(loaded_map_cpu):
+                if other_expert != expert_id and int(other_slot) == local_slot:
+                    loaded_map_cpu[other_expert] = -1
+            if loaded_map_cpu[expert_id] != local_slot:
+                updates += 1
+            loaded_map_cpu[expert_id] = local_slot
+
+        if updates <= 0:
+            return 0
+        with torch.no_grad():
+            new_loaded_map = torch.tensor(loaded_map_cpu,
+                                          device=self.loaded_expert_map.device,
+                                          dtype=torch.int32)
+            self.loaded_expert_map.copy_(new_loaded_map)
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        self.clear_lossless_npu_export_slot_cache()
+        self.loaded_local_num_experts = sum(
+            1 for slot in loaded_map_cpu if int(slot) >= 0)
+        self.lossless_loaded_offloaded = False
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = (
+                self._should_enable_mode1_parity_for_current_layout())
+        if self.layer_idx == 0:
+            logger.info(
+                "Mode1 planned loaded-slot residency map updated: "
+                "layer=%s updates=%s mapped=%s loaded_capacity=%s reason=%s",
+                self.layer_idx,
+                updates,
+                self.loaded_local_num_experts,
+                loaded_capacity,
+                reason,
+            )
+        return updates
+
+    @staticmethod
+    def _is_power_of_two(value: int) -> bool:
+        return value > 0 and (value & (value - 1)) == 0
+
+    def _get_elastic_initial_ep_size(self) -> int:
+        return int(
+            getattr(self, "elastic_original_ep_size",
+                    getattr(self.moe_parallel_config, "ep_size", 1)))
+
+    def _get_configured_elastic_min_compute_group_size(self) -> Optional[int]:
+        min_compute_group_size = (
+            envs_ascend.VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE)
+        if min_compute_group_size is None:
+            return None
+        initial_ep_size = self._get_elastic_initial_ep_size()
+        if initial_ep_size <= 0:
+            raise ValueError(
+                f"Invalid initial EP size {initial_ep_size} at layer={self.layer_idx}.")
+        if not self._is_power_of_two(initial_ep_size):
+            raise ValueError(
+                "Elastic repeated shrink only supports power-of-two initial "
+                f"EP size, got {initial_ep_size} at layer={self.layer_idx}.")
+        if min_compute_group_size > initial_ep_size:
+            raise ValueError(
+                "VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE cannot exceed "
+                f"the initial EP size: {min_compute_group_size} > "
+                f"{initial_ep_size} at layer={self.layer_idx}.")
+        if initial_ep_size % min_compute_group_size != 0:
+            raise ValueError(
+                "VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE must divide the "
+                f"initial EP size: {min_compute_group_size} vs "
+                f"{initial_ep_size} at layer={self.layer_idx}.")
+        return min_compute_group_size
+
+    def _get_runtime_elastic_min_compute_group_size(self) -> Optional[int]:
+        configured_floor = self._get_configured_elastic_min_compute_group_size()
+        mode = int(getattr(self, "elastic_execution_mode", 0))
+        if mode not in (4, 5):
+            return configured_floor
+        runtime_floor = None
+        if mode == 5:
+            runtime_floor = (
+                envs_ascend.VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE)
+        if runtime_floor is None:
+            runtime_floor = (
+                envs_ascend.VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE)
+        if runtime_floor is None:
+            return configured_floor
+        initial_ep_size = self._get_elastic_initial_ep_size()
+        env_name = ("VLLM_ASCEND_MODE5_RUNTIME_MIN_COMPUTE_GROUP_SIZE"
+                    if mode == 5 else
+                    "VLLM_ASCEND_MODE4_RUNTIME_MIN_COMPUTE_GROUP_SIZE")
+        if runtime_floor > initial_ep_size:
+            raise ValueError(
+                f"{env_name} cannot exceed the initial EP size: "
+                f"{runtime_floor} > {initial_ep_size} at layer={self.layer_idx}.")
+        if initial_ep_size % runtime_floor != 0:
+            raise ValueError(
+                f"{env_name} must divide the initial EP size: "
+                f"{runtime_floor} vs {initial_ep_size} at layer={self.layer_idx}.")
+        return runtime_floor
+
+    def _get_default_single_shrink_ep_floor(self) -> int:
+        initial_ep_size = self._get_elastic_initial_ep_size()
+        if initial_ep_size <= 1:
+            return 1
+        return max(1, initial_ep_size // 2)
+
+    def _is_followup_shrink_enabled(self) -> bool:
+        initial_ep_size = self._get_elastic_initial_ep_size()
+        if initial_ep_size <= 1:
+            return False
+        min_compute_group_size = (
+            self._get_runtime_elastic_min_compute_group_size())
+        if min_compute_group_size is None:
+            return True
+        return min_compute_group_size < initial_ep_size
+
+    def _get_effective_runtime_prealloc_floor_ep_size(self) -> int:
+        min_compute_group_size = (
+            self._get_runtime_elastic_min_compute_group_size())
+        if min_compute_group_size is not None:
+            return min_compute_group_size
+        return self._get_default_single_shrink_ep_floor()
+
+    def _get_logical_num_experts_for_elastic(self) -> int:
+        logical_num_experts = int(
+            getattr(self, "elastic_original_num_experts",
+                    getattr(self, "global_num_experts",
+                            getattr(self, "num_experts", 0))))
+        if logical_num_experts <= 0:
+            raise ValueError(
+                f"Invalid logical num_experts={logical_num_experts} "
+                f"at layer={self.layer_idx}.")
+        return logical_num_experts
+
+    def _get_reserved_local_expert_slots_for_floor(self,
+                                                   min_ep_size: int) -> int:
+        logical_num_experts = self._get_logical_num_experts_for_elastic()
+        if logical_num_experts % min_ep_size != 0:
+            raise ValueError(
+                f"logical_num_experts={logical_num_experts} is not divisible "
+                f"by min_ep_size={min_ep_size} at layer={self.layer_idx}.")
+        return logical_num_experts // min_ep_size
+
+    def _get_allowed_lossless_active_local_expert_counts(self) -> set[int]:
+        logical_num_experts = self._get_logical_num_experts_for_elastic()
+        initial_ep_size = self._get_elastic_initial_ep_size()
+        min_ep_size = self._get_effective_runtime_prealloc_floor_ep_size()
+        allowed_counts = {0}
+        ep_size = initial_ep_size
+        while ep_size >= 1:
+            if logical_num_experts % ep_size == 0:
+                allowed_counts.add(logical_num_experts // ep_size)
+            if ep_size <= min_ep_size:
+                break
+            next_ep_size = ep_size // 2
+            if next_ep_size <= 0 or next_ep_size == ep_size:
+                break
+            ep_size = next_ep_size
+        return allowed_counts
+
+    def _get_zero_redundancy_prealloc_capacity(self) -> int:
+        active_local_num_experts = int(self.active_local_num_experts)
+        if (self.elastic_moe_mode != "lossless"
+                or getattr(self, "global_redundant_expert_num", 0) > 0):
+            return active_local_num_experts
+        if not self._is_followup_shrink_enabled():
+            return active_local_num_experts
+        if self._is_hybrid_cpu_swap_enabled():
+            return max(active_local_num_experts,
+                       self._get_hybrid_resident_capacity())
+        logical_num_experts = self._get_logical_num_experts_for_elastic()
+        min_compute_group_size = (
+            self._get_configured_elastic_min_compute_group_size())
+        if min_compute_group_size is not None:
+            return max(
+                active_local_num_experts,
+                self._get_reserved_local_expert_slots_for_floor(
+                    min_compute_group_size))
+
+        current_ep_size = self._get_elastic_initial_ep_size()
+        next_ep_size = current_ep_size // 2
+        if next_ep_size <= 0 or logical_num_experts % next_ep_size != 0:
+            return active_local_num_experts
+        return max(active_local_num_experts, logical_num_experts // next_ep_size)
+
+    def _get_lossless_loaded_slot_capacity(self) -> int:
+        loaded_local_num_experts = int(
+            getattr(self, "loaded_local_num_experts",
+                    getattr(self, "active_local_num_experts", 0)))
+        if self.elastic_moe_mode != "lossless":
+            return loaded_local_num_experts
+        if getattr(self, "global_redundant_expert_num", 0) <= 0:
+            return self._get_zero_redundancy_prealloc_capacity()
+        if not self._is_followup_shrink_enabled():
+            return loaded_local_num_experts
+        if self._is_hybrid_cpu_swap_enabled():
+            return max(loaded_local_num_experts,
+                       self._get_hybrid_resident_capacity())
+        min_compute_group_size = (
+            self._get_configured_elastic_min_compute_group_size())
+        if min_compute_group_size is None:
+            return loaded_local_num_experts
+        return max(
+            loaded_local_num_experts,
+            self._get_reserved_local_expert_slots_for_floor(
+                min_compute_group_size))
+
+    def _is_hybrid_cpu_swap_enabled(self) -> bool:
+        if not getattr(self, "lossless_hybrid_cpu_swap_enabled", False):
+            return False
+        if self.elastic_moe_mode != "lossless":
+            return False
+        if getattr(self, "elastic_execution_mode", 0) == 1:
+            return False
+        return True
+
+    def _is_mode3_cross_layer_buffer_enabled(self) -> bool:
+        return (self._is_hybrid_cpu_swap_enabled()
+                and int(getattr(self, "elastic_execution_mode", 0)) in (3, 4, 5))
+
+    def _get_hybrid_resident_capacity(self) -> int:
+        if getattr(self, "elastic_execution_mode", 0) in (3, 4, 5):
+            return max(1, self._get_lossless_primary_prefix_row_count())
+        configured_resident_slots = (
+            envs_ascend.VLLM_ASCEND_ELASTIC_HYBRID_RESIDENT_EXPERT_SLOTS)
+        if (getattr(self, "elastic_execution_mode", 0) == 2
+                and configured_resident_slots is not None):
+            return max(
+                int(getattr(self, "active_local_num_experts", 0)),
+                int(configured_resident_slots),
+            )
+        default_floor = self._get_default_single_shrink_ep_floor()
+        return max(
+            int(getattr(self, "active_local_num_experts", 0)),
+            self._get_reserved_local_expert_slots_for_floor(default_floor))
+
+    def _hybrid_requires_multi_wave_execution(self) -> bool:
+        if self._is_mode3_cross_layer_buffer_enabled():
+            return False
+        if not self.lossless_hybrid_active:
+            return False
+        resident_capacity = int(self.lossless_hybrid_resident_capacity)
+        if resident_capacity <= 0:
+            return False
+        rank_owned_expert_ids = getattr(self, "lossless_hybrid_rank_owned_expert_ids",
+                                        None)
+        if rank_owned_expert_ids:
+            return any(
+                len(expert_ids) > resident_capacity
+                for expert_ids in rank_owned_expert_ids)
+        return len(getattr(self, "lossless_hybrid_owned_expert_ids", [])) > resident_capacity
+
+    def should_activate_lossless_hybrid_for_target(
+            self, target_owned_local_expert_count: int,
+            active_rank_count: int) -> bool:
+        if not self._is_hybrid_cpu_swap_enabled():
+            return False
+        target_owned_local_expert_count = int(target_owned_local_expert_count)
+        if target_owned_local_expert_count <= 0:
+            return False
+        resident_capacity = self._get_hybrid_resident_capacity()
+        return target_owned_local_expert_count > resident_capacity
+
+    def should_offload_loaded_weights_after_lossless_activation(self) -> bool:
+        if self.elastic_moe_mode != "lossless":
+            return False
+        if int(getattr(self, "global_redundant_expert_num", 0)) > 0:
+            return False
+        if self._is_mode3_cross_layer_buffer_enabled():
+            return False
+        return self._is_hybrid_cpu_swap_enabled()
+
+    def clear_lossless_hybrid_state(self) -> None:
+        self.lossless_hybrid_active = False
+        self.lossless_hybrid_resident_capacity = 0
+        self.lossless_hybrid_owned_expert_ids = []
+        self.lossless_hybrid_resident_expert_ids = []
+        self.lossless_hybrid_cpu_only_expert_ids = []
+        self.lossless_hybrid_active_ranks = []
+        self.lossless_hybrid_active_rank_index = -1
+        self.lossless_hybrid_rank_owned_expert_ids = []
+        self.lossless_hybrid_rank_resident_expert_ids = []
+        self.lossless_hybrid_rank_lru = []
+        self.lossless_hybrid_owner_rank_by_expert = None
+        self.lossless_hybrid_owner_global_rank_by_expert = None
+        self.lossless_hybrid_last_stats = {}
+        self.lossless_mode1_native_parity_ready = (
+            self._should_enable_mode1_parity_for_current_layout())
+        self.lossless_mode3_primary_prefix_expert_ids = []
+        self.lossless_mode3_primary_prefix_local_slots = {}
+        self.lossless_mode4_remote_source_by_expert = {}
+        self.lossless_mode5_remote_source_chain_by_expert = {}
+        self.lossless_mode4_remote_fetcher = None
+        if not (int(getattr(self, "elastic_execution_mode", 0)) == 1
+                and _env_flag("VLLM_ASCEND_MODE1_SAFE_CPU_EXPORT", "0")):
+            self._clear_lossless_cpu_shadow_state(drop_buffers=False)
+        self._mode3_hybrid_inactive_logged = False
+        self._mode3_gate_reject_logged = False
+        self._mode3_refresh_skip_logged = False
+
+    def release_mode1_full_world_transient_state(self) -> None:
+        """Drop mode=1 shrink/runtime-only references for full-world steps."""
+        self.clear_lossless_hybrid_state()
+        self.runtime_w13_weight = None
+        self.runtime_w2_weight = None
+        self.runtime_w13_buffer = None
+        self.runtime_w2_buffer = None
+        self.runtime_weight_capacity = 0
+        self.lossless_runtime_activated = False
+        self.lossless_saved_primary_prefix_w13 = None
+        self.lossless_saved_primary_prefix_w2 = None
+        self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+        clear_export_cache = getattr(self, "clear_lossless_npu_export_slot_cache",
+                                     None)
+        if callable(clear_export_cache):
+            clear_export_cache()
+        clear_p2p_alias_cache = getattr(self, "clear_lossless_p2p_alias_cache",
+                                        None)
+        if callable(clear_p2p_alias_cache):
+            clear_p2p_alias_cache()
+        self.lossless_runtime_dispatch_log2phy = None
+        self.lossless_runtime_dispatch_signature = None
+        self.lossless_runtime_dispatch_num_experts = 0
+        if hasattr(self, "_mode3_double_buffer_manager"):
+            self._mode3_double_buffer_manager = None
+
+    def _finalize_mode1_full_world_compact_metadata(self) -> None:
+        """Keep compacted full-world weights and MoE routing metadata aligned."""
+        self._sync_mode1_active_log2phy_from_expert_map(
+            "finalize_full_world_compact_metadata",
+            update_primary=True,
+        )
+        self._mode1_execute_mapping_validated = False
+        self.elastic_runtime_log2phy = None
+        self.lossless_runtime_dispatch_log2phy = None
+        self.lossless_runtime_dispatch_signature = None
+        self.lossless_runtime_dispatch_num_experts = 0
+        clear_export_cache = getattr(self, "clear_lossless_npu_export_slot_cache",
+                                     None)
+        if callable(clear_export_cache):
+            clear_export_cache()
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        if self.layer_idx == 0:
+            try:
+                expert_slots = []
+                loaded_slots = []
+                if self.expert_map is not None:
+                    expert_slots = [
+                        int(slot) for slot in self.expert_map.detach().cpu().tolist()
+                        if int(slot) >= 0
+                    ]
+                if self.loaded_expert_map is not None:
+                    loaded_slots = [
+                        int(slot)
+                        for slot in self.loaded_expert_map.detach().cpu().tolist()
+                        if int(slot) >= 0
+                    ]
+                logger.info(
+                    "Mode1 full-world compact metadata aligned: layer=%s "
+                    "active_local=%s local_num=%s moe_config_local=%s "
+                    "loaded_local=%s loaded_capacity=%s weight_rows=%s "
+                    "expert_map_count=%s expert_map_max=%s "
+                    "loaded_map_count=%s loaded_map_max=%s",
+                    self.layer_idx,
+                    int(getattr(self, "active_local_num_experts", -1)),
+                    int(getattr(self, "local_num_experts", -1)),
+                    int(getattr(getattr(self, "moe_config", None),
+                                "num_local_experts", -1)),
+                    int(getattr(self, "loaded_local_num_experts", -1)),
+                    int(getattr(self, "loaded_weight_capacity", -1)),
+                    int(getattr(self.w13_weight, "shape", (0, ))[0]),
+                    len(expert_slots),
+                    max(expert_slots) if expert_slots else -1,
+                    len(loaded_slots),
+                    max(loaded_slots) if loaded_slots else -1,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to log mode1 full-world compact metadata alignment")
+
+    def _validate_mode1_lossless_active_mapping(self,
+                                                reason: str,
+                                                *,
+                                                require_log2phy: bool = True
+                                                ) -> bool:
+        """Validate mode1 active expert storage and routing metadata.
+
+        Floor2 keeps a larger canonical storage than the full-world active
+        prefix. That is valid only if the active expert maps and log2phy table
+        still describe the exact prefix used by fused MoE. Otherwise generation
+        can silently read stale expert rows and run to the response cap.
+        """
+        if not _env_flag("VLLM_ASCEND_MODE1_VALIDATE_EXPERT_MAPPING", "1"):
+            return True
+        if (getattr(self, "elastic_moe_mode", "lossy") != "lossless"
+                or int(getattr(self, "elastic_execution_mode", 0)) != 1):
+            return True
+
+        errors: list[str] = []
+        active = int(getattr(self, "active_local_num_experts", -1))
+        local_num = int(getattr(self, "local_num_experts", -1))
+        moe_local = int(getattr(getattr(self, "moe_config", None),
+                                "num_local_experts", -1))
+        loaded_local = int(getattr(self, "loaded_local_num_experts", -1))
+        capacity = int(getattr(self, "loaded_weight_capacity", -1))
+        w13_rows = int(getattr(getattr(self, "w13_weight", None),
+                               "shape", (0, ))[0])
+        w2_rows = int(getattr(getattr(self, "w2_weight", None),
+                              "shape", (0, ))[0])
+
+        if active <= 0:
+            errors.append(f"active_local={active}")
+        if local_num != active:
+            errors.append(f"local_num={local_num} active={active}")
+        if moe_local != active:
+            errors.append(f"moe_config_local={moe_local} active={active}")
+        if w13_rows < active or w2_rows < active:
+            errors.append(
+                f"weight_rows too small w13={w13_rows} w2={w2_rows} active={active}")
+        if capacity < active:
+            errors.append(f"capacity={capacity} active={active}")
+        if loaded_local < active:
+            errors.append(f"loaded_local={loaded_local} active={active}")
+
+        expert_map_list: list[int] = []
+        loaded_map_list: list[int] = []
+        log2phy_list: list[int] = []
+        try:
+            if self.expert_map is None:
+                errors.append("expert_map=None")
+            else:
+                expert_map_list = [
+                    int(v) for v in self.expert_map.detach().cpu().tolist()
+                ]
+            if self.loaded_expert_map is None:
+                errors.append("loaded_expert_map=None")
+            else:
+                loaded_map_list = [
+                    int(v)
+                    for v in self.loaded_expert_map.detach().cpu().tolist()
+                ]
+            if self.log2phy is None:
+                if require_log2phy:
+                    errors.append("log2phy=None")
+            else:
+                log2phy_list = [
+                    int(v) for v in self.log2phy.detach().cpu().tolist()
+                ]
+        except Exception as exc:
+            errors.append(f"map_copy_failed={exc!r}")
+
+        def _check_map(name: str,
+                       values: list[int],
+                       expected_count: int,
+                       slot_limit: int) -> None:
+            if not values:
+                return
+            slots = [slot for slot in values if slot >= 0]
+            if len(slots) != expected_count:
+                errors.append(
+                    f"{name}_valid_count={len(slots)} expected={expected_count}")
+            if slots:
+                if min(slots) < 0 or max(slots) >= slot_limit:
+                    errors.append(
+                        f"{name}_slot_range={min(slots)}..{max(slots)} limit={slot_limit}")
+                if len(set(slots)) != len(slots):
+                    errors.append(f"{name}_duplicate_slots={slots[:32]}")
+
+        _check_map("expert_map", expert_map_list, active, active)
+        _check_map("loaded_expert_map", loaded_map_list, loaded_local, capacity)
+        if expert_map_list and loaded_map_list:
+            for expert_id, slot in enumerate(expert_map_list):
+                if slot < 0:
+                    continue
+                if expert_id >= len(loaded_map_list):
+                    errors.append(
+                        f"loaded_map_too_short expert_id={expert_id} len={len(loaded_map_list)}")
+                    break
+                loaded_slot = int(loaded_map_list[expert_id])
+                if loaded_slot < 0 or loaded_slot >= capacity:
+                    errors.append(
+                        f"active_expert_missing_loaded_slot expert={expert_id} loaded_slot={loaded_slot} capacity={capacity}")
+                    break
+
+        if log2phy_list:
+            logical_num_experts = int(
+                getattr(self, "elastic_original_num_experts",
+                        getattr(self, "num_experts", len(log2phy_list))))
+            log_limit = int(getattr(self, "num_experts", logical_num_experts))
+            log_limit = max(log_limit, logical_num_experts, 1)
+            if len(log2phy_list) < logical_num_experts:
+                errors.append(
+                    f"log2phy_too_short len={len(log2phy_list)} expected={logical_num_experts}")
+            else:
+                logical_window = log2phy_list[:logical_num_experts]
+                if logical_window:
+                    log_min = min(logical_window)
+                    log_max = max(logical_window)
+                    if log_min < 0 or log_max >= log_limit:
+                        errors.append(
+                            f"log2phy_global_range={log_min}..{log_max} limit={log_limit}")
+
+        if errors:
+            message = (
+                "Mode1 lossless expert mapping invariant failed: "
+                f"layer={getattr(self, 'layer_idx', -1)} reason={reason} "
+                f"active={active} loaded_local={loaded_local} capacity={capacity} "
+                f"w13_rows={w13_rows} w2_rows={w2_rows} errors={errors[:8]}")
+            if _env_flag("VLLM_ASCEND_MODE1_VALIDATE_EXPERT_MAPPING_STRICT",
+                         "1"):
+                raise RuntimeError(message)
+            logger.error(message)
+            return False
+
+        if (int(getattr(self, "layer_idx", -1)) == 0 and _env_flag(
+                "VLLM_ASCEND_MODE1_VALIDATE_EXPERT_MAPPING_LOG", "1")):
+            logger.info(
+                "Mode1 lossless expert mapping validated: layer=%s reason=%s "
+                "active=%s loaded_local=%s capacity=%s weight_rows=%s/%s",
+                getattr(self, "layer_idx", -1),
+                reason,
+                active,
+                loaded_local,
+                capacity,
+                w13_rows,
+                w2_rows,
+            )
+        self._log_mode1_lossless_weight_fingerprints(reason)
+        return True
+
+    def _log_mode1_lossless_weight_fingerprints(self, reason: str) -> None:
+        """Log value-level expert slot checks for mode1 floor2 corruption.
+
+        The normal invariant checker validates counts, slot ranges and log2phy.
+        That is not enough for floor2: generation can still be corrupted if the
+        active execution slot points at the right slot id but the slot contains
+        stale or wrong expert weights.  This debug hook samples tiny row slices
+        from the active slot and the canonical loaded slot for the same expert.
+        """
+        if not _env_flag("VLLM_ASCEND_MODE1_WEIGHT_FINGERPRINT_LOG", "0"):
+            return
+        if (_mode1_in_profile_run()
+                and not _env_flag("VLLM_ASCEND_MODE1_DIAG_DURING_PROFILE",
+                                  "0")):
+            return
+        reason_filter = os.getenv(
+            "VLLM_ASCEND_MODE1_WEIGHT_FINGERPRINT_REASONS", "").strip()
+        if reason_filter:
+            allowed_reasons = [
+                item.strip() for item in reason_filter.split(",")
+                if item.strip()
+            ]
+            if allowed_reasons and not any(
+                    item in reason for item in allowed_reasons):
+                return
+        if (getattr(self, "elastic_moe_mode", "lossy") != "lossless"
+                or int(getattr(self, "elastic_execution_mode", 0)) != 1):
+            return
+        layer_filter = os.getenv("VLLM_ASCEND_MODE1_WEIGHT_FINGERPRINT_LAYERS",
+                                 "0")
+        layer_idx = int(getattr(self, "layer_idx", -1))
+        if layer_filter.strip().lower() not in ("", "all", "*"):
+            try:
+                allowed = {
+                    int(item.strip())
+                    for item in layer_filter.split(",") if item.strip()
+                }
+            except ValueError:
+                allowed = {0}
+            if layer_idx not in allowed:
+                return
+        if self.expert_map is None or self.loaded_expert_map is None:
+            logger.warning(
+                "Mode1 weight fingerprint skipped: layer=%s reason=%s "
+                "expert_map=%s loaded_expert_map=%s",
+                layer_idx,
+                reason,
+                self.expert_map is not None,
+                self.loaded_expert_map is not None,
+            )
+            return
+        limit = _env_int("VLLM_ASCEND_MODE1_WEIGHT_FINGERPRINT_EXPERTS",
+                         4,
+                         minimum=1)
+        sample = _env_int("VLLM_ASCEND_MODE1_WEIGHT_FINGERPRINT_VALUES",
+                          16,
+                          minimum=1)
+
+        def _row_fp(tensor: Optional[torch.Tensor], row: int) -> dict[str, Any]:
+            if tensor is None:
+                return {"ok": False, "why": "none"}
+            if row < 0 or row >= int(tensor.shape[0]):
+                return {
+                    "ok": False,
+                    "why": f"row_oob:{row}/{int(tensor.shape[0])}"
+                }
+            try:
+                flat = tensor[int(row)].reshape(-1).detach()
+                total_values = int(flat.numel())
+                if total_values <= sample:
+                    offsets = list(range(total_values))
+                    sampled = flat
+                else:
+                    offsets = sorted({
+                        int(round(i * (total_values - 1) / (sample - 1)))
+                        for i in range(sample)
+                    }) if sample > 1 else [0]
+                    sampled = flat[torch.tensor(offsets, device=flat.device)]
+                vals = sampled.to(dtype=torch.float32, device="cpu")
+                if vals.numel() == 0:
+                    return {"ok": False, "why": "empty"}
+                abs_vals = vals.abs()
+                return {
+                    "ok": True,
+                    "sum": round(float(vals.sum().item()), 6),
+                    "abs_mean": round(float(abs_vals.mean().item()), 6),
+                    "max": round(float(vals.max().item()), 6),
+                    "min": round(float(vals.min().item()), 6),
+                    "abs_max": round(float(abs_vals.max().item()), 6),
+                    "zero_like": bool(float(abs_vals.max().item()) == 0.0),
+                    "sample_offsets": offsets[:min(4, len(offsets))],
+                    "numel": total_values,
+                    "head": [
+                        round(float(v), 6)
+                        for v in vals[:min(4, int(vals.numel()))].tolist()
+                    ],
+                }
+            except Exception as exc:
+                return {"ok": False, "why": repr(exc)}
+
+        def _row_diff(lhs: Optional[torch.Tensor], lhs_row: int,
+                      rhs: Optional[torch.Tensor],
+                      rhs_row: int) -> Optional[float]:
+            if lhs is None or rhs is None:
+                return None
+            if lhs_row < 0 or rhs_row < 0:
+                return None
+            if lhs_row >= int(lhs.shape[0]) or rhs_row >= int(rhs.shape[0]):
+                return None
+            try:
+                lflat = lhs[int(lhs_row)].reshape(-1).detach()
+                rflat = rhs[int(rhs_row)].reshape(-1).detach()
+                total_values = min(int(lflat.numel()), int(rflat.numel()))
+                if total_values <= 0:
+                    return None
+                if total_values <= sample:
+                    offsets = list(range(total_values))
+                else:
+                    offsets = sorted({
+                        int(round(i * (total_values - 1) / (sample - 1)))
+                        for i in range(sample)
+                    }) if sample > 1 else [0]
+                offset_tensor = torch.tensor(offsets, device=lflat.device)
+                lvals = lflat[offset_tensor].to(dtype=torch.float32,
+                                                device="cpu")
+                rvals = rflat[offset_tensor.to(device=rflat.device)].to(
+                    dtype=torch.float32, device="cpu")
+                count = min(int(lvals.numel()), int(rvals.numel()))
+                if count <= 0:
+                    return None
+                return round(float((lvals[:count] - rvals[:count]).abs().mean().item()),
+                             6)
+            except Exception:
+                return None
+
+        try:
+            expert_map = [int(v) for v in self.expert_map.detach().cpu().tolist()]
+            loaded_map = [
+                int(v) for v in self.loaded_expert_map.detach().cpu().tolist()
+            ]
+            log2phy = ([] if self.log2phy is None else [
+                int(v) for v in self.log2phy.detach().cpu().tolist()
+            ])
+        except Exception:
+            logger.exception(
+                "Mode1 weight fingerprint failed to copy maps: layer=%s reason=%s",
+                layer_idx,
+                reason,
+            )
+            return
+
+        active_experts = [
+            (expert_id, slot)
+            for expert_id, slot in enumerate(expert_map) if int(slot) >= 0
+        ][:limit]
+        rows: list[dict[str, Any]] = []
+        zero_like_w13_active = 0
+        zero_like_w2_active = 0
+        suspicious_experts: list[int] = []
+        for expert_id, active_slot in active_experts:
+            loaded_slot = (loaded_map[expert_id]
+                           if expert_id < len(loaded_map) else -1)
+            log2phy_slot = (log2phy[expert_id] if expert_id < len(log2phy) else
+                            None)
+            w13_active_fp = _row_fp(self.w13_weight, int(active_slot))
+            w2_active_fp = _row_fp(self.w2_weight, int(active_slot))
+            if bool(w13_active_fp.get("zero_like", False)):
+                zero_like_w13_active += 1
+                suspicious_experts.append(int(expert_id))
+            if bool(w2_active_fp.get("zero_like", False)):
+                zero_like_w2_active += 1
+                if int(expert_id) not in suspicious_experts:
+                    suspicious_experts.append(int(expert_id))
+            rows.append({
+                "expert": int(expert_id),
+                "primary_owner_rank_hint": int(expert_id) // max(
+                    1, int(getattr(self, "local_num_experts", 1))),
+                "primary_owner_slot_hint": int(expert_id) % max(
+                    1, int(getattr(self, "local_num_experts", 1))),
+                "active_slot": int(active_slot),
+                "loaded_slot": int(loaded_slot),
+                "log2phy": log2phy_slot,
+                "w13_active": w13_active_fp,
+                "w13_loaded": _row_fp(self.w13_weight, int(loaded_slot)),
+                "w13_active_vs_loaded_absdiff": _row_diff(
+                    self.w13_weight, int(active_slot), self.w13_weight,
+                    int(loaded_slot)),
+                "w2_active": w2_active_fp,
+                "w2_loaded": _row_fp(self.w2_weight, int(loaded_slot)),
+                "w2_active_vs_loaded_absdiff": _row_diff(
+                    self.w2_weight, int(active_slot), self.w2_weight,
+                    int(loaded_slot)),
+            })
+
+        logger.warning(
+            "Mode1 weight fingerprint: layer=%s ep_rank=%s reason=%s "
+            "active=%s loaded_local=%s capacity=%s w13_shape=%s w2_shape=%s "
+            "zero_like_w13_active=%s zero_like_w2_active=%s "
+            "suspicious_experts=%s samples=%s",
+            layer_idx,
+            int(getattr(self, "ep_rank", -1)),
+            reason,
+            int(getattr(self, "active_local_num_experts", -1)),
+            int(getattr(self, "loaded_local_num_experts", -1)),
+            int(getattr(self, "loaded_weight_capacity", -1)),
+            tuple(getattr(self.w13_weight, "shape", ())),
+            tuple(getattr(self.w2_weight, "shape", ())),
+            zero_like_w13_active,
+            zero_like_w2_active,
+            suspicious_experts[:16],
+            rows,
+        )
+
+    def _can_reuse_loaded_prefix_for_hybrid(
+            self, resident_capacity: int, runtime_device: torch.device,
+            runtime_w13_dtype: torch.dtype,
+            runtime_w2_dtype: torch.dtype) -> bool:
+        if self.lossless_loaded_offloaded:
+            return False
+        if resident_capacity <= 0:
+            return False
+        if int(getattr(self, "loaded_weight_capacity", 0)) < resident_capacity:
+            return False
+        if int(self.w13_weight.shape[0]) < resident_capacity:
+            return False
+        if int(self.w2_weight.shape[0]) < resident_capacity:
+            return False
+        if self.w13_weight.device != runtime_device:
+            return False
+        if self.w2_weight.device != runtime_device:
+            return False
+        if self.w13_weight.dtype != runtime_w13_dtype:
+            return False
+        if self.w2_weight.dtype != runtime_w2_dtype:
+            return False
+        return True
+
+    def _get_lossless_primary_prefix_row_count(self) -> int:
+        primary_expert_map = getattr(self, "elastic_original_expert_map", None)
+        if primary_expert_map is not None:
+            return int((primary_expert_map != -1).sum().item())
+        initial_ep_size = self._get_elastic_initial_ep_size()
+        logical_num_experts = self._get_logical_num_experts_for_elastic()
+        if initial_ep_size > 0 and logical_num_experts % initial_ep_size == 0:
+            return logical_num_experts // initial_ep_size
+        return int(getattr(self, "active_local_num_experts", 0))
+
+    def _should_enable_mode1_parity_for_current_layout(self) -> bool:
+        mode = int(getattr(self, "elastic_execution_mode", 0))
+        return mode == 1
+
+    def _stash_lossless_primary_prefix_for_hybrid(self) -> None:
+        if int(getattr(self, "elastic_execution_mode", 0)) in (4, 5):
+            # Mode 4 never overwrites the primary loaded expert prefix: remote
+            # NPU experts are materialized only into the cross-layer double
+            # buffer. Stashing the prefix would create an unnecessary CPU copy
+            # and make restore copy it back layer-by-layer.
+            return
+        if self.lossless_loaded_offloaded:
+            return
+        if int(getattr(self, "loaded_weight_capacity", 0)) <= 0:
+            return
+        row_count = min(self._get_lossless_primary_prefix_row_count(),
+                        int(self.w13_weight.shape[0]),
+                        int(self.w2_weight.shape[0]))
+        if row_count <= 0:
+            return
+        self.lossless_saved_primary_prefix_w13 = self.w13_weight[
+            :row_count].detach().cpu().clone()
+        self.lossless_saved_primary_prefix_w2 = self.w2_weight[
+            :row_count].detach().cpu().clone()
+        if (self.layer_idx == 0
+                and not self.lossless_primary_prefix_stash_logged):
+            logger.info(
+                "Lossless primary prefix stashed for hybrid reuse: layer=%s rows=%s loaded_capacity=%s hybrid_resident_capacity=%s",
+                self.layer_idx,
+                row_count,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+                self._get_hybrid_resident_capacity(),
+            )
+            self.lossless_primary_prefix_stash_logged = True
+
+    def _stash_lossless_primary_prefix_for_mode1_full_world(self) -> None:
+        if int(getattr(self, "elastic_execution_mode", 0)) != 1:
+            return
+        if self.lossless_loaded_offloaded:
+            return
+        if int(getattr(self, "loaded_weight_capacity", 0)) <= 0:
+            return
+        row_count = min(self._get_lossless_primary_prefix_row_count(),
+                        int(self.w13_weight.shape[0]),
+                        int(self.w2_weight.shape[0]))
+        if row_count <= 0:
+            return
+        self.lossless_saved_primary_prefix_w13 = self.w13_weight[
+            :row_count].detach().cpu().clone()
+        self.lossless_saved_primary_prefix_w2 = self.w2_weight[
+            :row_count].detach().cpu().clone()
+        if (self.layer_idx == 0
+                and not self.lossless_primary_prefix_stash_logged):
+            logger.info(
+                "Mode1 primary prefix stashed for full-world compaction: "
+                "layer=%s rows=%s loaded_capacity=%s",
+                self.layer_idx,
+                row_count,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+            )
+            self.lossless_primary_prefix_stash_logged = True
+
+    def _clear_lossless_cpu_shadow_state(self,
+                                         drop_buffers: bool = False) -> None:
+        self.lossless_cpu_w13_weight = None
+        self.lossless_cpu_w2_weight = None
+        self.lossless_cpu_shadow_local_slots = {}
+        self.lossless_mode5_cpu_shadow_row_by_expert = {}
+        self.lossless_mode5_cpu_shadow_prepared = False
+        self.lossless_mode5_cpu_shadow_signature = ()
+        self.lossless_mode5_cpu_expert_weights = {}
+        self.lossless_mode5_legacy_cpu_shadow_rows = 0
+        if drop_buffers:
+            self.lossless_cpu_shadow_w13_buffer = None
+            self.lossless_cpu_shadow_w2_buffer = None
+            self.lossless_cpu_shadow_capacity = 0
+
+    def _restore_stashed_lossless_primary_prefix(self, *, force: bool = False) -> None:
+        if int(getattr(self, "elastic_execution_mode", 0)) in (4, 5):
+            self.lossless_saved_primary_prefix_w13 = None
+            self.lossless_saved_primary_prefix_w2 = None
+            return
+        # Mode=1 fixed-slot parity normally restores the full-world logical
+        # layout without copying a CPU-stashed prefix back into formatted NPU
+        # weights. The CPU shadow is only a last-mile safeguard for the
+        # explicit floor=16 physical compaction path. Restoring it on every
+        # between-step full-world reset can perturb the loaded expert tensors
+        # and causes pathological all-16k generations.
+        if int(getattr(self, "elastic_execution_mode", 0)) == 1 and not force:
+            self.lossless_saved_primary_prefix_w13 = None
+            self.lossless_saved_primary_prefix_w2 = None
+            return
+        saved_w13 = getattr(self, "lossless_saved_primary_prefix_w13", None)
+        saved_w2 = getattr(self, "lossless_saved_primary_prefix_w2", None)
+        if saved_w13 is None or saved_w2 is None:
+            return
+        row_count = min(int(saved_w13.shape[0]), int(saved_w2.shape[0]),
+                        int(self.w13_weight.shape[0]), int(self.w2_weight.shape[0]))
+        if row_count <= 0:
+            return
+        self.w13_weight[:row_count].copy_(saved_w13.to(
+            device=self.w13_weight.device, dtype=self.w13_weight.dtype),
+                                          non_blocking=False)
+        self.w2_weight[:row_count].copy_(saved_w2.to(
+            device=self.w2_weight.device, dtype=self.w2_weight.dtype),
+                                         non_blocking=False)
+        if (self.layer_idx == 0
+                and not self.lossless_primary_prefix_restore_logged):
+            logger.info(
+                "Lossless primary prefix restored after hybrid stage: layer=%s rows=%s loaded_capacity=%s",
+                self.layer_idx,
+                row_count,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+            )
+            self.lossless_primary_prefix_restore_logged = True
+
+    def _get_lossless_cpu_pair_for_expert(
+            self, expert_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        expert_id = int(expert_id)
+        prefer_safe_mode1_cpu_source = (
+            int(getattr(self, "elastic_execution_mode", 0)) == 1
+            and _env_flag("VLLM_ASCEND_MODE1_SAFE_CPU_EXPORT", "0"))
+        mode5_cpu_row = self.lossless_mode5_cpu_shadow_row_by_expert.get(
+            expert_id)
+        if mode5_cpu_row is not None:
+            mode5_cpu_row = int(mode5_cpu_row)
+            if (self.lossless_cpu_w13_weight is None
+                    or self.lossless_cpu_w2_weight is None
+                    or mode5_cpu_row >= int(self.lossless_cpu_w13_weight.shape[0])
+                    or mode5_cpu_row >= int(self.lossless_cpu_w2_weight.shape[0])):
+                raise RuntimeError(
+                    f"Mode5 CPU shadow row {mode5_cpu_row} for expert_id={expert_id} is "
+                    f"invalid at layer={self.layer_idx}.")
+            return (self.lossless_cpu_w13_weight[mode5_cpu_row].detach().cpu(),
+                    self.lossless_cpu_w2_weight[mode5_cpu_row].detach().cpu())
+        cpu_slot = self.lossless_cpu_shadow_local_slots.get(expert_id)
+        if cpu_slot is not None:
+            cpu_slot = int(cpu_slot)
+            if (self.lossless_cpu_w13_weight is None
+                    or self.lossless_cpu_w2_weight is None
+                    or cpu_slot >= int(self.lossless_cpu_w13_weight.shape[0])
+                    or cpu_slot >= int(self.lossless_cpu_w2_weight.shape[0])):
+                raise RuntimeError(
+                    f"CPU shadow slot {cpu_slot} for expert_id={expert_id} is "
+                    f"invalid at layer={self.layer_idx}.")
+            return (self.lossless_cpu_w13_weight[cpu_slot].detach().cpu(),
+                    self.lossless_cpu_w2_weight[cpu_slot].detach().cpu())
+        if prefer_safe_mode1_cpu_source:
+            primary_map = getattr(self, "elastic_original_expert_map", None)
+            saved_w13 = getattr(self, "lossless_saved_primary_prefix_w13", None)
+            saved_w2 = getattr(self, "lossless_saved_primary_prefix_w2", None)
+            if primary_map is not None and saved_w13 is not None and saved_w2 is not None:
+                try:
+                    primary_slot = int(primary_map[int(expert_id)].item())
+                except Exception:
+                    primary_slot = -1
+                if (0 <= primary_slot < int(saved_w13.shape[0])
+                        and primary_slot < int(saved_w2.shape[0])):
+                    return (saved_w13[primary_slot].detach().cpu(),
+                            saved_w2[primary_slot].detach().cpu())
+        export_map = self.loaded_expert_map if self.loaded_expert_map is not None else self.expert_map
+        if export_map is None:
+            raise RuntimeError(
+                f"Missing expert map while resolving expert_id={expert_id} at layer={self.layer_idx}."
+            )
+        local_slot = int(export_map[expert_id].item())
+        if local_slot < 0:
+            raise RuntimeError(
+                f"Expert {expert_id} is not available on rank={self.ep_rank} at layer={self.layer_idx}."
+            )
+        if (self.lossless_cpu_w13_weight is not None
+                and self.lossless_cpu_w2_weight is not None
+                and local_slot < int(self.lossless_cpu_w13_weight.shape[0])
+                and local_slot < int(self.lossless_cpu_w2_weight.shape[0])):
+            return (self.lossless_cpu_w13_weight[local_slot].detach().cpu(),
+                    self.lossless_cpu_w2_weight[local_slot].detach().cpu())
+        if local_slot < int(self.w13_weight.shape[0]):
+            return (self.w13_weight[local_slot].detach().cpu(),
+                    self.w2_weight[local_slot].detach().cpu())
+        raise RuntimeError(
+            f"Cannot resolve CPU shadow for expert_id={expert_id}, slot={local_slot} "
+            f"at layer={self.layer_idx}.")
+
+    def _get_lossless_cpu_pair_for_local_slot(
+            self, local_slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+        local_slot = int(local_slot)
+        if local_slot < 0:
+            raise RuntimeError(
+                f"Invalid local_slot={local_slot} at layer={self.layer_idx}.")
+        prefer_safe_mode1_cpu_source = (
+            int(getattr(self, "elastic_execution_mode", 0)) == 1
+            and _env_flag("VLLM_ASCEND_MODE1_SAFE_CPU_EXPORT", "0"))
+        if prefer_safe_mode1_cpu_source:
+            if (self.lossless_cpu_w13_weight is not None
+                    and self.lossless_cpu_w2_weight is not None
+                    and local_slot < int(self.lossless_cpu_w13_weight.shape[0])
+                    and local_slot < int(self.lossless_cpu_w2_weight.shape[0])):
+                return (self.lossless_cpu_w13_weight[local_slot].detach().cpu(),
+                        self.lossless_cpu_w2_weight[local_slot].detach().cpu())
+            saved_w13 = getattr(self, "lossless_saved_primary_prefix_w13", None)
+            saved_w2 = getattr(self, "lossless_saved_primary_prefix_w2", None)
+            if (saved_w13 is not None and saved_w2 is not None
+                    and local_slot < int(saved_w13.shape[0])
+                    and local_slot < int(saved_w2.shape[0])):
+                return (saved_w13[local_slot].detach().cpu(),
+                        saved_w2[local_slot].detach().cpu())
+        if (local_slot < int(self.w13_weight.shape[0])
+                and local_slot < int(self.w2_weight.shape[0])):
+            return (self.w13_weight[local_slot].detach().cpu(),
+                    self.w2_weight[local_slot].detach().cpu())
+        if (self.lossless_cpu_w13_weight is not None
+                and self.lossless_cpu_w2_weight is not None
+                and local_slot < int(self.lossless_cpu_w13_weight.shape[0])
+                and local_slot < int(self.lossless_cpu_w2_weight.shape[0])):
+            return (self.lossless_cpu_w13_weight[local_slot].detach().cpu(),
+                    self.lossless_cpu_w2_weight[local_slot].detach().cpu())
+        raise RuntimeError(
+            f"Cannot resolve CPU shadow for local_slot={local_slot} "
+            f"at layer={self.layer_idx}.")
+
+    def _build_lossless_cpu_shadow_for_owned_layout(
+            self,
+            active_expert_ids: list[int],
+            source_local_ids: list[int],
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if len(active_expert_ids) != len(source_local_ids):
+            raise RuntimeError(
+                f"Owned expert ids/source ids length mismatch at layer={self.layer_idx}: "
+                f"{len(active_expert_ids)} vs {len(source_local_ids)}")
+        if not active_expert_ids:
+            empty_w13 = torch.empty((0, ) + tuple(self.w13_weight.shape[1:]),
+                                    device="cpu",
+                                    dtype=self.w13_weight.dtype)
+            empty_w2 = torch.empty((0, ) + tuple(self.w2_weight.shape[1:]),
+                                   device="cpu",
+                                   dtype=self.w2_weight.dtype)
+            return empty_w13, empty_w2
+
+        mode = int(getattr(self, "elastic_execution_mode", 0))
+        mode5_remote_expert_ids = set(
+            int(expert_id)
+            for expert_id in getattr(self,
+                                     "lossless_mode4_remote_source_by_expert",
+                                     {}))
+        requested_cpu_expert_ids: list[int] = []
+        requested_source_local_ids: list[int] = []
+        for expert_id, source_local_id in zip(active_expert_ids, source_local_ids):
+            expert_id = int(expert_id)
+            source_local_id = int(source_local_id)
+            # Mode5 only needs CPU shadow rows for experts that really flow
+            # through the CPU path.
+            if mode == 5 and expert_id in mode5_remote_expert_ids:
+                continue
+            if mode == 5 and source_local_id >= 0:
+                continue
+            requested_cpu_expert_ids.append(expert_id)
+            requested_source_local_ids.append(source_local_id)
+        if not requested_cpu_expert_ids:
+            empty_w13 = torch.empty((0, ) + tuple(self.w13_weight.shape[1:]),
+                                    device="cpu",
+                                    dtype=self.w13_weight.dtype)
+            empty_w2 = torch.empty((0, ) + tuple(self.w2_weight.shape[1:]),
+                                   device="cpu",
+                                   dtype=self.w2_weight.dtype)
+            if mode == 5:
+                self.lossless_cpu_shadow_local_slots = {}
+                self.lossless_mode5_cpu_shadow_row_by_expert = {}
+                self.lossless_mode5_legacy_cpu_shadow_rows = 0
+            return empty_w13, empty_w2
+
+        existing_prefix_len = 0
+        existing_cpu_order: list[int] = []
+        existing_cpu_w13 = self.lossless_cpu_w13_weight
+        existing_cpu_w2 = self.lossless_cpu_w2_weight
+        existing_buffer_w13 = getattr(self, "lossless_cpu_shadow_w13_buffer",
+                                      None)
+        existing_buffer_w2 = getattr(self, "lossless_cpu_shadow_w2_buffer", None)
+        existing_capacity = int(getattr(self, "lossless_cpu_shadow_capacity", 0))
+        existing_cpu_row_map = (
+            dict(getattr(self, "lossless_mode5_cpu_shadow_row_by_expert", {}))
+            if mode == 5 else dict(self.lossless_cpu_shadow_local_slots))
+        if (existing_cpu_w13 is not None and existing_cpu_w2 is not None
+                and existing_cpu_row_map):
+            max_slot = max(int(slot)
+                           for slot in existing_cpu_row_map.values())
+            existing_cpu_order = [-1] * (max_slot + 1)
+            valid_existing_order = True
+            for expert_id, slot in existing_cpu_row_map.items():
+                slot = int(slot)
+                if slot < 0 or slot >= len(existing_cpu_order):
+                    valid_existing_order = False
+                    break
+                existing_cpu_order[slot] = int(expert_id)
+            if valid_existing_order and all(expert_id >= 0
+                                            for expert_id in existing_cpu_order):
+                if (len(existing_cpu_order) <= int(existing_cpu_w13.shape[0])
+                        and len(existing_cpu_order) <= int(existing_cpu_w2.shape[0])):
+                    for expert_id, existing_expert_id in zip(
+                            requested_cpu_expert_ids, existing_cpu_order):
+                        if int(expert_id) != int(existing_expert_id):
+                            break
+                        existing_prefix_len += 1
+            else:
+                existing_cpu_order = []
+
+        cpu_shadow_slot_by_expert: dict[int, int] = {}
+        if existing_prefix_len > 0:
+            for prefix_slot, expert_id in enumerate(
+                    requested_cpu_expert_ids[:existing_prefix_len]):
+                cpu_shadow_slot_by_expert[int(expert_id)] = int(prefix_slot)
+        requested_count = len(requested_cpu_expert_ids)
+        suffix_count = max(0, requested_count - existing_prefix_len)
+        empty_w13 = torch.empty((0, ) + tuple(self.w13_weight.shape[1:]),
+                                device="cpu",
+                                dtype=self.w13_weight.dtype)
+        empty_w2 = torch.empty((0, ) + tuple(self.w2_weight.shape[1:]),
+                               device="cpu",
+                               dtype=self.w2_weight.dtype)
+        if mode == 5:
+            self.lossless_mode5_cpu_shadow_row_by_expert = {
+                int(expert_id): int(row_idx)
+                for row_idx, expert_id in enumerate(requested_cpu_expert_ids)
+            }
+            self.lossless_mode5_legacy_cpu_shadow_rows = len(
+                requested_cpu_expert_ids)
+            reuse_existing_buffer = (
+                existing_buffer_w13 is not None and existing_buffer_w2 is not None
+                and existing_capacity >= requested_count
+                and existing_buffer_w13.dtype == self.w13_weight.dtype
+                and existing_buffer_w2.dtype == self.w2_weight.dtype)
+            if reuse_existing_buffer:
+                cpu_w13_buffer = _maybe_pin_cpu_tensor(existing_buffer_w13)
+                cpu_w2_buffer = _maybe_pin_cpu_tensor(existing_buffer_w2)
+            else:
+                cpu_w13_buffer = _maybe_pin_cpu_tensor(
+                    torch.empty((requested_count, ) + tuple(self.w13_weight.shape[1:]),
+                                device="cpu",
+                                dtype=self.w13_weight.dtype))
+                cpu_w2_buffer = _maybe_pin_cpu_tensor(
+                    torch.empty((requested_count, ) + tuple(self.w2_weight.shape[1:]),
+                                device="cpu",
+                                dtype=self.w2_weight.dtype))
+                if existing_prefix_len > 0 and existing_cpu_w13 is not None                         and existing_cpu_w2 is not None:
+                    cpu_w13_buffer[:existing_prefix_len].copy_(
+                        existing_cpu_w13[:existing_prefix_len], non_blocking=False)
+                    cpu_w2_buffer[:existing_prefix_len].copy_(
+                        existing_cpu_w2[:existing_prefix_len], non_blocking=False)
+                self.lossless_cpu_shadow_w13_buffer = cpu_w13_buffer
+                self.lossless_cpu_shadow_w2_buffer = cpu_w2_buffer
+                self.lossless_cpu_shadow_capacity = requested_count
+            cpu_w13 = cpu_w13_buffer[:requested_count]
+            cpu_w2 = cpu_w2_buffer[:requested_count]
+        else:
+            suffix_w13 = None
+            suffix_w2 = None
+            if suffix_count > 0:
+                suffix_w13 = _maybe_pin_cpu_tensor(
+                    torch.empty((suffix_count, ) + tuple(self.w13_weight.shape[1:]),
+                                device="cpu",
+                                dtype=self.w13_weight.dtype))
+                suffix_w2 = _maybe_pin_cpu_tensor(
+                    torch.empty((suffix_count, ) + tuple(self.w2_weight.shape[1:]),
+                                device="cpu",
+                                dtype=self.w2_weight.dtype))
+        suffix_slot = 0
+        for expert_id, source_local_id in zip(
+                requested_cpu_expert_ids[existing_prefix_len:],
+                requested_source_local_ids[existing_prefix_len:]):
+            expert_id = int(expert_id)
+            source_local_id = int(source_local_id)
+            if mode == 5 and source_local_id >= 0:
+                continue
+            if source_local_id >= 0:
+                source_w13, source_w2 = self._get_lossless_cpu_pair_for_local_slot(
+                    source_local_id)
+            else:
+                existing_cpu_slot = None
+                if mode == 5:
+                    existing_cpu_slot = existing_cpu_row_map.get(expert_id)
+                if existing_cpu_slot is not None:
+                    existing_cpu_slot = int(existing_cpu_slot)
+                    if (self.lossless_cpu_w13_weight is None
+                            or self.lossless_cpu_w2_weight is None
+                            or existing_cpu_slot >= int(
+                                self.lossless_cpu_w13_weight.shape[0])
+                            or existing_cpu_slot >= int(
+                                self.lossless_cpu_w2_weight.shape[0])):
+                        raise RuntimeError(
+                            "Mode5 CPU-shadow reuse found a stale slot mapping: "
+                            f"layer={self.layer_idx} expert_id={expert_id} "
+                            f"cpu_slot={existing_cpu_slot}")
+                    # existing_cpu_slot indexes the CPU-shadow table, not the
+                    # NPU resident prefix.  Do not route this through
+                    # _get_lossless_cpu_pair_for_local_slot(), which checks NPU
+                    # slots first and can silently copy the wrong expert.
+                    source_w13 = self.lossless_cpu_w13_weight[
+                        existing_cpu_slot].detach().cpu()
+                    source_w2 = self.lossless_cpu_w2_weight[
+                        existing_cpu_slot].detach().cpu()
+                elif cpu_expert_weights is None or expert_id not in cpu_expert_weights:
+                    raise RuntimeError(
+                        f"Missing CPU import payload for expert_id={expert_id} "
+                        f"at layer={self.layer_idx}.")
+                else:
+                    source_w13, source_w2 = cpu_expert_weights[expert_id]
+            cpu_shadow_slot_by_expert[expert_id] = existing_prefix_len + suffix_slot
+            if mode == 5:
+                target_w13 = cpu_w13[existing_prefix_len + suffix_slot]
+                target_w2 = cpu_w2[existing_prefix_len + suffix_slot]
+            else:
+                if suffix_w13 is None or suffix_w2 is None:
+                    raise RuntimeError(
+                        "CPU-shadow suffix buffers were not allocated for a non-empty suffix: "
+                        f"layer={self.layer_idx} expert_id={expert_id} suffix_count={suffix_count}")
+                target_w13 = suffix_w13[suffix_slot]
+                target_w2 = suffix_w2[suffix_slot]
+            if source_w13.device.type == "cpu":
+                target_w13.copy_(source_w13, non_blocking=False)
+            else:
+                target_w13.copy_(source_w13.to(device="cpu"),
+                                 non_blocking=False)
+            if source_w2.device.type == "cpu":
+                target_w2.copy_(source_w2, non_blocking=False)
+            else:
+                target_w2.copy_(source_w2.to(device="cpu"),
+                                non_blocking=False)
+            suffix_slot += 1
+        if suffix_slot != suffix_count:
+            raise RuntimeError(
+                f"CPU-shadow suffix fill mismatch at layer={self.layer_idx}: "
+                f"expected_suffix={suffix_count} filled={suffix_slot}")
+        if mode != 5:
+            if existing_prefix_len > 0 and existing_cpu_w13 is not None \
+                    and existing_cpu_w2 is not None:
+                reused_w13 = existing_cpu_w13[:existing_prefix_len]
+                reused_w2 = existing_cpu_w2[:existing_prefix_len]
+                if suffix_count > 0:
+                    cpu_w13 = torch.cat([reused_w13, suffix_w13], dim=0)
+                    cpu_w2 = torch.cat([reused_w2, suffix_w2], dim=0)
+                else:
+                    cpu_w13 = reused_w13
+                    cpu_w2 = reused_w2
+            else:
+                cpu_w13 = suffix_w13 if suffix_w13 is not None else empty_w13
+                cpu_w2 = suffix_w2 if suffix_w2 is not None else empty_w2
+        if mode == 5:
+            self.lossless_cpu_shadow_local_slots = {}
+        return _maybe_pin_cpu_tensor(cpu_w13), _maybe_pin_cpu_tensor(cpu_w2)
+
+    def _mode5_cpu_shadow_signature_for_owned_layout(
+            self,
+            active_expert_ids: list[int],
+            source_local_ids: list[int]) -> tuple[int, ...]:
+        remote_expert_ids = set(
+            int(expert_id)
+            for expert_id in getattr(self,
+                                     "lossless_mode4_remote_source_by_expert",
+                                     {}))
+        return tuple(
+            int(expert_id)
+            for expert_id, source_local_id in zip(active_expert_ids,
+                                                  source_local_ids)
+            if int(source_local_id) < 0
+            and int(expert_id) not in remote_expert_ids)
+
+    def _has_prepared_mode5_cpu_shadow_for_owned_layout(
+            self,
+            active_expert_ids: list[int],
+            source_local_ids: list[int]) -> bool:
+        if int(getattr(self, "elastic_execution_mode", 0)) != 5:
+            return False
+        if not getattr(self, "lossless_mode5_cpu_shadow_prepared", False):
+            return False
+        expected_signature = self._mode5_cpu_shadow_signature_for_owned_layout(
+            active_expert_ids, source_local_ids)
+        if tuple(getattr(self, "lossless_mode5_cpu_shadow_signature",
+                         ())) != expected_signature:
+            return False
+        if (self.lossless_cpu_w13_weight is None
+                or self.lossless_cpu_w2_weight is None):
+            return False
+        row_map = dict(getattr(self, "lossless_mode5_cpu_shadow_row_by_expert",
+                               {}))
+        if len(row_map) != len(expected_signature):
+            return False
+        for row_idx, expert_id in enumerate(expected_signature):
+            if int(row_map.get(int(expert_id), -1)) != int(row_idx):
+                return False
+        if int(self.lossless_cpu_w13_weight.shape[0]) < len(expected_signature):
+            return False
+        if int(self.lossless_cpu_w2_weight.shape[0]) < len(expected_signature):
+            return False
+        return True
+
+    def prepare_lossless_mode5_cpu_shadow(
+            self,
+            active_expert_ids: list[int],
+            source_local_ids: list[int],
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]] = None
+    ) -> float:
+        if int(getattr(self, "elastic_execution_mode", 0)) != 5:
+            return 0.0
+        if _mode5_cpu_shadow_runtime_strategy() == "legacy_cpu_shadow":
+            return 0.0
+        if self._has_prepared_mode5_cpu_shadow_for_owned_layout(
+                active_expert_ids, source_local_ids):
+            return 0.0
+        build_start = time.perf_counter()
+        cpu_w13, cpu_w2 = self._build_lossless_cpu_shadow_for_owned_layout(
+            active_expert_ids, source_local_ids, cpu_expert_weights)
+        self.lossless_cpu_w13_weight = cpu_w13
+        self.lossless_cpu_w2_weight = cpu_w2
+        self.lossless_mode5_cpu_expert_weights = {}
+        self.lossless_mode5_cpu_shadow_prepared = True
+        self.lossless_mode5_cpu_shadow_signature = (
+            self._mode5_cpu_shadow_signature_for_owned_layout(
+                active_expert_ids, source_local_ids))
+        if self.layer_idx == 0:
+            logger.info(
+                "Mode5 CPU shadow prepared at shrink-time: layer=%s cpu_rows=%s signature_rows=%s",
+                self.layer_idx,
+                int(self.lossless_cpu_w13_weight.shape[0]),
+                len(self.lossless_mode5_cpu_shadow_signature),
+            )
+        return (time.perf_counter() - build_start) * 1000.0
+
+    def _set_lossless_hybrid_runtime_num_experts(self) -> None:
+        active_rank_count = len(self.lossless_hybrid_active_ranks)
+        if active_rank_count <= 0:
+            return
+        if int(getattr(self, "elastic_execution_mode", 0)) in (4, 5):
+            rank_owned = getattr(self, "lossless_hybrid_rank_owned_expert_ids",
+                                 None)
+            if rank_owned:
+                # Mode=4 keeps a small local resident/double-buffer capacity,
+                # but token dispatch still spans the full logical expert set
+                # owned by the active ranks plus their remote NPU cache ranks.
+                # Using resident_capacity here collapses runtime_num_experts
+                # to 16 at 4->2, corrupting the topk-id remap space.
+                self.set_runtime_num_experts(
+                    sum(len(expert_ids) for expert_ids in rank_owned))
+                return
+        resident_capacity = int(self.lossless_hybrid_resident_capacity)
+        self.set_runtime_num_experts(active_rank_count * resident_capacity)
+
+    def _build_lossless_hybrid_runtime_log2phy(
+            self,
+            rank_resident_expert_ids: Optional[list[list[int]]] = None
+    ) -> Optional[torch.Tensor]:
+        if rank_resident_expert_ids is None:
+            rank_resident_expert_ids = self.lossless_hybrid_rank_resident_expert_ids
+        if not rank_resident_expert_ids:
+            return None
+        logical_num_experts = int(self.elastic_original_num_experts)
+        resident_capacity = int(self.lossless_hybrid_resident_capacity)
+        runtime_log2phy_cpu = torch.full((logical_num_experts, ),
+                                         -1,
+                                         dtype=torch.int32)
+        for rank_idx, expert_ids in enumerate(rank_resident_expert_ids):
+            for slot_idx, expert_id in enumerate(expert_ids[:resident_capacity]):
+                expert_id = int(expert_id)
+                # Padding may duplicate a real resident expert to occupy unused
+                # fixed slots. Keep the first slot for routing and treat later
+                # duplicates as inert fillers so worker-side validation and
+                # token dispatch observe the canonical slot layout.
+                if int(runtime_log2phy_cpu[expert_id].item()) != -1:
+                    continue
+                runtime_log2phy_cpu[expert_id] = (
+                    rank_idx * resident_capacity + slot_idx)
+        return runtime_log2phy_cpu
+
+    @staticmethod
+    def _pad_hybrid_resident_ids(expert_ids: list[int],
+                                 resident_capacity: int) -> list[int]:
+        resident = [int(expert_id) for expert_id in expert_ids[:resident_capacity]]
+        if len(resident) >= resident_capacity or resident_capacity <= 0:
+            return resident
+        if not resident:
+            raise RuntimeError("Hybrid resident padding requires at least one expert id.")
+        filler = resident[0]
+        resident.extend([filler] * (resident_capacity - len(resident)))
+        return resident
+
+    def set_lossless_hybrid_global_layout(
+            self, active_ranks: list[int],
+            ordered_assignments: list[list[tuple[int, int]]]) -> None:
+        # A new active layout changes the dense MC2 dispatch id space.  Do not
+        # let the next floor reuse a log2phy map generated for the previous
+        # shrink topology (for example floor2 -> floor4).
+        self.lossless_runtime_dispatch_log2phy = None
+        self.lossless_runtime_dispatch_num_experts = 0
+        self.lossless_runtime_dispatch_signature = None
+        self.lossless_runtime_dispatch_active_rank_count = 0
+        self.lossless_runtime_dispatch_owned_per_rank = 0
+        resident_capacity = self._get_hybrid_resident_capacity()
+        rank_owned_expert_ids = [[int(expert_id) for expert_id, _ in assignments]
+                                 for assignments in ordered_assignments]
+        rank_resident_expert_ids = [
+            self._pad_hybrid_resident_ids(expert_ids, resident_capacity)
+            for expert_ids in rank_owned_expert_ids
+        ]
+        owner_rank_by_expert = torch.full((int(self.elastic_original_num_experts), ),
+                                          -1,
+                                          dtype=torch.int32)
+        owner_global_rank_by_expert = torch.full(
+            (int(self.elastic_original_num_experts), ),
+            -1,
+            dtype=torch.int32)
+        for rank_idx, expert_ids in enumerate(rank_owned_expert_ids):
+            for expert_id in expert_ids:
+                owner_rank_by_expert[int(expert_id)] = rank_idx
+                owner_global_rank_by_expert[int(expert_id)] = int(
+                    active_ranks[rank_idx])
+        self.lossless_hybrid_active = True
+        self.lossless_hybrid_resident_capacity = resident_capacity
+        self.lossless_hybrid_active_ranks = [int(rank) for rank in active_ranks]
+        current_global_rank = (torch.distributed.get_rank()
+                               if torch.distributed.is_initialized() else -1)
+        self.lossless_hybrid_active_rank_index = (
+            self.lossless_hybrid_active_ranks.index(current_global_rank)
+            if current_global_rank in self.lossless_hybrid_active_ranks else -1)
+        self.lossless_hybrid_rank_owned_expert_ids = rank_owned_expert_ids
+        self.lossless_hybrid_rank_resident_expert_ids = [
+            list(expert_ids) for expert_ids in rank_resident_expert_ids
+        ]
+        self.lossless_hybrid_rank_lru = [
+            list(expert_ids) for expert_ids in rank_resident_expert_ids
+        ]
+        self._mode3_hybrid_inactive_logged = False
+        self._mode3_gate_reject_logged = False
+        self._mode3_refresh_skip_logged = False
+        target_device = (self.log2phy.device if self.log2phy is not None else
+                         self.expert_map.device if self.expert_map is not None else
+                         None)
+        if target_device is not None:
+            self.lossless_hybrid_owner_rank_by_expert = owner_rank_by_expert.to(
+                device=target_device, dtype=torch.int32)
+            self.lossless_hybrid_owner_global_rank_by_expert = (
+                owner_global_rank_by_expert.to(device=target_device,
+                                               dtype=torch.int32))
+        else:
+            self.lossless_hybrid_owner_rank_by_expert = owner_rank_by_expert
+            self.lossless_hybrid_owner_global_rank_by_expert = (
+                owner_global_rank_by_expert)
+        self._set_lossless_hybrid_runtime_num_experts()
+        runtime_log2phy_cpu = self._build_lossless_hybrid_runtime_log2phy(
+            self.lossless_hybrid_rank_resident_expert_ids)
+        if runtime_log2phy_cpu is not None:
+            self.set_elastic_runtime_log2phy(
+                runtime_log2phy_cpu.to(device=target_device
+                                       if target_device is not None else
+                                       runtime_log2phy_cpu.device,
+                                       dtype=self.log2phy.dtype
+                                       if self.log2phy is not None else
+                                       runtime_log2phy_cpu.dtype))
+
+    def materialize_hybrid_resident_experts(self,
+                                            target_resident_expert_ids:
+                                            list[int]) -> None:
+        if not self.lossless_hybrid_active:
+            return
+        resident_capacity = int(self.lossless_hybrid_resident_capacity)
+        if resident_capacity <= 0:
+            raise RuntimeError(
+                f"Invalid hybrid resident capacity at layer={self.layer_idx}.")
+        target = [int(expert_id) for expert_id in target_resident_expert_ids]
+        if len(target) > resident_capacity:
+            raise RuntimeError(
+                f"Hybrid resident overflow at layer={self.layer_idx}: "
+                f"{len(target)} > {resident_capacity}")
+        if len(target) < resident_capacity:
+            current_resident = list(self.lossless_hybrid_resident_expert_ids)
+            fillers = [
+                expert_id for expert_id in current_resident
+                if expert_id not in target
+            ]
+            fillers.extend([
+                expert_id for expert_id in self.lossless_hybrid_owned_expert_ids
+                if expert_id not in target and expert_id not in fillers
+            ])
+            target.extend(fillers[:resident_capacity - len(target)])
+        if len(target) < resident_capacity:
+            if not target:
+                raise RuntimeError(
+                    f"Hybrid resident materialization requires at least one target expert at layer={self.layer_idx}."
+                )
+            target.extend([int(target[0])] * (resident_capacity - len(target)))
+        if target == list(self.lossless_hybrid_resident_expert_ids):
+            return
+
+        self.ensure_lossless_cpu_shadow()
+        self.lossless_cpu_w13_weight = _maybe_pin_cpu_tensor(
+            self.lossless_cpu_w13_weight)
+        self.lossless_cpu_w2_weight = _maybe_pin_cpu_tensor(
+            self.lossless_cpu_w2_weight)
+        if (self.lossless_cpu_w13_weight is None
+                or self.lossless_cpu_w2_weight is None):
+            raise RuntimeError(
+                "Hybrid resident materialization requires CPU shadow weights: "
+                f"layer={self.layer_idx}")
+
+        runtime_device = self.w13_weight.device
+        runtime_w13_dtype = (self.lossless_cpu_w13_weight.dtype
+                             if self.lossless_cpu_w13_weight is not None else
+                             self.w13_weight.dtype)
+        runtime_w2_dtype = (self.lossless_cpu_w2_weight.dtype
+                            if self.lossless_cpu_w2_weight is not None else
+                            self.w2_weight.dtype)
+        reuse_loaded_prefix = self._can_reuse_loaded_prefix_for_hybrid(
+            resident_capacity, runtime_device, runtime_w13_dtype,
+            runtime_w2_dtype)
+        if reuse_loaded_prefix:
+            runtime_w13_storage = self.w13_weight[:resident_capacity]
+            runtime_w2_storage = self.w2_weight[:resident_capacity]
+            self.runtime_w13_buffer = None
+            self.runtime_w2_buffer = None
+            self.runtime_weight_capacity = max(
+                resident_capacity, int(getattr(self, "loaded_weight_capacity",
+                                               0)))
+            if self.layer_idx == 0 and self.lossless_hybrid_reuse_log_budget > 0:
+                logger.info(
+                    "Hybrid resident materialization reusing fixed NPU slots: layer=%s resident_capacity=%s loaded_capacity=%s target_head=%s w13_ptr=%s w2_ptr=%s",
+                    self.layer_idx,
+                    resident_capacity,
+                    int(getattr(self, "loaded_weight_capacity", 0)),
+                    target[:8],
+                    int(runtime_w13_storage.data_ptr()),
+                    int(runtime_w2_storage.data_ptr()),
+                )
+                self.lossless_hybrid_reuse_log_budget -= 1
+        else:
+            runtime_format_w13 = _lossless_weight_format(self.w13_weight)
+            runtime_format_w2 = _lossless_weight_format(self.w2_weight)
+            if (self.runtime_w13_buffer is None or self.runtime_w2_buffer is None
+                    or self.runtime_weight_capacity < resident_capacity
+                    or self.runtime_w13_buffer.device != runtime_device
+                    or self.runtime_w2_buffer.device != runtime_device
+                    or self.runtime_w13_buffer.dtype != runtime_w13_dtype
+                    or self.runtime_w2_buffer.dtype != runtime_w2_dtype
+                    or _lossless_weight_format(self.runtime_w13_buffer) != runtime_format_w13
+                    or _lossless_weight_format(self.runtime_w2_buffer) != runtime_format_w2):
+                self.runtime_w13_buffer = _allocate_formatted_buffer_like(
+                    self.w13_weight,
+                    resident_capacity,
+                    dtype=runtime_w13_dtype)
+                self.runtime_w2_buffer = _allocate_formatted_buffer_like(
+                    self.w2_weight,
+                    resident_capacity,
+                    dtype=runtime_w2_dtype)
+                self.runtime_weight_capacity = resident_capacity
+                if self.layer_idx == 0 and not self.lossless_hybrid_fallback_logged:
+                    logger.warning(
+                        "Hybrid resident materialization fell back to fresh runtime buffers: layer=%s resident_capacity=%s loaded_capacity=%s",
+                        self.layer_idx,
+                        resident_capacity,
+                        int(getattr(self, "loaded_weight_capacity", 0)),
+                    )
+                    self.lossless_hybrid_fallback_logged = True
+            runtime_w13_storage = self.runtime_w13_buffer[:resident_capacity]
+            runtime_w2_storage = self.runtime_w2_buffer[:resident_capacity]
+        current_resident = list(self.lossless_hybrid_resident_expert_ids)
+        for slot_idx, expert_id in enumerate(target):
+            expert_id = int(expert_id)
+            if (slot_idx < len(current_resident)
+                    and int(current_resident[slot_idx]) == expert_id):
+                continue
+            cpu_slot = self.lossless_mode5_cpu_shadow_row_by_expert.get(
+                expert_id)
+            if cpu_slot is None:
+                cpu_slot = self.lossless_cpu_shadow_local_slots.get(expert_id)
+            if cpu_slot is None:
+                cpu_slot = self._get_host_expert_map_value(
+                    self.loaded_expert_map,
+                    "_host_loaded_expert_map",
+                    expert_id,
+                )
+            source_w13 = self.lossless_cpu_w13_weight[cpu_slot]
+            source_w2 = self.lossless_cpu_w2_weight[cpu_slot]
+            runtime_w13_storage[slot_idx].copy_(
+                source_w13, non_blocking=True)
+            runtime_w2_storage[slot_idx].copy_(
+                source_w2, non_blocking=True)
+
+        new_expert_map = torch.full((int(self.elastic_original_num_experts), ),
+                                    -1,
+                                    dtype=torch.int32,
+                                    device=runtime_device)
+        mapped_expert_ids: set[int] = set()
+        for slot_idx, expert_id in enumerate(target):
+            expert_id = int(expert_id)
+            if expert_id in mapped_expert_ids:
+                continue
+            new_expert_map[expert_id] = slot_idx
+            mapped_expert_ids.add(expert_id)
+        self.expert_map = new_expert_map
+        self._set_lossless_expert_map_cpu_from_active(list(target))
+        self.active_local_num_experts = resident_capacity
+        self.local_num_experts = resident_capacity
+        self.moe_config.num_local_experts = resident_capacity
+        self.runtime_w13_weight = runtime_w13_storage[:resident_capacity]
+        self.runtime_w2_weight = runtime_w2_storage[:resident_capacity]
+        self.lossless_runtime_activated = True
+        self.lossless_hybrid_resident_expert_ids = list(target)
+        self.lossless_hybrid_cpu_only_expert_ids = [
+            expert_id for expert_id in self.lossless_hybrid_owned_expert_ids
+            if expert_id not in set(target)
+        ]
+        if 0 <= self.lossless_hybrid_active_rank_index < len(
+                self.lossless_hybrid_rank_resident_expert_ids):
+            self.lossless_hybrid_rank_resident_expert_ids[
+                self.lossless_hybrid_active_rank_index] = list(target)
+            self.lossless_hybrid_rank_lru[
+                self.lossless_hybrid_active_rank_index] = list(target)
+
+    def activate_lossless_hybrid_local_experts(
+            self,
+            active_expert_ids: list[int],
+            source_local_ids: list[int],
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]] = None
+    ) -> None:
+        resident_capacity = self._get_hybrid_resident_capacity()
+        if not active_expert_ids:
+            raise RuntimeError(
+                f"Hybrid activation requires at least one owned expert at layer={self.layer_idx}.")
+        self._stash_lossless_primary_prefix_for_hybrid()
+        if self.layer_idx == 0:
+            self.lossless_hybrid_reuse_log_budget = 2
+            logger.info(
+                "Hybrid fixed-slot activation starting: layer=%s owned_local=%s resident_capacity=%s loaded_capacity=%s fixed_slot_candidate=%s",
+                self.layer_idx,
+                len(active_expert_ids),
+                resident_capacity,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+                self._can_reuse_loaded_prefix_for_hybrid(
+                    resident_capacity,
+                    self.w13_weight.device,
+                    self.w13_weight.dtype,
+                    self.w2_weight.dtype,
+                ),
+            )
+        mode = int(getattr(self, "elastic_execution_mode", 0))
+        is_mode4 = mode == 4
+        is_mode5 = mode == 5
+        cpu_shadow_build_ms = 0.0
+        materialize_resident_ms = 0.0
+        mode5_remote_expert_ids = set(
+            int(expert_id)
+            for expert_id in getattr(self,
+                                     "lossless_mode4_remote_source_by_expert",
+                                     {}))
+        if is_mode4:
+            cpu_w13 = None
+            cpu_w2 = None
+            self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+            self.lossless_loaded_offloaded = False
+        else:
+            mode5_strategy = (_mode5_cpu_shadow_runtime_strategy()
+                              if is_mode5 else "n/a")
+            use_mode5_legacy_runtime = (
+                is_mode5 and mode5_strategy == "legacy_cpu_shadow")
+            if is_mode5 and self._has_prepared_mode5_cpu_shadow_for_owned_layout(
+                    active_expert_ids, source_local_ids) and not use_mode5_legacy_runtime:
+                cpu_w13 = self.lossless_cpu_w13_weight
+                cpu_w2 = self.lossless_cpu_w2_weight
+                if self.layer_idx == 0:
+                    logger.info(
+                        "Mode5 activation reusing prepared CPU shadow: layer=%s cpu_rows=%s signature_rows=%s",
+                        self.layer_idx,
+                        int(cpu_w13.shape[0]) if cpu_w13 is not None else -1,
+                        len(getattr(self,
+                                    "lossless_mode5_cpu_shadow_signature",
+                                    ())),
+                    )
+            else:
+                cpu_active_expert_ids = []
+                cpu_source_local_ids = []
+                for expert_id, source_local_id in zip(active_expert_ids,
+                                                      source_local_ids):
+                    if is_mode5 and int(expert_id) in mode5_remote_expert_ids:
+                        continue
+                    cpu_active_expert_ids.append(int(expert_id))
+                    cpu_source_local_ids.append(int(source_local_id))
+                cpu_shadow_build_start = time.perf_counter() if is_mode5 else None
+                cpu_w13, cpu_w2 = self._build_lossless_cpu_shadow_for_owned_layout(
+                    cpu_active_expert_ids, cpu_source_local_ids,
+                    cpu_expert_weights)
+                if cpu_shadow_build_start is not None:
+                    cpu_shadow_build_ms = (
+                        time.perf_counter() - cpu_shadow_build_start) * 1000.0
+                self.lossless_cpu_w13_weight = cpu_w13
+                self.lossless_cpu_w2_weight = cpu_w2
+            if is_mode5:
+                self.lossless_mode5_cpu_expert_weights = {}
+                if use_mode5_legacy_runtime:
+                    self.lossless_mode5_cpu_shadow_prepared = False
+                    self.lossless_mode5_cpu_shadow_signature = ()
+                    self.lossless_cpu_shadow_local_slots = {
+                        int(expert_id): int(cpu_row)
+                        for expert_id, cpu_row in getattr(
+                            self, "lossless_mode5_cpu_shadow_row_by_expert",
+                            {}).items()
+                    }
+                else:
+                    self.lossless_mode5_cpu_shadow_prepared = True
+                    self.lossless_mode5_cpu_shadow_signature = (
+                        self._mode5_cpu_shadow_signature_for_owned_layout(
+                            active_expert_ids, source_local_ids))
+            if mode != 5:
+                self.lossless_cpu_shadow_local_slots = {
+                    int(expert_id): int(local_slot)
+                    for local_slot, expert_id in enumerate(cpu_active_expert_ids)
+                }
+            self.lossless_loaded_offloaded = False
+
+        if self._is_mode3_cross_layer_buffer_enabled():
+            materialize_start = time.perf_counter() if is_mode5 else None
+            loaded_expert_map = torch.full(
+                (int(self.elastic_original_num_experts), ),
+                -1,
+                dtype=torch.int32,
+                device=self.w13_weight.device)
+            for local_slot, expert_id in enumerate(active_expert_ids):
+                loaded_expert_map[int(expert_id)] = local_slot
+            self.loaded_expert_map = loaded_expert_map
+            self._set_lossless_map_cpu_from_tensor(
+                self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+            self.loaded_local_num_experts = len(active_expert_ids)
+            self.lossless_cpu_import_expert_ids = [
+                int(expert_id) for expert_id, source_local_id in zip(
+                    active_expert_ids, source_local_ids)
+                if int(source_local_id) < 0
+                and int(expert_id) not in mode5_remote_expert_ids
+            ]
+            self.lossless_hybrid_owned_expert_ids = [
+                int(x) for x in active_expert_ids
+            ]
+            self.lossless_hybrid_resident_capacity = resident_capacity
+            self.lossless_mode3_primary_prefix_local_slots = {
+                int(expert_id): int(source_local_id)
+                for expert_id, source_local_id in zip(active_expert_ids,
+                                                      source_local_ids)
+                if 0 <= int(source_local_id) < resident_capacity
+            }
+            self.lossless_mode3_primary_prefix_expert_ids = [
+                int(expert_id) for expert_id in active_expert_ids
+                if int(expert_id) in self.lossless_mode3_primary_prefix_local_slots
+            ]
+            self.lossless_hybrid_resident_expert_ids = list(
+                self.lossless_mode3_primary_prefix_expert_ids)
+            self.lossless_hybrid_cpu_only_expert_ids = [
+                expert_id for expert_id in self.lossless_hybrid_owned_expert_ids
+                if expert_id not in set(self.lossless_mode3_primary_prefix_expert_ids)
+                and expert_id not in mode5_remote_expert_ids
+            ]
+            self.active_local_num_experts = len(active_expert_ids)
+            self.local_num_experts = len(active_expert_ids)
+            self.moe_config.num_local_experts = len(active_expert_ids)
+            self.moe_config.num_experts = len(active_expert_ids)
+            self.num_experts = len(active_expert_ids)
+            self.lossless_runtime_activated = False
+            if materialize_start is not None:
+                materialize_resident_ms = (
+                    time.perf_counter() - materialize_start) * 1000.0
+                self.lossless_hybrid_last_stats["mode5_cpu_shadow_build_ms"] = float(
+                    cpu_shadow_build_ms)
+                self.lossless_hybrid_last_stats[
+                    "mode5_materialize_resident_ms"] = float(
+                        materialize_resident_ms)
+            return
+
+        loaded_expert_map = torch.full((int(self.elastic_original_num_experts), ),
+                                       -1,
+                                       dtype=torch.int32,
+                                       device=self.w13_weight.device)
+        for local_slot, expert_id in enumerate(active_expert_ids):
+            loaded_expert_map[int(expert_id)] = local_slot
+        self.loaded_expert_map = loaded_expert_map
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        self.loaded_local_num_experts = len(active_expert_ids)
+        self.lossless_cpu_import_expert_ids = [
+            int(expert_id) for expert_id, source_local_id in zip(
+                active_expert_ids, source_local_ids) if int(source_local_id) < 0
+        ]
+        self.lossless_hybrid_owned_expert_ids = [int(x) for x in active_expert_ids]
+        self.lossless_hybrid_resident_capacity = resident_capacity
+        self.active_local_num_experts = resident_capacity
+        self.local_num_experts = resident_capacity
+        self.moe_config.num_local_experts = resident_capacity
+        materialize_start = time.perf_counter() if is_mode5 else None
+        self.materialize_hybrid_resident_experts(
+            [int(expert_id) for expert_id in active_expert_ids[:resident_capacity]])
+        if materialize_start is not None:
+            materialize_resident_ms = (
+                time.perf_counter() - materialize_start) * 1000.0
+            self.lossless_hybrid_last_stats["mode5_cpu_shadow_build_ms"] = float(
+                cpu_shadow_build_ms)
+            self.lossless_hybrid_last_stats[
+                "mode5_materialize_resident_ms"] = float(
+                    materialize_resident_ms)
+
+    def _plan_lossless_hybrid_rank_waves(
+            self, logical_topk_ids: torch.Tensor) -> list[dict[str, Any]]:
+        if not self.lossless_hybrid_active:
+            return []
+        if self.lossless_hybrid_owner_rank_by_expert is None:
+            raise RuntimeError(
+                f"Missing hybrid owner map at layer={self.layer_idx}.")
+        # Keep the local planning pass on CPU. This avoids exercising aclnnIndex
+        # on the device inside the fallback path, and it makes the planner more
+        # resilient if a previous async mode3 prefetch has already put the NPU
+        # stream into an error state.
+        logical_topk_ids_cpu = logical_topk_ids.detach().cpu()
+        owner_map_cpu = self.lossless_hybrid_owner_rank_by_expert.detach().cpu()
+        if logical_topk_ids_cpu.numel() > 0:
+            invalid_mask = ((logical_topk_ids_cpu < 0)
+                            | (logical_topk_ids_cpu >= owner_map_cpu.numel()))
+            if bool(invalid_mask.any()):
+                invalid_values = logical_topk_ids_cpu[invalid_mask][:8].tolist()
+                raise RuntimeError(
+                    "Invalid logical expert ids in hybrid wave planner: "
+                    f"layer={self.layer_idx} invalid={invalid_values} "
+                    f"owner_map_size={owner_map_cpu.numel()}. This usually "
+                    "means an earlier mode3 runtime-buffer failure corrupted "
+                    "the fallback path.")
+        owner_rank = owner_map_cpu[logical_topk_ids_cpu]
+        resident_capacity = int(self.lossless_hybrid_resident_capacity)
+        per_rank_needed: list[list[int]] = []
+        per_rank_waves: list[list[list[int]]] = []
+        per_rank_final_resident: list[list[int]] = []
+        active_rank_count = len(self.lossless_hybrid_active_ranks)
+        local_per_rank_needed: list[list[int]] = []
+        for rank_idx in range(active_rank_count):
+            rank_mask = owner_rank == rank_idx
+            if torch.any(rank_mask):
+                rank_needed_ids = torch.unique(
+                    logical_topk_ids_cpu[rank_mask]).tolist()
+                rank_needed = sorted(int(expert_id)
+                                     for expert_id in rank_needed_ids)
+            else:
+                rank_needed = []
+            local_per_rank_needed.append(rank_needed)
+        if active_rank_count > 1:
+            metadata_group = getattr(self.ep_group, "cpu_group",
+                                     self.ep_group.device_group)
+            metadata_world_size = torch.distributed.get_world_size(
+                group=metadata_group)
+            if metadata_world_size != active_rank_count:
+                raise RuntimeError(
+                    "Hybrid active-rank metadata group mismatch at "
+                    f"layer={self.layer_idx}: "
+                    f"metadata_world_size={metadata_world_size} "
+                    f"active_rank_count={active_rank_count}")
+            gathered_needed: list[Optional[list[list[int]]]] = [None] * active_rank_count
+            torch.distributed.all_gather_object(gathered_needed,
+                                                local_per_rank_needed,
+                                                group=metadata_group)
+            merged_needed = [set() for _ in range(active_rank_count)]
+            for src_rank_idx, payload in enumerate(gathered_needed):
+                if payload is None or len(payload) != active_rank_count:
+                    raise RuntimeError(
+                        "Hybrid global wave metadata malformed at "
+                        f"layer={self.layer_idx}: src_rank={src_rank_idx} "
+                        f"payload_len={-1 if payload is None else len(payload)} "
+                        f"active_rank_count={active_rank_count}")
+                for rank_idx, expert_ids in enumerate(payload):
+                    merged_needed[rank_idx].update(int(expert_id)
+                                                   for expert_id in expert_ids)
+            per_rank_needed = [
+                sorted(expert_ids) for expert_ids in merged_needed
+            ]
+        else:
+            per_rank_needed = local_per_rank_needed
+
+        for rank_idx in range(active_rank_count):
+            rank_needed = per_rank_needed[rank_idx]
+            current_resident = list(
+                self.lossless_hybrid_rank_resident_expert_ids[rank_idx])
+            resident_hits = [
+                expert_id for expert_id in current_resident
+                if expert_id in set(rank_needed)
+            ]
+            resident_miss = [
+                expert_id for expert_id in rank_needed
+                if expert_id not in set(resident_hits)
+            ]
+            ordered_needed = resident_hits + resident_miss
+            waves = [
+                ordered_needed[idx:idx + resident_capacity]
+                for idx in range(0, len(ordered_needed), resident_capacity)
+            ]
+            if not waves:
+                waves = [[]]
+            final_resident = list(waves[-1])
+            fillers = [
+                expert_id for expert_id in current_resident
+                if expert_id not in final_resident
+            ]
+            if len(final_resident) < resident_capacity:
+                final_resident.extend(
+                    fillers[:resident_capacity - len(final_resident)])
+            per_rank_waves.append(waves)
+            per_rank_final_resident.append(final_resident)
+
+        num_waves = max(len(waves) for waves in per_rank_waves)
+        wave_plans: list[dict[str, Any]] = []
+        for wave_idx in range(num_waves):
+            wave_rank_resident = []
+            wave_expert_to_slot = {}
+            wave_active_expert_ids = set()
+            for rank_idx in range(active_rank_count):
+                wave_group = (per_rank_waves[rank_idx][wave_idx]
+                              if wave_idx < len(per_rank_waves[rank_idx]) else [])
+                wave_group = [int(expert_id) for expert_id in wave_group]
+                current_resident = list(
+                    self.lossless_hybrid_rank_resident_expert_ids[rank_idx])
+                target_resident = list(wave_group)
+                fillers = [
+                    expert_id for expert_id in current_resident
+                    if expert_id not in target_resident
+                ]
+                if len(target_resident) < resident_capacity:
+                    target_resident.extend(
+                        fillers[:resident_capacity - len(target_resident)])
+                wave_rank_resident.append(target_resident)
+                dense_offset = rank_idx * resident_capacity
+                wave_active_expert_ids.update(wave_group)
+                for slot_idx, expert_id in enumerate(target_resident):
+                    expert_id = int(expert_id)
+                    if expert_id not in wave_group:
+                        continue
+                    if expert_id in wave_expert_to_slot:
+                        continue
+                    wave_expert_to_slot[expert_id] = dense_offset + slot_idx
+            token_mask = torch.zeros(logical_topk_ids.shape[0],
+                                     dtype=torch.bool,
+                                     device=logical_topk_ids.device)
+            topk_mask = torch.zeros_like(logical_topk_ids, dtype=torch.bool)
+            for expert_id in wave_active_expert_ids:
+                topk_mask |= logical_topk_ids == int(expert_id)
+            if topk_mask.numel() > 0:
+                token_mask = torch.any(topk_mask, dim=1)
+            if token_mask.numel() > 0 and torch.any(token_mask):
+                local_wave_topk = int(
+                    topk_mask[token_mask].sum(dim=1).max().item())
+            else:
+                local_wave_topk = 0
+            if active_rank_count > 1:
+                metadata_group = getattr(self.ep_group, "cpu_group",
+                                         self.ep_group.device_group)
+                gathered_wave_topk: list[Optional[int]] = [None] * active_rank_count
+                torch.distributed.all_gather_object(gathered_wave_topk,
+                                                    local_wave_topk,
+                                                    group=metadata_group)
+                wave_topk = max(int(value) for value in gathered_wave_topk
+                                if value is not None)
+            else:
+                wave_topk = local_wave_topk
+            wave_plans.append({
+                "wave_idx": wave_idx,
+                "rank_wave_groups": [
+                    [int(expert_id) for expert_id in (
+                        per_rank_waves[rank_idx][wave_idx]
+                        if wave_idx < len(per_rank_waves[rank_idx]) else []
+                    )] for rank_idx in range(active_rank_count)
+                ],
+                "rank_resident": wave_rank_resident,
+                "wave_expert_to_slot": wave_expert_to_slot,
+                "wave_active_expert_ids": sorted(wave_active_expert_ids),
+                "token_mask": token_mask,
+                "topk_mask": topk_mask,
+                "wave_topk": wave_topk,
+                "final_rank_resident": per_rank_final_resident,
+            })
+        return wave_plans
+
+    @staticmethod
+    def _summarize_slot_region(weight: Optional[torch.Tensor], start: int,
+                               end: int) -> float:
+        if weight is None or weight.numel() == 0:
+            return 0.0
+        row_count = int(weight.shape[0])
+        start = max(0, int(start))
+        end = min(max(start, int(end)), row_count)
+        if start >= end:
+            return 0.0
+        return float(weight[start:end].detach().abs().mean().item())
+
+    def set_lossless_runtime_prefix_views(self) -> None:
+        if self.elastic_moe_mode != "lossless":
+            self.clear_lossless_hybrid_state()
+            self.runtime_w13_weight = None
+            self.runtime_w2_weight = None
+            self.runtime_w13_buffer = None
+            self.runtime_w2_buffer = None
+            self.runtime_weight_capacity = 0
+            self.lossless_runtime_activated = False
+            return
+
+        active_local_num_experts = int(self.active_local_num_experts)
+        allowed_local_num_experts = (
+            self._get_allowed_lossless_active_local_expert_counts())
+        if active_local_num_experts not in allowed_local_num_experts:
+            raise RuntimeError(
+                f"Unsupported active_local_num_experts={active_local_num_experts}, "
+                f"allowed={sorted(allowed_local_num_experts)} "
+                f"at layer={self.layer_idx}.")
+        loaded_capacity = int(getattr(self, "loaded_weight_capacity", 0))
+        if active_local_num_experts > int(self.w13_weight.shape[0]):
+            raise RuntimeError(
+                f"contain the active prefix: active={active_local_num_experts}, "
+                f"loaded_rows={int(self.w13_weight.shape[0])} at layer={self.layer_idx}.")
+        self.runtime_w13_weight = self.w13_weight[:active_local_num_experts]
+        self.runtime_w2_weight = self.w2_weight[:active_local_num_experts]
+        self.runtime_w13_buffer = None
+        self.runtime_w2_buffer = None
+        self.runtime_weight_capacity = max(
+            loaded_capacity, int(self.w13_weight.shape[0]))
+        self.lossless_runtime_activated = True
+
+    def _can_use_lossless_loaded_prefix_views(
+            self,
+            source_local_ids: list[int],
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]],
+    ) -> bool:
+        if self.elastic_moe_mode != "lossless":
+            return False
+        if self.lossless_loaded_offloaded:
+            return False
+        if cpu_expert_weights:
+            return False
+        active_local_num_experts = int(self.active_local_num_experts)
+        if len(source_local_ids) != active_local_num_experts:
+            return False
+        if any(int(source_local_id) != local_slot
+               for local_slot, source_local_id in enumerate(source_local_ids)):
+            return False
+        if active_local_num_experts > int(self.w13_weight.shape[0]):
+            return False
+        if active_local_num_experts > int(self.w2_weight.shape[0]):
+            return False
+        return True
+
+    def _can_materialize_lossless_loaded_prefix_slots(
+            self,
+            source_local_ids: list[int],
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]],
+    ) -> bool:
+        if self.elastic_moe_mode != "lossless":
+            return False
+        if self.lossless_loaded_offloaded:
+            return False
+        active_local_num_experts = int(self.active_local_num_experts)
+        if len(source_local_ids) != active_local_num_experts:
+            return False
+        if active_local_num_experts > int(self.w13_weight.shape[0]):
+            return False
+        if active_local_num_experts > int(self.w2_weight.shape[0]):
+            return False
+        if active_local_num_experts > int(
+                getattr(self, "loaded_weight_capacity", 0)):
+            return False
+        if getattr(self, "elastic_execution_mode", 0) == 1:
+            return True
+        return bool(
+            getattr(self, "lossless_zero_redundancy_preallocated_loaded",
+                    False))
+
+    def _can_materialize_lossless_loaded_prefix_slots_for_target(
+            self,
+            target_active_local_num_experts: int,
+            source_local_ids: list[int],
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]],
+    ) -> bool:
+        if self.elastic_moe_mode != "lossless":
+            return False
+        if self.lossless_loaded_offloaded:
+            return False
+        target_active_local_num_experts = int(target_active_local_num_experts)
+        if len(source_local_ids) != target_active_local_num_experts:
+            return False
+        if target_active_local_num_experts > int(self.w13_weight.shape[0]):
+            return False
+        if target_active_local_num_experts > int(self.w2_weight.shape[0]):
+            return False
+        if target_active_local_num_experts > int(
+                getattr(self, "loaded_weight_capacity", 0)):
+            return False
+        if getattr(self, "elastic_execution_mode", 0) == 1:
+            return True
+        return bool(
+            getattr(self, "lossless_zero_redundancy_preallocated_loaded",
+                    False))
+
+    def _copy_lossless_loaded_slots_into_prefix(
+            self, moves: list[tuple[int, int]]) -> None:
+        pending = {int(dst): int(src) for dst, src in moves if dst != src}
+        while pending:
+            progressed = False
+            pending_sources = set(pending.values())
+            for dst, src in list(pending.items()):
+                if dst in pending_sources:
+                    continue
+                self.w13_weight[dst].copy_(self.w13_weight[src])
+                self.w2_weight[dst].copy_(self.w2_weight[src])
+                del pending[dst]
+                progressed = True
+            if progressed:
+                continue
+
+            start = next(iter(pending))
+            tmp_w13 = self.w13_weight[start].detach().clone()
+            tmp_w2 = self.w2_weight[start].detach().clone()
+            dst = start
+            while True:
+                src = pending[dst]
+                if src == start:
+                    self.w13_weight[dst].copy_(tmp_w13)
+                    self.w2_weight[dst].copy_(tmp_w2)
+                    del pending[dst]
+                    break
+                self.w13_weight[dst].copy_(self.w13_weight[src])
+                self.w2_weight[dst].copy_(self.w2_weight[src])
+                del pending[dst]
+                dst = src
+
+    def restore_lossless_full_world_primary_layout(self) -> None:
+        if self.elastic_moe_mode != "lossless":
+            self.reset_expert_map_and_log2phy()
+            return
+
+        self.clear_lossless_hybrid_state()
+        self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+        logical_num_experts = int(
+            getattr(self, "elastic_original_num_experts", self.num_experts))
+        self.num_experts = logical_num_experts
+        self.moe_config.num_experts = logical_num_experts
+
+        target_device = None
+        if self.log2phy is not None:
+            target_device = self.log2phy.device
+        elif self.expert_map is not None:
+            target_device = self.expert_map.device
+        elif hasattr(self, "w13_weight"):
+            target_device = self.w13_weight.device
+        if target_device is not None and target_device.type == "cpu" and hasattr(
+                torch, "npu") and torch.npu.is_available():
+            target_device = torch.device("npu", torch.npu.current_device())
+        log2phy_dtype = (self.log2phy.dtype
+                         if self.log2phy is not None else torch.int32)
+
+        self.loaded_local_num_experts, self.loaded_expert_map = (
+            determine_redundant_replica_expert_map(
+                logical_num_experts,
+                self.ep_size,
+                self.ep_rank,
+                self.global_redundant_expert_num,
+                prefer_balanced_cyclic=(self.elastic_execution_mode == 1),
+            ))
+        active_mapping = determine_expert_map(
+            self.ep_size,
+            self.ep_rank,
+            logical_num_experts,
+            layer_idx=self.layer_idx,
+        )
+        if len(active_mapping) == 3:
+            (self.active_local_num_experts, self.expert_map,
+             self.log2phy) = active_mapping
+        elif len(active_mapping) == 2:
+            self.active_local_num_experts, self.expert_map = active_mapping
+            self.log2phy = determine_default_log2phy_map(
+                logical_num_experts, self.ep_size, self.ep_rank, 0)
+        else:
+            raise ValueError(
+                f"Unexpected determine_expert_map return arity={len(active_mapping)}")
+        if target_device is not None:
+            if self.loaded_expert_map is not None:
+                self.loaded_expert_map = self.loaded_expert_map.to(
+                    device=target_device, dtype=torch.int32)
+            if self.expert_map is not None:
+                self.expert_map = self.expert_map.to(
+                    device=target_device, dtype=torch.int32)
+            if self.log2phy is not None:
+                self.log2phy = self.log2phy.to(device=target_device,
+                                               dtype=log2phy_dtype)
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        self.primary_log2phy = self.log2phy.clone()
+        self.local_num_experts = self.active_local_num_experts
+        self.moe_config.num_local_experts = self.active_local_num_experts
+        self.elastic_runtime_log2phy = None
+        self.lossless_cpu_import_expert_ids = []
+        self._mode1_execute_mapping_validated = False
+        # In mode1, weight reload already owns the canonical full-world
+        # prefix.  Do not force-copy a CPU-stashed prefix back into formatted
+        # NPU Parameter storage; that can overwrite freshly loaded rows with
+        # stale snapshots and corrupt generation.
+        self._restore_stashed_lossless_primary_prefix()
+        self.set_lossless_runtime_prefix_views()
+        if self._should_use_primary_reload_map_after_mode1_restore():
+            self.use_lossless_primary_reload_map_for_mode1()
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = (
+                self._should_enable_mode1_parity_for_current_layout())
+            self._validate_mode1_lossless_active_mapping(
+                "restore_lossless_full_world_primary_layout")
+        if self.layer_idx == 0 and self.ep_rank == 0:
+            logger.info(
+                "Lossless full-world primary layout restored with loaded-slot prefix views: layer=%s active_local=%s loaded_capacity=%s",
+                self.layer_idx,
+                self.active_local_num_experts,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+            )
+
+    def _should_use_primary_reload_map_after_mode1_restore(self) -> bool:
+        if int(getattr(self, "elastic_execution_mode", 0)) != 1:
+            return False
+        if self.elastic_moe_mode != "lossless":
+            return False
+        return os.getenv(
+            "VLLM_ASCEND_MODE1_PRIMARY_RELOAD_MAP_AFTER_RESTORE",
+            "0").lower() in ("1", "true", "yes", "on")
+
+    def use_lossless_primary_reload_map_for_mode1(self) -> bool:
+        """Use the primary full-world map for the next rollout weight reload.
+
+        Floor-2 mode=1 keeps enough physical expert rows to materialize the
+        2-rank survivor layout.  After restoring to full world between steps,
+        the next update_weights call only needs to refresh the primary
+        full-world experts for this rank.  If loaded_expert_map still points at
+        the redundant floor-2 loaded layout, process_weights_after_loading()
+        can perform unnecessary slot moves before the step even shrinks.
+
+        This method keeps the physical capacity intact for the later shrink,
+        but makes the reload-time map a compact primary prefix map.
+        """
+        if self.elastic_moe_mode != "lossless":
+            return False
+        if int(getattr(self, "elastic_execution_mode", 0)) != 1:
+            return False
+        primary_rows = int(self._get_lossless_primary_prefix_row_count())
+        if primary_rows <= 0:
+            return False
+        if primary_rows > int(self.w13_weight.shape[0]):
+            return False
+        if primary_rows > int(self.w2_weight.shape[0]):
+            return False
+
+        logical_num_experts = int(
+            getattr(self, "elastic_original_num_experts", self.num_experts))
+        primary_map = getattr(self, "elastic_original_expert_map", None)
+        primary_log2phy = getattr(self, "primary_log2phy", None)
+        if primary_map is None:
+            primary_mapping = determine_expert_map(
+                self.ep_size,
+                self.ep_rank,
+                logical_num_experts,
+                layer_idx=self.layer_idx,
+            )
+            primary_map = primary_mapping[1]
+            if len(primary_mapping) == 3:
+                primary_log2phy = primary_mapping[2]
+        target_device = None
+        if self.log2phy is not None:
+            target_device = self.log2phy.device
+        elif self.expert_map is not None:
+            target_device = self.expert_map.device
+        elif self.loaded_expert_map is not None:
+            target_device = self.loaded_expert_map.device
+        elif hasattr(self, "w13_weight"):
+            target_device = self.w13_weight.device
+        if target_device is None:
+            target_device = torch.device("npu", torch.npu.current_device()
+                                         ) if hasattr(
+                                             torch, "npu"
+                                         ) and torch.npu.is_available(
+                                         ) else self.w13_weight.device
+        if target_device.type == "cpu" and hasattr(
+                torch, "npu") and torch.npu.is_available():
+            target_device = torch.device("npu", torch.npu.current_device())
+        primary_map = primary_map.to(device=target_device, dtype=torch.int32)
+        self.expert_map = primary_map.clone()
+        self.loaded_expert_map = primary_map.clone()
+        self.active_local_num_experts = primary_rows
+        self.local_num_experts = primary_rows
+        self.loaded_local_num_experts = primary_rows
+        self.moe_config.num_local_experts = primary_rows
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        self._sync_mode1_active_log2phy_from_expert_map(
+            "restore_full_world_primary_layout",
+            update_primary=True,
+        )
+        self.elastic_runtime_log2phy = None
+        self.lossless_cpu_import_expert_ids = []
+        self._mode1_execute_mapping_validated = False
+        self.set_lossless_runtime_prefix_views()
+        self._finalize_mode1_full_world_compact_metadata()
+        self.lossless_mode1_native_parity_ready = (
+            self._should_enable_mode1_parity_for_current_layout())
+        if self.layer_idx == 0:
+            logger.info(
+                "Mode1 primary reload map enabled after full-world restore: "
+                "layer=%s primary_rows=%s loaded_capacity=%s weight_rows=%s",
+                self.layer_idx,
+                primary_rows,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+                int(getattr(self.w13_weight, "shape", (0, ))[0]),
+            )
+        return True
+
+    def shrink_lossless_loaded_weights_to_primary(
+            self, min_capacity: int = 0) -> bool:
+        """Physically drop redundant loaded expert slots for full-world steps.
+
+        restore_lossless_full_world_primary_layout() switches the logical
+        active layout back to the primary 16-rank view, but the canonical loaded
+        tensors may still keep the floor-N redundant tail allocated.  A step
+        that intentionally runs with floor=16 needs that HBM back for KV cache,
+        so compact the primary prefix into a new smaller Parameter.  Upward
+        floor transitions may still need the first shrink wave's resident
+        slots; min_capacity preserves that many loaded rows while dropping the
+        deeper-floor tail.
+        """
+        if self.elastic_moe_mode != "lossless":
+            return False
+        primary_rows = int(self._get_lossless_primary_prefix_row_count())
+        if primary_rows <= 0:
+            return False
+        try:
+            min_capacity = int(min_capacity)
+        except (TypeError, ValueError):
+            min_capacity = 0
+        old_w13 = self.w13_weight
+        old_w2 = self.w2_weight
+        old_rows = min(int(old_w13.shape[0]), int(old_w2.shape[0]))
+        old_capacity = int(getattr(self, "loaded_weight_capacity", old_rows))
+        target_rows = max(primary_rows, min_capacity)
+        target_rows = min(target_rows, old_rows)
+        if target_rows <= 0:
+            return False
+        if old_rows <= target_rows and old_capacity <= target_rows:
+            return False
+        self._restore_stashed_lossless_primary_prefix()
+
+        old_loaded_map = self.loaded_expert_map
+        old_w13_bytes = int(old_w13.numel()) * int(old_w13.element_size())
+        old_w2_bytes = int(old_w2.numel()) * int(old_w2.element_size())
+        old_w13_storage_bytes = _tensor_storage_nbytes(old_w13)
+        old_w2_storage_bytes = _tensor_storage_nbytes(old_w2)
+        self.runtime_w13_weight = None
+        self.runtime_w2_weight = None
+        self.runtime_w13_buffer = None
+        self.runtime_w2_buffer = None
+
+        # Keep the compaction peak low.  A view of the first target_rows would
+        # still retain the full 64-row storage, so we must allocate a smaller
+        # backing store.  Do it one tensor at a time and release the old storage
+        # immediately before allocating the next tensor.
+        new_w13 = _allocate_formatted_buffer_like(old_w13, target_rows)
+        new_w13.copy_(old_w13[:target_rows], non_blocking=False)
+        self.w13_weight = _replace_parameter(self, "w13_weight", new_w13)
+        released_old_w13_storage = _release_npu_parameter_storage(
+            old_w13, reason="mode1_full_world_compact_w13")
+        del old_w13
+        del new_w13
+        if os.getenv(
+                "VLLM_ASCEND_MODE1_EMPTY_CACHE_BETWEEN_COMPACT_TENSORS",
+                "1").lower() in ("1", "true", "yes", "on"):
+            gc.collect()
+            if hasattr(torch, "npu") and torch.npu.is_available():
+                torch.npu.empty_cache()
+
+        new_w2 = _allocate_formatted_buffer_like(old_w2, target_rows)
+        new_w2.copy_(old_w2[:target_rows], non_blocking=False)
+        self.w2_weight = _replace_parameter(self, "w2_weight", new_w2)
+        released_old_w2_storage = _release_npu_parameter_storage(
+            old_w2, reason="mode1_full_world_compact_w2")
+        del old_w2
+        del new_w2
+        new_w13_bytes = int(self.w13_weight.numel()) * int(
+            self.w13_weight.element_size())
+        new_w2_bytes = int(self.w2_weight.numel()) * int(
+            self.w2_weight.element_size())
+        new_w13_storage_bytes = _tensor_storage_nbytes(self.w13_weight)
+        new_w2_storage_bytes = _tensor_storage_nbytes(self.w2_weight)
+        self.loaded_weight_capacity = target_rows
+        self.active_local_num_experts = primary_rows
+        self.local_num_experts = primary_rows
+        self.moe_config.num_local_experts = primary_rows
+        self.global_redundant_expert_num = 0
+        self.moe_config.num_global_redundant_experts = 0
+
+        logical_num_experts = int(
+            getattr(self, "elastic_original_num_experts", self.num_experts))
+        loaded_map = torch.full((logical_num_experts, ),
+                                -1,
+                                dtype=torch.int32,
+                                device=self.w13_weight.device)
+        primary_map = getattr(self, "elastic_original_expert_map", None)
+        primary_log2phy = getattr(self, "primary_log2phy", None)
+        if primary_map is None:
+            primary_mapping = determine_expert_map(
+                self.ep_size,
+                self.ep_rank,
+                logical_num_experts,
+                layer_idx=self.layer_idx,
+            )
+            primary_map = primary_mapping[1]
+            if len(primary_mapping) == 3:
+                primary_log2phy = primary_mapping[2]
+        if old_loaded_map is not None:
+            old_loaded_map_cpu = old_loaded_map.detach().cpu().tolist()
+            for expert_id, local_slot in enumerate(old_loaded_map_cpu):
+                local_slot = int(local_slot)
+                if 0 <= local_slot < target_rows:
+                    loaded_map[int(expert_id)] = local_slot
+        primary_map_cpu = primary_map.detach().cpu().tolist()
+        for expert_id, local_slot in enumerate(primary_map_cpu):
+            local_slot = int(local_slot)
+            if 0 <= local_slot < primary_rows:
+                loaded_map[int(expert_id)] = local_slot
+        self.loaded_expert_map = loaded_map
+        self.loaded_local_num_experts = sum(
+            1 for slot in loaded_map.detach().cpu().tolist()
+            if int(slot) >= 0)
+        expert_map = torch.full((logical_num_experts, ),
+                                -1,
+                                dtype=torch.int32,
+                                device=self.w13_weight.device)
+        for expert_id, local_slot in enumerate(primary_map_cpu):
+            local_slot = int(local_slot)
+            if 0 <= local_slot < primary_rows:
+                expert_map[int(expert_id)] = local_slot
+        self.expert_map = expert_map
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self._set_lossless_map_cpu_from_tensor(
+            self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+        self._sync_mode1_active_log2phy_from_expert_map(
+            "shrink_loaded_weights_to_primary",
+            update_primary=True,
+        )
+
+        self.runtime_weight_capacity = 0
+        self.lossless_runtime_activated = False
+        self.lossless_loaded_offloaded = False
+        self.lossless_cpu_import_expert_ids = []
+        self.clear_lossless_hybrid_state()
+        self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+        self.set_lossless_runtime_prefix_views()
+        self._finalize_mode1_full_world_compact_metadata()
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = (
+                self._should_enable_mode1_parity_for_current_layout())
+
+        released_old_storage = int(bool(released_old_w13_storage)) + int(
+            bool(released_old_w2_storage))
+        if os.getenv(
+                "VLLM_ASCEND_MODE1_FULL_WORLD_COMPACT_EMPTY_CACHE_PER_LAYER",
+                "0").lower() in ("1", "true", "yes", "on"):
+            gc.collect()
+            if hasattr(torch, "npu") and torch.npu.is_available():
+                torch.npu.empty_cache()
+                torch.npu.synchronize()
+        if self.layer_idx == 0:
+            logger.info(
+                "Mode1 full-world step physically compacted MoE loaded slots: "
+                "layer=%s primary_rows=%s min_capacity=%s target_rows=%s "
+                "old_rows=%s old_capacity=%s "
+                "new_capacity=%s old_weight_bytes=%s new_weight_bytes=%s "
+                "old_storage_bytes=%s new_storage_bytes=%s "
+                "released_old_storage=%s",
+                self.layer_idx,
+                primary_rows,
+                min_capacity,
+                target_rows,
+                old_rows,
+                old_capacity,
+                int(getattr(self, "loaded_weight_capacity", 0)),
+                old_w13_bytes + old_w2_bytes,
+                new_w13_bytes + new_w2_bytes,
+                old_w13_storage_bytes + old_w2_storage_bytes,
+                new_w13_storage_bytes + new_w2_storage_bytes,
+                released_old_storage,
+            )
+        return True
+
+    def enforce_mode1_target_floor_loaded_capacity_after_reload(
+            self, reason: str = "reload") -> bool:
+        """Keep the canonical loaded tensors aligned with this step's floor.
+
+        Weight reload is the source of truth for the next rollout step.  If a
+        floor=4 step reloads into the floor=2 64-slot layout, the later KV
+        rebuild sees too much resident torch memory and cannot honor the
+        floor=4 KV budget.  Enforce the target floor immediately after reload
+        so same-floor steps have the same invariant as upward transitions.
+        """
+        if not _env_flag("VLLM_ASCEND_MODE1_ENFORCE_TARGET_FLOOR_ON_WEIGHT_RELOAD",
+                         "1"):
+            return False
+        if (getattr(self, "elastic_moe_mode", "lossy") != "lossless"
+                or int(getattr(self, "elastic_execution_mode", 0)) != 1):
+            return False
+        target_floor = _mode1_target_floor_for_weight_reload()
+        if target_floor is None:
+            return False
+        if not hasattr(self, "w13_weight") or not hasattr(self, "w2_weight"):
+            return False
+        try:
+            target_capacity = int(
+                self._get_reserved_local_expert_slots_for_floor(target_floor))
+        except Exception:
+            logger.exception(
+                "Mode1 failed to resolve target floor reload capacity: "
+                "layer=%s target_floor=%s reason=%s",
+                getattr(self, "layer_idx", -1),
+                target_floor,
+                reason,
+            )
+            return False
+        old_rows = min(int(self.w13_weight.shape[0]),
+                       int(self.w2_weight.shape[0]))
+        old_capacity = int(getattr(self, "loaded_weight_capacity", old_rows))
+        if old_rows < target_capacity:
+            raise RuntimeError(
+                "Mode1 target-floor reload has insufficient physical expert "
+                f"rows at layer={self.layer_idx}: target_floor={target_floor} "
+                f"target_capacity={target_capacity} weight_rows={old_rows} "
+                f"loaded_capacity={old_capacity} reason={reason}.")
+
+        if old_rows == target_capacity:
+            metadata_changed = old_capacity != target_capacity
+            if metadata_changed:
+                # A weight reload restores the preallocated Parameter shape, but
+                # the previous shallower floor may leave loaded_weight_capacity
+                # at 8 or 16. The rows already exist, so expose them as writable
+                # direct-import slots without allocating another expert tensor.
+                self.loaded_weight_capacity = target_capacity
+            self._finalize_mode1_full_world_compact_metadata()
+            self._validate_mode1_lossless_active_mapping(
+                f"{reason}:metadata_aligned")
+            if (metadata_changed and
+                    int(getattr(self, "layer_idx", -1)) == 0):
+                logger.info(
+                    "Mode1 target-floor reload capacity metadata restored: "
+                    "layer=%s target_floor=%s target_capacity=%s "
+                    "old_capacity=%s new_capacity=%s weight_rows=%s reason=%s",
+                    self.layer_idx,
+                    target_floor,
+                    target_capacity,
+                    old_capacity,
+                    int(getattr(self, "loaded_weight_capacity", 0)),
+                    old_rows,
+                    reason,
+                )
+            elif (int(getattr(self, "layer_idx", -1)) == 0 and _env_flag(
+                    "VLLM_ASCEND_MODE1_WEIGHT_RELOAD_CAPACITY_LOG", "0")):
+                logger.info(
+                    "Mode1 target-floor reload capacity already aligned: "
+                    "layer=%s target_floor=%s target_capacity=%s "
+                    "loaded_capacity=%s weight_rows=%s reason=%s",
+                    self.layer_idx,
+                    target_floor,
+                    target_capacity,
+                    old_capacity,
+                    old_rows,
+                    reason,
+                )
+            return metadata_changed
+
+        changed = self.shrink_lossless_loaded_weights_to_primary(
+            min_capacity=target_capacity)
+        self._validate_mode1_lossless_active_mapping(
+            f"{reason}:capacity_enforced")
+        if (changed and int(getattr(self, "layer_idx", -1)) == 0
+                and _env_flag("VLLM_ASCEND_MODE1_WEIGHT_RELOAD_CAPACITY_LOG",
+                              "0")):
+            logger.info(
+                "Mode1 target-floor reload capacity enforced: layer=%s "
+                "target_floor=%s target_capacity=%s old_rows=%s "
+                "old_capacity=%s new_rows=%s new_capacity=%s changed=%s "
+                "reason=%s",
+                getattr(self, "layer_idx", -1),
+                target_floor,
+                target_capacity,
+                old_rows,
+                old_capacity,
+                min(int(self.w13_weight.shape[0]),
+                    int(self.w2_weight.shape[0])),
+                int(getattr(self, "loaded_weight_capacity", 0)),
+                changed,
+                reason,
+            )
+        return changed
+
+    def prepare_lossless_zero_redundancy_runtime_slots(self) -> bool:
+        if (self.elastic_moe_mode != "lossless"
+                or getattr(self, "global_redundant_expert_num", 0) > 0):
+            return False
+        active_local_num_experts = int(self.active_local_num_experts)
+        target_capacity = self._get_zero_redundancy_prealloc_capacity()
+        if target_capacity <= active_local_num_experts:
+            return False
+        self.set_lossless_runtime_prefix_views()
+        self.runtime_weight_capacity = max(
+            target_capacity, int(getattr(self, "loaded_weight_capacity", 0)))
+        self.lossless_zero_redundancy_preallocated = True
+        return True
+
+    def ensure_lossless_cpu_shadow(self) -> None:
+        if self.elastic_moe_mode != "lossless":
+            return
+        mode = int(getattr(self, "elastic_execution_mode", 0))
+        if mode == 5 and getattr(self, "lossless_mode5_cpu_shadow_prepared",
+                                 False):
+            if _mode5_cpu_shadow_runtime_strategy() == "legacy_cpu_shadow":
+                return
+            if self.lossless_cpu_w13_weight is None:
+                self.lossless_cpu_w13_weight = _maybe_pin_cpu_tensor(
+                    torch.empty((0, ) + tuple(self.w13_weight.shape[1:]),
+                                device="cpu",
+                                dtype=self.w13_weight.dtype))
+            else:
+                self.lossless_cpu_w13_weight = _maybe_pin_cpu_tensor(
+                    self.lossless_cpu_w13_weight)
+            if self.lossless_cpu_w2_weight is None:
+                self.lossless_cpu_w2_weight = _maybe_pin_cpu_tensor(
+                    torch.empty((0, ) + tuple(self.w2_weight.shape[1:]),
+                                device="cpu",
+                                dtype=self.w2_weight.dtype))
+            else:
+                self.lossless_cpu_w2_weight = _maybe_pin_cpu_tensor(
+                    self.lossless_cpu_w2_weight)
+            return
+        if self.lossless_cpu_w13_weight is None:
+            self.lossless_cpu_w13_weight = _maybe_pin_cpu_tensor(
+                self.w13_weight.detach().cpu())
+        else:
+            self.lossless_cpu_w13_weight = _maybe_pin_cpu_tensor(
+                self.lossless_cpu_w13_weight)
+        if self.lossless_cpu_w2_weight is None:
+            self.lossless_cpu_w2_weight = _maybe_pin_cpu_tensor(
+                self.w2_weight.detach().cpu())
+        else:
+            self.lossless_cpu_w2_weight = _maybe_pin_cpu_tensor(
+                self.lossless_cpu_w2_weight)
+        if (not self.lossless_cpu_shadow_local_slots
+                and not self.lossless_mode5_cpu_shadow_row_by_expert):
+            export_map = (self.loaded_expert_map
+                          if self.loaded_expert_map is not None else
+                          self.expert_map)
+            if export_map is not None:
+                cpu_shadow_slot_by_expert = {
+                    int(expert_id): int(local_slot)
+                    for expert_id, local_slot in enumerate(
+                        export_map.detach().cpu().tolist())
+                    if int(local_slot) >= 0
+                }
+                self.lossless_cpu_shadow_local_slots = (
+                    cpu_shadow_slot_by_expert)
+
+    def offload_lossless_loaded_weights_to_cpu(self) -> None:
+        if self.elastic_moe_mode != "lossless" or self.lossless_loaded_offloaded:
+            return
+        if int(getattr(self, "elastic_execution_mode", 0)) in (4, 5):
+            if self.layer_idx == 0 and not getattr(
+                    self, "_mode4_loaded_weight_offload_block_logged", False):
+                logger.info(
+                    "Mode4 remote NPU cache blocked loaded-weight CPU offload: "
+                    "layer=%s w13_device=%s w2_device=%s",
+                    self.layer_idx,
+                    self.w13_weight.device,
+                    self.w2_weight.device,
+                )
+                self._mode4_loaded_weight_offload_block_logged = True
+            return
+        self.ensure_lossless_cpu_shadow()
+        old_w13_weight = self.w13_weight
+        old_w2_weight = self.w2_weight
+        w13_tail_shape = tuple(self.w13_weight.shape[1:])
+        w2_tail_shape = tuple(self.w2_weight.shape[1:])
+        w13_dtype = self.w13_weight.dtype
+        w2_dtype = self.w2_weight.dtype
+        self.w13_weight = torch.nn.Parameter(
+            torch.empty((0, ) + w13_tail_shape, device="cpu", dtype=w13_dtype),
+            requires_grad=False)
+        self.w2_weight = torch.nn.Parameter(
+            torch.empty((0, ) + w2_tail_shape, device="cpu", dtype=w2_dtype),
+            requires_grad=False)
+        # Runtime prefix views and runtime buffers may both alias or contain
+        # loaded expert storage. Once the canonical loaded weights are offloaded,
+        # no runtime tensor should keep the old NPU allocation alive.
+        self.runtime_w13_weight = None
+        self.runtime_w2_weight = None
+        self.runtime_w13_buffer = None
+        self.runtime_w2_buffer = None
+        self.runtime_weight_capacity = 0
+        self.lossless_runtime_activated = False
+        self.lossless_saved_primary_prefix_w13 = None
+        self.lossless_saved_primary_prefix_w2 = None
+        clear_export_cache = getattr(self, "clear_lossless_npu_export_slot_cache",
+                                     None)
+        if callable(clear_export_cache):
+            clear_export_cache()
+        self.lossless_loaded_offloaded = True
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = False
+        gc.collect()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+        if torch.npu.is_available():
+            torch.npu.empty_cache()
+
+    def refresh_lossless_runtime_weights(
+            self,
+            source_local_ids: Optional[list[int]] = None,
+            cpu_expert_weights: Optional[dict[int, tuple[torch.Tensor,
+                                                         torch.Tensor]]] = None,
+            preserve_prefix_len: int = 0,
+    ) -> None:
+        if self.elastic_moe_mode != "lossless":
+            self.runtime_w13_weight = None
+            self.runtime_w2_weight = None
+            self.runtime_w13_buffer = None
+            self.runtime_w2_buffer = None
+            self.runtime_weight_capacity = 0
+            self.lossless_mode1_native_parity_ready = False
+            return
+
+        active_local_num_experts = int(self.active_local_num_experts)
+        if source_local_ids is None:
+            source_local_ids = list(range(active_local_num_experts))
+        if len(source_local_ids) != active_local_num_experts:
+            raise RuntimeError(
+                f"expected {active_local_num_experts}, got {len(source_local_ids)}."
+            )
+        preserve_prefix_len = min(max(int(preserve_prefix_len), 0),
+                                  active_local_num_experts)
+
+        if getattr(self, "global_redundant_expert_num", 0) <= 0:
+            if cpu_expert_weights is not None:
+                raise RuntimeError(
+                    "materialized into loaded weights before refreshing runtime "
+                    f"views at layer={self.layer_idx}.")
+            expected_prefix = list(range(active_local_num_experts))
+            if list(source_local_ids) != expected_prefix:
+                raise RuntimeError(
+                    "contiguous prefix of loaded weights: "
+                    f"source_local_ids={source_local_ids}, expected={expected_prefix} "
+                    f"at layer={self.layer_idx}.")
+            if preserve_prefix_len not in (0, active_local_num_experts):
+                raise RuntimeError(
+                    f"buffers; got preserve_prefix_len={preserve_prefix_len} "
+                    f"at layer={self.layer_idx}.")
+            self.set_lossless_runtime_prefix_views()
+            if self.elastic_execution_mode == 1:
+                self.lossless_mode1_native_parity_ready = (
+                    self._should_enable_mode1_parity_for_current_layout())
+            return
+
+        target_capacity = self._get_lossless_runtime_capacity(
+            active_local_num_experts)
+        target_format_w13 = _lossless_weight_format(self.w13_weight)
+        target_format_w2 = _lossless_weight_format(self.w2_weight)
+        if (self.runtime_w13_buffer is None or self.runtime_w2_buffer is None
+                or self.runtime_weight_capacity < target_capacity
+                or _lossless_weight_format(self.runtime_w13_buffer) != target_format_w13
+                or _lossless_weight_format(self.runtime_w2_buffer) != target_format_w2):
+            old_runtime_w13 = self.runtime_w13_weight
+            old_runtime_w2 = self.runtime_w2_weight
+            buffer_device = self.expert_map.device
+            buffer_w13_dtype = (self.lossless_cpu_w13_weight.dtype
+                                if self.lossless_loaded_offloaded and
+                                self.lossless_cpu_w13_weight is not None else
+                                self.w13_weight.dtype)
+            buffer_w2_dtype = (self.lossless_cpu_w2_weight.dtype
+                               if self.lossless_loaded_offloaded and
+                               self.lossless_cpu_w2_weight is not None else
+                               self.w2_weight.dtype)
+            self.runtime_w13_buffer = _allocate_formatted_buffer_like(
+                self.w13_weight,
+                target_capacity,
+                dtype=buffer_w13_dtype)
+            self.runtime_w2_buffer = _allocate_formatted_buffer_like(
+                self.w2_weight,
+                target_capacity,
+                dtype=buffer_w2_dtype)
+            self.runtime_weight_capacity = target_capacity
+            if preserve_prefix_len > 0 and old_runtime_w13 is not None and old_runtime_w2 is not None:
+                self.runtime_w13_buffer[:preserve_prefix_len].copy_(
+                    old_runtime_w13[:preserve_prefix_len], non_blocking=False)
+                self.runtime_w2_buffer[:preserve_prefix_len].copy_(
+                    old_runtime_w2[:preserve_prefix_len], non_blocking=False)
+        elif preserve_prefix_len == 0:
+            # Reusing existing buffers without any preserved prefix.
+            self.runtime_w13_buffer[:active_local_num_experts].zero_()
+            self.runtime_w2_buffer[:active_local_num_experts].zero_()
+
+        cpu_import_ids = list(self.lossless_cpu_import_expert_ids)
+        cpu_import_cursor = 0
+        if self.lossless_loaded_offloaded:
+            self.ensure_lossless_cpu_shadow()
+
+        for slot_idx in range(preserve_prefix_len, active_local_num_experts):
+            source_local_id = source_local_ids[slot_idx]
+            if source_local_id >= 0:
+                if self.lossless_loaded_offloaded:
+                    source_w13 = self.lossless_cpu_w13_weight[source_local_id]
+                    source_w2 = self.lossless_cpu_w2_weight[source_local_id]
+                    _copy_logical_row_to_weight_slot(
+                        self.runtime_w13_buffer,
+                        slot_idx,
+                        source_w13,
+                        non_blocking=False)
+                    _copy_logical_row_to_weight_slot(
+                        self.runtime_w2_buffer,
+                        slot_idx,
+                        source_w2,
+                        non_blocking=False)
+                else:
+                    self.runtime_w13_buffer[slot_idx].copy_(
+                        self.w13_weight[source_local_id], non_blocking=False)
+                    self.runtime_w2_buffer[slot_idx].copy_(
+                        self.w2_weight[source_local_id], non_blocking=False)
+            else:
+                if cpu_expert_weights is None:
+                    raise RuntimeError(
+                        "negative source_local_ids.")
+                expert_id = cpu_import_ids[cpu_import_cursor]
+                cpu_import_cursor += 1
+                cpu_w13, cpu_w2 = cpu_expert_weights[expert_id]
+                _copy_logical_row_to_weight_slot(
+                    self.runtime_w13_buffer,
+                    slot_idx,
+                    cpu_w13,
+                    non_blocking=False)
+                _copy_logical_row_to_weight_slot(
+                    self.runtime_w2_buffer,
+                    slot_idx,
+                    cpu_w2,
+                    non_blocking=False)
+
+        self.runtime_w13_weight = self.runtime_w13_buffer[:active_local_num_experts]
+        self.runtime_w2_weight = self.runtime_w2_buffer[:active_local_num_experts]
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = False
+
+    def _get_lossless_runtime_capacity(self,
+                                       active_local_num_experts: int) -> int:
+        capacity = int(active_local_num_experts)
+        min_compute_group_size = (
+            self._get_configured_elastic_min_compute_group_size())
+        if min_compute_group_size is not None:
+            return max(
+                capacity,
+                self._get_reserved_local_expert_slots_for_floor(
+                    min_compute_group_size))
+        logical_num_experts = self._get_logical_num_experts_for_elastic()
+        if getattr(self, "global_redundant_expert_num", 0) <= 0:
+            # In zero-redundancy mode, pre-reserving the next shrink stage
+            # makes the first 16->8 activation peak too expensive.
+            return capacity
+        current_ep_size = int(getattr(self.moe_parallel_config, "ep_size", 1))
+        min_ep_size = int(envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE)
+        if current_ep_size <= 1 or logical_num_experts <= 0:
+            return capacity
+        next_ep_size = current_ep_size // 2
+        while next_ep_size >= min_ep_size:
+            if logical_num_experts % next_ep_size == 0:
+                return max(capacity, logical_num_experts // next_ep_size)
+            next_ep_size //= 2
+        return capacity
+
+    def activate_lossless_primary_experts(self) -> None:
+        if self.elastic_moe_mode != "lossless" or self.loaded_expert_map is None:
+            return
+        self.clear_lossless_hybrid_state()
+        self._restore_stashed_lossless_primary_prefix()
+        if getattr(self, "lossless_lazy_activation", False):
+            if self.prepare_lossless_zero_redundancy_runtime_slots():
+                if self.ep_rank == 0:
+                    logger.info(
+                        "Preallocating lossless zero-redundancy runtime slots: layer=%s active_local=%s capacity=%s fixed_slot_reuse=%s primary_prefix_rows=%s hybrid_resident_capacity=%s",
+                        self.layer_idx,
+                        self.active_local_num_experts,
+                        self.runtime_weight_capacity,
+                        bool(
+                            getattr(self,
+                                    "lossless_zero_redundancy_preallocated_loaded",
+                                    False)),
+                        self._get_lossless_primary_prefix_row_count(),
+                        self._get_hybrid_resident_capacity(),
+                    )
+                    if (self.layer_idx == 0
+                            and not self.lossless_fixed_slot_plan_logged):
+                        logger.info(
+                            "Lossless fixed-slot resident plan ready: layer=%s primary_prefix_rows=%s loaded_capacity=%s runtime_capacity=%s hybrid_resident_capacity=%s",
+                            self.layer_idx,
+                            self._get_lossless_primary_prefix_row_count(),
+                            int(getattr(self, "loaded_weight_capacity", 0)),
+                            int(getattr(self, "runtime_weight_capacity", 0)),
+                            self._get_hybrid_resident_capacity(),
+                        )
+                        self.lossless_fixed_slot_plan_logged = True
+            else:
+                # Keep pre-shrink execution identical to the primary layout.
+                self.runtime_w13_weight = None
+                self.runtime_w2_weight = None
+                self.runtime_w13_buffer = None
+                self.runtime_w2_buffer = None
+                self.runtime_weight_capacity = 0
+                self.lossless_runtime_activated = False
+            return
+        primary_expert_map = getattr(self, "elastic_original_expert_map", None)
+        if primary_expert_map is None:
+            primary_expert_map = self.expert_map
+        active_expert_ids: list[int] = []
+        source_local_ids: list[int] = []
+        primary_map_list = primary_expert_map.detach().cpu().tolist()
+        loaded_map_list = self.loaded_expert_map.detach().cpu().tolist()
+        for expert_id, primary_local_id in enumerate(primary_map_list):
+            if primary_local_id < 0:
+                continue
+            loaded_local_id = loaded_map_list[expert_id]
+            if loaded_local_id < 0:
+                raise RuntimeError(
+                    f"primary expert {expert_id} missing from loaded_expert_map "
+                    f"at layer={self.layer_idx}."
+                )
+            active_expert_ids.append(expert_id)
+            source_local_ids.append(int(loaded_local_id))
+        self.activate_lossless_local_experts(active_expert_ids,
+                                             source_local_ids)
+
+    def export_lossless_expert_cpu_weights(
+            self, expert_ids: list[int]) -> dict[int, tuple[torch.Tensor,
+                                                            torch.Tensor]]:
+        if self.elastic_moe_mode != "lossless" or not expert_ids:
+            return {}
+        safe_mode1_cpu_export = (
+            int(getattr(self, "elastic_execution_mode", 0)) == 1
+            and _env_flag("VLLM_ASCEND_MODE1_SAFE_CPU_EXPORT", "0"))
+        runtime_w13 = (self.runtime_w13_buffer
+                       if self.runtime_w13_buffer is not None else
+                       self.runtime_w13_weight)
+        runtime_w2 = (self.runtime_w2_buffer if self.runtime_w2_buffer is not None
+                      else self.runtime_w2_weight)
+        runtime_slot_by_expert: dict[int, int] = {}
+        if (not safe_mode1_cpu_export
+                and runtime_w13 is not None and runtime_w2 is not None
+                and self.expert_map is not None):
+            runtime_slot_by_expert = {
+                int(expert_id): self._get_host_expert_map_value(
+                    self.expert_map,
+                    "_host_expert_map",
+                    int(expert_id),
+                )
+                for expert_id in expert_ids
+            }
+            if all(local_slot >= 0
+                   for local_slot in runtime_slot_by_expert.values()):
+                return {
+                    int(expert_id): (
+                        runtime_w13[local_slot].detach().cpu(),
+                        runtime_w2[local_slot].detach().cpu(),
+                    )
+                    for expert_id, local_slot in runtime_slot_by_expert.items()
+                }
+        need_cpu_shadow = any(
+            runtime_slot_by_expert.get(int(expert_id), -1) < 0
+            for expert_id in expert_ids)
+        if need_cpu_shadow and not safe_mode1_cpu_export:
+            self.ensure_lossless_cpu_shadow()
+        export_map = (self.loaded_expert_map
+                      if self.loaded_expert_map is not None else self.expert_map)
+        cpu_weights: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        mode = int(getattr(self, "elastic_execution_mode", 0))
+        for expert_id in expert_ids:
+            expert_id = int(expert_id)
+            runtime_slot = runtime_slot_by_expert.get(expert_id, -1)
+            if (not safe_mode1_cpu_export
+                    and runtime_slot >= 0 and runtime_w13 is not None
+                    and runtime_w2 is not None):
+                cpu_weights[expert_id] = (
+                    runtime_w13[runtime_slot].detach().cpu(),
+                    runtime_w2[runtime_slot].detach().cpu(),
+                )
+                continue
+            if safe_mode1_cpu_export:
+                cpu_weights[expert_id] = self._get_lossless_cpu_pair_for_expert(
+                    expert_id)
+                continue
+            cpu_slot = self.lossless_mode5_cpu_shadow_row_by_expert.get(
+                expert_id)
+            if cpu_slot is None:
+                cpu_slot = self.lossless_cpu_shadow_local_slots.get(expert_id)
+            if cpu_slot is not None:
+                local_slot = int(cpu_slot)
+            else:
+                if mode == 5:
+                    raise RuntimeError(
+                        "CPU export requested experts that are not present in "
+                        f"the CPU shadow at layer={self.layer_idx}: "
+                        f"missing={[expert_id]} count=1 "
+                        f"cpu_shadow_rows={int(self.lossless_cpu_w13_weight.shape[0])}. "
+                        "For mode=5 this usually means remote-NPU experts "
+                        "leaked into the CPU import payload.")
+                local_slot = int(export_map[expert_id].item())
+            if local_slot < 0:
+                continue
+            if (local_slot >= int(self.lossless_cpu_w13_weight.shape[0])
+                    or local_slot >= int(self.lossless_cpu_w2_weight.shape[0])):
+                raise RuntimeError(
+                    "CPU export slot exceeds CPU shadow rows at "
+                    f"layer={self.layer_idx}: expert_id={expert_id} "
+                    f"slot={local_slot} "
+                    f"w13_rows={int(self.lossless_cpu_w13_weight.shape[0])} "
+                    f"w2_rows={int(self.lossless_cpu_w2_weight.shape[0])}.")
+            cpu_weights[int(expert_id)] = (
+                self.lossless_cpu_w13_weight[local_slot].detach().cpu(),
+                self.lossless_cpu_w2_weight[local_slot].detach().cpu(),
+            )
+        return cpu_weights
+
+    def refresh_lossless_npu_export_slot_cache(self) -> dict[str, float]:
+        """Snapshot tiny expert->slot maps on CPU for shrink-export diagnostics."""
+        stats = {
+            "expert_map_cpu_ms": 0.0,
+            "loaded_map_cpu_ms": 0.0,
+        }
+        if self.expert_map is not None:
+            start_t = time.perf_counter()
+            self._lossless_npu_export_expert_map_cpu = [
+                int(slot) for slot in self.expert_map.detach().cpu().tolist()
+            ]
+            self._lossless_npu_export_expert_map_cpu_tensor_id = id(
+                self.expert_map)
+            stats["expert_map_cpu_ms"] = (time.perf_counter() -
+                                          start_t) * 1000.0
+        else:
+            self._lossless_npu_export_expert_map_cpu = None
+            self._lossless_npu_export_expert_map_cpu_tensor_id = None
+        if self.loaded_expert_map is not None:
+            start_t = time.perf_counter()
+            self._lossless_npu_export_loaded_map_cpu = [
+                int(slot)
+                for slot in self.loaded_expert_map.detach().cpu().tolist()
+            ]
+            self._lossless_npu_export_loaded_map_cpu_tensor_id = id(
+                self.loaded_expert_map)
+            stats["loaded_map_cpu_ms"] = (time.perf_counter() -
+                                          start_t) * 1000.0
+        else:
+            self._lossless_npu_export_loaded_map_cpu = None
+            self._lossless_npu_export_loaded_map_cpu_tensor_id = None
+        return stats
+
+
+    def clear_lossless_npu_export_slot_cache(self) -> None:
+        self._lossless_npu_export_expert_map_cpu = None
+        self._lossless_npu_export_loaded_map_cpu = None
+        self._lossless_npu_export_expert_map_cpu_tensor_id = None
+        self._lossless_npu_export_loaded_map_cpu_tensor_id = None
+        self.clear_lossless_p2p_alias_cache()
+
+
+    def clear_lossless_p2p_alias_cache(self) -> None:
+        self._lossless_p2p_alias_cache = {}
+
+
+    def _lossless_p2p_alias_for_range(
+            self,
+            base: torch.Tensor,
+            first_slot: int,
+            rows: int,
+            *,
+            cache_kind: str) -> torch.Tensor:
+        slot_view = base[int(first_slot):int(first_slot) + int(rows)]
+        if slot_view.device.type != "npu":
+            return slot_view
+        if not _env_flag("VLLM_ASCEND_MODE1_CACHE_P2P_ALIASES", "1"):
+            return _npu_zero_offset_alias_for_p2p(base, slot_view)
+        key = (
+            str(cache_kind),
+            int(base.data_ptr()),
+            int(slot_view.data_ptr()),
+            tuple(slot_view.shape),
+            str(slot_view.dtype),
+            int(first_slot),
+            int(rows),
+        )
+        cached = self._lossless_p2p_alias_cache.get(key)
+        if cached is not None:
+            return cached
+        alias = _npu_zero_offset_alias_for_p2p(base, slot_view)
+        self._lossless_p2p_alias_cache[key] = alias
+        return alias
+
+
+    def _lossless_npu_export_slot_from_map(
+            self, export_map: torch.Tensor,
+            expert_id: int) -> tuple[int, str]:
+        if export_map is None:
+            raise RuntimeError(
+                f"Missing export map at layer={self.layer_idx} "
+                f"expert_id={int(expert_id)}.")
+        use_cpu_slot_map_default = (
+            "1" if int(getattr(self, "elastic_execution_mode", 0)) == 1 else "0")
+        use_cpu_slot_map = _env_flag(
+            "VLLM_ASCEND_MODE1_USE_CPU_EXPORT_SLOT_MAP",
+            use_cpu_slot_map_default)
+        if use_cpu_slot_map:
+            if export_map is self.expert_map:
+                expert_map_cpu = getattr(self, "_lossless_expert_map_cpu",
+                                         None)
+                if (expert_map_cpu is not None
+                        and getattr(self,
+                                    "_lossless_expert_map_cpu_tensor_id",
+                                    None) == id(export_map)):
+                    return int(expert_map_cpu[int(expert_id)]), "expert_cpu"
+                expert_map_cpu = getattr(
+                    self, "_lossless_npu_export_expert_map_cpu", None)
+                if (expert_map_cpu is not None
+                        and getattr(
+                            self,
+                            "_lossless_npu_export_expert_map_cpu_tensor_id",
+                            None) == id(export_map)):
+                    return int(expert_map_cpu[int(expert_id)]), "expert_cpu"
+            if export_map is self.loaded_expert_map:
+                loaded_map_cpu = getattr(self,
+                                         "_lossless_loaded_expert_map_cpu",
+                                         None)
+                if (loaded_map_cpu is not None
+                        and getattr(
+                            self,
+                            "_lossless_loaded_expert_map_cpu_tensor_id",
+                            None) == id(export_map)):
+                    return int(loaded_map_cpu[int(expert_id)]), "loaded_cpu"
+                loaded_map_cpu = getattr(
+                    self, "_lossless_npu_export_loaded_map_cpu", None)
+                if (loaded_map_cpu is not None
+                        and getattr(
+                            self,
+                            "_lossless_npu_export_loaded_map_cpu_tensor_id",
+                            None) == id(export_map)):
+                    return int(loaded_map_cpu[int(expert_id)]), "loaded_cpu"
+            if (int(getattr(self, "elastic_execution_mode", 0)) == 1
+                    and not _env_flag(
+                        "VLLM_ASCEND_MODE1_ALLOW_NPU_EXPORT_SLOT_FALLBACK",
+                        "0")):
+                map_kind = ("expert_map" if export_map is self.expert_map else
+                            "loaded_expert_map" if export_map is self.loaded_expert_map
+                            else "unknown_map")
+                raise RuntimeError(
+                    "Mode1 export slot CPU mirror is missing or stale; "
+                    "refusing to fall back to NPU scalar .item() because that "
+                    "is the known 350s stall path. "
+                    f"layer={self.layer_idx} ep_rank={self.ep_rank} "
+                    f"expert_id={int(expert_id)} map_kind={map_kind} "
+                    f"map_tensor_id={id(export_map)} "
+                    f"expert_cpu_id={getattr(self, '_lossless_expert_map_cpu_tensor_id', None)} "
+                    f"loaded_cpu_id={getattr(self, '_lossless_loaded_expert_map_cpu_tensor_id', None)} "
+                    f"diag_cpu_id={getattr(self, '_lossless_npu_export_expert_map_cpu_tensor_id', None)} "
+                    f"diag_loaded_cpu_id={getattr(self, '_lossless_npu_export_loaded_map_cpu_tensor_id', None)}.")
+        return int(export_map[int(expert_id)].item()), "npu_item"
+
+
+    def lossless_export_slot_map_status(self) -> dict[str, Any]:
+        expert_cpu = getattr(self, "_lossless_expert_map_cpu", None)
+        loaded_cpu = getattr(self, "_lossless_loaded_expert_map_cpu", None)
+        diag_expert_cpu = getattr(self,
+                                  "_lossless_npu_export_expert_map_cpu", None)
+        diag_loaded_cpu = getattr(self,
+                                  "_lossless_npu_export_loaded_map_cpu", None)
+        return {
+            "layer_idx": int(getattr(self, "layer_idx", -1)),
+            "ep_rank": int(getattr(self, "ep_rank", -1)),
+            "expert_map_id": id(self.expert_map)
+            if self.expert_map is not None else None,
+            "loaded_map_id": id(self.loaded_expert_map)
+            if self.loaded_expert_map is not None else None,
+            "expert_cpu_ready": bool(
+                expert_cpu is not None
+                and getattr(self, "_lossless_expert_map_cpu_tensor_id", None)
+                == id(self.expert_map)),
+            "loaded_cpu_ready": bool(
+                loaded_cpu is not None
+                and getattr(self,
+                            "_lossless_loaded_expert_map_cpu_tensor_id", None)
+                == id(self.loaded_expert_map)),
+            "diag_expert_cpu_ready": bool(
+                diag_expert_cpu is not None
+                and getattr(
+                    self,
+                    "_lossless_npu_export_expert_map_cpu_tensor_id", None)
+                == id(self.expert_map)),
+            "diag_loaded_cpu_ready": bool(
+                diag_loaded_cpu is not None
+                and getattr(
+                    self,
+                    "_lossless_npu_export_loaded_map_cpu_tensor_id", None)
+                == id(self.loaded_expert_map)),
+            "expert_cpu_len": len(expert_cpu) if expert_cpu is not None else 0,
+            "loaded_cpu_len": len(loaded_cpu) if loaded_cpu is not None else 0,
+            "diag_expert_cpu_len": len(diag_expert_cpu)
+            if diag_expert_cpu is not None else 0,
+            "diag_loaded_cpu_len": len(diag_loaded_cpu)
+            if diag_loaded_cpu is not None else 0,
+        }
+
+
+    def export_lossless_expert_npu_weights(
+            self, expert_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        self._last_lossless_npu_export_debug = {}
+        if self.elastic_moe_mode != "lossless" or not expert_ids:
+            empty_w13 = self.w13_weight[:0]
+            empty_w2 = self.w2_weight[:0]
+            return empty_w13, empty_w2
+        diag_export_timing = _env_flag(
+            "VLLM_ASCEND_MODE1_DIAG_EXPORT_INTERNAL_TIMING", "0")
+        export_total_start_t = time.perf_counter() if diag_export_timing else 0.0
+        source_select_start_t = (
+            time.perf_counter() if diag_export_timing else 0.0)
+        runtime_slot_map_ms = 0.0
+        source_kind = "unknown"
+        runtime_slot_lookup_source = "none"
+        export_slot_lookup_source = "none"
+        runtime_w13 = (self.runtime_w13_buffer
+                       if self.runtime_w13_buffer is not None else
+                       self.runtime_w13_weight)
+        runtime_w2 = (self.runtime_w2_buffer if self.runtime_w2_buffer is not None
+                      else self.runtime_w2_weight)
+        if (runtime_w13 is not None and runtime_w2 is not None
+                and self.expert_map is not None):
+            runtime_slot_map_start_t = (
+                time.perf_counter() if diag_export_timing else 0.0)
+            runtime_slots = []
+            runtime_slot_sources: list[str] = []
+            for expert_id in expert_ids:
+                runtime_slot, lookup_source = (
+                    self._lossless_npu_export_slot_from_map(
+                        self.expert_map, int(expert_id)))
+                runtime_slots.append(runtime_slot)
+                runtime_slot_sources.append(lookup_source)
+            runtime_slot_lookup_source = (
+                runtime_slot_sources[0] if runtime_slot_sources else "none")
+            runtime_slot_map_ms = (
+                (time.perf_counter() - runtime_slot_map_start_t) * 1000.0
+                if diag_export_timing else 0.0)
+            if all(local_slot >= 0 for local_slot in runtime_slots):
+                source_w13 = runtime_w13
+                source_w2 = runtime_w2
+                export_map = self.expert_map
+                source_kind = "runtime"
+            elif self.lossless_loaded_offloaded:
+                if self.runtime_w13_weight is None or self.runtime_w2_weight is None:
+                    raise RuntimeError(
+                        f"expert weights were offloaded at layer={self.layer_idx}.")
+                source_w13 = (self.runtime_w13_buffer
+                              if self.runtime_w13_buffer is not None else
+                              self.runtime_w13_weight)
+                source_w2 = (self.runtime_w2_buffer if self.runtime_w2_buffer
+                             is not None else self.runtime_w2_weight)
+                export_map = self.expert_map
+                source_kind = "runtime_offloaded"
+            else:
+                if self.lossless_hybrid_active:
+                    source_w13 = (self.runtime_w13_buffer
+                                  if self.runtime_w13_buffer is not None else
+                                  self.runtime_w13_weight)
+                    source_w2 = (self.runtime_w2_buffer
+                                 if self.runtime_w2_buffer is not None else
+                                 self.runtime_w2_weight)
+                    if source_w13 is None or source_w2 is None:
+                        raise RuntimeError(
+                            f"Hybrid resident runtime buffers are missing at "
+                            f"layer={self.layer_idx}.")
+                    export_map = self.expert_map
+                    source_kind = "hybrid_runtime"
+                else:
+                    source_w13 = self.w13_weight
+                    source_w2 = self.w2_weight
+                    export_map = (self.loaded_expert_map
+                                  if self.loaded_expert_map is not None else
+                                  self.expert_map)
+                    source_kind = "loaded"
+        elif self.lossless_loaded_offloaded:
+            if self.runtime_w13_weight is None or self.runtime_w2_weight is None:
+                raise RuntimeError(
+                    f"expert weights were offloaded at layer={self.layer_idx}.")
+            source_w13 = (self.runtime_w13_buffer
+                          if self.runtime_w13_buffer is not None else
+                          self.runtime_w13_weight)
+            source_w2 = (self.runtime_w2_buffer if self.runtime_w2_buffer
+                         is not None else self.runtime_w2_weight)
+            export_map = self.expert_map
+            source_kind = "offloaded"
+        else:
+            if self.lossless_hybrid_active:
+                source_w13 = (self.runtime_w13_buffer
+                              if self.runtime_w13_buffer is not None else
+                              self.runtime_w13_weight)
+                source_w2 = (self.runtime_w2_buffer
+                             if self.runtime_w2_buffer is not None else
+                             self.runtime_w2_weight)
+                if source_w13 is None or source_w2 is None:
+                    raise RuntimeError(
+                        f"Hybrid resident runtime buffers are missing at "
+                        f"layer={self.layer_idx}.")
+                export_map = self.expert_map
+                source_kind = "hybrid_runtime_no_runtime"
+            else:
+                source_w13 = self.w13_weight
+                source_w2 = self.w2_weight
+                export_map = (self.loaded_expert_map
+                              if self.loaded_expert_map is not None else
+                              self.expert_map)
+                source_kind = "loaded_no_runtime"
+        source_select_ms = (
+            (time.perf_counter() - source_select_start_t) * 1000.0
+            if diag_export_timing else 0.0)
+        export_map_start_t = time.perf_counter() if diag_export_timing else 0.0
+        local_slots = []
+        export_slot_sources: list[str] = []
+        for expert_id in expert_ids:
+            local_slot, lookup_source = (
+                self._lossless_npu_export_slot_from_map(
+                    export_map, int(expert_id)))
+            local_slots.append(local_slot)
+            export_slot_sources.append(lookup_source)
+        export_slot_lookup_source = (
+            export_slot_sources[0] if export_slot_sources else "none")
+        export_map_ms = ((time.perf_counter() - export_map_start_t) * 1000.0
+                         if diag_export_timing else 0.0)
+        if len(local_slots) == 1:
+            local_slot = local_slots[0]
+            if local_slot < 0:
+                raise RuntimeError(
+                    f"expert_id={int(expert_ids[0])} at layer={self.layer_idx}."
+                )
+            export_view_start_t = time.perf_counter() if diag_export_timing else 0.0
+            export_w13 = source_w13[local_slot:local_slot + 1]
+            export_w2 = source_w2[local_slot:local_slot + 1]
+            export_view_ms = ((time.perf_counter() - export_view_start_t) *
+                              1000.0 if diag_export_timing else 0.0)
+            allow_p2p_alias_export = _env_flag(
+                "VLLM_ASCEND_MODE1_ALLOW_CONTIGUOUS_P2P_ALIAS_EXPORT", "1")
+            alias_w13_start_t = time.perf_counter() if diag_export_timing else 0.0
+            if allow_p2p_alias_export:
+                export_w13 = self._lossless_p2p_alias_for_range(
+                    source_w13,
+                    int(local_slot),
+                    1,
+                    cache_kind=f"export_w13:{source_kind}",
+                )
+            else:
+                export_w13 = export_w13.clone()
+            alias_w13_ms = ((time.perf_counter() - alias_w13_start_t) * 1000.0
+                            if diag_export_timing else 0.0)
+            alias_w2_start_t = time.perf_counter() if diag_export_timing else 0.0
+            if allow_p2p_alias_export:
+                export_w2 = self._lossless_p2p_alias_for_range(
+                    source_w2,
+                    int(local_slot),
+                    1,
+                    cache_kind=f"export_w2:{source_kind}",
+                )
+            else:
+                export_w2 = export_w2.clone()
+            alias_w2_ms = ((time.perf_counter() - alias_w2_start_t) * 1000.0
+                           if diag_export_timing else 0.0)
+            if diag_export_timing:
+                export_total_ms = (
+                    time.perf_counter() - export_total_start_t) * 1000.0
+                self._last_lossless_npu_export_debug = {
+                    "layer_idx": int(self.layer_idx),
+                    "expert_id": int(expert_ids[0]),
+                    "expert_count": 1,
+                    "expert_ids": [int(expert_ids[0])],
+                    "local_slot": int(local_slot),
+                    "local_slots": [int(local_slot)],
+                    "local_slots_contiguous": True,
+                    "source_kind": source_kind,
+                    "runtime_slot_lookup_source": runtime_slot_lookup_source,
+                    "export_slot_lookup_source": export_slot_lookup_source,
+                    "source_select_ms": float(source_select_ms),
+                    "runtime_slot_map_ms": float(runtime_slot_map_ms),
+                    "map_ms": float(export_map_ms),
+                    "view_ms": float(export_view_ms),
+                    "alias_w13_ms": float(alias_w13_ms),
+                    "alias_w2_ms": float(alias_w2_ms),
+                    "total_ms": float(export_total_ms),
+                    "source_w13_shape0": int(source_w13.shape[0]),
+                    "source_w2_shape0": int(source_w2.shape[0]),
+                    "view_w13_offset": int(export_w13.storage_offset()),
+                    "view_w2_offset": int(export_w2.storage_offset()),
+                    "alias_export_enabled": bool(allow_p2p_alias_export),
+                    "alias_w13_offset": int(export_w13.storage_offset()),
+                    "alias_w2_offset": int(export_w2.storage_offset()),
+                }
+            return export_w13, export_w2
+        if any(local_slot < 0 for local_slot in local_slots):
+            raise RuntimeError(
+                f"Missing NPU export slots at layer={self.layer_idx}: "
+                f"expert_ids={expert_ids[:8]} local_slots={local_slots[:8]}.")
+
+        first_slot = int(local_slots[0])
+        contiguous_slots = local_slots == list(
+            range(first_slot, first_slot + len(local_slots)))
+        if contiguous_slots:
+            export_view_start_t = (
+                time.perf_counter() if diag_export_timing else 0.0)
+            export_w13 = source_w13[first_slot:first_slot + len(local_slots)]
+            export_w2 = source_w2[first_slot:first_slot + len(local_slots)]
+            export_view_ms = ((time.perf_counter() - export_view_start_t) *
+                              1000.0 if diag_export_timing else 0.0)
+            allow_p2p_alias_export = _env_flag(
+                "VLLM_ASCEND_MODE1_ALLOW_CONTIGUOUS_P2P_ALIAS_EXPORT", "1")
+            alias_w13_start_t = (
+                time.perf_counter() if diag_export_timing else 0.0)
+            if allow_p2p_alias_export:
+                export_w13 = self._lossless_p2p_alias_for_range(
+                    source_w13,
+                    int(first_slot),
+                    int(len(local_slots)),
+                    cache_kind=f"export_w13:{source_kind}",
+                )
+            else:
+                export_w13 = export_w13.clone()
+            alias_w13_ms = ((time.perf_counter() - alias_w13_start_t) * 1000.0
+                            if diag_export_timing else 0.0)
+            alias_w2_start_t = (
+                time.perf_counter() if diag_export_timing else 0.0)
+            if allow_p2p_alias_export:
+                export_w2 = self._lossless_p2p_alias_for_range(
+                    source_w2,
+                    int(first_slot),
+                    int(len(local_slots)),
+                    cache_kind=f"export_w2:{source_kind}",
+                )
+            else:
+                export_w2 = export_w2.clone()
+            alias_w2_ms = ((time.perf_counter() - alias_w2_start_t) * 1000.0
+                           if diag_export_timing else 0.0)
+            if diag_export_timing:
+                export_total_ms = (
+                    time.perf_counter() - export_total_start_t) * 1000.0
+                self._last_lossless_npu_export_debug = {
+                    "layer_idx": int(self.layer_idx),
+                    "expert_id": int(expert_ids[0]),
+                    "expert_count": int(len(expert_ids)),
+                    "expert_ids": [int(expert_id) for expert_id in expert_ids],
+                    "local_slot": int(first_slot),
+                    "local_slots": [int(local_slot) for local_slot in local_slots],
+                    "local_slots_contiguous": True,
+                    "source_kind": source_kind,
+                    "runtime_slot_lookup_source": runtime_slot_lookup_source,
+                    "export_slot_lookup_source": export_slot_lookup_source,
+                    "source_select_ms": float(source_select_ms),
+                    "runtime_slot_map_ms": float(runtime_slot_map_ms),
+                    "map_ms": float(export_map_ms),
+                    "view_ms": float(export_view_ms),
+                    "alias_w13_ms": float(alias_w13_ms),
+                    "alias_w2_ms": float(alias_w2_ms),
+                    "total_ms": float(export_total_ms),
+                    "source_w13_shape0": int(source_w13.shape[0]),
+                    "source_w2_shape0": int(source_w2.shape[0]),
+                    "view_w13_offset": int(export_w13.storage_offset()),
+                    "view_w2_offset": int(export_w2.storage_offset()),
+                    "alias_export_enabled": bool(allow_p2p_alias_export),
+                    "alias_w13_offset": int(export_w13.storage_offset()),
+                    "alias_w2_offset": int(export_w2.storage_offset()),
+                }
+            return export_w13, export_w2
+
+        if not _env_flag("VLLM_ASCEND_MODE1_ALLOW_BATCH_INDEX_SELECT_EXPORT",
+                         "0"):
+            raise RuntimeError(
+                "Refusing non-contiguous batched NPU export because the "
+                "index_select materialization path is the known mode=1 "
+                f"floor=2 350s stall path. layer={self.layer_idx} "
+                f"expert_ids={expert_ids[:16]} local_slots={local_slots[:16]}.")
+        export_index = torch.tensor(local_slots,
+                                    device=source_w13.device,
+                                    dtype=torch.long)
+        return (source_w13.index_select(0, export_index),
+                source_w2.index_select(0, export_index))
+
+    def get_lossless_expert_npu_slot_recv_buffers(
+            self, local_slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self._lossless_p2p_alias_for_range(
+                self.w13_weight, int(local_slot), 1, cache_kind="recv_w13"),
+            self._lossless_p2p_alias_for_range(
+                self.w2_weight, int(local_slot), 1, cache_kind="recv_w2"),
+        )
+
+    def get_lossless_expert_npu_slot_range_recv_buffers(
+            self, first_slot: int,
+            rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self._lossless_p2p_alias_for_range(
+                self.w13_weight,
+                int(first_slot),
+                int(rows),
+                cache_kind="recv_w13"),
+            self._lossless_p2p_alias_for_range(
+                self.w2_weight,
+                int(first_slot),
+                int(rows),
+                cache_kind="recv_w2"),
+        )
+
+    def get_lossless_expert_npu_slot_range_send_buffers(
+            self, first_slot: int,
+            rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self._lossless_p2p_alias_for_range(
+                self.w13_weight,
+                int(first_slot),
+                int(rows),
+                cache_kind="send_w13"),
+            self._lossless_p2p_alias_for_range(
+                self.w2_weight,
+                int(first_slot),
+                int(rows),
+                cache_kind="send_w2"),
+        )
+
+
+    def activate_lossless_local_experts(self, active_expert_ids: list[int],
+                                        source_local_ids: list[int],
+                                        cpu_expert_weights: Optional[dict[int, tuple[
+                                            torch.Tensor, torch.Tensor]]] = None,
+                                        offload_loaded_after_activation: bool = False) -> None:
+        if self.elastic_moe_mode != "lossless":
+            return
+        if self.elastic_execution_mode == 1:
+            self.clear_lossless_hybrid_state()
+            self.lossless_hybrid_cpu_swap_enabled = False
+            target_active_local_num_experts = len(active_expert_ids)
+            direct_preloaded_activation_ok = bool(
+                getattr(self, "_lossless_mode1_direct_preloaded_activation_ok",
+                        False))
+            if (direct_preloaded_activation_ok and self.layer_idx == 0
+                    and not getattr(self,
+                                    "_mode1_direct_preloaded_activation_logged",
+                                    False)):
+                logger.info(
+                    "Mode1 parity accepting direct-preloaded activation: "
+                    "layer=%s target_active=%s loaded_capacity=%s source_local_ids=%s",
+                    self.layer_idx,
+                    len(active_expert_ids),
+                    int(getattr(self, "loaded_weight_capacity", 0)),
+                    source_local_ids[:16],
+                )
+                self._mode1_direct_preloaded_activation_logged = True
+            if (not direct_preloaded_activation_ok and
+                    not self
+                    ._can_materialize_lossless_loaded_prefix_slots_for_target(
+                        target_active_local_num_experts,
+                        source_local_ids,
+                        cpu_expert_weights)):
+                logger.warning(
+                    "Mode1 parity path refused heavyweight activation fallback: "
+                    "layer=%s active_local=%s loaded_capacity=%s "
+                    "cpu_imports=%s source_local_ids=%s direct_preloaded_ok=%s",
+                    self.layer_idx,
+                    target_active_local_num_experts,
+                    int(getattr(self, "loaded_weight_capacity", 0)),
+                    0 if cpu_expert_weights is None else len(cpu_expert_weights),
+                    source_local_ids,
+                    direct_preloaded_activation_ok,
+                )
+                if _env_flag("VLLM_ASCEND_CUSTOM_MODE1_STRICT", "1"):
+                    raise RuntimeError(
+                        "Mode1 parity path would fall back to heavyweight "
+                        f"runtime-buffer activation at layer={self.layer_idx}.")
+        hybrid_enabled = self._is_hybrid_cpu_swap_enabled()
+        primary_prefix_rows = self._get_lossless_primary_prefix_row_count()
+        resident_capacity = (self._get_hybrid_resident_capacity()
+                             if hybrid_enabled else 0)
+        if (hybrid_enabled and len(active_expert_ids) > primary_prefix_rows
+                and resident_capacity > 0):
+            # In mode=2, any post-full-world activation that reaches the
+            # shrink stages must stay on the fixed-slot hybrid path. 16-rank
+            # keeps the primary 8-slot prefix view, while 8-rank and the
+            # smaller tail stages continue to execute with a fixed resident
+            # budget and optional CPU swap for overflow experts. Falling back
+            # to the generic runtime-buffer path reallocates large NPU tensors
+            # and causes OOM.
+            if self.layer_idx == 0:
+                logger.info(
+                    "Redirecting lossless activation to hybrid fixed-slot path: layer=%s owned_local=%s resident_capacity=%s primary_prefix_rows=%s hybrid_active=%s",
+                    self.layer_idx,
+                    len(active_expert_ids),
+                    resident_capacity,
+                    primary_prefix_rows,
+                    self.lossless_hybrid_active,
+                )
+            self.activate_lossless_hybrid_local_experts(
+                active_expert_ids,
+                source_local_ids,
+                cpu_expert_weights=cpu_expert_weights)
+            self.elastic_debug_tag += 1
+            self.elastic_debug_budget = 1 if self.layer_idx == 0 else 0
+            self.elastic_debug_reason = ("lossless_post_shrink"
+                                         if self.layer_idx == 0 else None)
+            return
+        self.clear_lossless_hybrid_state()
+        new_local_num_experts = len(active_expert_ids)
+        previous_expert_map = (self.expert_map.clone()
+                               if self.expert_map is not None else None)
+        new_expert_map = torch.full((self.elastic_original_num_experts, ),
+                                    -1,
+                                    dtype=torch.int32,
+                                    device=self.expert_map.device)
+        self.lossless_runtime_activated = True
+        for local_slot, expert_id in enumerate(active_expert_ids):
+            new_expert_map[expert_id] = local_slot
+        self.expert_map = new_expert_map
+        self._set_lossless_expert_map_cpu_from_active(active_expert_ids)
+        self._sync_mode1_active_log2phy_from_expert_map(
+            "activate_lossless_local_experts:set_active_map",
+            update_primary=(new_local_num_experts == int(
+                self._get_lossless_primary_prefix_row_count())),
+        )
+        self.active_local_num_experts = new_local_num_experts
+        self.local_num_experts = new_local_num_experts
+        self.moe_config.num_local_experts = new_local_num_experts
+        preserve_prefix_len = 0
+        if previous_expert_map is not None:
+            current_slots = previous_expert_map.detach().cpu().tolist()
+            for local_slot, expert_id in enumerate(active_expert_ids):
+                if expert_id >= len(current_slots) or int(current_slots[expert_id]) != local_slot:
+                    break
+                preserve_prefix_len += 1
+        self.lossless_cpu_import_expert_ids = [
+            int(expert_id) for expert_id, source_local_id in zip(
+                active_expert_ids, source_local_ids) if source_local_id < 0
+        ]
+        if self._can_materialize_lossless_loaded_prefix_slots(
+                source_local_ids, cpu_expert_weights):
+            activation_start = time.perf_counter()
+            if new_local_num_experts > int(self.w13_weight.shape[0]):
+                raise RuntimeError(
+                    f"need {new_local_num_experts}, have {int(self.w13_weight.shape[0])} "
+                    f"at layer={self.layer_idx}.")
+            mode1_safe_cpu_export = (
+                int(getattr(self, "elastic_execution_mode", 0)) == 1
+                and _env_flag("VLLM_ASCEND_MODE1_SAFE_CPU_EXPORT", "0"))
+            mode1_shadow_w13: list[torch.Tensor] = []
+            mode1_shadow_w2: list[torch.Tensor] = []
+            if mode1_safe_cpu_export:
+                for local_slot, (expert_id, source_local_id) in enumerate(
+                        zip(active_expert_ids, source_local_ids)):
+                    expert_id = int(expert_id)
+                    source_local_id = int(source_local_id)
+                    if (cpu_expert_weights is not None
+                            and expert_id in cpu_expert_weights):
+                        cpu_w13, cpu_w2 = cpu_expert_weights[expert_id]
+                    elif source_local_id >= 0:
+                        cpu_w13, cpu_w2 = self._get_lossless_cpu_pair_for_local_slot(
+                            source_local_id)
+                    else:
+                        fallback_loaded_slot = -1
+                        loaded_expert_map = getattr(self, "loaded_expert_map", None)
+                        if loaded_expert_map is not None:
+                            try:
+                                fallback_loaded_slot = int(
+                                    loaded_expert_map[expert_id])
+                            except Exception:
+                                fallback_loaded_slot = -1
+                        if fallback_loaded_slot < 0:
+                            raise RuntimeError(
+                                "Mode1 safe CPU shadow cannot resolve imported "
+                                f"expert={expert_id} layer={self.layer_idx} "
+                                f"local_slot={local_slot}.")
+                        cpu_w13, cpu_w2 = self._get_lossless_cpu_pair_for_local_slot(
+                            fallback_loaded_slot)
+                    mode1_shadow_w13.append(cpu_w13.detach().cpu())
+                    mode1_shadow_w2.append(cpu_w2.detach().cpu())
+            local_slot_moves: list[tuple[int, int]] = []
+            for local_slot, source_local_id in enumerate(source_local_ids):
+                if source_local_id >= 0:
+                    if local_slot != source_local_id:
+                        local_slot_moves.append(
+                            (local_slot, int(source_local_id)))
+                    continue
+                if cpu_expert_weights is None:
+                    continue
+                expert_id = active_expert_ids[local_slot]
+                if expert_id not in cpu_expert_weights:
+                    fallback_loaded_slot = -1
+                    loaded_expert_map = getattr(self, "loaded_expert_map", None)
+                    if loaded_expert_map is not None:
+                        try:
+                            fallback_loaded_slot = int(loaded_expert_map[expert_id])
+                        except Exception:
+                            fallback_loaded_slot = -1
+
+                    # If the same shrink target is re-entered, the imported expert may
+                    # already live inside the canonical loaded tensor. Reuse that copy
+                    # instead of requiring a second staged import.
+                    if 0 <= fallback_loaded_slot < self.loaded_weight_capacity:
+                        if fallback_loaded_slot != local_slot:
+                            self.w13_weight[local_slot].copy_(
+                                self.w13_weight[fallback_loaded_slot])
+                            self.w2_weight[local_slot].copy_(
+                                self.w2_weight[fallback_loaded_slot])
+                        pass  # debug log removed
+                        continue
+                    else:
+                        raise RuntimeError(
+                            f"Missing imported expert {expert_id} "
+                            f"for preallocated loaded slot fill at "
+                            f"layer={self.layer_idx}.")
+                cpu_w13, cpu_w2 = cpu_expert_weights[expert_id]
+                _copy_logical_row_to_weight_slot(
+                    self.w13_weight, local_slot, cpu_w13, non_blocking=False)
+                _copy_logical_row_to_weight_slot(
+                    self.w2_weight, local_slot, cpu_w2, non_blocking=False)
+            self._copy_lossless_loaded_slots_into_prefix(local_slot_moves)
+            # In preallocated loaded mode, imported experts are materialized into
+            # the canonical loaded tensor prefix. Keep the loaded map aligned with
+            # the current active layout so follow-up shrink/export logic sees the
+            # real resident experts instead of the initialization-time view.
+            self.loaded_expert_map = self.expert_map.clone()
+            self._set_lossless_loaded_map_cpu_from_active(active_expert_ids)
+            self.loaded_local_num_experts = new_local_num_experts
+            self.lossless_loaded_offloaded = False
+            if mode1_safe_cpu_export:
+                self.lossless_cpu_w13_weight = _maybe_pin_cpu_tensor(
+                    torch.stack(mode1_shadow_w13, dim=0).contiguous())
+                self.lossless_cpu_w2_weight = _maybe_pin_cpu_tensor(
+                    torch.stack(mode1_shadow_w2, dim=0).contiguous())
+                self.lossless_cpu_shadow_local_slots = {
+                    int(expert_id): int(local_slot)
+                    for local_slot, expert_id in enumerate(active_expert_ids)
+                }
+                self.lossless_mode5_cpu_shadow_row_by_expert = {}
+                self.lossless_mode5_cpu_shadow_prepared = False
+                self.lossless_mode5_cpu_shadow_signature = ()
+            else:
+                self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+            self._mode1_execute_mapping_validated = False
+            self.set_lossless_runtime_prefix_views()
+            if self.elastic_execution_mode == 1:
+                self.lossless_mode1_native_parity_ready = (
+                    self._should_enable_mode1_parity_for_current_layout())
+                self._validate_mode1_lossless_active_mapping(
+                    "activate_lossless_local_experts:materialized_prefix")
+            self.elastic_debug_tag += 1
+            self.elastic_debug_budget = 1 if self.layer_idx == 0 else 0
+            self.elastic_debug_reason = ("lossless_post_shrink"
+                                         if self.layer_idx == 0 else None)
+            if self.layer_idx == 0:
+                pass  # debug log removed
+            return
+        if self._can_use_lossless_loaded_prefix_views(source_local_ids,
+                                                      cpu_expert_weights):
+            self.lossless_loaded_offloaded = False
+            if not (int(getattr(self, "elastic_execution_mode", 0)) == 1
+                    and _env_flag("VLLM_ASCEND_MODE1_SAFE_CPU_EXPORT", "0")):
+                self._clear_lossless_cpu_shadow_state(drop_buffers=True)
+            self._mode1_execute_mapping_validated = False
+            self.set_lossless_runtime_prefix_views()
+            if self.elastic_execution_mode == 1:
+                self.lossless_mode1_native_parity_ready = (
+                    self._should_enable_mode1_parity_for_current_layout())
+                self._validate_mode1_lossless_active_mapping(
+                    "activate_lossless_local_experts:reuse_prefix")
+            if self.layer_idx == 0:
+                logger.info(
+                    "Lossless activation reused loaded-slot prefix views: layer=%s active_local=%s loaded_capacity=%s",
+                    self.layer_idx,
+                    new_local_num_experts,
+                    int(getattr(self, "loaded_weight_capacity", 0)),
+                )
+            self.elastic_debug_tag += 1
+            self.elastic_debug_budget = 1 if self.layer_idx == 0 else 0
+            self.elastic_debug_reason = ("lossless_post_shrink"
+                                         if self.layer_idx == 0 else None)
+            return
+        if offload_loaded_after_activation and not self.lossless_loaded_offloaded:
+            self.offload_lossless_loaded_weights_to_cpu()
+        self.refresh_lossless_runtime_weights(
+            source_local_ids,
+            cpu_expert_weights=cpu_expert_weights,
+            preserve_prefix_len=preserve_prefix_len)
+        if self.elastic_execution_mode == 1:
+            self.lossless_mode1_native_parity_ready = False
+        if offload_loaded_after_activation and not self.lossless_loaded_offloaded:
+            self.offload_lossless_loaded_weights_to_cpu()
+        self.elastic_debug_tag += 1
+        self.elastic_debug_budget = 1 if self.layer_idx == 0 else 0
+        self.elastic_debug_reason = ("lossless_post_shrink"
+                                     if self.layer_idx == 0 else None)
+
+    def set_active_expert_mask(self,
+                               new_active_expert_mask: Optional[torch.Tensor]):
+        if new_active_expert_mask is None:
+            self.active_expert_mask = None
+            self.elastic_runtime_log2phy = None
+            return
+        active_expert_mask = new_active_expert_mask.to(
+            device=self.expert_map.device if self.expert_map is not None else
+            new_active_expert_mask.device,
+            dtype=torch.bool)
+        if not bool(active_expert_mask.any().item()):
+            raise RuntimeError(
+                "Elastic active expert mask must contain at least one expert: "
+                f"layer={self.layer_idx}")
+        self.active_expert_mask = active_expert_mask
+
+    def set_elastic_runtime_log2phy(self,
+                                    new_log2phy: Optional[torch.Tensor]) -> None:
+        if new_log2phy is None:
+            self.elastic_runtime_log2phy = None
+            return
+        self.elastic_runtime_log2phy = new_log2phy.to(
+            device=self.log2phy.device if self.log2phy is not None else
+            new_log2phy.device,
+            dtype=self.log2phy.dtype if self.log2phy is not None else
+            new_log2phy.dtype)
+
+    def refresh_elastic_groups(self):
+        self.ep_group = get_ep_group()
+        self.moe_parallel_config.dp_size = get_dp_group().world_size
+        self.moe_parallel_config.dp_rank = get_dp_group().rank_in_group
+        self.moe_parallel_config.ep_size = self.ep_group.world_size
+        self.moe_parallel_config.ep_rank = self.ep_group.rank_in_group
+        self.moe_config.moe_parallel_config = self.moe_parallel_config
+        self.moe_config.model_type = self.model_type
+        self.moe_config.dp_group = get_dp_group()
+        self.moe_config.ep_group = self.ep_group
+        self.moe_config.mc2_group = get_mc2_group()
+        is_deepseek_v3_r1 = self.num_experts == 256
+        self.rm_router_logits = get_rm_router_logits_state(
+            self.moe_parallel_config.ep_size, self.dp_size, is_deepseek_v3_r1)
+        self.all_reduce_merge = get_all_reduce_merge_state(
+            self.moe_parallel_config.ep_size, is_deepseek_v3_r1)
+        setup_moe_comm_method(self.moe_config)
+        if (self.elastic_moe_mode == "lossless"
+                and self._is_mode3_cross_layer_buffer_enabled()
+                and self.lossless_hybrid_active):
+            if (self.layer_idx == 0
+                    and not getattr(self, "_mode3_refresh_skip_logged", False)):
+                logger.info(
+                    "Mode%s refresh preserving hybrid lazy runtime state: "
+                    "layer=%s ep_size=%s active_local=%s owned_local=%s "
+                    "resident_capacity=%s remote_npu_local=%s cpu_only_local=%s",
+                    int(getattr(self, "elastic_execution_mode", 3)),
+                    self.layer_idx,
+                    int(getattr(self.moe_parallel_config, "ep_size", 0)),
+                    int(getattr(self, "active_local_num_experts", 0)),
+                    len(getattr(self, "lossless_hybrid_owned_expert_ids", [])),
+                    int(getattr(self, "lossless_hybrid_resident_capacity", 0)),
+                    len(getattr(self, "lossless_mode4_remote_source_by_expert",
+                                {})),
+                    len(getattr(self, "lossless_hybrid_cpu_only_expert_ids",
+                                [])),
+                )
+                self._mode3_refresh_skip_logged = True
+            return
+        if self.elastic_moe_mode == "lossless" and (
+                self.runtime_w13_weight is None or self.runtime_w2_weight is None):
+            self.activate_lossless_primary_experts()
+
+    def get_map(self):
+        return self.expert_map
+
+    def get_log2phy_map(self):
+        return self.log2phy
+
+    def clear_moe_load(self):
+        if self.moe_load is not None:
+            self.moe_load.zero_()
+
+    def forward(self,
+                hidden_states: torch.Tensor,
+                router_logits: torch.Tensor,
+                is_prefill: bool,
+                enable_force_load_balance: bool = False,
+                top_k: Optional[int] = None,
+                shared_experts: Optional[Any] = None,
+                gate=None,
+                replace_allreduce: bool = False,
+                is_dummy: bool = False):
+
+        assert self.quant_method is not None
+
+        if top_k:
+            real_top_k = top_k
+        else:
+            real_top_k = self.top_k
+
+        forward_context = get_forward_context()
+        mc2_mask = forward_context.mc2_mask
+        debug_enabled = bool(
+            _env_flag("VLLM_ASCEND_CUSTOM_FUSED_MOE_FORWARD_DEBUG", "0")
+            and self.elastic_debug_budget > 0 and not is_dummy
+            and not getattr(forward_context, "in_profile_run", False))
+        if debug_enabled:
+            runtime_log2phy = (self.elastic_runtime_log2phy
+                               if self.elastic_runtime_log2phy is not None else
+                               self.log2phy)
+            log2phy_min = (int(runtime_log2phy.min().item())
+                           if runtime_log2phy is not None
+                           and runtime_log2phy.numel() > 0 else -1)
+            log2phy_max = (int(runtime_log2phy.max().item())
+                           if runtime_log2phy is not None
+                           and runtime_log2phy.numel() > 0 else -1)
+            active_mask_count = (int(self.active_expert_mask.sum().item())
+                                 if self.active_expert_mask is not None else -1)
+            runtime_w13_weight = getattr(self, "runtime_w13_weight", None)
+            runtime_w2_weight = getattr(self, "runtime_w2_weight", None)
+            compute_w13 = (runtime_w13_weight
+                           if runtime_w13_weight is not None else
+                           self.w13_weight)
+            compute_w2 = (runtime_w2_weight
+                          if runtime_w2_weight is not None else
+                          self.w2_weight)
+            compute_source = ("runtime_weight_view"
+                              if runtime_w13_weight is not None else
+                              "loaded_weight")
+
+            def _tensor_ptr(tensor: Optional[torch.Tensor]) -> int:
+                return int(tensor.data_ptr()) if tensor is not None else -1
+
+            def _tensor_meta(tensor: Optional[torch.Tensor]) -> tuple:
+                if tensor is None:
+                    return ()
+                return (tuple(tensor.shape), str(tensor.dtype),
+                        tuple(tensor.stride()))
+
+            def _is_prefix_view(view: Optional[torch.Tensor],
+                                base: Optional[torch.Tensor]) -> bool:
+                if view is None or base is None:
+                    return False
+                if view.device != base.device:
+                    return False
+                if view.dtype != base.dtype or view.ndim != base.ndim:
+                    return False
+                if tuple(view.shape[1:]) != tuple(base.shape[1:]):
+                    return False
+                if tuple(view.stride()) != tuple(base.stride()):
+                    return False
+                if int(view.storage_offset()) != 0:
+                    return False
+                if int(view.data_ptr()) != int(base.data_ptr()):
+                    return False
+                return int(view.shape[0]) <= int(base.shape[0])
+
+            def _row_abs_mean_samples(tensor: Optional[torch.Tensor],
+                                      start_row: int = 0,
+                                      max_rows: int = 4) -> list[tuple[int, float]]:
+                if tensor is None or tensor.ndim == 0:
+                    return []
+                samples = []
+                end_row = min(int(tensor.shape[0]), start_row + max_rows)
+                for row in range(start_row, end_row):
+                    samples.append(
+                        (row, round(float(tensor[row].float().abs().mean().item()), 6)))
+                return samples
+
+            def _row_abs_diff_samples(
+                    lhs: Optional[torch.Tensor],
+                    rhs: Optional[torch.Tensor],
+                    max_rows: int = 4) -> list[tuple[int, float]]:
+                if (lhs is None or rhs is None or lhs.shape != rhs.shape
+                        or lhs.ndim == 0):
+                    return []
+                samples = []
+                for row in range(min(int(lhs.shape[0]), max_rows)):
+                    samples.append((
+                        row,
+                        round(float((lhs[row].float() - rhs[row].float()).abs().mean().item()),
+                              6),
+                    ))
+                return samples
+
+            debug_info = {
+                "enabled": True,
+                "tag": self.elastic_debug_tag,
+                "reason": self.elastic_debug_reason,
+                "layer_idx": self.layer_idx,
+                "ep_rank": self.ep_rank,
+                "num_local_experts": self.local_num_experts,
+                "active_local_num_experts": self.active_local_num_experts,
+                "runtime_num_experts": self.moe_config.num_experts,
+                "active_mask_count": active_mask_count,
+                "log2phy_min": log2phy_min,
+                "log2phy_max": log2phy_max,
+                "loaded_weight_capacity": int(self.loaded_weight_capacity),
+                "compute_source": compute_source,
+                "compute_w13_shape": tuple(compute_w13.shape),
+                "compute_w2_shape": tuple(compute_w2.shape),
+                "route_debug": False,
+            }
+            setattr(forward_context, "elastic_debug_info", debug_info)
+            if self.elastic_debug_reason == "lossless_pre_shrink_loaded_only":
+                compute_w13_ptr = _tensor_ptr(compute_w13)
+                compute_w2_ptr = _tensor_ptr(compute_w2)
+                runtime_w13_ptr = _tensor_ptr(runtime_w13_weight)
+                runtime_w2_ptr = _tensor_ptr(runtime_w2_weight)
+                loaded_w13_ptr = _tensor_ptr(self.w13_weight)
+                loaded_w2_ptr = _tensor_ptr(self.w2_weight)
+                pass  # debug log removed
+        else:
+            setattr(forward_context, "elastic_debug_info", None)
+        # For w8a8 dynamic we can do npu_dynamic_quant and gate in parallel.
+        quantized_x_for_share, dynamic_scale_for_share = None, None
+
+        if shared_experts:
+            # When all_reduce_merge is in progress, shared_experts does not do all_reduce in mlp, but waits until shared_experts+router_experts are completed before doing all_reduce
+            shared_hidden_states = shared_experts(hidden_states)
+
+        if forward_context.sp_enabled:
+            replace_allreduce = True
+
+        forced_hybrid_comm_alignment = bool(self.lossless_hybrid_active)
+        original_moe_comm_method = getattr(forward_context, "moe_comm_method",
+                                           None)
+        original_moe_comm_type = getattr(forward_context, "moe_comm_type", None)
+        selected_moe_comm_type = getattr(forward_context,
+                                         "selected_moe_comm_type",
+                                         original_moe_comm_type)
+        original_fused_moe_state = getattr(forward_context, "fused_moe_state",
+                                           None)
+        original_hybrid_host_metadata = getattr(
+            forward_context, "hybrid_force_host_alltoall_metadata", None)
+        original_hybrid_stage = getattr(forward_context,
+                                        "hybrid_stage_active_ranks", None)
+        mode1_host_alltoall_metadata = (
+            getattr(self, "elastic_execution_mode", 0) == 1
+            and getattr(self, "lossless_mode1_native_parity_ready", False)
+            and _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_ALLTOALL_HOST_METADATA", "1")
+            and selected_moe_comm_type == MoECommType.ALLTOALL)
+        if mode1_host_alltoall_metadata:
+            forward_context.hybrid_force_host_alltoall_metadata = True
+            forward_context.hybrid_stage_active_ranks = int(
+                getattr(getattr(self, "moe_parallel_config", None), "ep_size",
+                        getattr(self, "ep_size", 0)) or 0)
+            if self.layer_idx == 0 and not getattr(
+                    self, "_mode1_host_alltoall_metadata_logged", False):
+                logger.info(
+                    "Mode1 parity ALLTOALL metadata host path enabled: "
+                    "layer=%s stage=%s selected=%s original=%s",
+                    self.layer_idx,
+                    forward_context.hybrid_stage_active_ranks,
+                    selected_moe_comm_type,
+                    original_moe_comm_type,
+                )
+                self._mode1_host_alltoall_metadata_logged = True
+        if forced_hybrid_comm_alignment:
+            effective_comm_type = selected_moe_comm_type
+            effective_method = (get_moe_comm_method(effective_comm_type)
+                                if effective_comm_type is not None else None)
+            if effective_method is None:
+                raise RuntimeError(
+                    f"Hybrid mode cannot resolve the selected MoE comm method "
+                    f"at layer={self.layer_idx}: comm_type={effective_comm_type}.")
+            forward_context.moe_comm_method = effective_method
+            forward_context.moe_comm_type = effective_comm_type
+            if effective_comm_type == MoECommType.MC2:
+                forward_context.fused_moe_state = FusedMoEState.MC2
+            elif effective_comm_type == MoECommType.ALLTOALL:
+                forward_context.fused_moe_state = FusedMoEState.All2All
+            elif effective_comm_type == MoECommType.ALLGATHER:
+                forward_context.fused_moe_state = FusedMoEState.AllGather
+            elif effective_comm_type == MoECommType.NAIVE_MULTICAST:
+                forward_context.fused_moe_state = FusedMoEState.NaiveMulticast
+            else:
+                forward_context.fused_moe_state = original_fused_moe_state
+            stage_size = len(getattr(self, "lossless_hybrid_active_ranks", []))
+            multi_wave_hint = self._hybrid_requires_multi_wave_execution()
+            forward_context.hybrid_force_host_alltoall_metadata = (
+                effective_comm_type == MoECommType.ALLTOALL)
+            forward_context.hybrid_stage_active_ranks = stage_size
+            logged_key = getattr(self, "_hybrid_effective_comm_logged_key",
+                                 None)
+            current_key = (
+                stage_size,
+                str(selected_moe_comm_type),
+                str(effective_comm_type),
+                bool(multi_wave_hint),
+            )
+            if self.layer_idx == 0 and logged_key != current_key:
+                logger.info(
+                    "Hybrid MoE comm resolution: layer=%s stage=%s selected=%s original=%s effective=%s multi_wave_hint=%s",
+                    self.layer_idx,
+                    stage_size,
+                    selected_moe_comm_type,
+                    original_moe_comm_type,
+                    effective_comm_type,
+                    multi_wave_hint,
+                )
+                logger.info(
+                    "Hybrid MoE effective comm path: layer=%s stage=%s comm=%s",
+                    self.layer_idx,
+                    stage_size,
+                    effective_comm_type,
+                )
+                self._hybrid_effective_comm_logged_key = current_key
+
+        try:
+            dummy_waste_timing = getattr(forward_context,
+                                         "dummy_waste_timing", None)
+            dummy_moe_timing_enabled = (
+                isinstance(dummy_waste_timing, dict)
+                and _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING", "0"))
+            dummy_moe_start = 0.0
+            if dummy_moe_timing_enabled:
+                dummy_selection_stats_enabled = _env_flag(
+                    "VLLM_ASCEND_DUMMY_WASTE_SELECTION_STATS", "0")
+                dummy_waste_timing["_current_moe_selected_topk"] = 0
+                dummy_waste_timing["_current_moe_selected_tokens"] = 0
+                dummy_waste_timing["_current_moe_selected_experts"] = 0
+                if _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC", "0"):
+                    try:
+                        torch.npu.synchronize()
+                    except Exception:
+                        pass
+                dummy_moe_start = time.perf_counter()
+            hidden_states, router_logits = forward_context.moe_comm_method.prepare(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                enable_shared_expert_dp=self.enable_shared_expert_dp,
+                rm_router_logits=self.rm_router_logits,
+                replace_allreduce=replace_allreduce,
+                gate=gate)
+
+            # print("is_dummy in ascendfusedmoe is:", is_dummy)
+            # Matrix multiply.
+            e_hidden_states = self.quant_method.apply(
+                layer=self,
+                x=hidden_states,
+                router_logits=router_logits,
+                top_k=real_top_k,
+                renormalize=self.renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                global_num_experts=self.global_num_experts,
+                expert_map=self.expert_map,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                custom_routing_function=self.custom_routing_function,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias,
+                is_prefill=is_prefill,
+                enable_force_load_balance=enable_force_load_balance,
+                log2phy=self.elastic_runtime_log2phy
+                if self.elastic_runtime_log2phy is not None else self.log2phy,
+                global_redundant_expert_num=self.global_redundant_expert_num,
+                shared_experts=None,
+                mc2_mask=mc2_mask,
+                quantized_x_for_share=quantized_x_for_share,
+                dynamic_scale_for_share=dynamic_scale_for_share,
+                layer_idx=self.layer_idx,
+                is_dummy=is_dummy,
+                active_expert_mask=self.active_expert_mask,
+            )
+
+            group_list_type = None
+
+            if shared_experts:
+                if isinstance(e_hidden_states,
+                              tuple) and len(e_hidden_states) == 2:
+                    e_hidden_states, shared_hidden_states = e_hidden_states
+
+            if isinstance(e_hidden_states, tuple) and len(e_hidden_states) == 3:
+                e_hidden_states, group_list_type, expert_tokens = e_hidden_states
+
+            if self.dynamic_eplb and group_list_type is not None:
+                self.moe_load += expert_tokens if group_list_type else \
+                    torch.cat([expert_tokens[:1], expert_tokens[1:] - expert_tokens[:-1]])
+
+            final_hidden_states = forward_context.moe_comm_method.finalize(
+                hidden_states=e_hidden_states,
+                reduce_results=(not self.all_reduce_merge))
+            if dummy_moe_timing_enabled:
+                dummy_moe_wall_ms = (
+                    time.perf_counter() - dummy_moe_start) * 1e3
+                dummy_moe_sync_wall_ms = 0.0
+                post_sync_overhead_ms = 0.0
+                if _env_flag("VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC", "0"):
+                    sync_start = time.perf_counter()
+                    try:
+                        torch.npu.synchronize()
+                    except Exception:
+                        pass
+                    dummy_moe_sync_wall_ms = (
+                        time.perf_counter() - dummy_moe_start) * 1e3
+                    post_sync_overhead_ms = (
+                        time.perf_counter() - sync_start) * 1e3
+                    # Keep the explicit post-op sync overhead visible for
+                    # debugging without folding it into the default wall metric.
+                dummy_waste_timing["moe_post_sync_overhead_ms"] = (
+                        dummy_waste_timing.get(
+                            "moe_post_sync_overhead_ms", 0.0)
+                        + post_sync_overhead_ms)
+                selected_topk_count = int(
+                    dummy_waste_timing.pop("_current_moe_selected_topk", 0))
+                selected_token_count = int(
+                    dummy_waste_timing.pop("_current_moe_selected_tokens", 0))
+                selected_expert_count = int(
+                    dummy_waste_timing.pop("_current_moe_selected_experts", 0))
+                selected_layer = (
+                    selected_topk_count > 0
+                    or not dummy_selection_stats_enabled)
+                dummy_waste_timing["moe_wall_ms"] = (
+                    dummy_waste_timing.get("moe_wall_ms", 0.0)
+                    + dummy_moe_wall_ms)
+                dummy_waste_timing["moe_total_sync_wall_ms"] = (
+                    dummy_waste_timing.get("moe_total_sync_wall_ms", 0.0)
+                    + dummy_moe_sync_wall_ms)
+                if selected_layer:
+                    dummy_waste_timing["moe_sync_wall_ms"] = (
+                        dummy_waste_timing.get("moe_sync_wall_ms", 0.0)
+                        + dummy_moe_sync_wall_ms)
+                    dummy_waste_timing["moe_selected_layers"] = (
+                        int(dummy_waste_timing.get("moe_selected_layers", 0))
+                        + 1)
+                    dummy_waste_timing["moe_selected_topk"] = (
+                        int(dummy_waste_timing.get("moe_selected_topk", 0))
+                        + selected_topk_count)
+                    dummy_waste_timing["moe_selected_tokens"] = (
+                        int(dummy_waste_timing.get("moe_selected_tokens", 0))
+                        + selected_token_count)
+                    dummy_waste_timing["moe_selected_experts"] = (
+                        int(dummy_waste_timing.get("moe_selected_experts", 0))
+                        + selected_expert_count)
+                else:
+                    dummy_waste_timing["moe_unselected_layers"] = (
+                        int(dummy_waste_timing.get("moe_unselected_layers", 0))
+                        + 1)
+                    dummy_waste_timing["moe_unselected_sync_wall_ms"] = (
+                        dummy_waste_timing.get(
+                            "moe_unselected_sync_wall_ms", 0.0)
+                        + dummy_moe_sync_wall_ms)
+                dummy_waste_timing["moe_layers"] = (
+                    int(dummy_waste_timing.get("moe_layers", 0)) + 1)
+                dummy_waste_timing["moe_tokens"] = (
+                    int(dummy_waste_timing.get("moe_tokens", 0))
+                    + int(hidden_states.shape[0]))
+            if debug_enabled:
+                self.elastic_debug_budget = max(0, self.elastic_debug_budget - 1)
+
+            if shared_experts:
+                return final_hidden_states, shared_hidden_states
+            else:
+                return final_hidden_states
+        finally:
+            if forced_hybrid_comm_alignment or mode1_host_alltoall_metadata:
+                forward_context.moe_comm_method = original_moe_comm_method
+                forward_context.moe_comm_type = original_moe_comm_type
+                forward_context.fused_moe_state = original_fused_moe_state
+                forward_context.hybrid_force_host_alltoall_metadata = (
+                    original_hybrid_host_metadata)
+                forward_context.hybrid_stage_active_ranks = (
+                    original_hybrid_stage)
+
+    def reset_expert_map_and_log2phy(self):
+        self.clear_lossless_hybrid_state()
+        logical_num_experts = int(
+            getattr(self, "elastic_original_num_experts", self.num_experts))
+        self.num_experts = logical_num_experts
+        self.moe_config.num_experts = logical_num_experts
+        target_device = None
+        if self.log2phy is not None:
+            target_device = self.log2phy.device
+        elif self.expert_map is not None:
+            target_device = self.expert_map.device
+        elif hasattr(self, "w13_weight"):
+            target_device = self.w13_weight.device
+        if target_device is not None and target_device.type == "cpu" and hasattr(
+                torch, "npu") and torch.npu.is_available():
+            target_device = torch.device("npu", torch.npu.current_device())
+        log2phy_dtype = self.log2phy.dtype if self.log2phy is not None else torch.int32
+        if self.elastic_moe_mode == "lossless":
+            self.loaded_local_num_experts, self.loaded_expert_map = determine_redundant_replica_expert_map(
+                logical_num_experts, self.ep_size, self.ep_rank,
+                self.global_redundant_expert_num,
+                prefer_balanced_cyclic=(self.elastic_execution_mode == 1))
+            active_mapping = determine_expert_map(
+                self.ep_size,
+                self.ep_rank,
+                logical_num_experts,
+                layer_idx=self.layer_idx)
+            if len(active_mapping) == 3:
+                (self.active_local_num_experts, self.expert_map,
+                 self.log2phy) = active_mapping
+            elif len(active_mapping) == 2:
+                self.active_local_num_experts, self.expert_map = active_mapping
+                self.log2phy = determine_default_log2phy_map(
+                    logical_num_experts, self.ep_size, self.ep_rank, 0)
+            else:
+                raise ValueError(
+                    f"Unexpected determine_expert_map return arity={len(active_mapping)}")
+            if target_device is not None:
+                if self.loaded_expert_map is not None:
+                    self.loaded_expert_map = self.loaded_expert_map.to(
+                        device=target_device, dtype=torch.int32)
+                if self.expert_map is not None:
+                    self.expert_map = self.expert_map.to(
+                        device=target_device, dtype=torch.int32)
+                if self.log2phy is not None:
+                    self.log2phy = self.log2phy.to(device=target_device,
+                                                   dtype=log2phy_dtype)
+            self._set_lossless_map_cpu_from_tensor(
+                self.expert_map, "_lossless_expert_map_cpu")
+            self._set_lossless_map_cpu_from_tensor(
+                self.loaded_expert_map, "_lossless_loaded_expert_map_cpu")
+            self.primary_log2phy = self.log2phy.clone()
+            self.local_num_experts = self.active_local_num_experts
+            self.moe_config.num_local_experts = self.active_local_num_experts
+            self.elastic_runtime_log2phy = None
+            self.refresh_lossless_runtime_weights()
+            if self.elastic_execution_mode == 1:
+                self.lossless_mode1_native_parity_ready = (
+                    self._should_enable_mode1_parity_for_current_layout() and
+                    self.runtime_w13_buffer is None
+                    and self.runtime_w2_buffer is None
+                    and self.runtime_w13_weight is not None
+                    and self.runtime_w2_weight is not None
+                )
+            return
+        else:
+            _, expert_map = determine_default_expert_map(
+                self.global_num_experts, self.ep_size, self.ep_rank,
+                self.global_redundant_expert_num)
+            log2phy = determine_default_log2phy_map(
+                self.global_num_experts, self.ep_size, self.ep_rank,
+                self.global_redundant_expert_num)
+            if target_device is not None:
+                if expert_map is not None:
+                    expert_map = expert_map.to(device=target_device,
+                                               dtype=torch.int32)
+                log2phy = log2phy.to(device=target_device,
+                                     dtype=log2phy_dtype)
+            elif hasattr(torch, "npu") and torch.npu.is_available():
+                log2phy = log2phy.npu()
+
+        self.expert_map.copy_(expert_map)
+        self.log2phy.copy_(log2phy)
+        self._set_lossless_map_cpu_from_tensor(
+            self.expert_map, "_lossless_expert_map_cpu")
+        self.elastic_runtime_log2phy = None
+
+    # ----------------------------------------- TBO-related --------------------------------------------
+
+    def _forward_ms_fused_moe_comp(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        is_prefill: bool,
+        real_top_k,
+        enable_force_load_balance: bool = False,
+    ):
+        hidden_states = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            router_logits=router_logits,
+            top_k=real_top_k,
+            renormalize=self.renormalize,
+            use_grouped_topk=self.use_grouped_topk,
+            global_num_experts=self.global_num_experts,
+            expert_map=self.expert_map,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            custom_routing_function=self.custom_routing_function,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.e_score_correction_bias,
+            is_prefill=is_prefill,
+            enable_force_load_balance=enable_force_load_balance,
+            log2phy=self.elastic_runtime_log2phy
+            if self.elastic_runtime_log2phy is not None else self.log2phy,
+            global_redundant_expert_num=self.global_redundant_expert_num,
+            active_expert_mask=self.active_expert_mask,
+            layer_idx=self.layer_idx,
+            )
+
+        return hidden_states
+
+
+def elastic_ascend_moe_forward(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Run topology-sensitive Ascend MoE work outside piecewise ACLGraph."""
+    forward_context = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+    if not isinstance(layer, AscendFusedMoE):
+        raise TypeError(
+            f"Elastic Ascend MoE boundary resolved {type(layer).__name__} "
+            f"for layer {layer_name!r}")
+    # This custom op is an explicit PIECEWISE graph boundary, so Python
+    # diagnostics remain eager and follow the current topology at runtime.
+    layer.lossless_ffn_enter_wall_ts = time.perf_counter()
+    layer.lossless_ffn_tokens = int(hidden_states.shape[0])
+    layer.lossless_ffn_seq = int(
+        getattr(layer, "lossless_ffn_seq", 0)) + 1
+    return layer.forward(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        is_prefill=bool(forward_context.with_prefill),
+        top_k=layer.top_k,
+        enable_force_load_balance=bool(forward_context.in_profile_run),
+        shared_experts=None,
+        is_dummy=bool(getattr(forward_context, "is_dummy", False)),
+    )
+
+
+def elastic_ascend_moe_forward_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="elastic_ascend_moe_forward",
+    op_func=elastic_ascend_moe_forward,
+    mutates_args=["hidden_states"],
+    fake_impl=elastic_ascend_moe_forward_fake,
+    dispatch_key="PrivateUse1",
+    tags=(torch.Tag.needs_fixed_stride_order, ),
+)

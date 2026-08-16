@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+RUN_TAG=${SIDECAR_RUN_TAG:-"$(date -u +%Y%m%dT%H%M%SZ)"}
+
+export FAIR_OUTPUT_ROOT=${FAIR_OUTPUT_ROOT:-"/data/adafloor_sidecar_runs/${RUN_TAG}"}
+export DYNAMIC_RUN_NAME=${DYNAMIC_RUN_NAME:-"adafloor_natural_floor2_qwen2_5_1_5b_multistage_dp_sidecars"}
+
+export VERL_SIDECAR_ENABLE=1
+export VERL_SIDECAR_MULTI_STAGE=1
+export VERL_SIDECAR_WORLD_SIZE=${VERL_SIDECAR_WORLD_SIZE:-16}
+export VERL_SIDECAR_TARGET_FLOORS=${VERL_SIDECAR_TARGET_FLOORS:-8,4,2}
+export VERL_SIDECAR_MODEL_PATH=${VERL_SIDECAR_MODEL_PATH:-/data/Qwen2.5-1.5B-Instruct}
+export VERL_SIDECAR_PROMPTS_FILE=${VERL_SIDECAR_PROMPTS_FILE:-/data/gsm8k}
+export VERL_SIDECAR_DATA_SPLIT=${VERL_SIDECAR_DATA_SPLIT:-train}
+
+# Each newly released NPU hosts one independent vLLM replica. The multistage
+# watcher replaces REPLICA_COUNT with the number of ranks released at that
+# transition and maps each replica to its physical rank shard.
+export VERL_SIDECAR_PARALLEL_MODE=dp
+export VERL_SIDECAR_TENSOR_PARALLEL_SIZE=1
+export VERL_SIDECAR_DATA_PARALLEL_SIZE=1
+export VERL_SIDECAR_ENABLE_EXPERT_PARALLEL=0
+
+export VERL_SIDECAR_GPU_MEMORY_UTILIZATION=${VERL_SIDECAR_GPU_MEMORY_UTILIZATION:-0.80}
+export VERL_SIDECAR_MAX_MODEL_LEN=${VERL_SIDECAR_MAX_MODEL_LEN:-4096}
+export VERL_SIDECAR_MAX_TOKENS=${VERL_SIDECAR_MAX_TOKENS:-1024}
+export VERL_SIDECAR_MAX_NUM_SEQS=${VERL_SIDECAR_MAX_NUM_SEQS:-128}
+export VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS=${VERL_SIDECAR_MAX_NUM_BATCHED_TOKENS:-32768}
+export VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA=${VERL_SIDECAR_MAX_PROMPTS_PER_REPLICA:-128}
+export VERL_SIDECAR_GENERATE_CHUNK_SIZE=${VERL_SIDECAR_GENERATE_CHUNK_SIZE:-128}
+export VERL_SIDECAR_TEMPERATURE=${VERL_SIDECAR_TEMPERATURE:-0.0}
+export VERL_SIDECAR_TOP_P=${VERL_SIDECAR_TOP_P:-1.0}
+export VERL_SIDECAR_N=${VERL_SIDECAR_N:-1}
+export VERL_SIDECAR_REPEAT_UNTIL_KILLED=${VERL_SIDECAR_REPEAT_UNTIL_KILLED:-1}
+export VERL_SIDECAR_STREAM_CHECKPOINT=${VERL_SIDECAR_STREAM_CHECKPOINT:-1}
+export VERL_SIDECAR_GRACEFUL_KILL_SECONDS=${VERL_SIDECAR_GRACEFUL_KILL_SECONDS:-5}
+
+[[ -f "${VERL_SIDECAR_MODEL_PATH}/config.json" ]] || {
+    echo "missing Qwen2.5-1.5B sidecar model at ${VERL_SIDECAR_MODEL_PATH}" >&2
+    echo "prepare it with ./prepare_qwen2_5_1_5b_sidecar_assets.sh" >&2
+    exit 2
+}
+[[ -e "${VERL_SIDECAR_PROMPTS_FILE}" ]] || {
+    echo "missing sidecar prompts at ${VERL_SIDECAR_PROMPTS_FILE}" >&2
+    exit 2
+}
+
+if [[ "${SIDECAR_DRY_RUN:-0}" == "1" ]]; then
+    export FAIR_DRY_RUN=1
+fi
+
+exec "${ROOT_DIR}/run_paper_fair_epoch1_2_from_common_epoch0.sh" adafloor_n_f2 "$@"

@@ -1,0 +1,47 @@
+From 7cfbd8632264c81a5ba6fc5dc88db2e6a099ef04 Mon Sep 17 00:00:00 2001
+From: mystri <mystri@noreply.gitcode.com>
+Date: Tue, 2 Dec 2025 00:31:35 +0800
+Subject: [PATCH] Integrated SAM spec decoding and related configs into verl
+ rollout
+
+---
+ .../workers/rollout/vllm_rollout/vllm_rollout_spmd.py    | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index f0749e4..59b75de 100644
+--- a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -205,7 +205,7 @@ class vLLMRollout(BaseRollout):
+             enforce_eager=config.enforce_eager,
+             gpu_memory_utilization=config.gpu_memory_utilization,
+             disable_custom_all_reduce=True,
+-            enable_expert_parallel=True,
++            enable_expert_parallel=int(os.environ.get("VLLM_ENABLE_EXPERT_PARALLEL", "0")),
+             skip_tokenizer_init=False,
+             max_model_len=max_model_len,
+             max_num_seqs=config.max_num_seqs,
+@@ -226,7 +226,7 @@ class vLLMRollout(BaseRollout):
+                     "enable_view_optimize": False,
+                     "enable_kv_nz": False,
+                     "enable_frozen_parameter": False,
+-                },
++                } if not config.enforce_eager else {"enabled": False},
+                 "ascend_scheduler_config": {
+                     "enabled": True,
+                     "enable_chunked_prefill": False,
+@@ -260,6 +260,11 @@ class vLLMRollout(BaseRollout):
+             repetition_penalty=config.get("repetition_penalty", 1.0),
+         )
+ 
++        # Patch: unset logprobs if speculative_config is enabled.
++        if "speculative_config" in engine_kwargs:
++            logger.warning("The 'logprobs' parameter is incompatible with Speculative Decoding and has been disabled.")
++            del kwargs["logprobs"]
++
+         kwargs["detokenize"] = False
+ 
+         # supporting adding any sampling params from the config file
+-- 
+2.28.0.windows.1
+

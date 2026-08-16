@@ -1,0 +1,70 @@
+{
+    "graph_id": 4,
+    "op": [
+        {
+            "error_type": "infer_shape_error",
+            "input0": {
+                "data_type": "DT_BFLOAT16",
+                "layout": "ND",
+                "shape": [
+                    -1,
+                    2048
+                ]
+            },
+            "input1": {
+                "data_type": "DT_INT32",
+                "layout": "ND",
+                "shape": [
+                    -1,
+                    8
+                ]
+            },
+            "input2": {
+                "data_type": "DT_BOOL",
+                "layout": "ND",
+                "shape": [
+                    -1
+                ]
+            },
+            "name": "MoeDistributeDispatchV2_192",
+            "output0": {
+                "data_type": "DT_BFLOAT16",
+                "layout": "ND",
+                "shape": []
+            },
+            "output1": {
+                "data_type": "DT_FLOAT",
+                "layout": "ND",
+                "shape": []
+            },
+            "output2": {
+                "data_type": "DT_INT32",
+                "layout": "ND",
+                "shape": []
+            },
+            "output3": {
+                "data_type": "DT_INT64",
+                "layout": "ND",
+                "shape": []
+            },
+            "output4": {
+                "data_type": "DT_INT32",
+                "layout": "ND",
+                "shape": []
+            },
+            "output5": {
+                "data_type": "DT_INT32",
+                "layout": "ND",
+                "shape": []
+            },
+            "output6": {
+                "data_type": "DT_FLOAT",
+                "layout": "ND",
+                "shape": []
+            },
+            "reason": "InferShapeFailed!",
+            "type": "MoeDistributeDispatchV2"
+        }
+    ],
+    "session_id": 0
+}
