@@ -1,0 +1,36 @@
+# Runtime and experiment outputs
+resample_result_*/
+noresample_result_*/
+noresample_baseline/
+mode0_*/
+mode1_*/
+outputs/
+record/
+record_old011/
+save4analyse_ingraphmode/
+tensorboard_log/
+official_like_30b_a3b/
+rollout_data/
+rollout_length/
+logs/
+checkpoints/
+*.log
+*.tsv
+
+# Generated caches and compiler artifacts
+.cache/
+.config/
+.pytest_cache/
+.triton/
+.tvm_test_data/
+Ascend/
+atc_data/
+extra-info/
+kernel_meta/
+__pycache__/
+*.py[cod]
+*.tmp
+*.lock
+
+# Local editor state
+.vscode/
