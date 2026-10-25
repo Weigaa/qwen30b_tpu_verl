@@ -1,0 +1,65 @@
+From 93849e1188f7bf730695623eb6d3e39f52a5e908 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Mon, 26 Jan 2026 17:33:31 +0800
+Subject: [PATCH] Update verl: support npugraph_ex for spec decode
+
+---
+ .../rollout/vllm_rollout/vllm_rollout_spmd.py | 21 ++++++++++++++-----
+ 1 file changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index c3adcaf..120a5ec 100644
+--- a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -188,12 +188,11 @@ class vLLMRollout(BaseRollout):
+         cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
+         # enforce_eager must be False to use cudagraph
+         if not config.enforce_eager and cudagraph_capture_sizes:
+-            if isinstance(cudagraph_capture_sizes, ListConfig):
+-                compilation_config["compilation_config"] = CompilationConfig(
+-                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=cudagraph_capture_sizes
+-                )
+-            else:
+-                logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
++            torch._dynamo.config.log_compilation_metrics = False
++            compilation_config["compilation_config"] = {
++                "cudagraph_capture_sizes": cudagraph_capture_sizes,
++                "cudagraph_mode": "FULL",
++            }
+ 
+         self.dynamic_eplb = int(os.environ.get("VLLM_ENABLE_EPLB", "0")) == 1
+         self.inference_engine = LLM(
+@@ -205,6 +204,7 @@ class vLLMRollout(BaseRollout):
+             enforce_eager=config.enforce_eager,
+             gpu_memory_utilization=config.gpu_memory_utilization,
+             disable_custom_all_reduce=True,
++            enable_expert_parallel=int(os.environ.get("VLLM_ENABLE_EXPERT_PARALLEL", "0")),
+             skip_tokenizer_init=False,
+             max_model_len=max_model_len,
+             max_num_seqs=config.max_num_seqs,
+@@ -224,6 +225,10 @@ class vLLMRollout(BaseRollout):
+                 "num_iterations_eplb_update": 400,  # gather stable workload over 400 iterations
+                 "gate_eplb": True,
+                 "num_wait_worker_iterations": 30,  # wait for 30 iterations to complete the EPLB calculation
++                "npugraph_ex_config": {
++                    "enable": True,
++                    "enable_static_kernel": eval(os.environ.get("NPUGRAPH_EX_ENABLE_STATIC_KERNEL", "False"))
++                }
+             },
+             **compilation_config,
+             **self.lora_kwargs,
+@@ -238,6 +243,11 @@ class vLLMRollout(BaseRollout):
+             repetition_penalty=config.get("repetition_penalty", 1.0),
+         )
+ 
++        # Patch: unset logprobs if speculative_config is enabled.
++        if "speculative_config" in engine_kwargs:
++            logger.warning("The 'logprobs' parameter is incompatible with Speculative Decoding and has been disabled.")
++            del kwargs["logprobs"]
++
+         kwargs["detokenize"] = False
+ 
+         # supporting adding any sampling params from the config file
+-- 
+2.45.1.windows.1
+

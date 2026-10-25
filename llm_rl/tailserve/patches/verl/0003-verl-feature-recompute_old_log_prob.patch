@@ -1,0 +1,113 @@
+From 540a74127672f448fcda271fe9cd5062db9284b4 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Tue, 11 Nov 2025 10:55:09 +0800
+Subject: [PATCH 03/18] Update verl: recompute_old_log_prob config
+For GRPO algorithm, add a new configuration item config `recompute_old_log_prob` (default can be True)
+and corresponding handling logic: when the configuration is set to False and `ppo_epochs=1`, save one 
+forward computation for performance optimization.
+
+---
+ .../verl/trainer/config/actor/actor.yaml      |  3 +++
+ .../qwen3/verl/trainer/ppo/ray_trainer.py     | 21 +++++++++++--------
+ .../verl/workers/actor/megatron_actor.py      |  8 +++++--
+ llm_rl/qwen3/verl/workers/config/actor.py   |  3 +++
+ 4 files changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/llm_rl/qwen3/verl/trainer/config/actor/actor.yaml b/llm_rl/qwen3/verl/trainer/config/actor/actor.yaml
+index 7c55df2..5f89134 100644
+--- a/llm_rl/qwen3/verl/trainer/config/actor/actor.yaml
++++ b/llm_rl/qwen3/verl/trainer/config/actor/actor.yaml
+@@ -93,6 +93,9 @@ ppo_epochs: 1
+ # Shuffle training data across PPO epochs
+ shuffle: false
+ 
++# Recompute old_log_prob
++recompute_old_log_prob: True
++
+ # checkpoint configs
+ checkpoint:
+ 
+diff --git a/llm_rl/qwen3/verl/trainer/ppo/ray_trainer.py b/llm_rl/qwen3/verl/trainer/ppo/ray_trainer.py
+index 61b710c..6f50a6e 100644
+--- a/llm_rl/qwen3/verl/trainer/ppo/ray_trainer.py
++++ b/llm_rl/qwen3/verl/trainer/ppo/ray_trainer.py
+@@ -1101,15 +1101,18 @@ class RayPPOTrainer:
+ 
+                     # recompute old_log_probs
+                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+-                        entropys = old_log_prob.batch["entropys"]
+-                        response_masks = batch.batch["response_mask"]
+-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+-                        metrics.update(old_log_prob_metrics)
+-                        old_log_prob.batch.pop("entropys")
+-                        batch = batch.union(old_log_prob)
++                        if self.config.actor_rollout_ref.actor.recompute_old_log_prob:
++                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
++                            entropys = old_log_prob.batch["entropys"]
++                            response_masks = batch.batch["response_mask"]
++                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
++                            entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
++                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
++                            metrics.update(old_log_prob_metrics)
++                            old_log_prob.batch.pop("entropys")
++                            batch = batch.union(old_log_prob)
++                        else:
++                            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+ 
+                         if "rollout_log_probs" in batch.batch.keys():
+                             # TODO: we may want to add diff of probs too.
+diff --git a/llm_rl/qwen3/verl/workers/actor/megatron_actor.py b/llm_rl/qwen3/verl/workers/actor/megatron_actor.py
+index 55c4d60..6f9b5bb 100644
+--- a/llm_rl/qwen3/verl/workers/actor/megatron_actor.py
++++ b/llm_rl/qwen3/verl/workers/actor/megatron_actor.py
+@@ -311,9 +311,10 @@ class MegatronPPOActor(BasePPOActor):
+             "attention_mask",
+             "response_mask",
+             "position_ids",
+-            "old_log_probs",
+             "advantages",
+         ]
++        if self.config.recompute_old_log_prob:
++            select_keys.append("old_log_probs")
+         if self.config.use_kl_loss:
+             select_keys.append("ref_log_prob")
+         # Include pre-computed IS weights if present in batch
+@@ -428,7 +429,10 @@ class MegatronPPOActor(BasePPOActor):
+             ret_entropy = None
+             stats = {}
+             if not forward_only:
+-                old_log_prob = data["old_log_probs"]
++                if self.config.recompute_old_log_prob:
++                    old_log_prob = data["old_log_probs"]
++                else:
++                    old_log_prob = log_prob.detach()
+                 advantages = data["advantages"]
+ 
+                 entropy_coeff = self.config.entropy_coeff
+diff --git a/llm_rl/qwen3/verl/workers/config/actor.py b/llm_rl/qwen3/verl/workers/config/actor.py
+index 60ba030..2d22c1a 100644
+--- a/llm_rl/qwen3/verl/workers/config/actor.py
++++ b/llm_rl/qwen3/verl/workers/config/actor.py
+@@ -120,6 +120,7 @@ class ActorConfig(BaseConfig):
+     data_loader_seed = 1
+     rollout_n: int = 1  # must be override by sampling config
+     model_config: HFModelConfig = field(default_factory=BaseConfig)
++    recompute_old_log_prob: bool = True
+ 
+     def __post_init__(self):
+         """Validate actor configuration parameters."""
+@@ -146,6 +147,8 @@ class ActorConfig(BaseConfig):
+         ]
+         if self.loss_agg_mode not in valid_loss_agg_modes:
+             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
++        if not self.recompute_old_log_prob:
++            assert self.ppo_epochs == 1
+ 
+     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+         """Validate actor configuration with runtime parameters."""
+-- 
+2.50.1.windows.1
+

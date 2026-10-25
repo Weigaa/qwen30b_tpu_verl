@@ -1,0 +1,33 @@
+From 9753773dcbb7036c00280272d35d22c7b3500a60 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Wed, 12 Nov 2025 15:29:53 +0800
+Subject: [PATCH 14/18] Update verl: weight_converter
+Improve model parameter name conversion from Mcore to HF format.
+
+---
+ llm_rl/qwen3/verl/models/mcore/weight_converter.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/llm_rl/qwen3/verl/models/mcore/weight_converter.py b/llm_rl/qwen3/verl/models/mcore/weight_converter.py
+index 791513f..de060be 100644
+--- a/llm_rl/qwen3/verl/models/mcore/weight_converter.py
++++ b/llm_rl/qwen3/verl/models/mcore/weight_converter.py
+@@ -474,6 +474,15 @@ class McoreToHFWeightConverterQwen3Moe(McoreToHFWeightConverterDense):
+             expert_id = name.split("weight")[-1]
+             convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
+             assert len(params) == 1
++        elif "mlp.experts.weight1" in name:  # split gate_proj and up_proj
++            num_moe_experts = int(len(params) / 2)
++            for expert_id in range(num_moe_experts):
++                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight")
++                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight")
++        elif "mlp.experts.weight2" in name:
++            num_moe_experts = len(params)
++            for expert_id in range(num_moe_experts):
++                convert_names.append(f"model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight")
+         else:
+             raise NotImplementedError(f"Unsupported parameter name: {name}")
+         return convert_names, params
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
+
+# MinSkew baseline for the main policy comparison.
+#
+# This keeps the final AdaFloor floor2 candidate floors, KV budgets, EMA
+# predictor, length-sorted step buckets, tail guard, mode1 runtime, and
+# checkpoint chain. It changes only within-step rank matching: prompt pairs
+# minimize rank-internal predicted length skew under the same KV constraints,
+# without AdaFloor's M8/M12/M14 quota-aware release-area objective.
+
+BASELINE_EPOCH0="${DYNAMIC_INITIAL_BASELINE_DIR:-$SCRIPT_DIR/mode1_dynamic_length_aware_adaptive_floor4_natural_tailguard_full3/epoch_000_mode0_probe}"
+DYNAMIC_RUN_NAME="${DYNAMIC_RUN_NAME:-baseline_minskew_floor2_tailguard_reuse_epoch0_2epoch}"
+OUTPUT_ROOT="${DYNAMIC_OUTPUT_ROOT:-$SCRIPT_DIR}"
+OUTPUT_DIR="$OUTPUT_ROOT/$DYNAMIC_RUN_NAME"
+
+if [[ ! -d "$BASELINE_EPOCH0/rollout_data" ]]; then
+    echo "missing reusable epoch0 rollout data: $BASELINE_EPOCH0/rollout_data" >&2
+    exit 2
+fi
+if [[ -e "$OUTPUT_DIR" && "${ALLOW_EXISTING_OUTPUT:-0}" != "1" ]]; then
+    echo "output already exists: $OUTPUT_DIR" >&2
+    echo "Set DYNAMIC_RUN_NAME to a new directory or ALLOW_EXISTING_OUTPUT=1." >&2
+    exit 2
+fi
+
+echo "[MinSkew baseline] output=$OUTPUT_DIR"
+echo "[MinSkew baseline] reusable_epoch0=$BASELINE_EPOCH0"
+echo "[MinSkew baseline] epochs=1,2 steps_per_epoch=5 matching=min_skew floors=2,4,8,16"
+
+export RANK_MATCHING_POLICY=min_skew
+export KV_SAFE_FIXED_FLOOR=0
+export ACTIVE_PEAK_SAFETY_FACTOR="${BASELINE_ACTIVE_PEAK_SAFETY_FACTOR:-1.16}"
+export ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.9}"
+export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR2="${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR2:-131072}"
+export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR4="${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR4:-280576}"
+export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR8="${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR8:-315648}"
+export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR16="${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR16:-${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS:-380800}}"
+export VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS="${VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS:-$VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR16}"
+export FLOOR_KV_CAPS="${FLOOR_KV_CAPS:-2:$VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR2,4:$VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR4,8:$VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR8,16:$VLLM_ASCEND_MODE1_PARITY_MAX_KV_TOKENS_FLOOR16}"
+export VLLM_ASCEND_SHRINK_AWARE_STAGES=8,4,2
+export VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE=2
+export MIN_ADAPTIVE_FLOOR=2
+
+exec env \
+    DYNAMIC_RUN_NAME="$DYNAMIC_RUN_NAME" \
+    DYNAMIC_OUTPUT_ROOT="$OUTPUT_ROOT" \
+    DYNAMIC_INITIAL_BASELINE_DIR="$BASELINE_EPOCH0" \
+    DYNAMIC_TOTAL_EPOCHS=3 \
+    DYNAMIC_START_EPOCH=1 \
+    DYNAMIC_SKIP_MODE0_PROBE=1 \
+    DYNAMIC_INITIAL_RESUME_CKPT="${BASELINE_INITIAL_RESUME_CKPT:-}" \
+    DYNAMIC_ENABLE_CKPT_CHAIN=1 \
+    DYNAMIC_LENGTH_EMA_DECAY=0.3 \
+    DYNAMIC_PLAN_STEPS=5 \
+    DYNAMIC_TRAIN_STEPS=5 \
+    DYNAMIC_ENABLE_THRESHOLD_CONTROL=0 \
+    DYNAMIC_DISABLE_TAIL_GUARD=0 \
+    DYNAMIC_SHORT_STEP_CAP_ENABLE=1 \
+    DYNAMIC_SHORT_STEP_EXIT_THRESHOLD=4096 \
+    DYNAMIC_SHORT_STEP_CAP_TOKENS=4096 \
+    DYNAMIC_SHORT_STEP_CAP_FLOORS=2,4 \
+    DYNAMIC_TAIL_GUARD_RATIO_QUANTILE=0.95 \
+    DYNAMIC_TAIL_GUARD_RATIO_WINDOW=3 \
+    DYNAMIC_TAIL_GUARD_DEFAULT_RATIO=1.20 \
+    DYNAMIC_TAIL_GUARD_MIN_CAP=4096 \
+    DYNAMIC_TAIL_GUARD_ROUND_TO=512 \
+    FLOOR_KV_CAPS="$FLOOR_KV_CAPS" \
+    DYNAMIC_FORCE_SELECTED_FLOOR= \
+    DYNAMIC_FORCE_SELECTED_FLOORS= \
+    FORCE_SELECTED_FLOOR= \
+    FORCE_SELECTED_FLOORS= \
+    "$SCRIPT_DIR/run_mode1_dynamic_length_aware_adaptive_floor2_natural_tailguard_reuse_epoch0_2epoch.sh" \
+    "$@"

@@ -1,0 +1,27 @@
+From 0faba7fc5b17bcc5ae428f3abb00495764dd2007 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Mon, 17 Nov 2025 20:43:10 +0800
+Subject: [PATCH 1/1] Update megatron: state_ten verification
+Add state_ten value check in the DistributedOptimizer class to prevent runtime exceptions caused by None,
+thereby improving code robustness.
+
+---
+ llm_rl/qwen3/megatron/core/optimizer/distrib_optimizer.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/llm_rl/qwen3/megatron/core/optimizer/distrib_optimizer.py b/llm_rl/qwen3/megatron/core/optimizer/distrib_optimizer.py
+index a00d1a3..62fe20f 100644
+--- a/llm_rl/qwen3/megatron/core/optimizer/distrib_optimizer.py
++++ b/llm_rl/qwen3/megatron/core/optimizer/distrib_optimizer.py
+@@ -1319,6 +1319,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                     # The optimizer state of STEP is handled
+                     # specifically and is read from param_groups.
+                     continue
++                if state_ten is None:
++                    return []
+                 replace_kwargs = dict(
+                     key=f'{prefix}.{state_key}.{sharded_metadata.key}',
+                     data=state_ten,
+-- 
+2.50.1.windows.1
+

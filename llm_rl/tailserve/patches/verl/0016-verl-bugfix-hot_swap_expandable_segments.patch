@@ -1,0 +1,22 @@
+From 6ba7750e196cdd92001ccc3584f1743e1b950ba8 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Tue, 30 Dec 2025 21:36:23 +0800
+Subject: [PATCH] enable hot swap for expandable segments
+
+---
+ verl/utils/device.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/llm_rl/qwen3/verl/utils/device.py b/llm_rl/qwen3/verl/utils/device.py
+index 28695ddb..04522217 100644
+--- a/llm_rl/qwen3/verl/utils/device.py
++++ b/llm_rl/qwen3/verl/utils/device.py
+@@ -93,3 +93,5 @@ def set_expandable_segments(enable: bool) -> None:
+     """
+     if is_cuda_available:
+         torch.cuda.memory._set_allocator_settings(f"expandable_segments:{enable}")
++    if is_npu_available:
++        torch.npu.memory._set_allocator_settings(f"expandable_segments:{enable}")
+-- 
+2.45.1.windows.1
+

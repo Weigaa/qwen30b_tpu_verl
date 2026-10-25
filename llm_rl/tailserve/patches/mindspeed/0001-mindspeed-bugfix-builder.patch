@@ -1,0 +1,26 @@
+From 9862567c3c97f7f52702511794eb841792e56c62 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Mon, 17 Nov 2025 20:40:21 +0800
+Subject: [PATCH 1/2] Update mindspeed: builder
+Fix the header file missing issue in compiler version 24.03.
+
+---
+ llm_rl/qwen3/mindspeed/op_builder/builder.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/llm_rl/qwen3/mindspeed/op_builder/builder.py b/llm_rl/qwen3/mindspeed/op_builder/builder.py
+index 8cacac2..1b10806 100644
+--- a/llm_rl/qwen3/mindspeed/op_builder/builder.py
++++ b/llm_rl/qwen3/mindspeed/op_builder/builder.py
+@@ -52,7 +52,7 @@ class MindSpeedOpBuilder(ABC):
+ 
+     def cxx_args(self):
+         args = ['-fstack-protector-all', '-Wl,-z,relro,-z,now,-z,noexecstack', '-fPIC', '-pie',
+-                '-s', '-fvisibility=hidden', '-D_FORTIFY_SOURCE=2', '-O2']
++                '-s', '-fvisibility=hidden', '-D_FORTIFY_SOURCE=2', '-O2', '-include cstring']
+         return args
+ 
+     def extra_ldflags(self):
+-- 
+2.50.1.windows.1
+

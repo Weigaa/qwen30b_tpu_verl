@@ -1,0 +1,44 @@
+From d85ac51d3414237ab519fd6ada5249be113e0be6 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Tue, 6 Jan 2026 00:21:59 +0800
+Subject: [PATCH] adapt vllm 0.13.0
+
+---
+ verl/utils/vllm/utils.py                               | 7 ++++++-
+ verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py | 2 +-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/llm_rl/qwen3/verl/utils/vllm/utils.py b/llm_rl/qwen3/verl/utils/vllm/utils.py
+index acf24398..751791e0 100644
+--- a/llm_rl/qwen3/verl/utils/vllm/utils.py
++++ b/llm_rl/qwen3/verl/utils/vllm/utils.py
+@@ -15,7 +15,12 @@
+ 
+ from msgspec import field
+ from packaging import version as vs
+-from vllm.lora.models import LoRAModel
++
++try:
++    from vllm.lora.lora_model import LoRAModel
++except ImportError:
++    from vllm.lora.models import LoRAModel
++
+ from vllm.lora.request import LoRARequest
+ from vllm.lora.utils import get_adapter_absolute_path
+ from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index b126fdbe..786e2d77 100644
+--- a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -50,7 +50,7 @@ from omegaconf import ListConfig
+ from tensordict import TensorDict
+ from torch.distributed.device_mesh import DeviceMesh
+ from vllm import LLM, SamplingParams
+-from vllm.config import CompilationConfig, CompilationLevel, LoRAConfig
++from vllm.config.lora import LoRAConfig
+ from vllm.lora.request import LoRARequest
+ from vllm_ascend.ascend_config import get_ascend_config
+ 
+-- 
+2.45.1.windows.1
+
