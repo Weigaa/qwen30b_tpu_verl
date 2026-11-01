@@ -518,6 +518,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         #extra variables
         self.decode_dummy_time = 0
         self.need_allreduce = True
+        # Elastic EP manager (initialized lazily after model load)
+        self._elastic_ep_mgr = None
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -811,6 +813,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # even if we are running in eager mode, which harms performance.
         # FIXME: Restore the `or self.vllm_config.model_config.enforce_eager` here
         # immediately once the other two flags are no longer needed.
+
+        # Elastic EP: coordinate with parked ranks before the DP all_reduce.
+        # This uses the coordination group (original full DP group, never rebuilt).
+        # Parked ranks call sync_and_rebuild_if_needed in dp_sync_only().
+        if self._elastic_ep_mgr is not None:
+            rebuilt = self._elastic_ep_mgr.sync_and_rebuild_if_needed()
+            if rebuilt:
+                self._update_moe_for_elastic_ep()
+                # Update dp_size/dp_rank to reflect the rebuilt DP group
+                new_dp = get_dp_group()
+                self.dp_size = new_dp.world_size
+                self.dp_rank = new_dp.rank_in_group
+
         if self.dp_size == 1:
             return num_tokens, None, with_prefill, enable_dbo
 
@@ -2770,6 +2785,290 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.model = ACLGraphWrapper(self.model,
                                          self.vllm_config,
                                          runtime_mode=CUDAGraphMode.FULL)
+
+        # Initialize elastic EP manager after model is loaded
+        self._init_elastic_ep()
+
+    def _init_elastic_ep(self):
+        """Initialize elastic EP manager. Call after model is loaded."""
+        if self.dp_size <= 1:
+            return
+        if not self.parallel_config.enable_expert_parallel:
+            return
+
+        from vllm.distributed.parallel_state import get_ep_group
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        ep_size = get_ep_group().world_size
+
+        # Find experts_per_rank and num_moe_experts from first MOE layer
+        experts_per_rank = 0
+        num_moe_experts = 0
+        global_redundant_expert_num = 0
+        hidden_size = 0
+        intermediate_size = 0
+        params_dtype = torch.float16
+        for module in self.model.modules():
+            if isinstance(module, AscendFusedMoE):
+                num_moe_experts = module.num_experts
+                global_redundant_expert_num = module.global_redundant_expert_num
+                experts_per_rank = module.global_num_experts // ep_size
+                hidden_size = module.moe_config.hidden_dim
+                intermediate_size = module.intermediate_size_per_partition
+                params_dtype = module.moe_config.in_dtype
+                break
+
+        if experts_per_rank == 0:
+            return
+
+        # Switch MoE layers from loading expert_map to runtime expert_map
+        # and set up redundancy manager if enabled
+        ascend_config = get_ascend_config()
+        redundancy_budget = ascend_config.elastic_ep_redundancy_budget
+        self._elastic_ep_redundancy_mgr = None
+
+        if redundancy_budget > 0:
+            from vllm_ascend.elastic_ep_redundancy import (
+                get_placement, ExpertRedundancyManager)
+            placement = get_placement()
+            if placement is not None:
+                # Switch all MoE layers to primary-only expert_map
+                for module in self.model.modules():
+                    if isinstance(module, AscendFusedMoE):
+                        if module._primary_expert_map is not None:
+                            module.expert_map = module._primary_expert_map.npu()
+                            module._primary_expert_map = None
+
+                # Create redundancy manager
+                self._elastic_ep_redundancy_mgr = ExpertRedundancyManager(
+                    placement=placement,
+                    hidden_size=hidden_size,
+                    intermediate_size_per_partition=intermediate_size,
+                    params_dtype=params_dtype,
+                )
+
+                # Pre-cache uncovered experts to CPU
+                self._precache_experts_to_cpu(placement)
+
+                logger.info(
+                    "ElasticEP redundancy enabled: budget=%d, strategy=%s",
+                    redundancy_budget,
+                    ascend_config.elastic_ep_placement_strategy)
+
+        from vllm_ascend.elastic_ep import ElasticEPManager
+        self._elastic_ep_mgr = ElasticEPManager(
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            original_ep_size=ep_size,
+            experts_per_rank=experts_per_rank,
+            num_moe_experts=num_moe_experts,
+            global_redundant_expert_num=global_redundant_expert_num,
+        )
+        logger.info(
+            "ElasticEP initialized: dp_size=%d, ep_size=%d, "
+            "experts_per_rank=%d, num_moe_experts=%d, redundancy=%s",
+            self.dp_size, ep_size, experts_per_rank, num_moe_experts,
+            "enabled" if self._elastic_ep_redundancy_mgr else "disabled")
+
+    def _precache_experts_to_cpu(self, placement):
+        """Pre-cache primary experts to CPU for potential future loading."""
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        ep_rank = self.dp_rank
+        to_cache = placement.get_experts_on_rank_for_cpu_cache(ep_rank)
+        if not to_cache:
+            return
+
+        epr = placement.experts_per_rank
+        start, _ = placement.get_primary_range(ep_rank)
+        redundancy = self._elastic_ep_redundancy_mgr
+
+        layer_idx = 0
+        for module in self.model.modules():
+            if isinstance(module, AscendFusedMoE):
+                for expert_id in to_cache:
+                    local_idx = expert_id - start
+                    if 0 <= local_idx < epr:
+                        redundancy.save_expert_weights_to_cpu(
+                            layer_idx, expert_id,
+                            module.w13_weight.data[local_idx],
+                            module.w2_weight.data[local_idx],
+                        )
+                layer_idx += 1
+
+        logger.info(
+            "ElasticEP: Pre-cached %d experts to CPU across %d layers",
+            len(to_cache), layer_idx)
+
+    def dp_sync_only(self, mark_done: bool = False):
+        """Lightweight sync for elastic EP. No model forward.
+
+        Called by parked ranks that have finished their prompts.
+        Participates in elastic EP coordination (done-flag exchange +
+        group rebuild). After the DP group is rebuilt to exclude this
+        rank, no further DP-level sync is needed from this rank.
+        """
+        if self._elastic_ep_mgr is None:
+            # Elastic EP not enabled, fall back to dummy run
+            self._dummy_run(1)
+            return
+
+        # Sync done flags and rebuild groups if needed (collective on
+        # coordination group which includes ALL original DP ranks)
+        rebuilt = self._elastic_ep_mgr.sync_and_rebuild_if_needed(
+            mark_self_done=mark_done)
+
+        if rebuilt and not self._elastic_ep_mgr.is_done:
+            self._update_moe_for_elastic_ep()
+
+    def reset_elastic_ep(self):
+        """Reset elastic EP state for the next rollout wave."""
+        if self._elastic_ep_mgr is None:
+            return
+
+        had_changes = bool(self._elastic_ep_mgr.done_ranks)
+        self._elastic_ep_mgr.reset()
+
+        if had_changes:
+            # Restore original expert mappings
+            self._update_moe_for_elastic_ep_original()
+            # Restore dp_size/dp_rank
+            from vllm.distributed.parallel_state import get_dp_group
+            new_dp = get_dp_group()
+            self.dp_size = new_dp.world_size
+            self.dp_rank = new_dp.rank_in_group
+
+    def _update_moe_for_elastic_ep_original(self):
+        """Restore original expert_map and log2phy on all MOE layers."""
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+        from vllm.distributed.parallel_state import get_ep_group
+
+        ep_group = get_ep_group()
+        ep_rank = ep_group.rank_in_group
+
+        if self._elastic_ep_redundancy_mgr is not None:
+            # With redundancy: restore primary-only expert_map
+            from vllm_ascend.elastic_ep_redundancy import get_placement
+            placement = get_placement()
+            if placement is not None:
+                expert_map = placement.get_expert_map_primary_only(ep_rank)
+                log2phy = placement.get_log2phy_for_loading(ep_rank)
+                expert_map_npu = expert_map.npu()
+                log2phy_npu = log2phy.npu()
+                for module in self.model.modules():
+                    if isinstance(module, AscendFusedMoE):
+                        module.expert_map = expert_map_npu
+                        module.log2phy = log2phy_npu
+                return
+
+        # Without redundancy: use standard defaults
+        from vllm_ascend.eplb.core.eplb_utils import (
+            determine_default_expert_map, determine_default_log2phy_map)
+
+        for module in self.model.modules():
+            if isinstance(module, AscendFusedMoE):
+                log2phy = determine_default_log2phy_map(
+                    module.global_num_experts,
+                    ep_group.world_size,
+                    ep_rank,
+                    module.global_redundant_expert_num,
+                )
+                _, expert_map = determine_default_expert_map(
+                    module.global_num_experts,
+                    ep_group.world_size,
+                    ep_rank,
+                    module.global_redundant_expert_num,
+                )
+                module.log2phy = log2phy.npu()
+                module.expert_map = expert_map.npu()
+
+    def _update_moe_for_elastic_ep(self):
+        """Update expert_map and log2phy on all MOE layers after EP rebuild."""
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        if self._elastic_ep_redundancy_mgr is not None:
+            self._update_moe_with_redundancy()
+        else:
+            self._update_moe_simple_remap()
+
+    def _update_moe_simple_remap(self):
+        """Simple expert remapping without redundancy (round-robin orphans)."""
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        result = self._elastic_ep_mgr.compute_new_expert_mapping()
+        log2phy, expert_map, new_moe_expert_num = result
+
+        if log2phy is None:
+            return
+
+        log2phy_npu = log2phy.npu()
+        expert_map_npu = expert_map.npu() if expert_map is not None else None
+
+        for module in self.model.modules():
+            if isinstance(module, AscendFusedMoE):
+                module.log2phy = log2phy_npu
+                if expert_map_npu is not None:
+                    module.expert_map = expert_map_npu
+
+        logger.info(
+            "ElasticEP: Updated %d MOE layers (simple remap): "
+            "new_moe_expert_num=%d, ep_size=%d",
+            sum(1 for m in self.model.modules()
+                if isinstance(m, AscendFusedMoE)),
+            new_moe_expert_num, self._elastic_ep_mgr.current_ep_size)
+
+    def _update_moe_with_redundancy(self):
+        """Expert remapping using redundant copies (zero-copy for hits)."""
+        from vllm_ascend.ops.fused_moe import AscendFusedMoE
+
+        mgr = self._elastic_ep_mgr
+        redundancy = self._elastic_ep_redundancy_mgr
+        active_ranks = mgr.get_active_dp_ranks()
+
+        # Analyze which orphaned experts are cached vs need CPU loading
+        hit_miss_info = redundancy.analyze_rank_exit(
+            mgr.done_ranks, active_ranks)
+
+        # Compute new expert mappings using redundancy
+        result = redundancy.compute_elastic_expert_mapping(
+            active_ranks, mgr.dp_rank, hit_miss_info)
+
+        if result is None:
+            return
+
+        log2phy, expert_map, new_moe_expert_num = result
+        log2phy_npu = log2phy.npu()
+        expert_map_npu = expert_map.npu()
+
+        # Load missing experts from CPU and update all MoE layers
+        my_info = hit_miss_info.get(mgr.dp_rank, {'hits': [], 'misses': []})
+        placement = redundancy.placement
+        epr = placement.experts_per_rank
+        num_redundant = len(placement.get_redundant_experts(mgr.dp_rank))
+
+        layer_idx = 0
+        for module in self.model.modules():
+            if isinstance(module, AscendFusedMoE):
+                # Load missing experts from CPU for this layer
+                for i, expert_id in enumerate(my_info['misses']):
+                    weight_idx = epr + num_redundant + i
+                    redundancy.load_expert_from_cpu(
+                        layer_idx, expert_id,
+                        module.w13_weight,
+                        module.w2_weight,
+                        weight_idx,
+                    )
+                module.log2phy = log2phy_npu
+                module.expert_map = expert_map_npu
+                layer_idx += 1
+
+        logger.info(
+            "ElasticEP: Updated MOE layers with redundancy: "
+            "new_moe_expert_num=%d, ep_size=%d, "
+            "hits=%d, misses=%d",
+            new_moe_expert_num, mgr.current_ep_size,
+            len(my_info['hits']), len(my_info['misses']))
 
     def _convert_torch_format(self, tensor):
         tensor = torch_npu.npu_format_cast(tensor, ACL_FORMAT)

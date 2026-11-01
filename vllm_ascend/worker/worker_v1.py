@@ -358,6 +358,19 @@ class NPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)
 
+    def execute_dp_sync_only(self, mark_done: bool = False) -> None:
+        """Lightweight sync for elastic EP - no model forward pass.
+
+        Called by ranks that have finished their prompts. Participates in
+        DP metadata sync and EP group rebuild if needed, but skips
+        the actual model forward computation.
+        """
+        self.model_runner.dp_sync_only(mark_done)
+
+    def reset_elastic_ep(self) -> None:
+        """Reset elastic EP state for the next rollout wave."""
+        self.model_runner.reset_elastic_ep()
+
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_distributed_environment(self.parallel_config.world_size,

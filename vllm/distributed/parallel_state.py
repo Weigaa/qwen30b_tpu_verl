@@ -968,12 +968,24 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
+def set_dp_group(new_group: GroupCoordinator) -> None:
+    """Replace the model-level DP group (used by elastic EP)."""
+    global _DP
+    _DP = new_group
+
+
 _EP: Optional[GroupCoordinator] = None
 
 
 def get_ep_group() -> GroupCoordinator:
     assert _EP is not None, ("expert parallel group is not initialized")
     return _EP
+
+
+def set_ep_group(new_group: GroupCoordinator) -> None:
+    """Replace the global EP group (used by elastic EP)."""
+    global _EP
+    _EP = new_group
 
 
 def get_pp_group() -> GroupCoordinator:

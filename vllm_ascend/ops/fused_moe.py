@@ -287,6 +287,26 @@ class AscendFusedMoE(FusedMoE):
                 self.log2phy = determine_default_log2phy_map(
                     self.global_num_experts, self.ep_size, self.ep_rank,
                     self.global_redundant_expert_num)
+
+        # Elastic EP redundancy: expand weight allocation for redundant experts
+        self._elastic_ep_redundancy_budget = ascend_config.elastic_ep_redundancy_budget
+        self._primary_expert_map = None
+        if (self._elastic_ep_redundancy_budget > 0
+                and self.ep_size > 1
+                and vllm_config.parallel_config.enable_expert_parallel):
+            from vllm_ascend.elastic_ep_redundancy import get_or_create_placement
+            epr = self.global_num_experts // self.ep_size
+            placement = get_or_create_placement(
+                self.global_num_experts, self.ep_size, epr,
+                self._elastic_ep_redundancy_budget,
+                ascend_config.elastic_ep_placement_strategy)
+            # Use expanded expert_map for weight loading (includes redundant)
+            self.local_num_experts, self.expert_map = (
+                placement.get_expert_map_for_loading(self.ep_rank))
+            # Save primary-only map for runtime (switched after weight loading)
+            self._primary_expert_map = (
+                placement.get_expert_map_primary_only(self.ep_rank))
+
         local_num_experts = (torch.sum(self.expert_map != -1)
                              if self.expert_map is not None else num_experts)
         if self.dynamic_eplb:

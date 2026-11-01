@@ -52,6 +52,12 @@ class AscendConfig:
             None)  # Provide path to export expert map
         self.init_redundancy_expert = additional_config.get(
             "init_redundancy_expert", 0)
+        # Elastic EP redundancy: per-rank budget for extra expert copies
+        self.elastic_ep_redundancy_budget = additional_config.get(
+            "elastic_ep_redundancy_budget", 0)
+        # Placement strategy: "uniform" or "predictive"
+        self.elastic_ep_placement_strategy = additional_config.get(
+            "elastic_ep_placement_strategy", "uniform")
         self.dynamic_eplb = additional_config.get("dynamic_eplb", False)
         self.num_iterations_eplb_update = additional_config.get(
             "num_iterations_eplb_update", 400)

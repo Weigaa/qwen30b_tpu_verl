@@ -1041,56 +1041,86 @@ class DPEngineCoreProc(EngineCoreProc):
                 (-1, EngineCoreOutputs(scheduler_stats=stats)))
 
     def run_busy_loop(self):
-        """Core busy loop of the EngineCore for data parallel case."""
+        """Core busy loop of the EngineCore for data parallel case.
+
+        With elastic EP enabled, ranks that finish their prompts exit the
+        forward pass loop and enter a lightweight sync-only loop. They
+        participate in elastic EP coordination (done-flag exchange and
+        group rebuild) but skip model forward passes entirely.
+        """
 
         # Loop until process is sent a SIGINT or SIGTERM
-        # print("not define", abc)
         begin_rollout_time = time.time()
         print("rank", self.dp_rank, "begin rollouts time", begin_rollout_time)
         rollouts_flag = True
+        self._elastic_ep_local_done = False
         while True:
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 
-            # 2) Step the engine core.
-            executed = self._process_engine_step()
-            self._maybe_publish_request_counts()
+            if self._elastic_ep_local_done:
+                # === PARKED PATH ===
+                # This rank is done. Participate in elastic EP coordination
+                # (so other ranks can detect exits and rebuild groups) but
+                # skip the model forward pass entirely.
+                self.model_executor.collective_rpc(
+                    "execute_dp_sync_only", args=(False,))
+            else:
+                # === ACTIVE PATH ===
+                # 2) Step the engine core (schedule + execute model).
+                executed = self._process_engine_step()
+                self._maybe_publish_request_counts()
 
-            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
-            if not executed:
-                if rollouts_flag:
-                    end_real_time = time.time()
-                    print("rank", self.dp_rank, "real rollouts time is", end_real_time - begin_rollout_time)
-                    rollouts_flag = False
-                if not local_unfinished_reqs and not self.engines_running:
-                    end_dummy_time = time.time()
-                    print("rank", self.dp_rank, "dummy rollouts time is", end_dummy_time - end_real_time)
-                    # All engines are idle.
-                    continue
+                local_unfinished_reqs = (
+                    self.scheduler.has_unfinished_requests())
+                if not executed:
+                    if rollouts_flag:
+                        end_real_time = time.time()
+                        print("rank", self.dp_rank,
+                              "real rollouts time is",
+                              end_real_time - begin_rollout_time)
+                        rollouts_flag = False
+                    if not local_unfinished_reqs:
+                        if not self.engines_running:
+                            # All engines are idle.
+                            continue
+                        # This rank has no more local work but other
+                        # ranks are still running. With elastic EP,
+                        # mark as done and enter parked path.
+                        self._elastic_ep_local_done = True
+                        exit_time = time.time()
+                        print("rank", self.dp_rank,
+                              "elastic EP exit at",
+                              exit_time - begin_rollout_time)
+                        # Signal done via first dp_sync_only call
+                        self.model_executor.collective_rpc(
+                            "execute_dp_sync_only", args=(True,))
 
-                # We are in a running state and so must execute a dummy pass
-                # if the model didn't execute any ready requests.
-                self.execute_dummy_batch()
-
-            # 3) All-reduce operation to determine global unfinished reqs.
+            # 3) All-reduce to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
-                local_unfinished_reqs)
+                False if self._elastic_ep_local_done
+                else local_unfinished_reqs)
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
                     # Notify client that we are pausing the loop.
                     logger.debug("Wave %d finished, pausing engine loop.",
                                  self.current_wave)
-                    # In the coordinator case, dp rank 0 sends updates to the
-                    # coordinator. Otherwise (offline spmd case), each rank
-                    # sends the update to its colocated front-end process.
                     client_index = -1 if self.has_coordinator else 0
                     self.output_queue.put_nowait(
                         (client_index,
                          EngineCoreOutputs(wave_complete=self.current_wave)))
-                # Increment wave count and reset step counter.
+                end_time = time.time()
+                print("rank", self.dp_rank,
+                      "total rollouts time is",
+                      end_time - begin_rollout_time,
+                      "elastic_done:", self._elastic_ep_local_done)
+                # Increment wave count and reset state for next wave.
                 self.current_wave += 1
                 self.step_counter = 0
+                self._elastic_ep_local_done = False
+                # Reset elastic EP groups back to original for next wave
+                self.model_executor.collective_rpc("reset_elastic_ep")
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
 

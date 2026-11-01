@@ -20,6 +20,12 @@ def get_mc2_group() -> GroupCoordinator:
     return _MC2
 
 
+def set_mc2_group(new_group: GroupCoordinator) -> None:
+    """Replace the MC2 group (used by elastic EP)."""
+    global _MC2
+    _MC2 = new_group
+
+
 def get_otp_group() -> GroupCoordinator:
     assert _OTP is not None, (
         "output tensor parallel group is not initialized")
