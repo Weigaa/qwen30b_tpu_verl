@@ -21,6 +21,8 @@ Important env overrides:
   STOP_ON_FIRST_PASS=1       # default: stop after the first passing cap
   PRESERVE_CANDIDATE_ORDER=0  # default: sort candidates numerically high->low
   FAIL_ON_TRACEBACK=0         # default: treat traceback as warning if exit_code=0
+  CLEAN_BETWEEN_CANDIDATES=1  # default: stop local Ray/repo training leftovers between candidates
+  CLEANUP_SLEEP_S=20          # default: wait after cleanup so NPU/Ray resources settle
   MODE1_FLOOR2_SUCCESS_LOGIC=1 # floor=2 default: match known-good 147456 run
   DATASET_FRACTION=0.005
   TRAINER_TOTAL_EPOCHS=1
@@ -57,6 +59,8 @@ fi
 STOP_ON_FIRST_PASS="${STOP_ON_FIRST_PASS:-1}"
 PRESERVE_CANDIDATE_ORDER="${PRESERVE_CANDIDATE_ORDER:-0}"
 FAIL_ON_TRACEBACK="${FAIL_ON_TRACEBACK:-0}"
+CLEAN_BETWEEN_CANDIDATES="${CLEAN_BETWEEN_CANDIDATES:-1}"
+CLEANUP_SLEEP_S="${CLEANUP_SLEEP_S:-20}"
 EXPECTED_STEPS="${EXPECTED_STEPS:-5}"
 ROLLOUT_REGRESSION_ABS_S="${ROLLOUT_REGRESSION_ABS_S:-180}"
 ROLLOUT_REGRESSION_DELTA_S="${ROLLOUT_REGRESSION_DELTA_S:-45}"
@@ -88,6 +92,53 @@ else
     RUNNER="$SCRIPT_DIR/run_mode1_local_baseline_random_batch_threshold_multistep.sh"
 fi
 
+cleanup_repo_runtime() {
+    local phase="$1"
+    local log_file="${2:-/dev/stdout}"
+
+    if [[ "$CLEAN_BETWEEN_CANDIDATES" != "1" ]]; then
+        return 0
+    fi
+
+    {
+        printf '[kv sweep cleanup] phase=%s start=%s\n' "$phase" "$(date +%Y-%m-%dT%H:%M:%S%z)"
+
+        if command -v ray >/dev/null 2>&1; then
+            ray stop --force || true
+        fi
+
+        # Keep process cleanup scoped to this repository path. This avoids
+        # killing unrelated jobs on shared machines while still removing a
+        # stale local trainer process if Ray did not reap it cleanly.
+        local uid pid cmd
+        uid="$(id -u)"
+        while IFS= read -r line; do
+            pid="${line%% *}"
+            cmd="${line#* }"
+            if [[ -n "$pid" && "$pid" != "$$" && "$cmd" == *"$SCRIPT_DIR"* && "$cmd" == *"verl.trainer.main_ppo"* ]]; then
+                printf '[kv sweep cleanup] TERM stale repo trainer pid=%s cmd=%s\n' "$pid" "$cmd"
+                kill "$pid" 2>/dev/null || true
+            fi
+        done < <(ps -u "$uid" -o pid=,cmd= 2>/dev/null || true)
+
+        sleep 3
+        while IFS= read -r line; do
+            pid="${line%% *}"
+            cmd="${line#* }"
+            if [[ -n "$pid" && "$pid" != "$$" && "$cmd" == *"$SCRIPT_DIR"* && "$cmd" == *"verl.trainer.main_ppo"* ]]; then
+                printf '[kv sweep cleanup] KILL stale repo trainer pid=%s cmd=%s\n' "$pid" "$cmd"
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done < <(ps -u "$uid" -o pid=,cmd= 2>/dev/null || true)
+
+        if [[ "$CLEANUP_SLEEP_S" =~ ^[0-9]+$ && "$CLEANUP_SLEEP_S" -gt 0 ]]; then
+            printf '[kv sweep cleanup] settling sleep_s=%s\n' "$CLEANUP_SLEEP_S"
+            sleep "$CLEANUP_SLEEP_S"
+        fi
+        printf '[kv sweep cleanup] phase=%s done=%s\n' "$phase" "$(date +%Y-%m-%dT%H:%M:%S%z)"
+    } >>"$log_file" 2>&1
+}
+
 printf '[kv sweep] floor=%s candidates="%s" sweep_dir=%s runner=%s\n' \
     "$FLOOR" "$KV_CANDIDATES" "$SWEEP_DIR" "$RUNNER"
 
@@ -95,6 +146,7 @@ for kv in $KV_CANDIDATES; do
     output_subdir="mode1_kv_cap_sweep_floor${FLOOR}_kv${kv}_${STAMP}"
     run_log="$SWEEP_DIR/floor${FLOOR}_kv${kv}.launcher.log"
     printf '\n[kv sweep] start floor=%s kv=%s output=%s\n' "$FLOOR" "$kv" "$output_subdir" | tee -a "$run_log"
+    cleanup_repo_runtime "before_floor${FLOOR}_kv${kv}" "$run_log"
 
     set +e
     if [[ "$FLOOR" == "2" ]]; then
@@ -117,6 +169,7 @@ for kv in $KV_CANDIDATES; do
     fi
     rc=${PIPESTATUS[0]}
     set -e
+    cleanup_repo_runtime "after_floor${FLOOR}_kv${kv}" "$run_log"
 
     log_path=$(find "$SCRIPT_DIR/$output_subdir/logs" -maxdepth 1 -type f \
         -name 'wjqwen30b-a3b-record_graph_save4eagle3_[0-9]*.txt' \

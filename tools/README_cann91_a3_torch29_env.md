@@ -87,3 +87,22 @@ Validation evidence from the restored run:
 - Process exit: `run_exit_code=0`
 
 Rule of thumb: for KV-cap sweeps, judge success primarily by `exit_code=0`, completion validator success, actual KV reaching the requested cap, and no strict pre/post-run fatal errors.  Do not use a bare case-insensitive `OOM` grep; it will match `headroom` and invalidate otherwise successful runs.
+
+## 2026-07-05 Clean KV-cap sweep isolation
+
+A KV-cap sweep must not run candidates back-to-back without cleanup.  A higher failed or partial candidate can leave local Ray workers, trainer subprocesses, or NPU-side runtime state in a shape that makes the next lower candidate exit with `run_exit_code=0` but without any `rollout_generate_start/done` events.  This produced misleading rows where a known-good `KV_TOKENS=147456` run appeared to fail only because it was executed after several contaminated candidates.
+
+`run_mode1_floor_kv_cap_sweep.sh` now defaults to a conservative cleanup mode:
+
+- `CLEAN_BETWEEN_CANDIDATES=1`
+- `ray stop --force` before and after each candidate
+- repository-scoped cleanup for stale `verl.trainer.main_ppo` processes
+- `CLEANUP_SLEEP_S=20` settling time after cleanup
+
+If this still shows inconsistent results, use a single-candidate sweep invocation for final confirmation, for example:
+
+```bash
+FLOOR=2 KV_CANDIDATES="147456" STOP_ON_FIRST_PASS=1 bash run_mode1_floor_kv_cap_sweep.sh
+```
+
+For upper-bound search, run candidates from high to low, but trust only rows where the completion validator reports all expected rollout steps.  Rows with `exit_code=0` but zero rollout events are not successful lower-bound evidence; they indicate an incomplete or contaminated run.
