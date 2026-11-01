@@ -1,6 +1,6 @@
 # Custom Mode=1 Unified Reference
 
-Last updated: 2026-06-07
+Last updated: 2026-06-14
 
 This file merges the useful final content that originally lived in:
 
@@ -272,7 +272,96 @@ Reason:
 Only the full-world EP signature should be kept this way. Stale floor EP / DP
 groups should not accumulate. Mode=1 does not keep stale DP groups by default.
 
-#### 3.4.4 Why the 7.5 GB cost disappears
+#### 3.4.4 Final 300s stall root cause from bad-path repro
+
+Bad-path repro:
+
+- repo: `/workspace/cann-recipes-train/llm_rl/qwen3_mode1_bad_repro`
+- run: `mode1_bad_repro_runs/20260614T070624Z_floor2_old_bad`
+- training log:
+  `wjeagerqwen30b-a3b-with_draft_breakdown_20260614150624893543200_elastic.txt`
+- CANN/HCCL plog example:
+  `ascend_log/run/plog/plog-1935451_20260614150700320.log`
+
+Observed symptom:
+
+- The final `4->2` shrink to `active_ranks=[14, 15]` took about `324s`.
+- The direct NPU payload transfer itself was not slow:
+  `send_wait_ms` was about `1ms`.
+- The long time was charged to export-side metadata lookup:
+  `send_export_runtime_slot_map_ms=317767ms` on rank 12 and
+  `317744ms` on rank 13.
+- The exact Python boundary was a NPU scalar read of the expert slot map:
+  `expert_map[expert_id].item()`.
+
+Key evidence:
+
+```text
+BAD_REPRO NPU scalar slot read done ... item_ms=317734.11 ... map_device=npu:0
+Elastic shrink stream import breakdown ... send_export_ms=317778.14 ... send_wait_ms=0.91
+```
+
+The corresponding HCCL plog shows that, during the preceding `8->4` shrink,
+an extra 4-rank NPU AllReduce/control-plane communicator was created:
+
+```text
+identifier[group_name_311], userRankSize[4],
+topoRankInfo[userRank/devicePhyId: 0/12; 1/13; 2/14; 3/15]
+create hccl transport: communicator[AllReduce_group_name_311]
+```
+
+That communicator did not finish cleanly. Only part of its heartbeat completed,
+then it timed out around the same moment the Python `.item()` returned:
+
+```text
+group:[group_name_311], establish rank[192.168.0.163/12] to rank[192.168.0.163/15] heartbeat connection success
+establish rank[192.168.0.163/12] to rank[192.168.0.163/13] heartbeat connection failed.
+Reason: get rasocket timeout, timeout[360s]. Group[group_name_311].
+```
+
+The decode payload path used a separate MC2 communicator and was healthy:
+
+```text
+group_name_3158_mc2RunAlltoAllDirectFullmesh_device
+build aicpu unfold resource success
+```
+
+Final root cause:
+
+- The 300s-class stall was not KV cache, P2P bandwidth, zero-offset alias,
+  CPU shadow transfer, rebuild, refresh, or MC2 payload communication.
+- It was caused by an unnecessary mode=1 post-shrink NPU DP
+  AllReduce/metadata path creating a 4-rank HCCL communicator
+  (`group_name_311` in this run) whose heartbeat was incomplete.
+- The communicator failure stayed pending in the NPU/HCCL runtime. A later
+  `expert_map[expert_id].item()` in the `4->2` shrink became a synchronization
+  boundary and waited until the HCCL heartbeat timeout path resolved.
+- `group_name_311` is not a stable name; it is the HCCL-generated name for this
+  run. The bug is the class of communicator: an extra mode=1 NPU DP
+  AllReduce/control-plane group after shrink.
+
+Fix:
+
+- Do not create that NPU DP warmup communicator in mode=1 by default:
+  `VLLM_ASCEND_MODE1_PARITY_ENABLE_POST_SHRINK_DP_WARMUP=0`.
+- Route lightweight mode=1 DP metadata sync through the CPU group:
+  `VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC=1`.
+- Keep the real expert payload on the direct NPU / MC2 path; only scalar
+  metadata/control-plane synchronization is moved away from NPU.
+
+Mentor-report summary:
+
+- Phenomenon: local mode=1 floor=2 final shrink had a stable extra
+  `~300-350s` delay; remote healthy machine did not.
+- Cause: old code created an unnecessary 4-rank NPU DP AllReduce communicator
+  during shrink. Its HCCL heartbeat connection hung and timed out; a later NPU
+  scalar `.item()` exposed the pending HCCL wait.
+- Resolution: remove the unnecessary NPU DP warmup/control-plane path for
+  mode=1 and use CPU DP metadata sync for tiny scalar metadata, while preserving
+  NPU-NPU/MC2 expert payload transfer. This eliminates the timeout without
+  reducing the real payload communication performance.
+
+#### 3.4.5 Why the 7.5 GB cost disappears
 
 The cost did not disappear because the hardware stopped needing communication
 workspace. It disappeared from KV-cache reservation because mode=1 now makes

@@ -951,7 +951,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 elastic_mode == 4
                 and _env_flag("VLLM_ASCEND_MODE4_CPU_DP_METADATA_SYNC", "1")) or (
                     elastic_mode == 3
-                    and _env_flag("VLLM_ASCEND_MODE3_CPU_DP_METADATA_SYNC", "1"))
+                    and _env_flag("VLLM_ASCEND_MODE3_CPU_DP_METADATA_SYNC", "1")) or (
+                        elastic_mode == 1 and _env_flag(
+                            "VLLM_ASCEND_MODE1_CPU_DP_METADATA_SYNC", "1"))
         sync_device = "cpu" if use_cpu_dp_metadata_sync else "npu"
         sync_group = (get_dp_group().cpu_group
                       if use_cpu_dp_metadata_sync else
