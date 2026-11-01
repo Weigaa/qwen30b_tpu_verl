@@ -1100,6 +1100,7 @@ class vLLMRollout(BaseRollout):
                     rotate_modes[rotate_call_idx % len(rotate_modes)]
                     if rotate_buckets else "tail")
                 effective_rank = global_rank
+                explicit_floor4_ranks = None
                 if rotate_mode in ("head", "reverse", "low"):
                     effective_rank = world_size - 1 - global_rank
                 elif rotate_mode in ("tail", "normal", "high"):
@@ -1119,6 +1120,61 @@ class vLLMRollout(BaseRollout):
                             "shift/offset entry=%s; falling back to normal tail "
                             "bucket order.",
                             rotate_mode)
+                        rotate_mode = "tail"
+                        effective_rank = global_rank
+                elif rotate_mode.startswith("floor4:"):
+                    # Validation-only mode: explicitly select the real ranks
+                    # that should fall into the final four tail slots. This
+                    # makes floor=4 communicator overlap experiments precise
+                    # without relying on shift arithmetic in shell scripts.
+                    spec = rotate_mode.split(":", 1)[1].strip()
+                    selected: list[int] = []
+                    try:
+                        for raw_part in spec.replace("+", ";").split(";"):
+                            raw_part = raw_part.strip()
+                            if not raw_part:
+                                continue
+                            if "-" in raw_part:
+                                start_s, end_s = raw_part.split("-", 1)
+                                start = int(start_s.strip())
+                                end = int(end_s.strip())
+                                step = 1 if end >= start else -1
+                                selected.extend(range(start, end + step, step))
+                            else:
+                                selected.append(int(raw_part))
+                        selected = list(dict.fromkeys(selected))
+                        if len(selected) != 4:
+                            raise ValueError(
+                                f"expected 4 ranks, got {len(selected)}")
+                        if any(rank < 0 or rank >= world_size
+                               for rank in selected):
+                            raise ValueError(
+                                f"rank out of range for world_size={world_size}")
+                        selected_sorted = sorted(selected)
+                        tail_slots = list(range(max(world_size - 4, 0),
+                                                world_size))
+                        non_tail_slots = list(range(max(world_size - 4, 0)))
+                        non_selected = [
+                            rank for rank in range(world_size)
+                            if rank not in selected_sorted
+                        ]
+                        logical_rank_map = {
+                            rank: tail_slots[idx]
+                            for idx, rank in enumerate(selected_sorted)
+                        }
+                        logical_rank_map.update({
+                            rank: non_tail_slots[idx]
+                            for idx, rank in enumerate(non_selected)
+                        })
+                        effective_rank = logical_rank_map[global_rank]
+                        explicit_floor4_ranks = tuple(selected_sorted)
+                    except Exception as exc:
+                        logger.warning(
+                            "Invalid VERL_ELASTIC_TAIL_VALIDATE_ROTATE_MODES "
+                            "floor4 entry=%s: %s; falling back to normal tail "
+                            "bucket order.",
+                            rotate_mode,
+                            exc)
                         rotate_mode = "tail"
                         effective_rank = global_rank
                 else:
@@ -1142,7 +1198,8 @@ class vLLMRollout(BaseRollout):
                 logger.info(
                     "Elastic tail validation cap override: rank=%s world_size=%s "
                     "bucket=%s/%s bucket_sizes=%s max_tokens=%s "
-                    "rotate=%s rotate_call=%s effective_rank=%s",
+                    "rotate=%s rotate_call=%s effective_rank=%s "
+                    "explicit_floor4_ranks=%s",
                     global_rank,
                     world_size,
                     bucket_idx,
@@ -1152,6 +1209,7 @@ class vLLMRollout(BaseRollout):
                     rotate_mode if rotate_buckets else "off",
                     rotate_call_idx if rotate_buckets else -1,
                     effective_rank,
+                    explicit_floor4_ranks,
                 )
 
         lora_requests = None

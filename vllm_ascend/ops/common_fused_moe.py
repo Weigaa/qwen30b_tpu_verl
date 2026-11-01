@@ -143,7 +143,10 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.tp_group = get_tp_group()
         self.moe_config.dp_group = get_dp_group()
         self.moe_config.ep_group = get_ep_group()
-        self.moe_config.mc2_group = get_mc2_group()
+        if getattr(self.moe_config, "disable_mc2_comm_method", False):
+            self.moe_config.mc2_group = None
+        else:
+            self.moe_config.mc2_group = get_mc2_group()
         ascend_config = get_ascend_config()
         self.dynamic_eplb = ascend_config.dynamic_eplb
         self.expert_map_path = ascend_config.expert_map_path

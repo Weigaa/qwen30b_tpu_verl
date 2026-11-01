@@ -127,6 +127,36 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                lmhead_tp_enable, vllm_version_is)
 from vllm_ascend.worker.npu_input_batch import CachedRequestState, InputBatch
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes",
+                                                       "on")
+
+
+def _parse_floor4_rank_sets(raw_rank_sets: str) -> set[tuple[int, ...]]:
+    parsed: set[tuple[int, ...]] = set()
+    for raw_item in raw_rank_sets.replace("|", ";").split(";"):
+        raw_item = raw_item.strip()
+        if not raw_item:
+            continue
+        ranks: list[int] = []
+        for raw_part in raw_item.replace("+", ",").split(","):
+            raw_part = raw_part.strip()
+            if not raw_part:
+                continue
+            if "-" in raw_part:
+                start_s, end_s = raw_part.split("-", 1)
+                start = int(start_s.strip())
+                end = int(end_s.strip())
+                step = 1 if end >= start else -1
+                ranks.extend(range(start, end + step, step))
+            else:
+                ranks.append(int(raw_part))
+        ranks_tuple = tuple(sorted(dict.fromkeys(ranks)))
+        if len(ranks_tuple) == 4:
+            parsed.add(ranks_tuple)
+    return parsed
+
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -575,11 +605,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # ((maxBs * tokenNeedSizeDispatch * ep_worldsize * localMoeExpertNum) + (maxBs * tokenNeedSizeCombine * (k + sharedExpertNum))) * 2
         # so we have to limit the MC2 tokens to save memory, should fix this in the future.
         self.mc2_tokens_capacity = 512
-        self.reserved_mc2_mask = torch.zeros(
-            self.mc2_tokens_capacity,
-            dtype=torch.bool,
-            device=self.device,
-        )
+        # Keep one immutable mask for every active-token count. MC2 dispatch
+        # and combine may consume x_active_mask on internal streams after the
+        # Python call returns, so mutating one shared mask in the next forward
+        # can race with the previous collective.
+        mask_token_ids = torch.arange(self.mc2_tokens_capacity,
+                                      device=self.device)
+        mask_lengths = torch.arange(self.mc2_tokens_capacity + 1,
+                                    device=self.device)
+        self.reserved_mc2_mask = (
+            mask_token_ids.unsqueeze(0) < mask_lengths.unsqueeze(1))
         self.dynamic_eplb = self.ascend_config.dynamic_eplb
         if self.dynamic_eplb:
             self.is_eplb_warmuped = False
@@ -2265,6 +2300,26 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         mc2_available = (
             current_ep_size >= envs_ascend.VLLM_ASCEND_MC2_MIN_EP_SIZE
             and not force_alltoall_moe)
+        if (mc2_available and current_ep_size == 4
+                and _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_FALLBACK_ON_UNPOOLED",
+                    "0")):
+            current_ep_ranks = tuple(sorted(int(rank) for rank in get_ep_group().ranks))
+            allowed_rank_sets = _parse_floor4_rank_sets(
+                os.getenv(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL_RANK_SETS",
+                    ""))
+            if (not allowed_rank_sets
+                    or current_ep_ranks not in allowed_rank_sets):
+                mc2_available = False
+                logger.warning(
+                    "Floor4 MC2 fallback on unpooled rank set: ranks=%s "
+                    "allowed_rank_sets=%s num_tokens=%s with_prefill=%s",
+                    current_ep_ranks,
+                    tuple(sorted(allowed_rank_sets)),
+                    num_tokens,
+                    with_prefill,
+                )
 
         if not self.parallel_config.enable_expert_parallel:
             moe_comm_type = MoECommType.ALLGATHER
@@ -2373,6 +2428,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if self.speculative_config and not self.speculative_decoding_active:
             total_num_scheduled_tokens = self.input_batch.num_reqs
+        forward_num_actual_tokens = total_num_scheduled_tokens
+        mode2_uniform_mc2 = (
+            moe_comm_type == MoECommType.MC2
+            and os.getenv("VLLM_ASCEND_ELASTIC_EXECUTION_MODE", "0") == "2"
+            and _env_flag("VLLM_ASCEND_MODE2_UNIFORM_MC2_ACTIVE_MASK", "1"))
+        mode2_num_mlp_tokens = None
+        if mode2_uniform_mc2:
+            forward_num_actual_tokens = num_input_tokens
+            mode2_num_mlp_tokens = total_num_scheduled_tokens
         with ProfileExecuteDuration().capture_async("forward"):
             with set_ascend_forward_context(
                     attn_metadata,
@@ -2384,7 +2448,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     moe_comm_type=moe_comm_type,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
-                    num_actual_tokens=total_num_scheduled_tokens,
+                    num_actual_tokens=forward_num_actual_tokens,
+                    mode2_num_mlp_tokens=mode2_num_mlp_tokens,
                     prefetch_stream=self.prefetch_stream,
                     moe_prefetch_stream=self.moe_prefetch_stream,
                     model_instance=self.model):
@@ -2971,6 +3036,29 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     return self._compute_logits_wrapper(
                         hidden_states[dummy_indices], None)
 
+            forward_num_actual_tokens = max(
+                0, min(num_actual_tokens, num_tokens))
+            mode2_uniform_mc2 = (
+                moe_comm_type == MoECommType.MC2
+                and os.getenv("VLLM_ASCEND_ELASTIC_EXECUTION_MODE", "0") == "2"
+                and _env_flag(
+                    "VLLM_ASCEND_MODE2_UNIFORM_MC2_ACTIVE_MASK", "1"))
+            mode2_num_mlp_tokens = None
+            if mode2_uniform_mc2:
+                # CombineV2 on A3 can fault when peers in the same fixed-slot
+                # group launch one call with sharply different active-BS values
+                # (for example, a one-token dummy beside 32-token live ranks).
+                # The padded rows are already present and their outputs are
+                # discarded, so marking the synchronized launch width active
+                # preserves model results while keeping MC2 metadata uniform.
+                forward_num_actual_tokens = num_tokens
+                # A long-tail dummy has no model-visible rows. Keep its full
+                # synchronized MC2 width, but do not treat the synthetic input
+                # row or its padding as expert-compute work.
+                mode2_num_mlp_tokens = (
+                    0 if is_long_tail else max(
+                        0, min(num_actual_tokens, num_tokens)))
+
             with set_ascend_forward_context(
                     attn_metadata,
                     self.vllm_config,
@@ -2980,7 +3068,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     in_profile_run=self.in_profile_run,
                     reserved_mc2_mask=self.reserved_mc2_mask,
                     moe_comm_type=moe_comm_type,
-                    num_actual_tokens=max(0, min(num_actual_tokens, num_tokens)),
+                    num_actual_tokens=forward_num_actual_tokens,
+                    mode2_num_mlp_tokens=mode2_num_mlp_tokens,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     prefetch_stream=self.prefetch_stream,

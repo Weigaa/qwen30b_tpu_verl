@@ -58,7 +58,10 @@ def _resolve_model_type(moe_config: FusedMoEConfig) -> str:
 def setup_moe_comm_method(moe_config):
     _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
-    _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
+    if getattr(moe_config, "disable_mc2_comm_method", False):
+        _MoECommMethods.pop(MoECommType.MC2, None)
+    else:
+        _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
     _MoECommMethods[MoECommType.NAIVE_MULTICAST] = NaiveMulticastCommImpl(
         moe_config)
 
@@ -70,6 +73,8 @@ class MoECommMethod(ABC):
         self.model_type = _resolve_model_type(moe_config)
         self.moe_config = moe_config
         self.mc2_mask = None
+        self.mode2_mlp_mask = None
+        self.mode2_num_mlp_tokens = None
 
         self.token_dispatcher = self._get_token_dispatcher()
         self.fused_moe_prepare_finalize = self._get_fused_moe_prepare_finalize(
@@ -86,6 +91,27 @@ class MoECommMethod(ABC):
             hidden_states, router_logits, enable_shared_expert_dp,
             rm_router_logits, replace_allreduce, gate)
         self.mc2_mask = mc2_mask
+        forward_context = get_forward_context()
+        mode2_mlp_mask = getattr(forward_context, "mode2_mlp_mask", None)
+        mode2_num_mlp_tokens = getattr(
+            forward_context, "mode2_num_mlp_tokens", None)
+        tp_size = int(
+            getattr(self.fused_moe_prepare_finalize, "tp_size", 1))
+        tp_rank = int(
+            getattr(self.fused_moe_prepare_finalize, "tp_rank", 0))
+        if mode2_mlp_mask is not None and tp_size > 1:
+            full_num_tokens = int(mode2_mlp_mask.shape[0])
+            split_masks = torch.tensor_split(mode2_mlp_mask, tp_size, dim=0)
+            mode2_mlp_mask = split_masks[tp_rank]
+            if mode2_num_mlp_tokens is not None:
+                base_size, remainder = divmod(full_num_tokens, tp_size)
+                split_start = tp_rank * base_size + min(tp_rank, remainder)
+                split_size = base_size + int(tp_rank < remainder)
+                mode2_num_mlp_tokens = max(
+                    0,
+                    min(int(mode2_num_mlp_tokens) - split_start, split_size))
+        self.mode2_mlp_mask = mode2_mlp_mask
+        self.mode2_num_mlp_tokens = mode2_num_mlp_tokens
         return hidden_states, router_logits
 
     def finalize(self, hidden_states: torch.Tensor,

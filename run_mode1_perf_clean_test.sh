@@ -98,6 +98,8 @@ export VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC=0
 export VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE=0
 export VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS=0
 
+source "$SCRIPT_DIR/perf_clean_common_env.sh"
+
 export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-47241}"
 export MASTER_PORT="${MASTER_PORT:-26240}"
 export VERL_HCCL_IF_BASE_PORT_START="${VERL_HCCL_IF_BASE_PORT_START:-47241}"
@@ -121,5 +123,6 @@ printf '[mode1 perf clean] profile=%s timing_log=%s timing_sync=%s markers=%s\n'
     "$VLLM_ASCEND_STAGE_DECODE_PROFILE_MARKERS"
 printf '[mode1 perf clean] ports HCCL_IF_BASE_PORT=%s MASTER_PORT=%s VERL_HCCL_IF_BASE_PORT_START=%s\n' \
     "$HCCL_IF_BASE_PORT" "$MASTER_PORT" "$VERL_HCCL_IF_BASE_PORT_START"
+print_perf_clean_common_config
 
-bash "$LAUNCHER" 2>&1 | tee "$tee_log"
+bash "$LAUNCHER" "${PERF_CLEAN_LAUNCHER_ARGS[@]}" 2>&1 | tee "$tee_log"

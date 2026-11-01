@@ -786,6 +786,45 @@ def _module_is_mode4_remote_npu_lightweight(module: nn.Module) -> bool:
     return True
 
 
+def _module_is_mode2_fixed_slot_lightweight(module: nn.Module) -> bool:
+    if not _is_ascend_fused_moe_module(module):
+        return False
+    if int(getattr(module, "elastic_execution_mode", 0) or 0) != 2:
+        return False
+    if not _module_uses_lossless_elastic(module):
+        return False
+    if not _module_hybrid_cpu_swap_enabled(module):
+        return False
+    get_resident_capacity = getattr(module, "_get_hybrid_resident_capacity",
+                                    None)
+    if not callable(get_resident_capacity):
+        return False
+    try:
+        resident_capacity = int(get_resident_capacity())
+    except (TypeError, ValueError):
+        return False
+    if resident_capacity <= 0:
+        return False
+    if bool(getattr(module, "lossless_loaded_offloaded", False)):
+        return False
+    loaded_capacity = int(getattr(module, "loaded_weight_capacity", 0) or 0)
+    if loaded_capacity < resident_capacity:
+        return False
+    w13_weight = getattr(module, "w13_weight", None)
+    w2_weight = getattr(module, "w2_weight", None)
+    if w13_weight is None or w2_weight is None:
+        return False
+    if (len(w13_weight.shape) < 1 or len(w2_weight.shape) < 1
+            or int(w13_weight.shape[0]) < resident_capacity
+            or int(w2_weight.shape[0]) < resident_capacity):
+        return False
+    # The loaded per-layer prefix is already included in profile_run(). Mode 2
+    # reuses those same rows as its CPU-swap destination instead of allocating a
+    # floor-sized NPU expert table, so charging all generic elastic headrooms is
+    # the same double accounting avoided by the mode 3/4/5 lightweight paths.
+    return True
+
+
 def _module_is_mode3_cross_layer_lightweight(module: nn.Module) -> bool:
     if not _is_ascend_fused_moe_module(module):
         return False
@@ -806,6 +845,9 @@ def _module_is_mode3_cross_layer_lightweight(module: nn.Module) -> bool:
 
 def _module_is_elastic_lightweight_no_headroom(module: nn.Module) -> bool:
     if _module_is_mode1_lightweight_parity(module):
+        return True
+    if (_module_is_mode2_fixed_slot_lightweight(module)
+            and not _env_flag("VLLM_ASCEND_MODE2_ENABLE_GENERIC_HEADROOM", "0")):
         return True
     if (_module_is_mode4_remote_npu_lightweight(module)
             and not _env_flag("VLLM_ASCEND_MODE4_ENABLE_GENERIC_HEADROOM", "0")):
@@ -861,6 +903,8 @@ def _module_mode1_lightweight_parity_path(module: nn.Module) -> str:
 
 
 def _module_lightweight_no_headroom_path(module: nn.Module) -> str:
+    if _module_is_mode2_fixed_slot_lightweight(module):
+        return "mode2_fixed_slot_cpu_swap"
     if _module_is_mode4_remote_npu_lightweight(module):
         mode = int(getattr(module, "elastic_execution_mode", 0) or 0)
         if mode == 5:
@@ -1273,6 +1317,29 @@ class NPUWorker(WorkerBase):
                 min_floor = min(min_floor, configured_floor)
         return min_floor
 
+    def _mode2_fixed_slot_lightweight_min_configured_floor(
+            self) -> Optional[int]:
+        model_runner = getattr(self, "model_runner", None)
+        model = getattr(model_runner, "model", None) if model_runner else None
+        if model is None:
+            return None
+
+        min_floor: Optional[int] = None
+        for module in model.modules():
+            if not _module_is_mode2_fixed_slot_lightweight(module):
+                continue
+            if not _module_followup_shrink_enabled(module):
+                continue
+            configured_floor = _module_configured_elastic_floor(module)
+            if configured_floor is None:
+                continue
+            configured_floor = int(configured_floor)
+            if min_floor is None:
+                min_floor = configured_floor
+            else:
+                min_floor = min(min_floor, configured_floor)
+        return min_floor
+
     def _estimate_zero_redundancy_shrink_headroom_bytes(self) -> int:
         model_runner = getattr(self, "model_runner", None)
         model = getattr(model_runner, "model", None) if model_runner else None
@@ -1617,6 +1684,18 @@ class NPUWorker(WorkerBase):
     def _estimate_post_restore_moe_dispatch_headroom_bytes(self) -> int:
         if not envs_ascend.VLLM_ASCEND_ENABLE_ELASTIC_PARALLEL_SHRINK:
             return 0
+        mode2_floor = self._mode2_fixed_slot_lightweight_min_configured_floor()
+        if (mode2_floor is not None
+                and not _env_flag("VLLM_ASCEND_MODE2_ENABLE_GENERIC_HEADROOM",
+                                  "0")):
+            # Fixed-slot weights are already covered by profile_run(). Their NPU
+            # footprint does not decrease with the configured shrink floor, so
+            # use the floor=2 validated dispatch peak for every mode=2 floor.
+            # This remains much smaller than summing all generic elastic budgets.
+            default_headroom_bytes = 6 * 1024 * 1024 * 1024
+            return int(
+                os.getenv("VLLM_ASCEND_MODE2_MOE_DISPATCH_HEADROOM_BYTES",
+                          str(default_headroom_bytes)))
         mode4_floor = self._mode4_lightweight_min_configured_floor()
         if (mode4_floor is not None
                 and not _env_flag("VLLM_ASCEND_MODE4_ENABLE_GENERIC_HEADROOM",
@@ -2339,7 +2418,11 @@ class NPUWorker(WorkerBase):
                         module.moe_config.moe_parallel_config = module.moe_parallel_config
                         module.moe_config.dp_group = current_dp_group
                         module.moe_config.ep_group = current_ep_group
-                        module.moe_config.mc2_group = get_mc2_group()
+                        if getattr(module.moe_config,
+                                   "disable_mc2_comm_method", False):
+                            module.moe_config.mc2_group = None
+                        else:
+                            module.moe_config.mc2_group = get_mc2_group()
                         original_num_experts = int(
                             module.elastic_original_num_experts)
                         module.num_experts = original_num_experts
@@ -2372,7 +2455,15 @@ class NPUWorker(WorkerBase):
                                     getattr(module,
                                             "active_local_num_experts", None),
                                     get_ep_group().world_size)
+                            self._set_module_mc2_disabled_for_unpooled_floor4(
+                                module, active_ranks,
+                                "restore_full_world_refresh_groups")
                             module.refresh_elastic_groups()
+                            self._log_floor4_mc2_binding_state(
+                                "restore_full_world_refresh_groups",
+                                module,
+                                active_ranks,
+                            )
                         continue
                     raise RuntimeError(
                         f"Missing lossless shrink payload for layer={module.layer_idx}."
@@ -2668,7 +2759,14 @@ class NPUWorker(WorkerBase):
                 hybrid_t4 = time.perf_counter() if use_hybrid_cpu_swap else None
                 # Rebuild the token dispatcher with the post-shrink local expert
                 # count before decode resumes on the new 8-rank EP group.
+                self._set_module_mc2_disabled_for_unpooled_floor4(
+                    module, active_ranks, "lossless_refresh_groups")
                 module.refresh_elastic_groups()
+                self._log_floor4_mc2_binding_state(
+                    "lossless_refresh_groups",
+                    module,
+                    active_ranks,
+                )
                 hybrid_t5 = time.perf_counter() if use_hybrid_cpu_swap else None
                 imported_expert_ids = [
                     expert_id for expert_id, source_local_id in zip(
@@ -2789,7 +2887,15 @@ class NPUWorker(WorkerBase):
                 _set_moe_active_expert_mask(module, None)
                 _set_moe_elastic_runtime_log2phy(module, None)
                 module.moe_config.num_experts = module.elastic_original_num_experts
+                self._set_module_mc2_disabled_for_unpooled_floor4(
+                    module, active_ranks,
+                    "non_lossless_empty_map_refresh_groups")
                 module.refresh_elastic_groups()
+                self._log_floor4_mc2_binding_state(
+                    "non_lossless_empty_map_refresh_groups",
+                    module,
+                    active_ranks,
+                )
                 continue
             else:
                 if participate_only:
@@ -2875,7 +2981,14 @@ class NPUWorker(WorkerBase):
                     _set_moe_elastic_runtime_log2phy(module, None)
                     module.set_runtime_num_experts(sum(local_expert_counts))
 
+                self._set_module_mc2_disabled_for_unpooled_floor4(
+                    module, active_ranks, "non_lossless_refresh_groups")
                 module.refresh_elastic_groups()
+                self._log_floor4_mc2_binding_state(
+                    "non_lossless_refresh_groups",
+                    module,
+                    active_ranks,
+                )
 
         if is_active_rank and aggregate_mode5_hybrid_layers > 0:
             mode5_strategy = _mode5_cpu_shadow_runtime_strategy()
@@ -7238,6 +7351,26 @@ class NPUWorker(WorkerBase):
                 int(rank) for rank in getattr(group, "ranks", []))
         else:
             group_ranks = tuple(int(rank) for rank in group_ranks)
+        if self._is_floor4_mc2_live_pool_group(normalized_group_kind,
+                                               group_ranks):
+            # Live-pool groups are intentionally process-lifetime resources.
+            # If one reaches the generic retire path, returning early is safer
+            # than touching its PG references and accidentally triggering the
+            # same HCCL destroy/recreate tail that this mode avoids.
+            self._log_floor4_mc2_live_pool_state("retire_skip", group_ranks)
+            return {
+                "retire_wrapper_ms": (
+                    time.perf_counter() - retire_start_t) * 1000.0,
+                "npu_sync_ms": 0.0,
+                "device_pg_destroy_ms": 0.0,
+                "destroy_device_pg": 0.0,
+                "dropped_pg_refs": 0.0,
+                "deferred_device_pg_refs": 0.0,
+                "deferred_cpu_pg_refs": 0.0,
+                "device_pgs": [],
+                "destroyed_device_pgs": [],
+                "cpu_pgs": [],
+            }
         if _env_flag("VLLM_ASCEND_MODE1_PARITY_SYNC_BEFORE_DEVICE_PG_RETIRE",
                      "1"):
             sync_start_t = time.perf_counter()
@@ -7612,6 +7745,10 @@ class NPUWorker(WorkerBase):
         is_floor4_mc2 = (
             (group_kind or "").lower() == "mc2" and len(group_ranks) == 4
             and self._is_mode1_low_floor_elastic_runtime())
+        if self._is_floor4_mc2_live_pool_group(group_kind, group_ranks):
+            self._log_floor4_mc2_live_pool_state("quarantine_skip",
+                                                 group_ranks)
+            return False
         quarantine_total_start_t = time.perf_counter()
         mark_ms = 0.0
         retire_call_ms = 0.0
@@ -7913,6 +8050,386 @@ class NPUWorker(WorkerBase):
             return "mc2"
         return normalized_name
 
+    def _floor4_mc2_live_pool_allowed_rank_sets(
+            self) -> set[tuple[int, ...]]:
+        raw_rank_sets = os.getenv(
+            "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL_RANK_SETS",
+            "").strip()
+        if not raw_rank_sets:
+            return set()
+        cached_raw = getattr(self, "_elastic_floor4_mc2_live_pool_rank_sets_raw",
+                             None)
+        cached_sets = getattr(self, "_elastic_floor4_mc2_live_pool_rank_sets",
+                              None)
+        if cached_raw == raw_rank_sets and cached_sets is not None:
+            return cached_sets
+        parsed_sets: set[tuple[int, ...]] = set()
+        for raw_item in raw_rank_sets.replace("|", ";").split(";"):
+            raw_item = raw_item.strip()
+            if not raw_item:
+                continue
+            ranks: list[int] = []
+            try:
+                for raw_part in raw_item.replace("+", ",").split(","):
+                    raw_part = raw_part.strip()
+                    if not raw_part:
+                        continue
+                    if "-" in raw_part:
+                        start_s, end_s = raw_part.split("-", 1)
+                        start = int(start_s.strip())
+                        end = int(end_s.strip())
+                        step = 1 if end >= start else -1
+                        ranks.extend(range(start, end + step, step))
+                    else:
+                        ranks.append(int(raw_part))
+                ranks_tuple = tuple(sorted(dict.fromkeys(ranks)))
+                if len(ranks_tuple) != 4:
+                    raise ValueError(
+                        f"expected 4 unique ranks, got {len(ranks_tuple)}")
+                parsed_sets.add(ranks_tuple)
+            except Exception:
+                logger.warning(
+                    "Invalid floor4 MC2 live-pool rank set ignored: rank=%s raw=%s all_raw=%s",
+                    self.rank,
+                    raw_item,
+                    raw_rank_sets,
+                    exc_info=True,
+                )
+        self._elastic_floor4_mc2_live_pool_rank_sets_raw = raw_rank_sets
+        self._elastic_floor4_mc2_live_pool_rank_sets = parsed_sets
+        return parsed_sets
+
+    def _is_floor4_mc2_live_pool_candidate(
+            self, group_kind: str,
+            group_ranks: tuple[int, ...]) -> bool:
+        return (
+            _env_flag("VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL", "0")
+            and self._is_mode1_low_floor_elastic_runtime()
+            and (group_kind or "").lower() == "mc2"
+            and len(tuple(group_ranks or ())) == 4)
+
+    def _is_floor4_mc2_live_pool_group(
+            self, group_kind: str,
+            group_ranks: tuple[int, ...]) -> bool:
+        """Keep 4-rank MC2 groups resident and reusable during mode=1 runs.
+
+        The affected CANN/HCCL stack can return quickly from explicit
+        destroy_process_group() while later restore/rebuild still blocks on
+        residual 4-rank MC2 communicator state.  This opt-in mode avoids that
+        lifecycle entirely: floor4 MC2 groups are treated as a bounded live pool
+        keyed by rank tuple, not as stale groups to retire in the hot path.
+        """
+        ranks_tuple = tuple(int(rank) for rank in tuple(group_ranks or ()))
+        if not self._is_floor4_mc2_live_pool_candidate(group_kind,
+                                                       ranks_tuple):
+            return False
+        allowed_rank_sets = self._floor4_mc2_live_pool_allowed_rank_sets()
+        if not allowed_rank_sets:
+            # In pure live-pool diagnostics, an empty whitelist historically
+            # meant "pool any floor4 MC2 tuple".  Once unpooled fallback is
+            # enabled, the same empty value should mean "no floor4 tuple is
+            # allowed to create MC2"; otherwise arbitrary 4-rank tests silently
+            # re-enter the HCCL floor4 MC2 create/destroy path.
+            return not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_FALLBACK_ON_UNPOOLED",
+                "0")
+        return tuple(sorted(ranks_tuple)) in allowed_rank_sets
+
+    def _ensure_floor4_mc2_live_pool_rank_set_allowed(
+            self, group_kind: str, group_ranks: tuple[int, ...],
+            event: str) -> None:
+        ranks_tuple = tuple(int(rank) for rank in tuple(group_ranks or ()))
+        if not self._is_floor4_mc2_live_pool_candidate(group_kind,
+                                                       ranks_tuple):
+            return
+        allowed_rank_sets = self._floor4_mc2_live_pool_allowed_rank_sets()
+        if not allowed_rank_sets:
+            if _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_FALLBACK_ON_UNPOOLED",
+                    "0"):
+                return
+            return
+        if tuple(sorted(ranks_tuple)) in allowed_rank_sets:
+            return
+        message = (
+            "Floor4 MC2 live-pool rank set is not allowed: "
+            f"rank={self.rank} event={event} group_ranks={ranks_tuple} "
+            f"allowed_rank_sets={tuple(sorted(allowed_rank_sets))}")
+        logger.warning(message)
+        if _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL_STRICT_RANK_SETS",
+                "1"):
+            raise RuntimeError(message)
+
+    def _ensure_floor4_mc2_live_pool_capacity(
+            self, group_kind: str, group_ranks: tuple[int, ...],
+            event: str) -> None:
+        ranks_tuple = tuple(int(rank) for rank in tuple(group_ranks or ()))
+        if not self._is_floor4_mc2_live_pool_group(group_kind, ranks_tuple):
+            return
+        max_groups_raw = os.getenv(
+            "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL_MAX_GROUPS",
+            "0").strip()
+        try:
+            max_groups = int(max_groups_raw) if max_groups_raw else 0
+        except ValueError:
+            max_groups = 0
+        if max_groups <= 0:
+            return
+        cached_groups = getattr(self, "_elastic_cached_parallel_groups", None)
+        real_pool = ((cached_groups or {}).get("_MC2") or {})
+        placeholder_pool = getattr(self, "_elastic_floor4_mc2_placeholder_groups",
+                                   {}) or {}
+        if ranks_tuple in real_pool or ranks_tuple in placeholder_pool:
+            return
+        combined_pool_size = len([
+            ranks for ranks in real_pool.keys() if len(tuple(ranks)) == 4
+        ]) + len(placeholder_pool)
+        if combined_pool_size < max_groups:
+            return
+        message = (
+            "Floor4 MC2 live-pool capacity exceeded before creating group: "
+            f"rank={self.rank} event={event} group_ranks={ranks_tuple} "
+            f"max_groups={max_groups} combined_pool_size={combined_pool_size} "
+            f"real_pool={tuple(sorted(tuple(ranks) for ranks in real_pool.keys() if len(tuple(ranks)) == 4))} "
+            f"placeholder_pool={tuple(sorted(tuple(ranks) for ranks in placeholder_pool.keys()))}")
+        logger.error(message)
+        raise RuntimeError(message)
+
+    def _log_floor4_mc2_unpooled_rebuild_if_needed(
+            self, group_kind: str, group_ranks: tuple[int, ...],
+            event: str) -> None:
+        ranks_tuple = tuple(int(rank) for rank in tuple(group_ranks or ()))
+        if not (
+                _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_FALLBACK_ON_UNPOOLED",
+                    "0")
+                and self._is_floor4_mc2_live_pool_candidate(group_kind,
+                                                            ranks_tuple)
+                and not self._is_floor4_mc2_live_pool_group(
+                    group_kind, ranks_tuple)):
+            return
+        logger.warning(
+            "Floor4 MC2 unpooled rebuild before fallback: rank=%s event=%s "
+            "group_ranks=%s allowed_rank_sets=%s",
+            self.rank,
+            event,
+            ranks_tuple,
+            tuple(sorted(self._floor4_mc2_live_pool_allowed_rank_sets())),
+        )
+
+    def _should_disable_mc2_for_unpooled_floor4(
+            self, active_ranks: tuple[int, ...]) -> bool:
+        ranks_tuple = tuple(int(rank) for rank in tuple(active_ranks or ()))
+        if not (
+                _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_FALLBACK_ON_UNPOOLED",
+                    "0")
+                and self._is_floor4_mc2_live_pool_candidate("mc2",
+                                                            ranks_tuple)):
+            return False
+        return not self._is_floor4_mc2_live_pool_group("mc2", ranks_tuple)
+
+    def _set_module_mc2_disabled_for_unpooled_floor4(
+            self, module, active_ranks: tuple[int, ...], event: str) -> None:
+        disable_mc2 = self._should_disable_mc2_for_unpooled_floor4(active_ranks)
+        moe_config = getattr(module, "moe_config", None)
+        if moe_config is None:
+            return
+        setattr(moe_config, "disable_mc2_comm_method", bool(disable_mc2))
+        if disable_mc2 and int(getattr(module, "layer_idx", -1)) == 0:
+            logger.warning(
+                "Floor4 MC2 comm method disabled for unpooled rank set: "
+                "rank=%s event=%s active_ranks=%s allowed_rank_sets=%s",
+                self.rank,
+                event,
+                tuple(int(rank) for rank in tuple(active_ranks or ())),
+                tuple(sorted(self._floor4_mc2_live_pool_allowed_rank_sets())),
+            )
+
+    def _suppress_mc2_for_unpooled_floor4_rebuild(
+            self, ascend_ps_module, active_ranks: tuple[int, ...],
+            event: str) -> None:
+        """Avoid creating a new MC2 group for a non-MC2 floor4 fallback.
+
+        The model path will use alltoall/allgather for unpooled floor=4 rank
+        sets.  Rebuilding `_MC2` here would still create the problematic
+        4-rank HCCL communicator before model_runner has a chance to fall back.
+        If the currently bound MC2 pointer is already a 4-rank old group, detach
+        it and keep a private reference so Python GC does not run communicator
+        teardown on this hot path.  Otherwise leave the existing full-world/8-rank
+        pointer alone; non-MC2 forward code must not consult it.
+        """
+        old_group = getattr(ascend_ps_module, "_MC2", None)
+        old_group_ranks = self._safe_group_ranks_for_log(old_group)
+        detached_old_floor4 = int(
+            old_group is not None and old_group_ranks is not None
+            and len(tuple(old_group_ranks)) == 4)
+        if detached_old_floor4:
+            setattr(ascend_ps_module, "_MC2", None)
+            suppressed = getattr(self,
+                                 "_elastic_suppressed_unpooled_floor4_mc2",
+                                 None)
+            if suppressed is None:
+                suppressed = []
+                self._elastic_suppressed_unpooled_floor4_mc2 = suppressed
+            suppressed.append({
+                "group": old_group,
+                "group_ranks": old_group_ranks,
+                "active_ranks": tuple(int(rank) for rank in active_ranks),
+                "event": event,
+                "time": time.time(),
+            })
+        logger.warning(
+            "Floor4 MC2 rebuild skipped for unpooled rank set: "
+            "rank=%s event=%s active_ranks=%s old_mc2_ranks=%s "
+            "detached_old_floor4=%s suppressed_count=%s allowed_rank_sets=%s",
+            self.rank,
+            event,
+            tuple(int(rank) for rank in tuple(active_ranks or ())),
+            old_group_ranks,
+            detached_old_floor4,
+            len(getattr(self, "_elastic_suppressed_unpooled_floor4_mc2", [])
+                or []),
+            tuple(sorted(self._floor4_mc2_live_pool_allowed_rank_sets())),
+        )
+
+    def _floor4_mc2_live_pool_state(self) -> tuple[int, tuple[tuple[int, ...], ...]]:
+        cached_groups = getattr(self, "_elastic_cached_parallel_groups", None)
+        if not cached_groups:
+            return 0, ()
+        groups_by_ranks = cached_groups.get("_MC2") or {}
+        floor4_ranks = tuple(
+            sorted(
+                tuple(int(rank) for rank in ranks)
+                for ranks in groups_by_ranks.keys()
+                if len(tuple(ranks)) == 4))
+        return len(floor4_ranks), floor4_ranks
+
+    def _floor4_mc2_placeholder_pool_state(
+            self) -> tuple[int, tuple[tuple[int, ...], ...]]:
+        placeholder_groups = getattr(self, "_elastic_floor4_mc2_placeholder_groups",
+                                     None)
+        if not placeholder_groups:
+            return 0, ()
+        floor4_ranks = tuple(sorted(tuple(ranks)
+                                    for ranks in placeholder_groups.keys()))
+        return len(floor4_ranks), floor4_ranks
+
+    def _log_floor4_mc2_live_pool_state(
+            self, event: str, group_ranks: tuple[int, ...]) -> None:
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL_LOG", "1"):
+            return
+        pool_size, pool_ranks = self._floor4_mc2_live_pool_state()
+        placeholder_pool_size, placeholder_pool_ranks = (
+            self._floor4_mc2_placeholder_pool_state())
+        allowed_rank_sets = tuple(sorted(
+            self._floor4_mc2_live_pool_allowed_rank_sets()))
+        max_pool_size = int(
+            os.getenv("VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL_WARN_SIZE",
+                      "8"))
+        combined_pool_size = pool_size + placeholder_pool_size
+        pool_over_budget = int(combined_pool_size >= max_pool_size)
+        log_fn = logger.warning if pool_over_budget else logger.info
+        log_fn(
+            "Elastic floor4 MC2 live pool: rank=%s event=%s group_ranks=%s "
+            "pool_size=%s pool_ranks=%s placeholder_pool_size=%s "
+            "placeholder_pool_ranks=%s combined_pool_size=%s "
+            "pool_over_budget=%s warn_size=%s allowed_rank_sets=%s",
+            self.rank,
+            event,
+            group_ranks,
+            pool_size,
+            pool_ranks,
+            placeholder_pool_size,
+            placeholder_pool_ranks,
+            combined_pool_size,
+            pool_over_budget,
+            max_pool_size,
+            allowed_rank_sets,
+        )
+
+    def _safe_group_ranks_for_log(self, group) -> tuple[int, ...] | None:
+        if group is None:
+            return None
+        for attr_name in (
+                "ranks",
+                "group_ranks",
+                "global_ranks",
+                "ranks_in_group",
+                "_ranks",
+                "_group_ranks",
+        ):
+            try:
+                ranks = getattr(group, attr_name, None)
+            except Exception:
+                ranks = None
+            if ranks is None:
+                continue
+            if callable(ranks):
+                try:
+                    ranks = ranks()
+                except Exception:
+                    continue
+            try:
+                return tuple(int(rank) for rank in tuple(ranks))
+            except Exception:
+                continue
+        return None
+
+    def _log_floor4_mc2_binding_state(
+            self, event: str, module, active_ranks: tuple[int, ...]) -> None:
+        """Log whether a MoE module still points at a stale MC2 group.
+
+        This is deliberately read-only and avoids global parallel_state calls:
+        the log itself must not create/destroy groups or enter synchronization.
+        """
+        if not _env_flag(
+                "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_BINDING_LOG", "0"):
+            return
+        if not self._is_mode1_low_floor_elastic_runtime():
+            return
+        if int(getattr(module, "layer_idx", -1)) != 0:
+            return
+        expected_ranks = tuple(int(rank) for rank in tuple(active_ranks or ()))
+        if len(expected_ranks) != 4:
+            return
+        moe_config = getattr(module, "moe_config", None)
+        module_group = getattr(moe_config, "mc2_group", None) if moe_config else None
+        module_group_ranks = self._safe_group_ranks_for_log(module_group)
+        mismatch = int(module_group_ranks is not None
+                       and tuple(module_group_ranks) != expected_ranks)
+        log_fn = logger.warning if mismatch else logger.info
+        log_fn(
+            "Elastic floor4 MC2 binding state: rank=%s event=%s "
+            "layer=%s expected_ranks=%s module_mc2_ranks=%s "
+            "module_mc2_id=%s mismatch=%s",
+            self.rank,
+            event,
+            getattr(module, "layer_idx", None),
+            expected_ranks,
+            module_group_ranks,
+            id(module_group) if module_group is not None else None,
+            mismatch,
+        )
+
+    def _elastic_group_name_for_rebuild(
+            self, group_kind: str, group_name: str,
+            group_ranks: tuple[int, ...]) -> str:
+        if not (
+                _env_flag(
+                    "VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_UNIQUE_GROUP_NAME",
+                    "0")
+                and self._is_mode1_low_floor_elastic_runtime()
+                and (group_kind or "").lower() == "mc2"
+                and len(tuple(group_ranks or ())) == 4):
+            return group_name
+        suffix = "_r" + "_".join(str(int(rank)) for rank in group_ranks)
+        if group_name.endswith(suffix):
+            return group_name
+        return f"{group_name}{suffix}"
+
     def _should_cache_elastic_parallel_group(self, attr_name: str) -> bool:
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
         if group_kind != "mc2":
@@ -7941,6 +8458,15 @@ class NPUWorker(WorkerBase):
             return True
         if ((group_kind or "").lower() == "mc2" and len(group_ranks) == 4
                 and self._is_mode1_low_floor_elastic_runtime()):
+            if self._is_floor4_mc2_live_pool_group(group_kind, group_ranks):
+                return True
+            if _env_flag("VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL", "0"):
+                # When live-pool is enabled, KEEP_FLOOR4_GROUP_CACHE is used
+                # only to keep allowed live-pool tuples resident.  Do not let a
+                # non-allowed floor4 MC2 tuple slip into stale cache, otherwise
+                # it can revisit the exact HCCL teardown/stale-wrapper problem
+                # the live pool is meant to avoid.
+                return False
             # Keep floor4 MC2 out of the elastic cache by default.  The overlap
             # floor4 tests showed that clearing old cache entries alone is not
             # enough: newly rebuilt 4-rank MC2 wrappers can be stored again and
@@ -7984,6 +8510,13 @@ class NPUWorker(WorkerBase):
         # avoided one HCCL destroy path, but overlapping 4-rank groups can then
         # drag an old wrapper through full-restore stash/rebuild and produce
         # 60s+ latency.  Use the env only as an explicit diagnostic opt-in.
+        if self._is_floor4_mc2_live_pool_group(group_kind, cached_group_ranks):
+            return True
+        if ((group_kind or "").lower() == "mc2"
+                and len(cached_group_ranks) == 4
+                and _env_flag("VLLM_ASCEND_MODE1_PARITY_FLOOR4_MC2_LIVE_POOL",
+                              "0")):
+            return False
         keep_floor4_default = "0"
         if not _env_flag("VLLM_ASCEND_MODE1_PARITY_KEEP_FLOOR4_GROUP_CACHE",
                          keep_floor4_default):
@@ -8741,6 +9274,8 @@ class NPUWorker(WorkerBase):
         full_world_ranks = tuple(range(world_size))
         if target_ranks != full_world_ranks:
             return False
+        if self._is_floor4_mc2_live_pool_group(group_kind, group_ranks):
+            return False
         if self._should_keep_mode1_floor4_group_cache(
                 group_kind, group_ranks, target_ranks):
             return False
@@ -8793,6 +9328,8 @@ class NPUWorker(WorkerBase):
             return False
         world_size = int(torch.distributed.get_world_size())
         if group_ranks == tuple(range(world_size)):
+            return False
+        if self._is_floor4_mc2_live_pool_group(group_kind, group_ranks):
             return False
         if self._should_keep_mode1_floor4_group_cache(
                 group_kind, group_ranks, target_ranks):
@@ -9216,14 +9753,34 @@ class NPUWorker(WorkerBase):
             "log_ms": 0.0,
             "groups": 0.0,
             "reuse": 0.0,
+            "live_pool_placeholder_reuse": 0.0,
+            "live_pool_placeholder_store": 0.0,
+            "live_pool_placeholder_signature_seen": 0.0,
+            "live_pool_placeholder_signature_without_pool": 0.0,
         }
         group_kind = self._normalize_elastic_parallel_group_kind(group_name)
         unseen_group_ranks = []
         seen_signatures = self._get_seen_elastic_parallel_group_signatures()
+        placeholder_pool = getattr(self,
+                                   "_elastic_floor4_mc2_placeholder_groups",
+                                   None)
+        if placeholder_pool is None:
+            placeholder_pool = {}
+            self._elastic_floor4_mc2_placeholder_groups = placeholder_pool
         for ranks in group_ranks:
             ranks_key = tuple(int(rank) for rank in ranks)
             group_signature = (group_kind, ranks_key)
             if group_signature in seen_signatures:
+                if self._is_floor4_mc2_live_pool_group(group_kind, ranks_key):
+                    stats["live_pool_placeholder_signature_seen"] += 1.0
+                    if ranks_key in placeholder_pool:
+                        self._log_floor4_mc2_live_pool_state(
+                            "placeholder_signature_seen", ranks_key)
+                    else:
+                        stats[
+                            "live_pool_placeholder_signature_without_pool"] += 1.0
+                        self._log_floor4_mc2_live_pool_state(
+                            "placeholder_signature_seen_no_pool", ranks_key)
                 continue
             unseen_group_ranks.append(ranks)
 
@@ -9252,17 +9809,37 @@ class NPUWorker(WorkerBase):
             return stats
 
         placeholder_groups = []
+        pooled_group_keys: set[tuple[int, ...]] = set()
         for ranks in unseen_group_ranks:
+            ranks_key = tuple(int(rank) for rank in ranks)
+            self._ensure_floor4_mc2_live_pool_rank_set_allowed(
+                group_kind, ranks_key, "placeholder_pre_create")
+            if self._is_floor4_mc2_live_pool_group(group_kind, ranks_key):
+                self._ensure_floor4_mc2_live_pool_capacity(
+                    group_kind, ranks_key, "placeholder_pre_create")
+                pooled_placeholder = placeholder_pool.get(ranks_key)
+                if pooled_placeholder is not None:
+                    stats["live_pool_placeholder_reuse"] += 1.0
+                    self._log_floor4_mc2_live_pool_state(
+                        "placeholder_cache_hit", ranks_key)
+                    continue
             device_group_start_t = time.perf_counter()
-            placeholder_groups.append(
-                torch.distributed.new_group(ranks, backend=backend))
+            device_group = torch.distributed.new_group(ranks, backend=backend)
             stats["device_new_group_ms"] += (
                 time.perf_counter() - device_group_start_t) * 1000.0
             cpu_group_start_t = time.perf_counter()
-            placeholder_groups.append(
-                torch.distributed.new_group(ranks, backend="gloo"))
+            cpu_group = torch.distributed.new_group(ranks, backend="gloo")
             stats["cpu_new_group_ms"] += (
                 time.perf_counter() - cpu_group_start_t) * 1000.0
+            if self._is_floor4_mc2_live_pool_group(group_kind, ranks_key):
+                placeholder_pool[ranks_key] = (device_group, cpu_group)
+                pooled_group_keys.add(ranks_key)
+                stats["live_pool_placeholder_store"] += 1.0
+                self._log_floor4_mc2_live_pool_state(
+                    "placeholder_cache_store", ranks_key)
+            else:
+                placeholder_groups.append(device_group)
+                placeholder_groups.append(cpu_group)
 
         destroy_start_t = time.perf_counter()
         for group in placeholder_groups:
@@ -9283,11 +9860,16 @@ class NPUWorker(WorkerBase):
         if verbose_sequence_log or stats["total_ms"] >= slow_log_ms:
             log_start_t = time.perf_counter()
             logger.info(
-                "Elastic parallel non-member group sequence advanced: rank=%s group_name=%s groups=%s total_ms=%.2f device_new_group_ms=%.2f cpu_new_group_ms=%.2f destroy_ms=%.2f signature_ms=%.2f",
+                "Elastic parallel non-member group sequence advanced: rank=%s group_name=%s groups=%s total_ms=%.2f device_new_group_ms=%.2f cpu_new_group_ms=%.2f destroy_ms=%.2f signature_ms=%.2f live_pool_placeholder_store=%.0f live_pool_placeholder_reuse=%.0f live_pool_placeholder_signature_seen=%.0f live_pool_placeholder_signature_without_pool=%.0f pooled_keys=%s",
                 self.rank, group_name, len(unseen_group_ranks),
                 stats["total_ms"], stats["device_new_group_ms"],
                 stats["cpu_new_group_ms"], stats["destroy_ms"],
-                stats["signature_ms"])
+                stats["signature_ms"],
+                stats["live_pool_placeholder_store"],
+                stats["live_pool_placeholder_reuse"],
+                stats["live_pool_placeholder_signature_seen"],
+                stats["live_pool_placeholder_signature_without_pool"],
+                tuple(sorted(pooled_group_keys)))
             stats["log_ms"] = (time.perf_counter() - log_start_t) * 1000.0
             stats["total_ms"] = (time.perf_counter() - start_t) * 1000.0
         return stats
@@ -9401,11 +9983,13 @@ class NPUWorker(WorkerBase):
                                         None)
         self._elastic_rebuild_target_ranks = local_group_ranks
         group_kind = self._normalize_elastic_parallel_group_kind(attr_name)
+        effective_group_name = self._elastic_group_name_for_rebuild(
+            group_kind, group_name, local_group_ranks)
         try:
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "before_rebuild_mc2_stash",
-                    f"group_name={group_name} target_ranks={local_group_ranks}",
+                    f"group_name={effective_group_name} base_group_name={group_name} target_ranks={local_group_ranks}",
                 )
             stash_start_t = time.perf_counter()
             self._stash_group_if_present(state_module, attr_name)
@@ -9437,7 +10021,7 @@ class NPUWorker(WorkerBase):
                             self.rank,
                             attr_name,
                             group_kind,
-                            group_name,
+                            effective_group_name,
                             local_group_ranks,
                         )
                         cached_groups.get(attr_name,
@@ -9450,36 +10034,61 @@ class NPUWorker(WorkerBase):
                         cache_hit = True
                 if cached_group is not None and cache_hit:
                     if self._elastic_group_cache_hit_log_enabled():
+                        cached_device_pg = getattr(cached_group,
+                                                   "device_group", None)
+                        cached_cpu_pg = getattr(cached_group, "cpu_group", None)
                         logger.info(
-                            "Elastic parallel group cache hit: rank=%s attr=%s group_name=%s ranks=%s",
-                            self.rank, attr_name, group_name,
-                            local_group_ranks)
+                            "Elastic parallel group cache hit: rank=%s attr=%s "
+                            "group_name=%s base_group_name=%s ranks=%s "
+                            "coordinator_id=%s device_pg_id=%s cpu_pg_id=%s",
+                            self.rank,
+                            attr_name,
+                            effective_group_name,
+                            group_name,
+                            local_group_ranks,
+                            id(cached_group),
+                            id(cached_device_pg)
+                            if cached_device_pg is not None else None,
+                            id(cached_cpu_pg) if cached_cpu_pg is not None else None,
+                        )
+                    if self._is_floor4_mc2_live_pool_group(
+                            group_kind, local_group_ranks):
+                        self._log_floor4_mc2_live_pool_state(
+                            "cache_hit", local_group_ranks)
                     if group_kind == "mc2":
                         self._log_custom_mode1_worker_memory(
                             "after_rebuild_mc2_cache_hit",
-                            f"group_name={group_name} ranks={local_group_ranks}",
+                            f"group_name={effective_group_name} base_group_name={group_name} ranks={local_group_ranks}",
                         )
                     return
             elif should_cache_group and bypass_cache_hit:
                 logger.info(
                     "Elastic parallel group cache bypass: rank=%s attr=%s group_name=%s ranks=%s reason=mode3_restore_force_rebuild_mc2",
-                    self.rank, attr_name, group_name, local_group_ranks)
+                    self.rank, attr_name, effective_group_name,
+                    local_group_ranks)
 
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "before_rebuild_mc2_create",
-                    f"group_name={group_name} ranks={local_group_ranks}",
+                    f"group_name={effective_group_name} base_group_name={group_name} ranks={local_group_ranks}",
                 )
+                self._log_floor4_mc2_unpooled_rebuild_if_needed(
+                    group_kind, local_group_ranks, "rebuild_pre_create")
+                self._ensure_floor4_mc2_live_pool_rank_set_allowed(
+                    group_kind, local_group_ranks, "rebuild_pre_create")
+                self._ensure_floor4_mc2_live_pool_capacity(
+                    group_kind, local_group_ranks, "rebuild_pre_create")
             create_start_t = time.perf_counter()
             setattr(
                 state_module, attr_name,
                 init_model_parallel_group(group_ranks, world_group.local_rank,
-                                          backend, group_name=group_name))
+                                          backend,
+                                          group_name=effective_group_name))
             create_ms = (time.perf_counter() - create_start_t) * 1000.0
             if group_kind == "mc2":
                 self._log_custom_mode1_worker_memory(
                     "after_rebuild_mc2_create",
-                    f"group_name={group_name} ranks={local_group_ranks}",
+                    f"group_name={effective_group_name} base_group_name={group_name} ranks={local_group_ranks}",
                 )
             if local_group_ranks:
                 if should_cache_group:
@@ -9490,9 +10099,28 @@ class NPUWorker(WorkerBase):
                     cache_store_ms = (
                         time.perf_counter() - cache_store_start_t) * 1000.0
                     if group_kind == "mc2":
+                        cached_group_obj = getattr(state_module, attr_name)
+                        cached_device_pg = getattr(cached_group_obj,
+                                                   "device_group", None)
+                        cached_cpu_pg = getattr(cached_group_obj, "cpu_group",
+                                                None)
                         logger.info(
-                            "Elastic parallel MC2 group cached: rank=%s group_name=%s ranks=%s",
-                            self.rank, group_name, local_group_ranks)
+                            "Elastic parallel MC2 group cached: rank=%s "
+                            "group_name=%s base_group_name=%s ranks=%s "
+                            "coordinator_id=%s device_pg_id=%s cpu_pg_id=%s",
+                            self.rank,
+                            effective_group_name,
+                            group_name,
+                            local_group_ranks,
+                            id(cached_group_obj),
+                            id(cached_device_pg)
+                            if cached_device_pg is not None else None,
+                            id(cached_cpu_pg) if cached_cpu_pg is not None else None,
+                        )
+                    if self._is_floor4_mc2_live_pool_group(
+                            group_kind, local_group_ranks):
+                        self._log_floor4_mc2_live_pool_state(
+                            "cache_store", local_group_ranks)
                 self._get_seen_elastic_parallel_group_signatures().add(
                     (group_kind, local_group_ranks))
         finally:
@@ -9511,7 +10139,7 @@ class NPUWorker(WorkerBase):
                     self.rank,
                     attr_name,
                     group_kind,
-                    group_name,
+                    effective_group_name,
                     local_group_ranks,
                     int(cache_hit),
                     total_ms,
@@ -10163,8 +10791,16 @@ class NPUWorker(WorkerBase):
                 rebuild_ep_ms = (
                     time.perf_counter() - rebuild_ep_start_t) * 1000.0
                 rebuild_mc2_start_t = time.perf_counter()
-                self._rebuild_group(ascend_ps, "_MC2", elastic_group_ranks,
-                                    world_group, backend, "mc2")
+                if self._should_disable_mc2_for_unpooled_floor4(
+                        tuple(int(rank) for rank in active_ranks)):
+                    self._suppress_mc2_for_unpooled_floor4_rebuild(
+                        ascend_ps,
+                        tuple(int(rank) for rank in active_ranks),
+                        "shrink_rebuild",
+                    )
+                else:
+                    self._rebuild_group(ascend_ps, "_MC2", elastic_group_ranks,
+                                        world_group, backend, "mc2")
                 rebuild_mc2_ms = (
                     time.perf_counter() - rebuild_mc2_start_t) * 1000.0
             rebuild_ms = (time.perf_counter() - rebuild_start_t) * 1000.0

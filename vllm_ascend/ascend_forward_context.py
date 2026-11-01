@@ -66,6 +66,7 @@ def set_ascend_forward_context(
         reserved_mc2_mask: Optional[torch.Tensor] = None,
         moe_comm_type: Optional[MoECommType] = None,
         num_actual_tokens: Optional[int] = None,
+        mode2_num_mlp_tokens: Optional[int] = None,
         aclgraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         batch_descriptor: Optional[BatchDescriptor] = None,
         prefetch_stream: torch.npu.Stream = None,
@@ -104,6 +105,13 @@ def set_ascend_forward_context(
         ) and vllm_config.model_config.hf_config.n_routed_experts == 256
         fused_moe_state = _get_fused_moe_state(ep_size, with_prefill,
                                                is_deepseek_v3_r1)
+        if moe_comm_type is not None and moe_comm_type != MoECommType.MC2:
+            if moe_comm_type == MoECommType.ALLGATHER:
+                fused_moe_state = FusedMoEState.AllGather
+            elif moe_comm_type == MoECommType.ALLTOALL:
+                fused_moe_state = FusedMoEState.All2All
+            elif moe_comm_type == MoECommType.NAIVE_MULTICAST:
+                fused_moe_state = FusedMoEState.NaiveMulticast
         forward_context.fused_moe_state = fused_moe_state
         forward_context.in_profile_run = in_profile_run
 
@@ -179,6 +187,9 @@ def set_ascend_forward_context(
             max_tokens_across_dp = num_tokens
 
         forward_context.max_tokens_across_dp = max_tokens_across_dp
+        forward_context.mc2_mask = None
+        forward_context.mode2_mlp_mask = None
+        forward_context.mode2_num_mlp_tokens = None
 
         if num_tokens is not None:
             if num_actual_tokens is None:
@@ -187,12 +198,43 @@ def set_ascend_forward_context(
             forward_context.padded_num_tokens = math.ceil(
                 max_tokens_across_dp / tp_world_size) * tp_world_size
 
-            if reserved_mc2_mask is not None:
-                mc2_mask = reserved_mc2_mask[:forward_context.
-                                             padded_num_tokens]
-                mc2_mask[:num_actual_tokens] = True
-                mc2_mask[num_actual_tokens:] = False
+            if (reserved_mc2_mask is not None
+                    and moe_comm_type == MoECommType.MC2):
+                padded_num_tokens = int(forward_context.padded_num_tokens)
+                num_actual_tokens = max(
+                    0, min(int(num_actual_tokens), padded_num_tokens))
+                if reserved_mc2_mask.dim() == 2:
+                    if (num_actual_tokens >= reserved_mc2_mask.shape[0]
+                            or padded_num_tokens > reserved_mc2_mask.shape[1]):
+                        raise RuntimeError(
+                            "MC2 mask table capacity exceeded: "
+                            f"actual_tokens={num_actual_tokens} "
+                            f"padded_tokens={padded_num_tokens} "
+                            f"table_shape={tuple(reserved_mc2_mask.shape)}")
+                    mc2_mask = reserved_mc2_mask[
+                        num_actual_tokens, :padded_num_tokens]
+                else:
+                    # Compatibility for runners that still provide the legacy
+                    # mutable one-dimensional buffer.
+                    mc2_mask = reserved_mc2_mask[:padded_num_tokens]
+                    mc2_mask[:num_actual_tokens] = True
+                    mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
+
+                if mode2_num_mlp_tokens is not None:
+                    mode2_num_mlp_tokens = max(
+                        0, min(int(mode2_num_mlp_tokens), padded_num_tokens))
+                    if reserved_mc2_mask.dim() == 2:
+                        mode2_mlp_mask = reserved_mc2_mask[
+                            mode2_num_mlp_tokens, :padded_num_tokens]
+                    else:
+                        mode2_mlp_mask = reserved_mc2_mask[
+                            :padded_num_tokens].clone()
+                        mode2_mlp_mask[:mode2_num_mlp_tokens] = True
+                        mode2_mlp_mask[mode2_num_mlp_tokens:] = False
+                    forward_context.mode2_mlp_mask = mode2_mlp_mask
+                    forward_context.mode2_num_mlp_tokens = (
+                        mode2_num_mlp_tokens)
 
         try:
             yield

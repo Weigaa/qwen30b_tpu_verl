@@ -427,6 +427,11 @@ else
         # mode=1 pure runs use no extra KV-init headroom; the KV size should be
         # determined by resident expert redundancy and the optional mode1 cap.
         export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-0}
+    elif [[ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "2" ]]; then
+        # Mode 2 keeps the same fixed NPU-resident expert capacity at floor
+        # 2/4/8. Use the floor=2 validated initialization margin for every floor
+        # instead of exposing floor 4/8 to a larger KV allocation.
+        export VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES=${VLLM_ASCEND_KV_CACHE_INIT_HEADROOM_BYTES:-2147483648}
     elif [[ "${VLLM_ASCEND_ELASTIC_EXECUTION_MODE}" == "3" ]]; then
         # mode=3 now defaults to direct CPU -> final runtime slot copies, so it
         # should not pay the old CPU staging-buffer KV reservation. Use the same

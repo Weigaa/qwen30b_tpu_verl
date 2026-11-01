@@ -898,6 +898,58 @@ def maybe_cap_mode1_parity_num_blocks(
     return max_blocks
 
 
+def maybe_cap_mode2_num_blocks(
+        vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec],
+        num_blocks: int) -> int:
+    if num_blocks <= 0 or not kv_cache_groups:
+        return num_blocks
+    if not _env_flag("VLLM_ASCEND_MODE2_NATIVE_KV_CAP", "1"):
+        return num_blocks
+    if os.getenv("VLLM_ASCEND_ELASTIC_EXECUTION_MODE", "0") != "2":
+        return num_blocks
+    configured_floor = os.getenv("VLLM_ASCEND_ELASTIC_MIN_COMPUTE_GROUP_SIZE",
+                                 "")
+    if configured_floor not in ("2", "4", "8"):
+        return num_blocks
+
+    max_tokens = int(os.getenv("VLLM_ASCEND_MODE2_MAX_KV_TOKENS", "0"))
+    if max_tokens <= 0:
+        return num_blocks
+
+    min_block_size = min(
+        group.kv_cache_spec.block_size for group in kv_cache_groups)
+    dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+    tokens_per_block_group = min_block_size * max(int(dcp_world_size), 1)
+    if tokens_per_block_group <= 0:
+        return num_blocks
+
+    num_groups = len(kv_cache_groups)
+    max_blocks_per_group = max_tokens // tokens_per_block_group
+    max_blocks = max_blocks_per_group * num_groups
+    if max_blocks <= 0 or num_blocks <= max_blocks:
+        return num_blocks
+
+    requested_tokens = (num_blocks // num_groups * min_block_size *
+                        max(int(dcp_world_size), 1))
+    capped_tokens = (max_blocks // num_groups * min_block_size *
+                     max(int(dcp_world_size), 1))
+    logger.info(
+        "Capping mode2 KV blocks to floor%s budget: requested_blocks=%s "
+        "capped_blocks=%s block_size=%s groups=%s dcp_world_size=%s "
+        "requested_tokens=%s capped_tokens=%s max_tokens=%s",
+        configured_floor,
+        num_blocks,
+        max_blocks,
+        min_block_size,
+        num_groups,
+        dcp_world_size,
+        requested_tokens,
+        capped_tokens,
+        max_tokens,
+    )
+    return max_blocks
+
+
 def get_uniform_page_size(kv_cache_spec: dict[str, KVCacheSpec]) -> int:
     """
     Get the page size of the KV cache.
@@ -1108,6 +1160,8 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
         num_blocks = may_override_num_blocks(vllm_config, num_blocks)
         num_blocks = maybe_cap_mode1_parity_num_blocks(
             vllm_config, kv_cache_groups, num_blocks)
+        num_blocks = maybe_cap_mode2_num_blocks(vllm_config, kv_cache_groups,
+                                                num_blocks)
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
         kv_cache_tensors = [
             KVCacheTensor(size=per_layer_specs[layer_name].page_size_bytes *
@@ -1132,6 +1186,8 @@ def get_kv_cache_config_from_groups(vllm_config: VllmConfig,
                                     page_size)
         num_blocks = maybe_cap_mode1_parity_num_blocks(
             vllm_config, kv_cache_groups, num_blocks)
+        num_blocks = maybe_cap_mode2_num_blocks(vllm_config, kv_cache_groups,
+                                                num_blocks)
         kv_cache_tensors = []
         for i in range(group_size):
             shared_by = []

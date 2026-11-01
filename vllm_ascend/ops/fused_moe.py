@@ -3162,7 +3162,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             wave_plans: list[dict[str, Any]],
             use_dense_mc2_waves: bool,
             shared_experts: Optional[Any]) -> bool:
-        if not use_dense_mc2_waves or len(wave_plans) <= 1:
+        if not _env_flag("VLLM_ASCEND_MODE2_SINGLE_DISPATCH", "1"):
+            return False
+        if not use_dense_mc2_waves or not wave_plans:
             return False
         if self.dynamic_eplb:
             return False
@@ -4249,6 +4251,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             wave_plans: list[dict[str, Any]],
             shared_experts: Optional[Any],
             prepared_mc2_mask: Optional[torch.Tensor],
+            mode2_mlp_mask: Optional[torch.Tensor],
+            mode2_num_mlp_tokens: Optional[int],
             enable_force_load_balance: bool,
             kwargs: dict[str, Any],
             ids_already_runtime_remapped: bool,
@@ -4297,13 +4301,93 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 % dispatch_num_experts).to(torch.int32).reshape(
                     dispatch_topk_ids.shape)
 
+        trim_padding_mlp = _env_flag(
+            "VLLM_ASCEND_MODE2_TRIM_PADDING_MLP", "1")
+        if shared_experts is not None:
+            # A shared expert is evaluated inside token_dispatch(), before the
+            # routed-expert rows can be filtered. Keep the generic behavior for
+            # models with shared experts instead of injecting marker values.
+            trim_padding_mlp = False
+        dispatch_hidden_states = x
+        dispatch_topk_weights = topk_weights
+        padding_sink_local_indices: set[int] = set()
+        padding_marker_hi = torch.finfo(x.dtype).max
+        padding_marker_lo = -padding_marker_hi
+        local_padding_tokens = 0
+        local_padding_routes = 0
+        if trim_padding_mlp and mode2_mlp_mask is not None:
+            mode2_mlp_mask = mode2_mlp_mask.to(device=x.device,
+                                               dtype=torch.bool)
+            if mode2_mlp_mask.shape != (x.shape[0], ):
+                raise RuntimeError(
+                    "Hybrid mode2 single-dispatch MLP mask shape mismatch: "
+                    f"mask_shape={tuple(mode2_mlp_mask.shape)} "
+                    f"hidden_shape={tuple(x.shape)}")
+            if mode2_num_mlp_tokens is None:
+                raise RuntimeError(
+                    "Hybrid mode2 single-dispatch is missing the real MLP "
+                    "token count.")
+            mode2_num_mlp_tokens = int(mode2_num_mlp_tokens)
+            if not 0 <= mode2_num_mlp_tokens <= int(x.shape[0]):
+                raise RuntimeError(
+                    "Hybrid mode2 single-dispatch invalid real MLP token "
+                    f"count: count={mode2_num_mlp_tokens} "
+                    f"hidden_tokens={int(x.shape[0])}")
+            if int(x.shape[1]) < 2:
+                raise RuntimeError(
+                    "Hybrid mode2 single-dispatch padding trim requires at "
+                    f"least two hidden columns, got shape={tuple(x.shape)}")
+
+            # Route padding to a small deterministic set of existing experts.
+            # The MC2 expert count, active mask, input shape, and collective
+            # sequence stay unchanged on every rank. Two marker columns let the
+            # owning rank remove only padding rows before invoking the MLP,
+            # including when real tokens select the same sink expert.
+            top_k = int(dispatch_topk_ids.shape[1])
+            padding_sink_id_values = [
+                (column % active_rank_count) * owned_per_rank
+                + column // active_rank_count for column in range(top_k)
+            ]
+            if (padding_sink_id_values
+                    and max(padding_sink_id_values) >= dispatch_num_experts):
+                raise RuntimeError(
+                    "Hybrid mode2 single-dispatch padding sink exceeds the "
+                    f"expert range: sinks={padding_sink_id_values} "
+                    f"dispatch_num_experts={dispatch_num_experts}")
+            padding_sink_ids = torch.tensor(
+                padding_sink_id_values,
+                device=dispatch_topk_ids.device,
+                dtype=dispatch_topk_ids.dtype)
+            local_dense_start = local_rank_idx * owned_per_rank
+            local_dense_end = local_dense_start + owned_per_rank
+            padding_sink_local_indices = {
+                int(sink_id) - local_dense_start
+                for sink_id in padding_sink_id_values
+                if local_dense_start <= int(sink_id) < local_dense_end
+            }
+
+            local_padding_tokens = int(x.shape[0]) - mode2_num_mlp_tokens
+            local_padding_routes = local_padding_tokens * top_k
+            if local_padding_tokens > 0:
+                padding_mask = ~mode2_mlp_mask
+                dispatch_hidden_states = x.clone()
+                dispatch_hidden_states[:, 0].masked_fill_(
+                    padding_mask, padding_marker_hi)
+                dispatch_hidden_states[:, 1].masked_fill_(
+                    padding_mask, padding_marker_lo)
+                dispatch_topk_ids = torch.where(
+                    padding_mask.unsqueeze(1),
+                    padding_sink_ids.view(1, -1), dispatch_topk_ids)
+                dispatch_topk_weights = topk_weights.masked_fill(
+                    padding_mask.unsqueeze(1), 0)
+
         old_dispatch_num_experts = int(getattr(token_dispatcher, "num_experts", 0))
         token_dispatcher.num_experts = dispatch_num_experts
         dispatch_results = None
         try:
             dispatch_results = token_dispatcher.token_dispatch(
-                hidden_states=x,
-                topk_weights=topk_weights,
+                hidden_states=dispatch_hidden_states,
+                topk_weights=dispatch_topk_weights,
                 topk_ids=dispatch_topk_ids,
                 row_idx=row_idx,
                 expert_map=layer.expert_map,
@@ -4351,16 +4435,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             local_wave_counts = []
             local_cpu_miss = 0
             local_resident_hits = 0
+            local_padding_rows_skipped = 0
 
             for wave_idx, wave_plan in enumerate(wave_plans):
                 effective_token_mask = wave_plan["token_mask"]
-                if prepared_mc2_mask is not None:
-                    mc2_active_mask = prepared_mc2_mask.to(
+                effective_mlp_mask = mode2_mlp_mask
+                if effective_mlp_mask is None:
+                    effective_mlp_mask = prepared_mc2_mask
+                if effective_mlp_mask is not None:
+                    mc2_active_mask = effective_mlp_mask.to(
                         device=effective_token_mask.device, dtype=torch.bool)
                     effective_token_mask = effective_token_mask & mc2_active_mask
-                    if (is_dummy and not torch.any(effective_token_mask)
-                            and torch.any(wave_plan["token_mask"])):
-                        effective_token_mask = wave_plan["token_mask"]
                 if (effective_token_mask.numel() > 0
                         and torch.any(effective_token_mask)):
                     local_wave_counts.append(
@@ -4393,7 +4478,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                                    dtype=torch.int64,
                                                    device=dispatched_hidden_states.device)
                 hidden_segments: list[torch.Tensor] = []
-                segment_targets: list[tuple[int, int, int]] = []
+                segment_targets: list[
+                    tuple[int, int, int, Optional[torch.Tensor]]] = []
                 for slot_idx, expert_id in enumerate(target_resident[:resident_capacity]):
                     expert_id = int(expert_id)
                     if expert_id not in local_wave_group_set:
@@ -4406,9 +4492,32 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     token_count = max(0, end - start)
                     if token_count <= 0:
                         continue
+                    output_indices = None
+                    hidden_segment = dispatched_hidden_states[start:end]
+                    if (trim_padding_mlp
+                            and local_owned_idx
+                            in padding_sink_local_indices):
+                        padding_rows = (
+                            (hidden_segment[:, 0] == padding_marker_hi)
+                            & (hidden_segment[:, 1] == padding_marker_lo))
+                        real_rows = ~padding_rows
+                        real_token_count = int(
+                            torch.count_nonzero(real_rows).item())
+                        local_padding_rows_skipped += (
+                            token_count - real_token_count)
+                        if real_token_count <= 0:
+                            continue
+                        if real_token_count < token_count:
+                            segment_indices = torch.nonzero(
+                                real_rows, as_tuple=False).flatten()
+                            hidden_segment = hidden_segment.index_select(
+                                0, segment_indices)
+                            output_indices = segment_indices + start
+                        token_count = real_token_count
                     resident_group_counts[slot_idx] = token_count
-                    hidden_segments.append(dispatched_hidden_states[start:end])
-                    segment_targets.append((slot_idx, start, end))
+                    hidden_segments.append(hidden_segment)
+                    segment_targets.append(
+                        (slot_idx, start, end, output_indices))
 
                 if layer.layer_idx == 0:
                     logger.info(
@@ -4447,10 +4556,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     fusion=False,
                     need_trans=True)
                 output_cursor = 0
-                for _slot_idx, start, end in segment_targets:
-                    token_count = end - start
-                    dispatched_output[start:end] = wave_output[
+                for (_slot_idx, start, end,
+                     output_indices) in segment_targets:
+                    token_count = (end - start if output_indices is None else
+                                   int(output_indices.shape[0]))
+                    output_segment = wave_output[
                         output_cursor:output_cursor + token_count]
+                    if output_indices is None:
+                        dispatched_output[start:end] = output_segment
+                    else:
+                        dispatched_output.index_copy_(0, output_indices,
+                                                      output_segment)
                     output_cursor += token_count
             final_hidden_states = token_dispatcher.token_combine(dispatched_output)
         finally:
@@ -4470,10 +4586,13 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             "local_wave_tokens": local_wave_counts,
             "local_cpu_miss": local_cpu_miss,
             "local_resident_hits": local_resident_hits,
+            "local_padding_tokens": local_padding_tokens,
+            "local_padding_routes": local_padding_routes,
+            "local_padding_rows_skipped": local_padding_rows_skipped,
         }
         if layer.layer_idx == 0 and wave_plans:
             logger.info(
-                "Hybrid MoE single-dispatch execution: rank=%s layer=%s stage=%s waves=%s resident_hits=%s cpu_miss=%s local_wave_tokens=%s resident=%s dispatch_experts=%s",
+                "Hybrid MoE single-dispatch execution: rank=%s layer=%s stage=%s waves=%s resident_hits=%s cpu_miss=%s local_wave_tokens=%s resident=%s dispatch_experts=%s local_padding_tokens=%s local_padding_routes=%s padding_rows_skipped=%s",
                 layer.rank if hasattr(layer, "rank") else -1,
                 layer.layer_idx,
                 len(getattr(layer, "lossless_hybrid_active_ranks", [])),
@@ -4483,6 +4602,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 local_wave_counts[:8],
                 getattr(layer, "lossless_hybrid_resident_expert_ids", [])[:8],
                 dispatch_num_experts,
+                local_padding_tokens,
+                local_padding_routes,
+                local_padding_rows_skipped,
             )
         return final_hidden_states
 
@@ -5004,7 +5126,23 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     getattr(layer, "lossless_hybrid_active", False),
                 )
                 layer._mode3_gate_reject_logged = True
-            wave_plans = layer._plan_lossless_hybrid_rank_waves(logical_topk_ids)
+            forward_context = get_forward_context()
+            use_dense_mc2_waves = (
+                getattr(forward_context, "moe_comm_type", None)
+                == MoECommType.MC2)
+            prepared_mc2_mask = (
+                getattr(moe_comm_method, "mc2_mask", None)
+                if use_dense_mc2_waves else None)
+            mode2_mlp_mask = (
+                getattr(moe_comm_method, "mode2_mlp_mask", None)
+                if use_dense_mc2_waves else None)
+            mode2_num_mlp_tokens = getattr(
+                moe_comm_method, "mode2_num_mlp_tokens", None)
+            planning_token_mask = (
+                mode2_mlp_mask
+                if getattr(layer, "elastic_execution_mode", 0) == 2 else None)
+            wave_plans = layer._plan_lossless_hybrid_rank_waves(
+                logical_topk_ids, active_token_mask=planning_token_mask)
             if wave_plans:
                 final_hidden_states = torch.zeros_like(x)
                 local_rank_idx = int(
@@ -5012,14 +5150,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 local_wave_counts = []
                 local_cpu_miss = 0
                 local_resident_hits = 0
-                prepared_mc2_mask = getattr(moe_comm_method, "mc2_mask", None)
-                use_dense_mc2_waves = (
-                    getattr(get_forward_context(), "moe_comm_type", None)
-                    == MoECommType.MC2)
-                has_real_mc2_tokens = True
-                if prepared_mc2_mask is not None and prepared_mc2_mask.numel() > 0:
-                    has_real_mc2_tokens = bool(
-                        torch.any(prepared_mc2_mask).item())
                 sync_mc2_multi_wave = use_dense_mc2_waves and len(wave_plans) > 1
                 grouped_dense_mc2_multi_wave = (
                     sync_mc2_multi_wave
@@ -5044,7 +5174,12 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                         layer=layer,
                         wave_plans=wave_plans,
                         use_dense_mc2_waves=use_dense_mc2_waves,
-                        shared_experts=shared_experts) and not is_dummy and has_real_mc2_tokens:
+                        shared_experts=shared_experts):
+                    # The collective path must not depend on rank-local tail
+                    # state. A rank with no live requests still participates
+                    # with the synchronized padded mask; otherwise it executes two
+                    # collectives per wave while a live peer executes one
+                    # dispatch/combine pair, permanently desynchronizing HCCL.
                     if layer.layer_idx == 0:
                         logger.info(
                             "Hybrid MC2 single-dispatch mode enabled: rank=%s stage=%s waves=%s resident_capacity=%s mode=%s",
@@ -5064,6 +5199,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                             wave_plans=wave_plans,
                             shared_experts=shared_experts,
                             prepared_mc2_mask=prepared_mc2_mask,
+                            mode2_mlp_mask=mode2_mlp_mask,
+                            mode2_num_mlp_tokens=mode2_num_mlp_tokens,
                             enable_force_load_balance=enable_force_load_balance,
                             kwargs=kwargs,
                             ids_already_runtime_remapped=
@@ -5847,7 +5984,10 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.tp_group = get_tp_group()
         self.moe_config.dp_group = get_dp_group()
         self.moe_config.ep_group = get_ep_group()
-        self.moe_config.mc2_group = get_mc2_group()
+        if getattr(self.moe_config, "disable_mc2_comm_method", False):
+            self.moe_config.mc2_group = None
+        else:
+            self.moe_config.mc2_group = get_mc2_group()
         self.moe_config.num_global_redundant_experts = self.global_redundant_expert_num
 
         setup_moe_comm_method(self.moe_config)
@@ -7235,7 +7375,10 @@ class AscendFusedMoE(FusedMoE):
                     materialize_resident_ms)
 
     def _plan_lossless_hybrid_rank_waves(
-            self, logical_topk_ids: torch.Tensor) -> list[dict[str, Any]]:
+            self,
+            logical_topk_ids: torch.Tensor,
+            active_token_mask: Optional[torch.Tensor] = None
+    ) -> list[dict[str, Any]]:
         if not self.lossless_hybrid_active:
             return []
         if self.lossless_hybrid_owner_rank_by_expert is None:
@@ -7246,19 +7389,33 @@ class AscendFusedMoE(FusedMoE):
         # resilient if a previous async mode3 prefetch has already put the NPU
         # stream into an error state.
         logical_topk_ids_cpu = logical_topk_ids.detach().cpu()
+        planning_topk_ids_cpu = logical_topk_ids_cpu
+        if active_token_mask is not None:
+            if (active_token_mask.dim() != 1
+                    or active_token_mask.shape[0] != logical_topk_ids.shape[0]):
+                raise RuntimeError(
+                    "Hybrid wave planner active-mask shape mismatch: "
+                    f"layer={self.layer_idx} "
+                    f"topk_shape={tuple(logical_topk_ids.shape)} "
+                    f"mask_shape={tuple(active_token_mask.shape)}")
+            active_token_mask_cpu = active_token_mask.detach().to(
+                device="cpu", dtype=torch.bool)
+            planning_topk_ids_cpu = logical_topk_ids_cpu[
+                active_token_mask_cpu]
         owner_map_cpu = self.lossless_hybrid_owner_rank_by_expert.detach().cpu()
-        if logical_topk_ids_cpu.numel() > 0:
-            invalid_mask = ((logical_topk_ids_cpu < 0)
-                            | (logical_topk_ids_cpu >= owner_map_cpu.numel()))
+        if planning_topk_ids_cpu.numel() > 0:
+            invalid_mask = ((planning_topk_ids_cpu < 0)
+                            | (planning_topk_ids_cpu >= owner_map_cpu.numel()))
             if bool(invalid_mask.any()):
-                invalid_values = logical_topk_ids_cpu[invalid_mask][:8].tolist()
+                invalid_values = planning_topk_ids_cpu[
+                    invalid_mask][:8].tolist()
                 raise RuntimeError(
                     "Invalid logical expert ids in hybrid wave planner: "
                     f"layer={self.layer_idx} invalid={invalid_values} "
                     f"owner_map_size={owner_map_cpu.numel()}. This usually "
                     "means an earlier mode3 runtime-buffer failure corrupted "
                     "the fallback path.")
-        owner_rank = owner_map_cpu[logical_topk_ids_cpu]
+        owner_rank = owner_map_cpu[planning_topk_ids_cpu]
         resident_capacity = int(self.lossless_hybrid_resident_capacity)
         per_rank_needed: list[list[int]] = []
         per_rank_waves: list[list[list[int]]] = []
@@ -7269,7 +7426,7 @@ class AscendFusedMoE(FusedMoE):
             rank_mask = owner_rank == rank_idx
             if torch.any(rank_mask):
                 rank_needed_ids = torch.unique(
-                    logical_topk_ids_cpu[rank_mask]).tolist()
+                    planning_topk_ids_cpu[rank_mask]).tolist()
                 rank_needed = sorted(int(expert_id)
                                      for expert_id in rank_needed_ids)
             else:
@@ -8689,7 +8846,10 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.model_type = self.model_type
         self.moe_config.dp_group = get_dp_group()
         self.moe_config.ep_group = self.ep_group
-        self.moe_config.mc2_group = get_mc2_group()
+        if getattr(self.moe_config, "disable_mc2_comm_method", False):
+            self.moe_config.mc2_group = None
+        else:
+            self.moe_config.mc2_group = get_mc2_group()
         is_deepseek_v3_r1 = self.num_experts == 256
         self.rm_router_logits = get_rm_router_logits_state(
             self.moe_parallel_config.ep_size, self.dp_size, is_deepseek_v3_r1)

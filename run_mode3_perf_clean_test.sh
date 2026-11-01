@@ -120,6 +120,8 @@ export VLLM_ASCEND_DUMMY_WASTE_TIMING_SYNC=0
 export VLLM_ASCEND_DUMMY_WASTE_TIMING_PROFILE=0
 export VLLM_ASCEND_DUMMY_WASTE_PROFILE_MARKERS=0
 
+source "$SCRIPT_DIR/perf_clean_common_env.sh"
+
 export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-47041}"
 export MASTER_PORT="${MASTER_PORT:-26040}"
 export VERL_HCCL_IF_BASE_PORT_START="${VERL_HCCL_IF_BASE_PORT_START:-47041}"
@@ -165,5 +167,6 @@ printf '[mode3 perf clean] post_shrink_dp_warmup=%s\n' \
     "$VLLM_ASCEND_MODE3_ENABLE_POST_SHRINK_DP_WARMUP"
 printf '[mode3 perf clean] ports HCCL_IF_BASE_PORT=%s MASTER_PORT=%s VERL_HCCL_IF_BASE_PORT_START=%s
 ' "$HCCL_IF_BASE_PORT" "$MASTER_PORT" "$VERL_HCCL_IF_BASE_PORT_START"
+print_perf_clean_common_config
 
-bash "$LAUNCHER" 2>&1 | tee "$tee_log"
+bash "$LAUNCHER" "${PERF_CLEAN_LAUNCHER_ARGS[@]}" 2>&1 | tee "$tee_log"
