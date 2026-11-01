@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import os
@@ -36,11 +36,18 @@ from vllm_ascend.ops.moe.token_dispatcher import (TokenDispatcherWithAll2AllV,
                                                   TokenDispatcherWithMoge)
 
 _MoECommMethods: Dict[Optional[MoECommType], MoECommMethod] = {}
+_MoECommMethodSetupSignature: Optional[Tuple[Any, ...]] = None
 
 
 def get_moe_comm_method(
         moe_comm_type: Optional[MoECommType]) -> Optional[MoECommMethod]:
     return _MoECommMethods.get(moe_comm_type)
+
+
+def reset_moe_comm_method_cache() -> None:
+    global _MoECommMethodSetupSignature
+    _MoECommMethods.clear()
+    _MoECommMethodSetupSignature = None
 
 
 def _resolve_model_type(moe_config: FusedMoEConfig) -> str:
@@ -51,12 +58,36 @@ def _resolve_model_type(moe_config: FusedMoEConfig) -> str:
     return getattr(moe_config, "model_type", "")
 
 
+def _build_moe_comm_setup_signature(moe_config: FusedMoEConfig) -> Tuple[Any, ...]:
+    dp_group = getattr(moe_config, "dp_group", None)
+    ep_group = getattr(moe_config, "ep_group", None)
+    mc2_group = getattr(moe_config, "mc2_group", None)
+    return (
+        getattr(moe_config, "model_type", ""),
+        int(getattr(moe_config, "num_experts", 0)),
+        int(getattr(moe_config, "num_local_experts", 0)),
+        int(getattr(moe_config, "experts_per_token", 0)),
+        int(getattr(moe_config, "num_global_redundant_experts", 0)),
+        int(getattr(dp_group, "world_size", 0)) if dp_group is not None else 0,
+        int(getattr(dp_group, "rank_in_group", 0)) if dp_group is not None else 0,
+        int(getattr(ep_group, "world_size", 0)) if ep_group is not None else 0,
+        int(getattr(ep_group, "rank_in_group", 0)) if ep_group is not None else 0,
+        int(getattr(mc2_group, "world_size", 0)) if mc2_group is not None else 0,
+        int(getattr(mc2_group, "rank_in_group", 0)) if mc2_group is not None else 0,
+    )
+
+
 def setup_moe_comm_method(moe_config):
+    global _MoECommMethodSetupSignature
+    signature = _build_moe_comm_setup_signature(moe_config)
+    if _MoECommMethodSetupSignature == signature:
+        return
     _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
     _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
     _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
     _MoECommMethods[MoECommType.NAIVE_MULTICAST] = NaiveMulticastCommImpl(
         moe_config)
+    _MoECommMethodSetupSignature = signature
 
 
 class MoECommMethod(ABC):

@@ -13,6 +13,7 @@
 # limitations under the License.
 import inspect
 import logging
+import os
 import socket
 import threading
 from copy import deepcopy
@@ -32,8 +33,18 @@ __all__ = ["Worker"]
 
 
 _HCCL_IF_BASE_PORT_LOCK = threading.Lock()
-_HCCL_IF_BASE_PORT_NEXT = 20000
-_HCCL_IF_BASE_PORT_BLOCK = 12288
+# Respect an explicitly exported launcher HCCL base-port first. The mode5
+# launcher already threads HCCL_IF_BASE_PORT through the top-level environment,
+# but the WorkerGroup allocator used to ignore it and always restart from
+# 20000, which made repeated validations self-collide on the same HCCL port
+# range even when the launcher asked for a different block.
+_HCCL_IF_BASE_PORT_START = int(
+    os.getenv(
+        "VERL_HCCL_IF_BASE_PORT_START",
+        os.getenv("HCCL_IF_BASE_PORT", "20000"),
+    ))
+_HCCL_IF_BASE_PORT_BLOCK = int(os.getenv("VERL_HCCL_IF_BASE_PORT_BLOCK", "12288"))
+_HCCL_IF_BASE_PORT_NEXT = _HCCL_IF_BASE_PORT_START
 _HCCL_IF_BASE_PORT_LIMIT = 65535 - _HCCL_IF_BASE_PORT_BLOCK
 
 
@@ -50,8 +61,8 @@ def _alloc_hccl_if_base_port() -> str:
     with _HCCL_IF_BASE_PORT_LOCK:
         port = _HCCL_IF_BASE_PORT_NEXT
         if port > _HCCL_IF_BASE_PORT_LIMIT:
-            port = 20000
-            _HCCL_IF_BASE_PORT_NEXT = 20000
+            port = _HCCL_IF_BASE_PORT_START
+            _HCCL_IF_BASE_PORT_NEXT = _HCCL_IF_BASE_PORT_START
         _HCCL_IF_BASE_PORT_NEXT += _HCCL_IF_BASE_PORT_BLOCK
         return str(port)
 
