@@ -34,3 +34,8 @@ __pycache__/
 
 # Local editor state
 .vscode/
+
+# Repository-local Python runtime and native artifact backups
+.venv_torch27_vllm014/
+.venv_cann85_a3_torch29/
+.runtime_backups/

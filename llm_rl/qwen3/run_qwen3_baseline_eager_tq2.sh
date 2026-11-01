@@ -5,23 +5,100 @@ set -eo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "${ROOT}"
 
-export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/asdsip/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh --cxx_abi=1
+source "${ROOT}/tools/activate_cann85_a3_torch29.sh"
 
-# Do not inherit rollout experiment knobs from the caller's shell.
+# The root filesystem is intentionally kept out of Ray's spill/session path.
+# It is nearly full on this host, while /home/sharedata has ample capacity.
+export RAY_TMPDIR=${RAY_TMPDIR:-/home/sharedata/qwen3_ray_tmp}
+export TMPDIR=${TMPDIR:-${RAY_TMPDIR}/tmp}
+mkdir -p "${RAY_TMPDIR}" "${TMPDIR}"
+
+# Do not inherit rollout experiment knobs from the caller's shell. Set options
+# that affect plugin/native loading before the runtime audit imports anything.
 while IFS= read -r name; do
   case "${name}" in
     VLLM_* | VERL_*) unset "${name}" ;;
   esac
 done < <(compgen -e)
 
-# Fixed baseline execution contract.
+# CANN 8.5 HCCL cannot build a multi-NPU communicator when Ray restricts each
+# actor to a single logical device through ASCEND_RT_VISIBLE_DEVICES. Keep all
+# local NPUs visible and let VERL bind each actor to the physical ID assigned
+# by Ray. This is required before ray.init() starts worker processes.
+unset ASCEND_RT_VISIBLE_DEVICES NPU_VISIBLE_DEVICES
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export HCCL_OP_EXPANSION_MODE=HOST
+
+# Match the remote 014_baseline execution contract. In particular, keep TQ2
+# paired with manual cache-engine release below; changing either setting makes
+# the local result no longer comparable with the validated remote run.
 export TASK_QUEUE_ENABLE=2
 export VLLM_USE_V1=1
 export VLLM_ENABLE_GRAPH_MODE=0
-export VLLM_ASCEND_EAGER_COMPILE=1
+export VLLM_PLUGINS=ascend,ascend_kv_connector,ascend_model_loader,ascend_service_profiling
+export VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP=0
+export VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB=0
+
+# A diagnostic override must never make the training launcher bypass its
+# driver compatibility gate.
+unset QWEN3_ALLOW_UNVALIDATED_DRIVER
+python3 "${ROOT}/tools/check_cann85_a3_torch29_runtime.py"
+
+if [ "${1:-}" != "dry-run" ] && [ "${QWEN3_ALLOW_BUSY_NPU:-0}" != 1 ]; then
+  if ! NPU_SMI_OUTPUT=$(npu-smi info 2>&1); then
+    printf '[qwen3 preflight] npu-smi failed; refusing to start:\n%s\n' \
+      "${NPU_SMI_OUTPUT}" >&2
+    exit 1
+  fi
+  NPU_BUSY_LINES=$(printf '%s\n' "${NPU_SMI_OUTPUT}" | awk '
+    /\| NPU[[:space:]]+Chip[[:space:]]+\| Process id/ {
+      in_process_table = 1
+      next
+    }
+    in_process_table &&
+      /^\|[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+\|[[:space:]]*[0-9]+/ {
+      print
+    }
+  ')
+  if [ -n "${NPU_BUSY_LINES}" ]; then
+    printf '[qwen3 preflight] NPU processes already exist; refusing to start:\n%s\n' \
+      "${NPU_BUSY_LINES}" >&2
+    printf '[qwen3 preflight] set QWEN3_ALLOW_BUSY_NPU=1 only when sharing is intentional\n' >&2
+    exit 1
+  fi
+fi
+unset NPU_SMI_OUTPUT NPU_BUSY_LINES
+
+# Imports alone cannot detect a broken HCCL AICPU kernel. Exercise the same
+# 16-rank collective families used by checkpoint loading, Megatron and EP, and
+# require communicator teardown to finish before starting the expensive job.
+if [ "${1:-}" != "dry-run" ] && [ "${QWEN3_SKIP_HCCL_PREFLIGHT:-0}" != 1 ]; then
+  bash "${ROOT}/tools/run_hccl_collective_smoke.sh"
+fi
+
+# The vendored v0.14 path supports eager compilation with Torch 2.9.
+TORCH_VERSION=$(
+  python3 -c 'import torch; print("TORCH_VERSION=" + torch.__version__.split("+")[0])' \
+    | sed -n 's/^TORCH_VERSION=//p' \
+    | tail -n 1
+)
+if [ -z "${TORCH_VERSION}" ]; then
+  printf '[qwen3 runtime] failed to detect torch version\n' >&2
+  exit 1
+fi
+if python3 - "${TORCH_VERSION}" <<'PY'
+import sys
+
+major, minor = (int(part) for part in sys.argv[1].split(".")[:2])
+raise SystemExit(0 if (major, minor) >= (2, 9) else 1)
+PY
+then
+  export VLLM_ASCEND_EAGER_COMPILE=1
+else
+  export VLLM_ASCEND_EAGER_COMPILE=0
+fi
+printf '[qwen3 runtime] torch=%s eager_compile=%s\n' \
+  "${TORCH_VERSION}" "${VLLM_ASCEND_EAGER_COMPILE}"
 export VLLM_ENABLE_EXPERT_PARALLEL=1
 export VLLM_DP_SIZE=16
 export VLLM_ENABLE_MC2=1
@@ -29,8 +106,6 @@ export ALL_TO_ALL_RESHARD=1
 export USE_ALLTOALL_OVERLAP=1
 
 # Fast validated v0.14 eager backend settings.
-export VLLM_ASCEND_USE_LOCAL_CUSTOM_OPP=0
-export VLLM_ASCEND_USE_LOCAL_CUSTOM_OP_API_LIB=0
 export VLLM_ASCEND_FORCE_TORCH_NPU_ADD_RMS_NORM=1
 export VLLM_ASCEND_EAGER_COMPILE_PASS_FUSION=0
 export VLLM_ASCEND_USE_LEGACY_FUSED_MOE=0
@@ -58,7 +133,6 @@ export ASCEND_SLOG_PRINT_TO_STDOUT=0
 export ASCEND_GLOBAL_LOG_LEVEL=3
 export HCCL_IF_BASE_PORT=${HCCL_IF_BASE_PORT:-50021}
 export HCCL_BUFFSIZE=800
-export HCCL_OP_EXPANSION_MODE=AIV
 export HCCL_ASYNC_ERROR_HANDLING=0
 export HCCL_EXEC_TIMEOUT=7200
 export HCCL_CONNECT_TIMEOUT=7200
@@ -67,11 +141,11 @@ export D2D_DATA_TRANSFER=1
 export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ASCEND_ENABLE_NZ=0
 
-MODEL_PATH=${MODEL_PATH:-/data/Qwen3-30B-A3B}
-DISTCP_PATH=${DISTCP_PATH:-/data/Qwen3-30B-A3B_megatron}
-TRAIN_FILE=${TRAIN_FILE:-/data/deepscaler/train.parquet}
-TEST_FILE=${TEST_FILE:-/data/deepscaler/test.parquet}
-OUTPUT_DIR=${OUTPUT_DIR:-/workspace/qwen3_baseline_results/eager_tq2_bs32_n16}
+MODEL_PATH=${MODEL_PATH:-/home/data/Qwen3-30B-A3B}
+DISTCP_PATH=${DISTCP_PATH:-/home/data/Qwen3-30B-A3B_megatron}
+TRAIN_FILE=${TRAIN_FILE:-/workspace/data/deepscaler/train.parquet}
+TEST_FILE=${TEST_FILE:-/workspace/data/deepscaler/test.parquet}
+OUTPUT_DIR=${OUTPUT_DIR:-/workspace/cann-recipes-train/llm_rl/qwen3_014_baseline/llm_rl/qwen3/outputs/qwen3_baseline_results/eager_tq2_bs32_n16_no_async_sche}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-3}
 DATASET_FRACTION=${DATASET_FRACTION:-0.005}
 
@@ -127,7 +201,7 @@ ARGS=(
   actor_rollout_ref.rollout.gpu_memory_utilization=0.83
   actor_rollout_ref.rollout.max_num_batched_tokens=17408
   actor_rollout_ref.rollout.max_num_seqs=32
-  actor_rollout_ref.rollout.async_scheduling=true
+  actor_rollout_ref.rollout.async_scheduling=false
   actor_rollout_ref.rollout.enable_prefix_caching=false
   actor_rollout_ref.rollout.enable_chunked_prefill=true
   actor_rollout_ref.rollout.n=16

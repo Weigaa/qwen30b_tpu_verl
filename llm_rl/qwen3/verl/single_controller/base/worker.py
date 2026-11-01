@@ -15,6 +15,7 @@
 the class for Worker
 """
 
+import logging
 import os
 import socket
 import warnings
@@ -241,9 +242,30 @@ class Worker(WorkerHelper):
             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set,
             # so we need to set local rank when the flag is set.
             device_name = "NPU" if is_npu_available else "GPU"
-            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            accelerator_ids = ray.get_runtime_context().get_accelerator_ids().get(device_name, [])
+            if len(accelerator_ids) != 1:
+                raise RuntimeError(
+                    f"Expected one Ray {device_name} ID per worker, got {accelerator_ids!r}"
+                )
+            if is_npu_available and os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
+                raise RuntimeError(
+                    "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES requires "
+                    "ASCEND_RT_VISIBLE_DEVICES to be unset before ray.init()"
+                )
+            local_rank = str(accelerator_ids[0])
             os.environ["LOCAL_RANK"] = local_rank
             get_torch_device().set_device(int(local_rank))
+            if get_torch_device().current_device() != int(local_rank):
+                raise RuntimeError(
+                    f"Failed to bind worker to {device_name} {local_rank}: "
+                    f"current device is {get_torch_device().current_device()}"
+                )
+            logging.info(
+                "Ray no-set device binding: resource=%s physical_id=%s visible_devices=%r",
+                device_name,
+                local_rank,
+                os.environ.get(get_visible_devices_keyword().upper()),
+            )
 
     def _configure_with_store(self, store: dict):
         """
