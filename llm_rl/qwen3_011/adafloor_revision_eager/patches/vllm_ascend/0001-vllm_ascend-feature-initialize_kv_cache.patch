@@ -1,0 +1,27 @@
+From ec2595f9a818ff5196c757bda36342a96a267f29 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Tue, 11 Nov 2025 11:18:04 +0800
+Subject: [PATCH 08/18] Update vllm_ascend: initialize_kv_cache
+Avoids repeated calles to AttentionBackend initialization during multiple KV Cache initializations,
+because redundant invocations would destroy the consistency of the internal state and cause exceptions.
+---
+ llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py b/llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py
+index 9281dd7..561e2ad 100644
+--- a/llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py
++++ b/llm_rl/qwen3/vllm_ascend/worker/model_runner_v1.py
+@@ -2682,7 +2682,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
+         """
+         kv_cache_config = deepcopy(kv_cache_config)
+         self.kv_cache_config = kv_cache_config
+-        self.initialize_attn_backend(kv_cache_config)
++        if len(self.attn_groups) == 0:
++            self.initialize_attn_backend(kv_cache_config)
+         self.use_hybrid_blocks = (len(self.attn_groups) > 1)
+         # NOTE: Currently, we determine whether we need `num_accepted_tokens` through `MambaSpec`.
+         if vllm_version_is("0.10.2"):
+-- 
+2.50.1.windows.1
+

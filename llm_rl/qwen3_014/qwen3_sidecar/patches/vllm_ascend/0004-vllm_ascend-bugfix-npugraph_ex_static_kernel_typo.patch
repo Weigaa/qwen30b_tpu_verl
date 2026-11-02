@@ -1,0 +1,32 @@
+From be8fd8a948530aeaa35477d9cd4bf1cf9595bd89 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Wed, 28 Jan 2026 10:24:24 +0800
+Subject: [PATCH] Fix npugraph_ex static kernel bug
+
+---
+ llm_rl/qwen3/vllm_ascend/compilation/compiler_interface.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/compilation/compiler_interface.py b/llm_rl/qwen3/vllm_ascend/compilation/compiler_interface.py
+index 7a02912..69c2a37 100644
+--- a/llm_rl/qwen3/vllm_ascend/compilation/compiler_interface.py
++++ b/llm_rl/qwen3/vllm_ascend/compilation/compiler_interface.py
+@@ -88,12 +88,12 @@ def npugraph_ex_compile(
+         # that can trigger the compilation of static kernel. If this configuration is
+         # not applied, new shapes will trigger the compilation of static kernels,
+         # affecting program execution.
+-        num_spec_tokens = vllm_config.speculative_config.num_speculative_token if vllm_config.speculative_config else 0
++        num_spec_tokens = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
+         uniform_decode_query_len = num_spec_tokens + 1
+-        max_num_tokens = vllm_config.scheduler_config.max_num_seq * uniform_decode_query_len
++        max_num_tokens = vllm_config.scheduler_config.max_num_seqs * uniform_decode_query_len
+         decode_cudagraph_batch_sizes = [
+             x
+-            for x in vllm_config.compilation_config.cudagraph_capture_size
++            for x in vllm_config.compilation_config.cudagraph_capture_sizes
+             if max_num_tokens >= x >= uniform_decode_query_len
+         ]
+         config.experimental_config.aclgraph._aclnn_static_shape_kernel_sym_value_range = decode_cudagraph_batch_sizes
+-- 
+2.45.1.windows.1
+

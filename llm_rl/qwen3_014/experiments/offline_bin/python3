@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Only the two code-domain offline planners are intercepted. All model/worker
+# and other Python commands use the original interpreter, without importing helpers.
+set -euo pipefail
+ORIGINAL=/workspace/cann-recipes-train/llm_rl/qwen3_014/qwen3_main/tools/build_mode1_length_sorted_e2e_plan.py
+if [[ "${1:-}" == "$ORIGINAL" ]]; then
+    exec /usr/local/python3.11.14/bin/python3 /workspace/cann-recipes-train/llm_rl/qwen3_014/experiments/cached_planner.py "$@"
+fi
+VANILLA=/workspace/cann-recipes-train/llm_rl/qwen3_014/qwen3_main/tools/build_vanilla_aclgraph_bucket_plan.py
+if [[ "${1:-}" == "$VANILLA" ]]; then
+    exec /usr/local/python3.11.14/bin/python3 /workspace/cann-recipes-train/llm_rl/qwen3_014/experiments/code_vanilla_bucket_plan.py "$@"
+fi
+exec /usr/local/python3.11.14/bin/python3 "$@"

@@ -1,0 +1,27 @@
+From aad6f6cd403719d48b7ca268b41863d9a2d4d8b9 Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Tue, 11 Nov 2025 10:47:22 +0800
+Subject: [PATCH 02/18] Update verl: use_tqdm set to True
+Enable tqdm progress bar in vLLM generation.
+Helps monitor prgress during long or large-batch rollouts in real time.
+
+---
+ .../verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py      | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index 40613f1..990e90d 100644
+--- a/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/llm_rl/qwen3/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -345,7 +345,7 @@ class vLLMRollout(BaseRollout):
+                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                 sampling_params=self.sampling_params,
+                 lora_request=lora_requests,
+-                use_tqdm=False,
++                use_tqdm=True,
+             )
+ 
+             # TODO(sgm): disable logprob when recompute_log_prob is enable
+-- 
+2.50.1.windows.1
+

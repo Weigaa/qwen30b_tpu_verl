@@ -1,0 +1,46 @@
+From ebf446024ccae581187bee60fa6d3886e09415b3 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Mon, 26 Jan 2026 22:51:16 +0800
+Subject: [PATCH] Integrate SAM decoding into vllm-ascend
+
+---
+ llm_rl/qwen3/vllm_ascend/spec_decode/__init__.py  | 3 +++
+ llm_rl/qwen3/vllm_ascend/spec_decode/interface.py | 1 +
+ 2 files changed, 4 insertions(+)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/spec_decode/__init__.py b/llm_rl/qwen3/vllm_ascend/spec_decode/__init__.py
+index 89f558d..fbefb77 100644
+--- a/llm_rl/qwen3/vllm_ascend/spec_decode/__init__.py
++++ b/llm_rl/qwen3/vllm_ascend/spec_decode/__init__.py
+@@ -21,6 +21,7 @@ from vllm_ascend.spec_decode.medusa_proposer import MedusaProposer
+ from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
+ from vllm_ascend.spec_decode.ngram_proposer import NgramProposer
+ from vllm_ascend.spec_decode.suffix_proposer import SuffixDecodingProposer
++from patches.vllm_ascend.spec_decode.sam_proposer import SAMDecodingProposer
+ 
+ 
+ def get_spec_decode_method(method, vllm_config, device, runner):
+@@ -34,6 +35,8 @@ def get_spec_decode_method(method, vllm_config, device, runner):
+         return SuffixDecodingProposer(vllm_config, device, runner)
+     elif method == "medusa":
+         return MedusaProposer(vllm_config, device, runner)
++    elif method == "sam":
++        return SAMDecodingProposer(vllm_config, device, runner)
+     else:
+         raise ValueError("Unknown speculative decoding method: "
+                          f"{method}")
+diff --git a/llm_rl/qwen3/vllm_ascend/spec_decode/interface.py b/llm_rl/qwen3/vllm_ascend/spec_decode/interface.py
+index feec5bc..968f75b 100644
+--- a/llm_rl/qwen3/vllm_ascend/spec_decode/interface.py
++++ b/llm_rl/qwen3/vllm_ascend/spec_decode/interface.py
+@@ -15,6 +15,7 @@ class SpecDcodeType(enum.Enum):
+     MTP = 4
+     SUFFIX = 5
+     MEDUSA = 6
++    SAM = 7
+ 
+ 
+ class Proposer:
+-- 
+2.45.1.windows.1
+

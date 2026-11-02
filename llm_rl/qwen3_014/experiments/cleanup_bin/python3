@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Analysis-only dispatch for finalizing an already-trained eager arm. No
+# training, worker, graph or dataset commands are modified/intercepted.
+set -euo pipefail
+original=/workspace/cann-recipes-train/llm_rl/qwen3_014/qwen3_main/tools/validate_native_planned_memory.py
+if [[ "${1:-}" == "$original" ]]; then
+    if [[ "${FAIR_FINALIZE_EXISTING:-0}" != 1 || "${ADAFLOOR_ACLGRAPH_MODE:-}" != NONE || "${TASK_QUEUE_ENABLE:-}" != 2 ]]; then
+        echo 'Eager cleanup verifier dispatch requires finalize-only NONE/TQ2' >&2
+        exit 2
+    fi
+    shift
+    exec /usr/local/python3.11.14/bin/python3 /workspace/cann-recipes-train/llm_rl/qwen3_014/experiments/native_eager_handoff.py "$@"
+fi
+exec /usr/local/python3.11.14/bin/python3 "$@"

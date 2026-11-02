@@ -1,0 +1,40 @@
+From 5e7202ed9063bfed33a8cfe36aa1c612f3c73a6d Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Tue, 11 Nov 2025 10:45:32 +0800
+Subject: [PATCH] Update verl: handle USE_ALLTOALL_OVERLAP
+
+Adds special handling logic for mlp.experts.weight in MoE model when USE_ALLTOALL_OVERLAP is enabled.
+After distributed checkpoint loading, it explicitly copies the expert weights loaded back into 
+the model's state_dict and parameter tensors to ensure they take effect properly.
+
+---
+ llm_rl/qwen3/verl/utils/model.py | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/llm_rl/qwen3/verl/utils/model.py b/llm_rl/qwen3/verl/utils/model.py
+index 15fdecd..009b3de 100644
+--- a/llm_rl/qwen3/verl/utils/model.py
++++ b/llm_rl/qwen3/verl/utils/model.py
+@@ -556,8 +556,17 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
+             for k in list(ssd.keys()):
+                 if "output_layer" in k:
+                     ssd.pop(k)
+-        dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
+-
++        if os.getenv('USE_ALLTOALL_OVERLAP', '0') == '1':
++            new_ssd = dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
++            sd = unwrap_model(model).state_dict()
++            for key in list(ssd.keys()):
++                if "mlp.experts.weight" in key:
++                    with torch.no_grad():
++                        ssd[key].data.copy_(new_ssd[key])   # param update
++                        sd[key].copy_(new_ssd[key])         # tensor update
++        else:
++            dist_checkpointing.load(ssd, dist_weight_path, strict=strict)
++            
+     return
+ 
+ 
+-- 
+2.50.1.windows.1
+

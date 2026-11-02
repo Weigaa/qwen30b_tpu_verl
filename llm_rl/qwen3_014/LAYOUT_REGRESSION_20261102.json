@@ -1,0 +1,46 @@
+{
+  "status": "PASS_SHORT_PAIRED_NPU_REGRESSION",
+  "date": "2026-11-02",
+  "runtime": "/workspace/cann-recipes-train/llm_rl/qwen3_014/qwen3_main",
+  "successful_arms": 6,
+  "steps_per_arm": 2,
+  "primary_responses": 6144,
+  "primary_rank_step_audits": 192,
+  "all_primary_pair_outputs_exact": true,
+  "full_graph_and_eager_exercised": true,
+  "native_sleep2_two_step_exercised": true,
+  "natural_actual_floors": [
+    16,
+    8,
+    4,
+    2
+  ],
+  "kv_preemptions": 0,
+  "successful_runs_oom": 0,
+  "sidecar_completed": 3923,
+  "sidecar_output_parity_not_universal": true,
+  "source_identical_sidecar_files": {
+    "internal/run_elastic_sidecar_infer.sh": "a88cf2f59a4554dbc153298fd27593d769c9196561fedb641a77d305d1abdd42",
+    "vllm_ascend/compilation/acl_graph.py": "47abbb166d21dc1ead9a52ce965b52d7a0892be9a32426fec0d1953013420c13",
+    "vllm_ascend/worker/model_runner_v1.py": "79824b4251bf3aec1eef8cc1b99983c38f8919e10332db82b1d2c81c03fa42c2"
+  },
+  "repaired_production_file": "/workspace/cann-recipes-train/llm_rl/qwen3_014/qwen3_main/internal/wj_train_grpo_qwen30b_a3b_16die_true_weight_regroup.sh",
+  "repaired_launcher_sha256": "e94d2609d9b7c85db949bb073e744a36dc6444146e8ddacb049a7ce1bc1bbd50",
+  "only_difference_from_premerge_basic_launcher": "Default output directory under /data",
+  "report": "/data/adafloor_graph_results/merge_regression_20261102T060000Z/RESULTS.md",
+  "raw_audit": "/data/adafloor_graph_results/merge_regression_20261102T060000Z/RAW_AUDIT.json",
+  "raw_audit_sha256": "93f735eb16804d83f7ed3359d471da29cbc22ad44671847a962d515df3473707",
+  "regression_test": "experiments/test_version_layout.py::test_primary_launcher_really_starts_and_cleans_up_basic_sidecar",
+  "regression_unit_tests_passed": 5,
+  "npus_idle_after_test": true,
+  "public_checkpoint_preserved": true,
+  "excluded_attempts": [
+    "natural_f2_graph_sidecar/reference_failed_fixture_metadata_1118",
+    "natural_f2_graph_sidecar/merged_failed_missing_watcher_1145",
+    "natural_f2_graph_sidecar/reference_failed_port_1047",
+    "natural_f2_graph_sidecar/reference_failed_finite_lease_1128",
+    "baseline_eager/merged_failed_port_1021"
+  ],
+  "frozen_weights_and_artificial_caps": true,
+  "full_training_or_statistical_performance_equivalence_claimed": false
+}

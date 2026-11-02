@@ -1,0 +1,125 @@
+{
+  "profile": "v014_native_sleep2_full_decode_f4validated_20261017",
+  "scope": "Capacity calibration, not Figure6 timing replicates; freeze before fresh seed0",
+  "hardware": {
+    "devices": 16,
+    "physical_HBM_GiB_per_device": 64
+  },
+  "runtime": {
+    "vllm": "0.14",
+    "task_queue": 1,
+    "graph": "FULL_DECODE_ONLY",
+    "sleep_level": 2,
+    "lifecycle": 1,
+    "kv_first": true,
+    "buckets": 8
+  },
+  "measured_old_profile": {
+    "path": "/data/adafloor_graph_results/mlsys_v014_reserve_calibration_20261017/current_minskew/phase_highwaters.json",
+    "sha256": "4a9a80797b3594a0f03629afd98047f149f3c6a8af9bc1fa41126de91d123408",
+    "sample_bytes": 46079107,
+    "sample_sha256": "19b80dd2731762b534263702b2a1a0874553678b11b47ea10564bc630d4dcfef",
+    "whole_job_peak_GiB": 59.6357421875,
+    "outside_rollout_peak_GiB": 59.6357421875,
+    "complete_windows": [
+      {
+        "epoch": "epoch_001_mode1_natural",
+        "step": 4,
+        "target_floor": 4,
+        "kv_tokens": 253184,
+        "peak_GiB": 57.6064453125,
+        "minimum_free_GiB": 6.3935546875,
+        "max_gap_ms": 593.288565
+      },
+      {
+        "epoch": "epoch_001_mode1_natural",
+        "step": 5,
+        "target_floor": 16,
+        "kv_tokens": 353408,
+        "peak_GiB": 57.060546875,
+        "minimum_free_GiB": 6.939453125,
+        "max_gap_ms": 729.986963
+      },
+      {
+        "epoch": "epoch_002_mode1_natural",
+        "step": 1,
+        "target_floor": 2,
+        "kv_tokens": 103680,
+        "peak_GiB": 54.9658203125,
+        "minimum_free_GiB": 9.0341796875,
+        "max_gap_ms": 774.021675
+      },
+      {
+        "epoch": "epoch_002_mode1_natural",
+        "step": 2,
+        "target_floor": 4,
+        "kv_tokens": 253184,
+        "peak_GiB": 57.19140625,
+        "minimum_free_GiB": 6.80859375,
+        "max_gap_ms": 532.057507
+      },
+      {
+        "epoch": "epoch_002_mode1_natural",
+        "step": 3,
+        "target_floor": 4,
+        "kv_tokens": 253184,
+        "peak_GiB": 57.796875,
+        "minimum_free_GiB": 6.203125,
+        "max_gap_ms": 597.132179
+      },
+      {
+        "epoch": "epoch_002_mode1_natural",
+        "step": 4,
+        "target_floor": 4,
+        "kv_tokens": 253184,
+        "peak_GiB": 57.6787109375,
+        "minimum_free_GiB": 6.3212890625,
+        "max_gap_ms": 573.558966
+      },
+      {
+        "epoch": "epoch_002_mode1_natural",
+        "step": 5,
+        "target_floor": 16,
+        "kv_tokens": 353408,
+        "peak_GiB": 56.9677734375,
+        "minimum_free_GiB": 7.0322265625,
+        "max_gap_ms": 728.945436
+      }
+    ]
+  },
+  "tested_hard_f4": {
+    "path": "/data/adafloor_graph_results/mlsys_fixed4_hard_capacity_probe_20261017/capacity_window_audit.json",
+    "sha256": "c0199f8370cec1fd2c8ff02ad2be679b979cbf0720dfcbd04b99389a1a239ed5",
+    "actual_kv_tokens": 280576,
+    "responses": 512,
+    "reward": 0.806640625,
+    "mean_length": 10666.658203125,
+    "at_cap": 92,
+    "preemptions": 0,
+    "generation_peak_GiB": 57.7744140625,
+    "whole_job_peak_GiB": 58.40625
+  },
+  "decision": {
+    "full16": 380800,
+    "natural_f2": 131072,
+    "natural_f4": 280576,
+    "natural_f8": 288256,
+    "natural_f4_family_f8": 349952,
+    "planned_f4": 133120,
+    "planned_f8": 235264
+  },
+  "basis": [
+    "F4 original280576 actually passed hard-window FULL+sleep2,512outputs+normal backward; old253184 was statically inadmissible.",
+    "Account for warm RL state: old warm F4 peak57.796875 plus nominal KV delta2.5078125 gives60.3046875GiB before allocator rounding; this is a sizing estimate, not a new measurement.",
+    "Full16 restore is a stronger baseline; old full16 generation peak57.060546875 plus same KV delta estimates59.568359375GiB. Rerun all old Full16 controls.",
+    "NaturalF2 restored131072 is a first-seed validation candidate supported by cold F2 coverage and expert/KV storage sizing; do not claim an already measured warm131072 run.",
+    "Unexercised floor8 target capacities remain at prior conservative graph limits; no extrapolation of the F4 cold case to larger F8 budgets.",
+    "All capacities shared by applicable policies; planned residency retains existing147456/114688-token headroom.",
+    "Source/protocol/budgets freeze for fresh seed0; review every method before any later seed. OOM/quality anomaly invalidates the affected run and requires diagnosis, not silent eager fallback or cap changes."
+  ],
+  "limitations": [
+    "DCMI sampled highwaters can miss sub-interval transients; not instantaneous-peak guarantees.",
+    "Extra KV withholding is not the literal physical graph-memory overhead; graphs still consume memory.",
+    "One diagnostic does not replace full two-epoch,all-policy validation."
+  ]
+}

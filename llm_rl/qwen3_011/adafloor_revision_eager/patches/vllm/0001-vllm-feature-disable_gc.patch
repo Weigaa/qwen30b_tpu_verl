@@ -1,0 +1,36 @@
+From d3f41b02ca14e0c0a6a40d5aec4ce59f1d4dab4e Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Tue, 11 Nov 2025 11:40:55 +0800
+Subject: [PATCH 11/18] Update vllm: disable gc during the decode step
+Disable garbage collect(gc) before decode steps to avoid host bound caused by memory management.
+Restore gc after completion.
+---
+ llm_rl/qwen3/vllm/entrypoints/llm.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/llm_rl/qwen3/vllm/entrypoints/llm.py b/llm_rl/qwen3/vllm/entrypoints/llm.py
+index 862f383..da97046 100644
+--- a/llm_rl/qwen3/vllm/entrypoints/llm.py
++++ b/llm_rl/qwen3/vllm/entrypoints/llm.py
+@@ -6,6 +6,7 @@ from collections.abc import Sequence
+ from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
+ 
+ import cloudpickle
++import gc
+ import torch.nn as nn
+ from pydantic import ValidationError
+ from tqdm.auto import tqdm
+@@ -1597,7 +1598,10 @@ class LLM:
+         total_in_toks = 0
+         total_out_toks = 0
+         while self.llm_engine.has_unfinished_requests():
++            original_threshold = gc.get_threshold()
++            gc.set_threshold(0)
+             step_outputs = self.llm_engine.step()
++            gc.set_threshold(*original_threshold)
+             for output in step_outputs:
+                 if output.finished:
+                     outputs.append(output)
+-- 
+2.50.1.windows.1
+

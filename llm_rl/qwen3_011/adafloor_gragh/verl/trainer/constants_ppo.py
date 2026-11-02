@@ -1,0 +1,81 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import os
+
+from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
+
+PPO_RAY_RUNTIME_ENV = {
+    "env_vars": {
+        "TOKENIZERS_PARALLELISM": "true",
+        "NCCL_DEBUG": "WARN",
+        "VLLM_LOGGING_LEVEL": "WARN",
+        "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        # To prevent hanging or crash during synchronization of weights between actor and rollout
+        # in disaggregated mode. See:
+        # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
+        # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+        "NCCL_CUMEM_ENABLE": "0",
+    },
+}
+
+_PPO_RAY_PASSTHROUGH_ENV_PREFIXES = (
+    "ADAFLOOR_FROZEN_",
+    "VERL_PAIRED_REQUEST_SAMPLING_SEEDS",
+    "VLLM_ASCEND_MODE1_WEIGHT_LOADER_DIAG",
+    "VLLM_ASCEND_ELASTIC_ACLGRAPH",
+    "VLLM_ASCEND_FULL_DECODE_ATTENTION_BACKEND",
+    "VLLM_ASCEND_FORCE_ALLTOALL_MOE",
+    "VLLM_ASCEND_MC2_MIN_EP_SIZE",
+    "VLLM_ASCEND_ENABLE_TOPK_TOPP_OPTIMIZATION",
+    "VLLM_ROLLOUT_NATIVE_SLEEP_MODE",
+    "VLLM_ROLLOUT_SLEEP_LEVEL",
+    "VLLM_ROLLOUT_REUSE_ACLGRAPH_AFTER_WEIGHT_UPDATE",
+    "VLLM_ROLLOUT_CAMEM_WEIGHT_RELOAD",
+    "VLLM_ROLLOUT_FILTER_EMPTY_WEIGHT_SHARDS",
+    "VERL_FIXED_WORK_REPLAY",
+    "VERL_FULL_DECODE_MAX_UPDATE_ACTOR_SECONDS",
+    "VERL_FULL_DECODE_MAX_UPDATE_ACTOR_MS_PER_TOKEN",
+    "VLLM_ENABLE_MC2",
+    "ASCEND_CUSTOM_OPP_PATH",
+    "MEGATRON_CI_DISABLE_EXPANDABLE_SEGMENTS",
+    "PYTORCH_NPU_ALLOC_CONF",
+    "ASCEND_LAUNCH_BLOCKING",
+    "TASK_QUEUE_ENABLE",
+)
+
+
+def get_ppo_ray_runtime_env():
+    """
+    A filter function to return the PPO Ray runtime environment.
+    To avoid repeat of some environment variables that are already set.
+    """
+    working_dir = (
+        json.loads(os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR, "{}")).get("runtime_env", {}).get("working_dir", None)
+    )
+
+    runtime_env = {
+        "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
+        **({"working_dir": None} if working_dir is None else {}),
+    }
+    for key, value in os.environ.items():
+        if key.startswith(_PPO_RAY_PASSTHROUGH_ENV_PREFIXES):
+            runtime_env["env_vars"][key] = value
+    for key in list(runtime_env["env_vars"].keys()):
+        if os.environ.get(key) is not None:
+            if not key.startswith(_PPO_RAY_PASSTHROUGH_ENV_PREFIXES):
+                runtime_env["env_vars"].pop(key, None)
+    return runtime_env

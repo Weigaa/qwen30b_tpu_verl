@@ -1,0 +1,24 @@
+From 4e736423d9c48be382a15b1afb5409cbfe00b451 Mon Sep 17 00:00:00 2001
+From: huyuanquan1 <huyuanquan1@huawei.com>
+Date: Tue, 27 Jan 2026 09:25:28 +0800
+Subject: [PATCH] Avoided hccl timeout of all_gather-ing from multiple
+
+---
+ llm_rl/qwen3/vllm_ascend/utils.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/llm_rl/qwen3/vllm_ascend/utils.py b/llm_rl/qwen3/vllm_ascend/utils.py
+index eb88afd..264ac91 100644
+--- a/llm_rl/qwen3/vllm_ascend/utils.py
++++ b/llm_rl/qwen3/vllm_ascend/utils.py
+@@ -999,6 +999,7 @@ def get_hccl_config_for_pg_options(group_name: str) -> dict | None:
+         return None
+     hccl_config_map = {
+         "dp": {"hccl_buffer_size": calculate_dp_buffer_size()},
++        "tp": {"hccl_op_expansion_mode": 3},
+     }
+     return hccl_config_map.get(group_name, get_default_buffer_config())
+ 
+-- 
+2.45.1.windows.1
+

@@ -1,0 +1,15 @@
+{
+  "status": "FRESH31_SWAP_CODE_P4_GOLD_PLAN_PARITY_PASS",
+  "wall_seconds": 1685.2338679526001,
+  "optimization_sha256": "bf252b1cd0770f103512bb2f465358fc7c5d0b3c3e5a5e5c4a9169a05f319ef8",
+  "fresh_search": true,
+  "no_repair_trace_replay": true,
+  "all_plan_and_reordered_input_fields_equal": true,
+  "reference": "/data/adafloor_graph_results/mlsys_v014_supplement_20261023T180000Z/code_plan_preview_after_multiturn_fix",
+  "gold_sha256": {
+    "length_sorted_rank_plan.json": "080fff8aed58f28707e23c40aa14e26ecafcb270aa85f3e9d8520c28440b4a10",
+    "length_sorted_rank_plan_summary.json": "f2492dbdfc87cd084c04216789c15cab6a1d0fa249ddda4c96411b566e492c9d",
+    "length_sorted_length_oracle.json": "e5cb6ba6100197a4ae4f5c3325909627dd68701b5e1c044f98f2a2808e5ba70b"
+  },
+  "scope": "CPU regression only. No new NPU experiment, seed, answer or reward selection."
+}

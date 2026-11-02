@@ -1,0 +1,40 @@
+{
+  "status": "FIVE_STEP_NATURAL_F2_EXACT_PLAN_PARITY_PASS",
+  "workload": "Existing mathematical epoch0, all160 prompts/5steps, original Natural-F2 budgets",
+  "results": {
+    "original": {
+      "seconds": 56.149675372987986,
+      "floors": [
+        2,
+        2,
+        4,
+        4,
+        16
+      ],
+      "plan_sha256": "6d82ddd3b10bad8bca74b3df9bbbe403dec0bf24629b9d3cdc385bbe77d3135b"
+    },
+    "optimized": {
+      "seconds": 1.244282452389598,
+      "floors": [
+        2,
+        2,
+        4,
+        4,
+        16
+      ],
+      "plan_sha256": "6d82ddd3b10bad8bca74b3df9bbbe403dec0bf24629b9d3cdc385bbe77d3135b"
+    }
+  },
+  "speedup": 45.12614902279996,
+  "optimization_sha256": "8f7218cd860c478a47bddcf682d816a38d480b1a23474c4b5efca413ca25da8b",
+  "counters": {
+    "oracle_calls": 9609,
+    "vertex_pruned": 9599,
+    "matching_pruned": 0,
+    "original_oracle_calls": 10,
+    "contexts": 10,
+    "pair_hits": 8928,
+    "pair_misses": 2480
+  },
+  "all_plan_fields_equal": true
+}

@@ -1,0 +1,96 @@
+{
+  "AddRmsNormBias": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "x1",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "x2",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "gamma",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "beta",
+          "index": 3,
+          "paramType": "optional",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "y",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "rstd",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "x",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "epsilon"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "AddRmsNormBias/d=0,p=1/0,2/0,2/0,2/0,2/0,2/0,2",
+          "AddRmsNormBias/d=0,p=0/0,2/0,2/0,2/0,2/0,2/0,2",
+          "AddRmsNormBias/d=1,p=1/0,2/0,2/0,2/0,2/0,2/0,2",
+          "AddRmsNormBias/d=1,p=0/0,2/0,2/0,2/0,2/0,2/0,2"
+        ],
+        "binPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_19e35017264aa50680f35d13d8badd71.o",
+        "jsonPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_19e35017264aa50680f35d13d8badd71.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "AddRmsNormBias/d=0,p=1/27,2/27,2/27,2/27,2/0,2/27,2",
+          "AddRmsNormBias/d=0,p=0/27,2/27,2/27,2/27,2/0,2/27,2",
+          "AddRmsNormBias/d=1,p=1/27,2/27,2/27,2/27,2/0,2/27,2",
+          "AddRmsNormBias/d=1,p=0/27,2/27,2/27,2/27,2/0,2/27,2"
+        ],
+        "binPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_352d2859a07d64c080e8dfc836d9897f.o",
+        "jsonPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_352d2859a07d64c080e8dfc836d9897f.json"
+      },
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "AddRmsNormBias/d=0,p=1/1,2/1,2/1,2/1,2/0,2/1,2",
+          "AddRmsNormBias/d=0,p=0/1,2/1,2/1,2/1,2/0,2/1,2",
+          "AddRmsNormBias/d=1,p=1/1,2/1,2/1,2/1,2/0,2/1,2",
+          "AddRmsNormBias/d=1,p=0/1,2/1,2/1,2/1,2/0,2/1,2"
+        ],
+        "binPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_6dc9d65746f49267d3d534b1b9ba85f9.o",
+        "jsonPath": "ascend910_93/add_rms_norm_bias/AddRmsNormBias_6dc9d65746f49267d3d534b1b9ba85f9.json"
+      }
+    ]
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "status": "PASS_WITH_ARCHIVED_CHECKPOINT_TEST_NOT_RUN",
+  "framework_implementations": [
+    "qwen3_main",
+    "qwen3_sidecar"
+  ],
+  "main_consolidates": 4,
+  "primary_protocol_graph_eager_sidecar_tests_passed": 52,
+  "multimodel_protocol_import_stop_memory_tests_passed": 16,
+  "version_layout_tests_passed": 4,
+  "paper_tests_passed": 35,
+  "total_cpu_and_offline_tests_passed": 107,
+  "shell_syntax_checks": 129,
+  "python_syntax_checks": 153,
+  "old_checkpoint_dependent_smoke_test": {
+    "status": "NOT_RUN_MISSING_PREEXISTING_CHECKPOINT",
+    "test": "test_runner_cpu_smoke_builds_the_shared_real_step",
+    "fixture": "/workspace/adafloor_graph_results/qwen3_vanilla_epoch0_full_decode_fia_v014opt_tq1_buckets16_32_seed0/common_epoch0_full_decode_fia_v014opt_tq1_buckets16_32_seed0"
+  },
+  "eager_dry_run": true,
+  "full_decode_graph_dry_run": true,
+  "nested_sidecar_import_origin_check": true,
+  "old_top_level_source_aliases": false,
+  "historical_raw_text_files_preserved_byte_exact": 70,
+  "common_epoch0_preserved": true,
+  "historical_protocol_hash_checks_not_disabled": true,
+  "npu_experiments_started": false,
+  "paper_body_pages": 10,
+  "paper_pdf": "/workspace/cann-recipes-train/llm_rl/qwen3_014/qwen3_main/analysis_eval/mlsys2027_two_metrics_v2/main.pdf",
+  "obsolete_absolute_runtime_paths": [],
+  "rollback_archives": [
+    {
+      "original": "qwen3",
+      "archive": "/data/adafloor_code_archives/qwen3_layout_before_20261101/qwen3.tar.gz",
+      "sha256": "11609b6e43e2d9b5d171e87d535ce5d82c48d640b352142ca8f7eed579ed32a3"
+    },
+    {
+      "original": "qwen3_graph_sidecar_v014",
+      "archive": "/data/adafloor_code_archives/qwen3_layout_before_20261101/qwen3_graph_sidecar_v014.tar.gz",
+      "sha256": "91ee65fde53dcc6f85c460728e9e85d6dfcbcc9d58b43af0937f392317fe8661"
+    },
+    {
+      "original": "qwen3_graph_sidecar_models_v014",
+      "archive": "/data/adafloor_code_archives/qwen3_layout_before_20261101/qwen3_graph_sidecar_models_v014.tar.gz",
+      "sha256": "71f31c0f9b8c8a41fc6a74ce33d79d3c064e67350950c53da33fe9696e1dac19"
+    },
+    {
+      "original": "qwen3_mlsys_supplement_v014",
+      "archive": "/data/adafloor_code_archives/qwen3_layout_before_20261101/qwen3_mlsys_supplement_v014.tar.gz",
+      "sha256": "4cf2b2842a2372bdea7e6c2dfbd9c1e7ba33236418ff506ca017f4066d46b348"
+    },
+    {
+      "original": "qwen3_mlsys_eager_controls_v014",
+      "archive": "/data/adafloor_code_archives/qwen3_layout_before_20261101/qwen3_mlsys_eager_controls_v014.tar.gz",
+      "sha256": "b23911d6a29b0d4bec9f3d552ffffc2fe0312038cb7f04a28880aae4d6b5c08f"
+    },
+    {
+      "original": "ref_ziyi_qwen3",
+      "archive": "/data/adafloor_code_archives/qwen3_layout_before_20261101/ref_ziyi_qwen3.tar.gz",
+      "sha256": "cf7809f4f7255f7fa15e899003d3b34392633754a2be4fef66b62e818467ad7d"
+    }
+  ],
+  "controller_archive_sha256": "5170c7687f6a646e8afe243ac28d5d26da76224de8809a81885face0c3047599"
+}

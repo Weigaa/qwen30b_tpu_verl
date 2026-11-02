@@ -1,0 +1,56 @@
+From 1a416212c07f5da2c26e99e45e8985e16fc40b7a Mon Sep 17 00:00:00 2001
+From: caojingyi <caojingyi@noreply.gitcode.com>
+Date: Tue, 18 Nov 2025 10:43:52 +0800
+Subject: [PATCH] Update verl: megatron_workers
+Fix the issue where MindSpeed framework disables `torch.compile` (causing in unavailable inference
+acceleration), enable the use of compiled model during rollout.
+---
+ llm_rl/qwen3/verl/workers/megatron_workers.py | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/llm_rl/qwen3/verl/workers/megatron_workers.py b/llm_rl/qwen3/verl/workers/megatron_workers.py
+index 0d5fbc9..9d20ca6 100644
+--- a/llm_rl/qwen3/verl/workers/megatron_workers.py
++++ b/llm_rl/qwen3/verl/workers/megatron_workers.py
+@@ -34,6 +34,8 @@ except ImportError:
+     repatch = None
+ 
+ from megatron.core import parallel_state as mpu
++from mindspeed.patch_utils import MindSpeedPatchesManager
++from mindspeed.core.megatron_basic.requirements_basic import dummy_compile
+ 
+ from verl import DataProto
+ from verl.single_controller.base import Worker
+@@ -78,6 +80,10 @@ from verl.workers.rollout import get_rollout_class
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
++MindSpeedPatchesManager.patches_info['torch.compile'].remove_patch()
++TRUE_COMPILE = torch.compile
++DUMMY_COMPILE = dummy_compile
++
+ 
+ def set_random_seed(seed):
+     import random
+@@ -390,6 +396,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+ 
+     def _build_rollout(self, trust_remote_code=False):
+         from torch.distributed.device_mesh import init_device_mesh
++        # Temporarily restore true torch.compile for the rollout build
++        torch.compile = TRUE_COMPILE
+ 
+         # 1. parse rollout and huggingface model config
+         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
+@@ -447,6 +455,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+             loop = asyncio.get_event_loop()
+             loop.run_until_complete(self.trainer_mode())
+ 
++        # Revert to dummy_compile after rollout is built
++        torch.compile = DUMMY_COMPILE
++
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def init_model(self):
+         if self.config.model.get("external_lib", None) is not None:
+-- 
+2.50.1.windows.1
+
