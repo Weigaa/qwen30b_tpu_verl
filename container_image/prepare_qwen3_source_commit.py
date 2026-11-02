@@ -29,7 +29,8 @@ def selected(path):
     rel=path.relative_to(ROOT)
     if set(rel.parts)&SKIP:
         # The small calibrated capacity contract is needed by runtime tools.
-        return str(rel).endswith('/analysis_eval/MLSYS_FIG6_CAPACITY_20261017.json')
+        return (str(rel).endswith('/analysis_eval/MLSYS_FIG6_CAPACITY_20261017.json') or
+                str(rel).endswith('/qwen3_shrink_aware/analysis_eval/plot_e2e_performance.py'))
     if any(p.startswith(('resample_result','noresample_result','mode0_','mode1_')) for p in rel.parts[:-1]):
         return False
     if path.is_symlink() or not path.is_file() or path.stat().st_size>50*1024**2:
