@@ -17,7 +17,7 @@ SKIP={'.git','.codex','.agents','.vscode','__pycache__','.pytest_cache','.cache'
       'outputs','record','record_old011','tensorboard_log','save4analyse_ingraphmode',
       'logs','rollout_data','rollout_length','checkpoints','validation_results',
       'qwen3_shrink_aware_cleanup_20260626T182116Z','analysis_eval','evidence',
-      'third_party','node_modules','.build','build','dist'}
+      'node_modules','.build','build','dist'}
 
 
 def git(*args,env=None,input=None):
@@ -47,6 +47,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--branch',default='014_MLSYS_adafloor')
     p.add_argument('--commit',action='store_true')
+    p.add_argument('--update-local',action='store_true',help='Fast-forward the newly prepared local branch before publication')
     p.add_argument('--receipt',type=Path,required=True)
     a=p.parse_args()
     files=[]
@@ -68,11 +69,13 @@ def main():
         print(json.dumps(summary,indent=2))
         return
     existing=subprocess.run(['git','show-ref','--verify','--quiet','refs/heads/'+a.branch],cwd=ROOT)
-    if existing.returncode==0:
+    if existing.returncode==0 and not a.update_local:
         raise RuntimeError('Local branch already exists, refusing to overwrite')
+    if existing.returncode!=0 and a.update_local:
+        raise RuntimeError('No local branch to advance')
     index=ROOT/'.git/index'
     before=hashlib.sha256(index.read_bytes()).hexdigest()
-    parent=git('rev-parse','HEAD').decode().strip()
+    parent=git('rev-parse','refs/heads/'+a.branch if a.update_local else 'HEAD').decode().strip()
     with tempfile.TemporaryDirectory(prefix='qwen3_publish_') as td:
         env=dict(os.environ,GIT_INDEX_FILE=str(Path(td)/'index'))
         git('read-tree',parent,env=env)
@@ -85,7 +88,10 @@ def main():
         tree=git('write-tree',env=env).decode().strip()
         commit=git('commit-tree',tree,'-p',parent,'-m',
                    'Consolidate AdaFloor v0.14 graph/eager/sidecar sources for MLSys',env=env).decode().strip()
-        git('branch',a.branch,commit)
+        if a.update_local:
+            git('update-ref','refs/heads/'+a.branch,commit,parent)
+        else:
+            git('branch',a.branch,commit)
     assert hashlib.sha256(index.read_bytes()).hexdigest()==before
     report=dict(summary,commit=commit,parent=parent,user_index_preserved_sha256=before,
                 current_worktree_branch_unchanged=True,pushed=False,
